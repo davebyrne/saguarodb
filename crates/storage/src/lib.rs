@@ -2223,6 +2223,90 @@ mod tests {
     }
 
     #[test]
+    fn inline_compressed_array_is_materialized_on_read() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, _) = array_base_and_toast_schema();
+        base.toast.compression = ToastCompression::Zstd;
+        base.toast.tuple_target = 2048;
+        let toast = toast_schema(&base, 2);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let array = integer_array((0..500).map(|_| 7));
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Array(array)],
+        };
+        let bytes = prepare_row_bytes(&harness, &ctx, &base, &row);
+        assert!(matches!(
+            decode_physical_row(&base, &bytes).unwrap().values[1],
+            DecodedPhysicalValue::Compressed { .. }
+        ));
+        seed_parent_tuple(&harness, &ctx, &base, &bytes, &pk(1));
+        assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+    }
+
+    #[test]
+    fn compressed_external_array_is_materialized_on_read() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, _) = array_base_and_toast_schema();
+        base.toast.compression = ToastCompression::Zstd;
+        base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
+        let toast = toast_schema(&base, 2);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let array = integer_array(0..2_000);
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Array(array)],
+        };
+        let bytes = prepare_row_bytes(&harness, &ctx, &base, &row);
+        assert!(matches!(
+            decode_physical_row(&base, &bytes).unwrap().values[1],
+            DecodedPhysicalValue::External {
+                pointer: ToastPointer {
+                    codec: compress::CODEC_ZSTD,
+                    ..
+                },
+                ..
+            }
+        ));
+        seed_parent_tuple(&harness, &ctx, &base, &bytes, &pk(1));
+        assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+    }
+
+    #[test]
+    fn array_primary_key_supports_insert_get_and_exact_range_scan() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut schema = users_schema();
+        schema.columns.truncate(2);
+        schema.columns[0].data_type =
+            DataType::Array(common::ArrayType::new(DataType::Integer).unwrap());
+        schema.columns[1].data_type = DataType::Integer;
+        schema.primary_key = vec![0];
+        harness.storage.create_table(&ctx, &schema).unwrap();
+        let array = integer_array([3, 1, 4]);
+        let key = Key(vec![Value::Array(array.clone())]);
+        let row = Row {
+            values: vec![Value::Array(array), Value::Integer(9)],
+        };
+        harness.storage.insert(&ctx, 1, row.clone()).unwrap();
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &key).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            collect(
+                harness
+                    .storage
+                    .scan_range(&ctx, 1, &KeyRange::Exact(key))
+                    .unwrap()
+            ),
+            vec![row]
+        );
+    }
+
+    #[test]
     fn prepare_default_auto_uses_1024_min_value_size() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
@@ -4191,6 +4275,46 @@ mod tests {
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
         (base, toast)
+    }
+
+    fn array_base_and_toast_schema() -> (TableSchema, TableSchema) {
+        let (mut base, _) = bytea_base_and_toast_schema();
+        base.columns[1].data_type =
+            DataType::Array(common::ArrayType::new(DataType::Integer).unwrap());
+        base.toast.min_value_size = 128;
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
+    fn integer_array(values: impl IntoIterator<Item = i64>) -> common::SqlArray {
+        let elements = values.into_iter().map(Value::Integer).collect::<Vec<_>>();
+        common::SqlArray::new(
+            DataType::Integer,
+            vec![common::ArrayDimension::new(elements.len() as u32, 1)],
+            elements,
+        )
+        .unwrap()
+    }
+
+    fn prepare_row_bytes(
+        harness: &StorageHarness,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Vec<u8> {
+        harness
+            .storage
+            .prepare_row_for_storage(
+                ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                schema,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                row,
+            )
+            .unwrap()
     }
 
     fn two_bytea_base_and_toast_schema() -> (TableSchema, TableSchema) {

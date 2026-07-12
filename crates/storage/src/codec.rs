@@ -279,6 +279,9 @@ pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
         return Err(corrupt_row("array has too many dimensions"));
     }
     let cardinality = read_u32(bytes, &mut offset)? as usize;
+    if cardinality > common::MAX_ARRAY_ELEMENTS {
+        return Err(corrupt_row("array cardinality exceeds the supported limit"));
+    }
     let mut dimensions = Vec::with_capacity(ndim);
     for _ in 0..ndim {
         let len = read_u32(bytes, &mut offset)?;
@@ -2108,6 +2111,14 @@ mod tests {
         let mut bad_cardinality = encode_array_payload(&integer_array()).unwrap();
         bad_cardinality[3..7].copy_from_slice(&5_u32.to_le_bytes());
         assert!(decode_array_payload(&bad_cardinality).is_err());
+
+        let mut allocation_bomb = vec![1, 0, 1];
+        allocation_bomb.extend_from_slice(
+            &u32::try_from(common::MAX_ARRAY_ELEMENTS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(decode_array_payload(&allocation_bomb).is_err());
 
         let mut bad_numeric = vec![1, 12];
         bad_numeric.extend_from_slice(&0_u32.to_le_bytes());

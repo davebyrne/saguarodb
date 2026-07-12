@@ -81,6 +81,11 @@ pub enum Value {
 }
 ```
 
+`SqlArray::new` validates rectangular shape, scalar element types, signed
+dimension bounds, and the canonical zero-dimensional empty representation. It
+caps cardinality at `MAX_ARRAY_ELEMENTS = 1_000_000`; durable decoders enforce
+the same limit before allocating element storage.
+
 `Value::Date`/`Value::Timestamp` are backed by `i64`, `Value::Bytes` by
 `Vec<u8>`, and `Value::Uuid` by `[u8; 16]`, so the derived `Ord`/`Hash` give
 correct chronological / lexicographic ordering and key/dedup behavior. `f64` does

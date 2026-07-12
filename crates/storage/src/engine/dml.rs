@@ -49,7 +49,11 @@ enum ToastColumnPlan {
 }
 
 enum ToastVarlenaPlan {
-    Plain,
+    Plain {
+        /// Arrays retain their versioned logical bytes so planning, compression,
+        /// materialization, and externalization serialize them only once.
+        cached_payload: Option<std::sync::Arc<[u8]>>,
+    },
     Compressed {
         codec: u8,
         dict_id: Option<u32>,
@@ -217,13 +221,18 @@ fn planned_column_len(
                 ));
             }
             match varlena {
-                ToastVarlenaPlan::Plain => {
-                    let raw = toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
-                        DbError::storage(
-                            SqlState::DatatypeMismatch,
-                            format!("value type does not match column {}", column.name),
-                        )
-                    })?;
+                ToastVarlenaPlan::Plain { cached_payload } => {
+                    let raw = match cached_payload {
+                        Some(payload) => std::borrow::Cow::Borrowed(payload.as_ref()),
+                        None => {
+                            toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
+                                DbError::storage(
+                                    SqlState::DatatypeMismatch,
+                                    format!("value type does not match column {}", column.name),
+                                )
+                            })?
+                        }
+                    };
                     supported_varlena_len(raw.len())?;
                     checked_varlena_len_add(4, raw.len())
                 }
@@ -383,13 +392,16 @@ fn materialize_prepared_values(
             ToastColumnPlan::Value => {
                 values.push(crate::codec::PreparedColumnValue::Value(value.clone()));
             }
-            ToastColumnPlan::Varlena(ToastVarlenaPlan::Plain) => {
-                let raw = toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
-                    DbError::storage(
-                        SqlState::DatatypeMismatch,
-                        format!("value type does not match column {}", column.name),
-                    )
-                })?;
+            ToastColumnPlan::Varlena(ToastVarlenaPlan::Plain { cached_payload }) => {
+                let raw = match cached_payload {
+                    Some(payload) => std::borrow::Cow::Borrowed(payload.as_ref()),
+                    None => toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
+                        DbError::storage(
+                            SqlState::DatatypeMismatch,
+                            format!("value type does not match column {}", column.name),
+                        )
+                    })?,
+                };
                 values.push(crate::codec::PreparedColumnValue::Varlena(
                     crate::codec::VarlenaPhysical::Plain(raw.to_vec()),
                 ));
@@ -568,10 +580,20 @@ impl PageBackedStorageEngine {
             };
             let raw_len = supported_varlena_len(raw.len())?;
             let raw_crc32 = crc32fast::hash(&raw);
-            let mut plan = ToastVarlenaPlan::Plain;
+            let cached_payload = match &raw {
+                std::borrow::Cow::Owned(payload) => {
+                    Some(std::sync::Arc::<[u8]>::from(payload.clone()))
+                }
+                std::borrow::Cow::Borrowed(_) => None,
+            };
+            let mut plan = ToastVarlenaPlan::Plain {
+                cached_payload: cached_payload.clone(),
+            };
             let mut stream_codec = compress::CODEC_NONE;
             let mut stream_dict_id = None;
-            let mut stream_payload = ToastStreamPayload::RawColumn;
+            let mut stream_payload = cached_payload
+                .map(ToastStreamPayload::Owned)
+                .unwrap_or(ToastStreamPayload::RawColumn);
             let mut current_stored_len = raw.len();
 
             if raw.len() >= schema.toast.min_value_size as usize

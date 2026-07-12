@@ -6,6 +6,8 @@ use crate::{DataType, DbError, Result, SqlState, Value};
 
 /// PostgreSQL-compatible maximum number of array dimensions.
 pub const MAX_ARRAY_DIMENSIONS: usize = 6;
+/// Practical allocation guard for one SQL array value.
+pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ArrayDimension {
@@ -57,6 +59,12 @@ impl SqlArray {
             return Err(invalid_array(format!(
                 "array has {} dimensions, maximum is {MAX_ARRAY_DIMENSIONS}",
                 dimensions.len()
+            )));
+        }
+        if elements.len() > MAX_ARRAY_ELEMENTS {
+            return Err(invalid_array(format!(
+                "array has {} elements, maximum is {MAX_ARRAY_ELEMENTS}",
+                elements.len()
             )));
         }
         if elements.is_empty() {
