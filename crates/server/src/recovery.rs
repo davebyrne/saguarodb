@@ -316,6 +316,7 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
             | WalRecordKind::AlterTablePrimaryKey { .. }
+            | WalRecordKind::UpdateTableStatistics { .. }
     )
 }
 
@@ -375,7 +376,8 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         | WalRecordKind::DropView { .. }
         | WalRecordKind::AlterTableCompression { .. }
         | WalRecordKind::AlterTableToast { .. }
-        | WalRecordKind::AlterTablePrimaryKey { .. } => Ok(false),
+        | WalRecordKind::AlterTablePrimaryKey { .. }
+        | WalRecordKind::UpdateTableStatistics { .. } => Ok(false),
         _ => Ok(false),
     }
 }
@@ -560,6 +562,18 @@ fn apply_redo(
         } => {
             let schema = catalog.set_table_primary_key(*table_id, primary_key.clone())?;
             storage.apply_set_table_primary_key(schema)
+        }
+        WalRecordKind::UpdateTableStatistics {
+            table_id,
+            statistics,
+        } => {
+            // Catalog-only; storage is untouched. The table may have been
+            // dropped later in the log — advisory statistics for it are
+            // simply skipped, never an error.
+            if catalog.get_table(*table_id)?.is_some() {
+                catalog.set_table_statistics(*table_id, statistics.clone())?;
+            }
+            Ok(())
         }
         // Normalized away above: `FullPageImageCompressed` never reaches this match
         // (it is rewritten to `FullPageImage` before the match runs).
@@ -1961,5 +1975,177 @@ mod tests {
         wal.flush().unwrap();
 
         assert_eq!(super::next_txn_id(&wal).unwrap(), 10);
+    }
+
+    /// Statistics matching the `users (id integer primary key, name text)`
+    /// shape the statistics-replay tests create via SQL.
+    fn users_statistics() -> common::TableStatistics {
+        common::TableStatistics {
+            row_count: 500,
+            page_count: 5,
+            columns: std::collections::BTreeMap::from([(
+                1,
+                common::ColumnStatistics {
+                    null_frac: common::OrderedF64::new(0.2),
+                    avg_width: 16,
+                    n_distinct: common::NDistinct::Count(7),
+                    most_common: vec![(
+                        common::Value::Text("carol".to_string()),
+                        common::OrderedF64::new(0.4),
+                    )],
+                    histogram_bounds: Vec::new(),
+                },
+            )]),
+        }
+    }
+
+    fn append_statistics_record(
+        app: &AppState,
+        txn_id: u64,
+        table_id: common::TableId,
+        outcome: Option<WalRecordKind>,
+    ) {
+        app.components
+            .wal
+            .append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::UpdateTableStatistics {
+                    table_id,
+                    statistics: users_statistics(),
+                },
+            })
+            .unwrap();
+        if let Some(kind) = outcome {
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind,
+                })
+                .unwrap();
+        }
+        app.components.wal.flush().unwrap();
+    }
+
+    #[test]
+    fn recovery_applies_committed_statistics_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            table_id = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .id;
+            append_statistics_record(&app, 42, table_id, Some(WalRecordKind::Commit));
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_table_statistics(table_id)
+                .unwrap(),
+            Some(users_statistics())
+        );
+    }
+
+    #[test]
+    fn recovery_skips_aborted_and_in_flight_statistics_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            table_id = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .id;
+            append_statistics_record(&app, 42, table_id, Some(WalRecordKind::Abort));
+            append_statistics_record(&app, 43, table_id, None); // in-flight: no outcome
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_table_statistics(table_id)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_skips_committed_statistics_for_missing_table_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            // A committed statistics record whose table id never resolves:
+            // advisory data must never fail recovery.
+            append_statistics_record(&app, 42, 9999, Some(WalRecordKind::Commit));
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_table_statistics(9999)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn statistics_survive_checkpoint_and_wal_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            table_id = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .id;
+            append_statistics_record(&app, 42, table_id, Some(WalRecordKind::Commit));
+            // Install in the live catalog too (normal execution does both),
+            // then checkpoint: the manifest must carry the statistics after
+            // the WAL below the checkpoint is truncated.
+            app.components
+                .catalog
+                .set_table_statistics(table_id, users_statistics())
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_table_statistics(table_id)
+                .unwrap(),
+            Some(users_statistics())
+        );
     }
 }

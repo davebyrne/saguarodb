@@ -1,10 +1,9 @@
 //! Optimizer statistics collected by `ANALYZE` (`docs/specs/statistics.md`).
 //!
 //! These types are durable catalog state: they ride inside the catalog JSON
-//! snapshot in the manifest, and the planned `UpdateTableStatistics` WAL
-//! record (`docs/specs/statistics.md` §4) will carry them too. Fractions use
-//! [`OrderedF64`] (not `f64`) so the types keep `Eq`, which the WAL record
-//! enum derives.
+//! snapshot in the manifest and inside the `UpdateTableStatistics` WAL record
+//! (`docs/specs/statistics.md` §4). Fractions use [`OrderedF64`] (not `f64`)
+//! so the types keep `Eq`, which the WAL record enum derives.
 
 use std::collections::BTreeMap;
 

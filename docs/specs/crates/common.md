@@ -40,9 +40,9 @@
   by VACUUM (Milestone F) rather than by snapshot-relative reads.
 - Optimizer statistics types collected by ANALYZE (`docs/specs/statistics.md`):
   `TableStatistics`, `ColumnStatistics`, and `NDistinct`. Durable catalog
-  state — they ride inside the catalog JSON snapshot; the planned
-  `UpdateTableStatistics` WAL record (`docs/specs/statistics.md` §4) will
-  carry them too. Fractions use `OrderedF64` so the types keep `Eq` for the
+  state — they ride inside the catalog JSON snapshot and the
+  `UpdateTableStatistics` WAL record (`docs/specs/statistics.md` §4).
+  Fractions use `OrderedF64` so the types keep `Eq` for the
   WAL record enum. `TableStatistics.columns` is a
   `BTreeMap<ColumnId, ColumnStatistics>` (deterministic serialization), and
   `TableStatistics::is_finite` guards the JSON durable boundary (serde_json

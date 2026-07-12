@@ -60,6 +60,8 @@ pub enum WalRecordKind {
     },
     // Primary-key metadata, JSON payload (the logical-DDL fallback encoding).
     AlterTablePrimaryKey { table_id: TableId, primary_key: Vec<ColumnId> },
+    // Optimizer statistics, JSON payload (the logical-DDL fallback encoding).
+    UpdateTableStatistics { table_id: TableId, statistics: TableStatistics },
 }
 ```
 
@@ -86,6 +88,21 @@ These record kinds support per-table page compression, WAL full-page-image compr
 - **`TruncateTable { table_id, new_table_storage_id, new_toast_storage_id, new_index_storage_ids }`** (type byte `22`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as the ALTER records). The logical DDL record for relation-generation `TRUNCATE`: it carries the stable logical table id and the fresh physical storage ids allocated for the table heap/primary-index pair, optional hidden TOAST heap/primary-index pair, and all secondary indexes. Skipped aborted/in-flight records reserve every carried storage id so future relation generations cannot reuse files that may have been created before abort. Committed replay builds/applies the catalog storage-id update and publishes the matching storage generation swap through `RecoveryOperations`; the replacement heap/index pages themselves are restored by the following physical redo records.
 - **`AlterTablePrimaryKey { table_id, primary_key }`** (type byte `23`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as `AlterTableCompression`). The DDL record for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: updates a table's primary-key column-id list in catalog and storage metadata. Replay is committed-only via `server::is_logical_catalog_record`; aborted/in-flight records are skipped and reserve no ids of their own. Normal execution derives the storage identity B-tree rebuild from this committed logical record, logs the resulting identity B-tree pages as full-page-image redo, and flushes them before checkpoint truncation can make the logical record redundant. During recovery, the metadata is installed at the record's WAL position (so following `CreateIndex`/`DropIndex` records validate), the table id is recorded as needing a derived rebuild, and the identity tree is rebuilt without appending WAL only after the full replay pass and crashed-writer abort resolution.
 - **`UpdateTableSchema { schema, indexes }`** (type byte `24`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as the ALTER records). The DDL record for schema-evolution `ALTER TABLE`: metadata-only renames carry the updated table schema and current catalog-index schemas; ADD/DROP column rewrites carry the updated table schema plus any affected catalog indexes with fresh storage ids allocated by the catalog update helpers. Replay is committed-only; committed replay applies the table and carried index schemas atomically to the catalog, then applies the carried index schemas and table schema to storage metadata. Skipped aborted/in-flight records reserve the carried table and index storage ids so rewrite relation files are not reused even though the catalog schema is not installed.
+- **`UpdateTableStatistics { table_id, statistics }`** (type byte `28`; no
+  dedicated binary arm, so it uses the same JSON logical-DDL fallback as the
+  ALTER records). The maintenance record for `ANALYZE`
+  (`docs/specs/statistics.md` §4): replaces a user table's optimizer
+  statistics in the catalog. Catalog-only — storage is untouched. Replay is
+  committed-only via `server::is_logical_catalog_record`, applied in LSN order
+  (last write wins); a record whose table no longer resolves at apply time
+  (dropped later in the log) is skipped, never an error, and skipped
+  aborted/in-flight records reserve no ids. The payload must be finite: the
+  JSON encoding cannot round-trip NaN/Infinity, and record decode happens for
+  every retained record regardless of its transaction's outcome, so one
+  non-finite payload would poison replay of the whole log — the codec's
+  encode path therefore refuses a non-finite payload
+  (`TableStatistics::is_finite`) with a structured WAL error, making the
+  invariant hold by construction rather than appender discipline.
 - **`CreateView { schema }`**, **`ReplaceView { schema }`**, and
   **`DropView { view }`** (type bytes `25`, `26`, and `27`; JSON logical-DDL
   fallback). The DDL records for user view metadata. Replay is committed-only
@@ -104,7 +121,7 @@ Payload: variable
 CRC32: 4 bytes
 ```
 
-CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields (not JSON) despite one being physiological-adjacent and the other logical/DDL-adjacent — see above; `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, and the view DDL records use the JSON fallback. The `Type` byte is authoritative for binary records.
+CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields (not JSON) despite one being physiological-adjacent and the other logical/DDL-adjacent — see above; `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `UpdateTableStatistics`, and the view DDL records use the JSON fallback. The `Type` byte is authoritative for binary records.
 
 ## Public API
 
@@ -200,7 +217,7 @@ After heap pages are flushed + fsynced and the control record is stored:
 Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
-- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index/sequence IDs. `CreateDictionary`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, and `UpdateTableSchema` are classified alongside those DDL records (`server::is_logical_catalog_record`): a skipped aborted/in-flight `CreateDictionary` still reserves its dictionary id, skipped ALTER records reserve no ids of their own, a skipped `TruncateTable` reserves every carried storage id, and a skipped `UpdateTableSchema` reserves the carried table and index storage ids. Primary-key ALTER metadata is installed during replay, but the derived storage identity tree rebuild is deferred until after replay and crashed-writer abort resolution.
+- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index/sequence IDs. `CreateDictionary`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, and `UpdateTableStatistics` are classified alongside those DDL records (`server::is_logical_catalog_record`): a skipped aborted/in-flight `CreateDictionary` still reserves its dictionary id, skipped ALTER records reserve no ids of their own, a skipped `TruncateTable` reserves every carried storage id, a skipped `UpdateTableSchema` reserves the carried table and index storage ids, and a skipped `UpdateTableStatistics` reserves nothing (a committed one whose table was dropped later in the log is also skipped). Primary-key ALTER metadata is installed during replay, but the derived storage identity tree rebuild is deferred until after replay and crashed-writer abort resolution.
 - Before physical redo runs, the server normalizes a `FullPageImageCompressed` record to a decompressed raw `FullPageImage` (resolving `dict_id` against the dictionary resolver seeded from `<data>/dicts/` before redo begins) — an unresolvable `dict_id` at this point is a fatal structured recovery error, since it indicates a deleted/corrupted dictionary file rather than a normal crash state. `storage::apply_physical_redo` itself only ever sees the raw `FullPageImage` variant.
 - Reconstructs the CLOG at `open`: seeded from the durable CLOG snapshot (`clog.dat`) plus a fold of the post-`clog_lsn` `Commit`/`Abort` records, or fully rebuilt from those records when no snapshot exists (see "Durable CLOG snapshot"). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
 - Seeds `next_txn_id` by scanning `replay_from(0)` over all retained records (including `CommitWithSubxids.subxids` and the `Checkpoint` marker's high-water), not just the post-checkpoint redo range.

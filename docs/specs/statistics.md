@@ -157,6 +157,13 @@ UpdateTableStatistics {
   transaction's `Commit` is flushed before success is reported, and the next
   checkpoint's manifest snapshot absorbs the statistics so WAL truncation is
   safe.
+- The WAL codec itself refuses to encode a non-finite payload
+  (`TableStatistics::is_finite`), so the append fails cleanly instead of
+  poisoning the log. Record decode happens for every retained record
+  regardless of its transaction's outcome, so a non-finite payload (which
+  JSON writes as `null` and cannot read back) would otherwise break replay of
+  the whole log even if the transaction aborted. `set_table_statistics`
+  enforces the same rule at the catalog/manifest boundary.
 
 ## 5. Collection: the ANALYZE pass
 

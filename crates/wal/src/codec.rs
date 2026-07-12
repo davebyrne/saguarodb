@@ -38,6 +38,7 @@ pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
 pub(crate) const TYPE_CREATE_VIEW: u8 = 25;
 pub(crate) const TYPE_REPLACE_VIEW: u8 = 26;
 pub(crate) const TYPE_DROP_VIEW: u8 = 27;
+pub(crate) const TYPE_UPDATE_TABLE_STATISTICS: u8 = 28;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -183,6 +184,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::TruncateTable { .. } => TYPE_TRUNCATE_TABLE,
         WalRecordKind::AlterTablePrimaryKey { .. } => TYPE_ALTER_TABLE_PRIMARY_KEY,
         WalRecordKind::UpdateTableSchema { .. } => TYPE_UPDATE_TABLE_SCHEMA,
+        WalRecordKind::UpdateTableStatistics { .. } => TYPE_UPDATE_TABLE_STATISTICS,
     }
 }
 
@@ -276,9 +278,23 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             buf.extend_from_slice(bytes);
             Ok(buf)
         }
+        WalRecordKind::UpdateTableStatistics { statistics, .. } => {
+            // serde_json writes a non-finite float as `null` and cannot read
+            // it back, and decode runs for every retained record regardless
+            // of its transaction's outcome — one such payload would poison
+            // replay of the whole log. Refuse it at append time so the
+            // invariant holds by construction, not appender discipline.
+            if !statistics.is_finite() {
+                return Err(wal_error(
+                    "statistics WAL payload contains a non-finite number",
+                ));
+            }
+            serde_json::to_vec(kind)
+                .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}")))
+        }
         // AlterTableCompression/AlterTableToast/TruncateTable/AlterTablePrimaryKey/
-        // UpdateTableSchema: no arms — the `_ =>` serde_json fallback handles
-        // logical DDL records.
+        // UpdateTableSchema and the view DDL records: no arms — the `_ =>`
+        // serde_json fallback handles logical DDL records.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -685,6 +701,29 @@ mod tests {
                 table_id: 5,
                 primary_key: vec![0, 2],
             },
+            WalRecordKind::UpdateTableStatistics {
+                table_id: 5,
+                statistics: common::TableStatistics {
+                    row_count: 1000,
+                    page_count: 10,
+                    columns: std::collections::BTreeMap::from([(
+                        0,
+                        common::ColumnStatistics {
+                            null_frac: common::OrderedF64::new(0.25),
+                            avg_width: 8,
+                            n_distinct: common::NDistinct::Count(3),
+                            most_common: vec![(
+                                common::Value::Text("a".to_string()),
+                                common::OrderedF64::new(0.5),
+                            )],
+                            histogram_bounds: vec![
+                                common::Value::Integer(1),
+                                common::Value::Integer(9),
+                            ],
+                        },
+                    )]),
+                },
+            },
         ];
         for kind in kinds {
             let record = WalRecord {
@@ -699,6 +738,35 @@ mod tests {
                 "kind failed round-trip"
             );
         }
+    }
+
+    #[test]
+    fn non_finite_statistics_payload_fails_to_encode() {
+        // serde_json would write NaN as `null`, which decode can never read
+        // back — the codec must refuse the append rather than poison the log.
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::UpdateTableStatistics {
+                table_id: 5,
+                statistics: common::TableStatistics {
+                    row_count: 10,
+                    page_count: 1,
+                    columns: std::collections::BTreeMap::from([(
+                        0,
+                        common::ColumnStatistics {
+                            null_frac: common::OrderedF64::new(f64::NAN),
+                            avg_width: 8,
+                            n_distinct: common::NDistinct::Count(1),
+                            most_common: Vec::new(),
+                            histogram_bounds: Vec::new(),
+                        },
+                    )]),
+                },
+            },
+        };
+        let err = encode_record(&record).unwrap_err();
+        assert!(err.message.contains("non-finite"), "{}", err.message);
     }
 
     #[test]

@@ -137,13 +137,13 @@ pub trait CatalogManager: Send + Sync {
     /// (`docs/specs/statistics.md`). Statistics are advisory: absent means
     /// "never analyzed (or cleared by a schema change)".
     fn get_table_statistics(&self, table: TableId) -> Result<Option<TableStatistics>>;
-    /// Replaces a live user table's optimizer statistics (ANALYZE today; the
-    /// planned `UpdateTableStatistics` replay — `docs/specs/statistics.md` §4
-    /// — will also come through here, skipping records whose table no longer
-    /// exists). Statistics changes do not bump `schema_version`. Rejects
-    /// unknown tables, non-user relations, statistics that reference column
-    /// ids the table does not have, and non-finite numbers (the JSON manifest
-    /// payload cannot round-trip them).
+    /// Replaces a live user table's optimizer statistics (ANALYZE, or
+    /// recovery replay of a committed `UpdateTableStatistics` record —
+    /// `docs/specs/statistics.md` §4; replay skips records whose table no
+    /// longer exists). Statistics changes do not bump `schema_version`.
+    /// Rejects unknown tables, non-user relations, statistics that reference
+    /// column ids the table does not have, and non-finite numbers (the JSON
+    /// manifest payload cannot round-trip them).
     fn set_table_statistics(&self, table: TableId, statistics: TableStatistics) -> Result<()>;
     /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
     /// "no dictionary").

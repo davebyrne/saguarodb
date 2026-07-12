@@ -1,6 +1,6 @@
 use common::{
     ColumnId, CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId,
-    SequenceSchema, TableId, TableSchema, ToastOptions, ViewSchema,
+    SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions, ViewSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +161,18 @@ pub enum WalRecordKind {
     AlterTablePrimaryKey {
         table_id: TableId,
         primary_key: Vec<ColumnId>,
+    },
+    /// Maintenance: replaces a user table's optimizer statistics
+    /// (`docs/specs/statistics.md` §4). Catalog-only and CLOG-gated on replay
+    /// like DDL — applied only for committed transactions, in LSN order (last
+    /// write wins). A skipped or dropped-table record reserves nothing. The
+    /// payload must be finite — serde_json cannot round-trip NaN/Infinity and
+    /// record decode happens for every retained record regardless of its
+    /// transaction's outcome — so the codec itself refuses to encode a
+    /// non-finite payload (`TableStatistics::is_finite`).
+    UpdateTableStatistics {
+        table_id: TableId,
+        statistics: TableStatistics,
     },
 }
 
