@@ -76,6 +76,9 @@ pub enum SqlState {
     /// operation, e.g. `currval` before this session has called `nextval`/`setval`
     /// for that sequence.
     ObjectNotInPrerequisiteState,
+    /// `55006`: the requested operation conflicts with another object owned by
+    /// the same session, such as TRUNCATE against a parked cursor.
+    ObjectInUse,
     /// `34000`: `FETCH`/`CLOSE` named a cursor that is not open in the session.
     InvalidCursorName,
     QueryCanceled,
@@ -135,6 +138,7 @@ impl SqlState {
             SqlState::CardinalityViolation => "21000",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::ObjectNotInPrerequisiteState => "55000",
+            SqlState::ObjectInUse => "55006",
             SqlState::InvalidCursorName => "34000",
             SqlState::QueryCanceled => "57014",
             SqlState::FeatureNotSupported => "0A000",
@@ -174,6 +178,7 @@ impl SqlState {
             "21000" => SqlState::CardinalityViolation,
             "2BP01" => SqlState::DependentObjectsStillExist,
             "55000" => SqlState::ObjectNotInPrerequisiteState,
+            "55006" => SqlState::ObjectInUse,
             "34000" => SqlState::InvalidCursorName,
             "57014" => SqlState::QueryCanceled,
             "0A000" => SqlState::FeatureNotSupported,

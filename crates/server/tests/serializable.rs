@@ -267,3 +267,56 @@ async fn read_only_serializable_does_not_falsely_abort() {
     reader.ok("commit").await;
     assert_eq!(server.active_txn_count(), 0);
 }
+
+/// A transaction that captured its snapshot while a concurrent TRUNCATE was in
+/// progress can read the replacement only after the truncator releases
+/// `AccessExclusive`. The retained relation-write record must still form the
+/// reader's outbound rw-edge; a later inbound edge then makes that reader a doomed
+/// pivot and aborts it with `40001`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transactional_truncate_relation_write_participates_in_ssi() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table truncated (id integer primary key)")
+        .await;
+    setup
+        .ok("create table anchor (id integer primary key)")
+        .await;
+    setup
+        .ok("create table written (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into truncated values (1)").await;
+    setup.ok("insert into anchor values (1)").await;
+    setup.ok("insert into written values (1, 10)").await;
+
+    let mut truncator = Connection::connect(&server).await.unwrap();
+    let mut pivot = Connection::connect(&server).await.unwrap();
+    let mut predecessor = Connection::connect(&server).await.unwrap();
+
+    truncator.ok("begin isolation level serializable").await;
+    truncator.ok("truncate truncated").await;
+
+    pivot.ok("begin isolation level serializable").await;
+    pivot.ok("select * from anchor").await;
+    predecessor.ok("begin isolation level serializable").await;
+    predecessor.ok("select * from written").await;
+
+    truncator.ok("commit").await;
+    assert!(
+        pivot.ok("select * from truncated").await.rows().is_empty(),
+        "the transaction follows the committed replacement generation"
+    );
+
+    let err = pivot
+        .query("update written set v = 20 where id = 1")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("the pivot must abort when it gains an inbound edge");
+    assert!(err.message.contains("C=40001"), "victim gets 40001: {err}");
+    pivot.ok("rollback").await;
+    predecessor.ok("commit").await;
+    assert_eq!(server.active_txn_count(), 0);
+}

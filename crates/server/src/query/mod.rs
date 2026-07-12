@@ -3,14 +3,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use catalog::{
-    CatalogManager, MemoryCatalog, check_constraint_oid, index_oid, primary_key_constraint_oid,
-    resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
+    CatalogManager, MemoryCatalog, TruncateCatalogOverlay, check_constraint_oid, index_oid,
+    primary_key_constraint_oid, resolve_system_view, sequence_oid, synthetic_primary_key_oid,
+    table_oid,
 };
 use common::{
     CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
     GucSetting, IndexConstraintKind, IsolationLevel, ParsedDefault, PgType, QueryCancel,
     RelationKind, Result, SequenceId, SessionActivityRow, SessionInfo, SessionSequenceState,
-    Snapshot, SqlState, SystemStateProvider, TableId, Value, WriteGuard,
+    Snapshot, SqlState, SystemStateProvider, TableId, TruncateCatalogUpdate, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -633,6 +634,10 @@ pub struct Transaction {
     /// into each statement's `StatementContext` (`live_txns`). `SAVEPOINT` appends;
     /// `ROLLBACK TO` removes the rolled-back subxids; `RELEASE` leaves it unchanged.
     live_subxids: Vec<u64>,
+    /// Final transaction-local relation generations installed by transactional
+    /// TRUNCATE, keyed by logical table id. Rebuilt over the live catalog for each
+    /// later statement and published atomically only after durable COMMIT.
+    pub(crate) truncate_updates: BTreeMap<TableId, TruncateCatalogUpdate>,
 }
 
 #[derive(Clone, Copy)]
@@ -781,6 +786,105 @@ impl QueryService {
         Ok((bound, requests))
     }
 
+    fn catalog_with_truncate_updates_under_gate(
+        &self,
+        updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+    ) -> Result<Arc<dyn CatalogManager>> {
+        if updates.is_empty() {
+            return Ok(self.components.catalog.clone());
+        }
+        Ok(Arc::new(TruncateCatalogOverlay::new(
+            self.components.catalog.clone(),
+            updates.values().cloned(),
+        )))
+    }
+
+    fn transaction_catalog(&self, txn: &Transaction) -> Result<Arc<dyn CatalogManager>> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        self.catalog_with_truncate_updates_under_gate(&txn.truncate_updates)
+    }
+
+    fn transaction_statement_catalog_from_validated(
+        &self,
+        txn: &Transaction,
+        bound: &BoundStatement,
+        validated: Arc<dyn CatalogManager>,
+    ) -> Result<(Arc<dyn CatalogManager>, bool)> {
+        if !txn.truncate_updates.is_empty() {
+            let mut references = BoundObjectReferences::default();
+            collect_bound_statement_objects(bound, &mut references)?;
+            if !references.uses_system_catalog {
+                return Ok((validated, false));
+            }
+            let _catalog_read = self
+                .components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            return Ok((
+                Arc::new(MemoryCatalog::try_from_snapshot(validated.snapshot()?)?),
+                true,
+            ));
+        }
+        self.statement_catalog(bound)
+    }
+
+    fn bind_and_lock_unprepared_in_transaction(
+        &self,
+        statement: &Statement,
+        updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+        guard: &mut ObjectLockGuard,
+        cancel: &QueryCancel,
+    ) -> Result<(
+        BoundStatement,
+        Vec<PreparedRelationVersion>,
+        Arc<dyn CatalogManager>,
+    )> {
+        let prior = guard.snapshot();
+        loop {
+            let discovered = {
+                let _catalog_read = self
+                    .components
+                    .catalog_publication_gate
+                    .read()
+                    .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+                let bound = planner::bind(statement, self.components.catalog.as_ref())?;
+                object_lock_requests(&bound, self.components.catalog.as_ref())?
+            };
+            if let Err(err) = guard.acquire_many(&discovered, cancel) {
+                guard.restore(&prior)?;
+                return Err(err);
+            }
+            let rebound = (|| {
+                let _catalog_read = self
+                    .components
+                    .catalog_publication_gate
+                    .read()
+                    .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+                let catalog = self.catalog_with_truncate_updates_under_gate(updates)?;
+                let bound = planner::bind(statement, catalog.as_ref())?;
+                let requests = object_lock_requests(&bound, catalog.as_ref())?;
+                let versions = prepared_schema_versions(&bound, catalog.as_ref())?;
+                Ok::<_, DbError>((bound, requests, versions, catalog))
+            })();
+            let (bound, requests, versions, catalog) = match rebound {
+                Ok(rebound) => rebound,
+                Err(err) => {
+                    guard.restore(&prior)?;
+                    return Err(err);
+                }
+            };
+            if requests == discovered {
+                return Ok((bound, versions, catalog));
+            }
+            guard.restore(&prior)?;
+        }
+    }
+
     fn bind_with_object_requests_and_preflight(
         &self,
         statement: &Statement,
@@ -852,19 +956,59 @@ impl QueryService {
         guard: &mut ObjectLockGuard,
         cancel: &QueryCancel,
     ) -> Result<()> {
-        let requests = self.object_requests_for_bound(bound)?;
+        self.lock_prepared_bound_with_truncate_updates(bound, schema_versions, None, guard, cancel)
+            .map(|_| ())
+    }
+
+    fn lock_prepared_bound_in_transaction(
+        &self,
+        bound: &BoundStatement,
+        schema_versions: &[PreparedRelationVersion],
+        truncate_updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+        guard: &mut ObjectLockGuard,
+        cancel: &QueryCancel,
+    ) -> Result<Arc<dyn CatalogManager>> {
+        self.lock_prepared_bound_with_truncate_updates(
+            bound,
+            schema_versions,
+            Some(truncate_updates),
+            guard,
+            cancel,
+        )
+    }
+
+    fn lock_prepared_bound_with_truncate_updates(
+        &self,
+        bound: &BoundStatement,
+        schema_versions: &[PreparedRelationVersion],
+        truncate_updates: Option<&BTreeMap<TableId, TruncateCatalogUpdate>>,
+        guard: &mut ObjectLockGuard,
+        cancel: &QueryCancel,
+    ) -> Result<Arc<dyn CatalogManager>> {
+        let requests = {
+            let _catalog_read = self
+                .components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            object_lock_requests(bound, self.components.catalog.as_ref())?
+        };
         guard.acquire_many(&requests, cancel)?;
         let _catalog_read = self
             .components
             .catalog_publication_gate
             .read()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-        self.validate_prepared_schema_versions_under_gate(schema_versions)?;
-        let current = object_lock_requests(bound, self.components.catalog.as_ref())?;
+        let catalog = match truncate_updates {
+            Some(updates) => self.catalog_with_truncate_updates_under_gate(updates)?,
+            None => self.components.catalog.clone(),
+        };
+        validate_prepared_schema_versions_in_catalog(schema_versions, catalog.as_ref())?;
+        let current = object_lock_requests(bound, catalog.as_ref())?;
         if current != requests {
             return Err(prepared_schema_changed_error());
         }
-        Ok(())
+        Ok(catalog)
     }
 
     fn object_requests_for_bound(&self, bound: &BoundStatement) -> Result<Vec<ObjectLockRequest>> {
@@ -896,6 +1040,20 @@ impl QueryService {
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
         Ok(Arc::new(MemoryCatalog::try_from_snapshot(
             self.components.catalog.snapshot()?,
+        )?))
+    }
+
+    fn snapshot_catalog_view(
+        &self,
+        catalog: &dyn CatalogManager,
+    ) -> Result<Arc<dyn CatalogManager>> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        Ok(Arc::new(MemoryCatalog::try_from_snapshot(
+            catalog.snapshot()?,
         )?))
     }
 
@@ -1098,6 +1256,16 @@ impl QueryService {
         declared_param_types: &[Option<PgType>],
         cancel: &QueryCancel,
     ) -> Result<PreparedStatement> {
+        self.prepare_sql_with_truncate_updates_cancelable(sql, declared_param_types, None, cancel)
+    }
+
+    pub(crate) fn prepare_sql_with_truncate_updates_cancelable(
+        &self,
+        sql: &str,
+        declared_param_types: &[Option<PgType>],
+        truncate_updates: Option<&BTreeMap<TableId, TruncateCatalogUpdate>>,
+        cancel: &QueryCancel,
+    ) -> Result<PreparedStatement> {
         cancel.check()?;
         let statement = parser::parse(sql)?;
         cancel.check()?;
@@ -1179,17 +1347,18 @@ impl QueryService {
             .catalog_publication_gate
             .read()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-        let (bound, param_types) = bind_parameterized_with_pg_types(
-            &statement,
-            self.components.catalog.as_ref(),
-            declared_param_types,
-        )?;
+        let catalog = match truncate_updates {
+            Some(updates) => self.catalog_with_truncate_updates_under_gate(updates)?,
+            None => self.components.catalog.clone(),
+        };
+        let (bound, param_types) =
+            bind_parameterized_with_pg_types(&statement, catalog.as_ref(), declared_param_types)?;
         cancel.check()?;
         // Remember each parameter's wire type so `ParameterDescription` echoes the
         // OID the client declared, or the more specific wire type inferred from
         // catalog function arguments.
         let param_pg_types = collect_param_pg_types(&bound, &param_types, declared_param_types)?;
-        let schema_versions = prepared_schema_versions(&bound, self.components.catalog.as_ref())?;
+        let schema_versions = prepared_schema_versions(&bound, catalog.as_ref())?;
         let result_columns = result_columns(&bound);
         cancel.check()?;
         Ok(PreparedStatement {
@@ -1473,9 +1642,33 @@ impl QueryService {
 
         // Maintenance does not bind/plan: dispatch it before parameter substitution.
         // Inside an open transaction block it is rejected (poisoning it to 'E', like
-        // DDL); otherwise it runs as a standalone maintenance unit.
+        // DDL), except for transactional TRUNCATE; otherwise it runs as a standalone
+        // maintenance unit.
         if let StatementClass::Maintenance = prepared.class {
             if let Some(mut txn) = slot {
+                if let Some(statement @ Statement::Truncate { .. }) = prepared.maintenance.clone() {
+                    if txn.failed {
+                        return (
+                            Some(txn),
+                            default_isolation,
+                            Err(DbError::execute(
+                                SqlState::InFailedSqlTransaction,
+                                "current transaction is aborted, commands ignored until end of transaction block",
+                            )),
+                        );
+                    }
+                    let result = self
+                        .run_truncate_in_transaction(&mut txn, statement, session.cancel().as_ref())
+                        .map(StreamOutcome::Direct);
+                    if let Err(err) = &result {
+                        if err.code == SqlState::DeadlockDetected {
+                            self.abort_deadlock_victim(&mut txn);
+                        } else {
+                            txn.failed = true;
+                        }
+                    }
+                    return (Some(txn), default_isolation, result);
+                }
                 txn.failed = true;
                 return (
                     Some(txn),
@@ -1693,14 +1886,10 @@ impl QueryService {
         &self,
         schema_versions: &[PreparedRelationVersion],
     ) -> Result<()> {
-        for (relation, prepared_version, prepared_storage) in schema_versions {
-            let current = relation_schema_identity(self.components.catalog.as_ref(), *relation)?
-                .ok_or_else(prepared_schema_changed_error)?;
-            if current != (*prepared_version, *prepared_storage) {
-                return Err(prepared_schema_changed_error());
-            }
-        }
-        Ok(())
+        validate_prepared_schema_versions_in_catalog(
+            schema_versions,
+            self.components.catalog.as_ref(),
+        )
     }
 
     pub(super) fn validate_relation_snapshot_schema_versions(
@@ -1732,6 +1921,20 @@ impl QueryService {
         }
         Ok(())
     }
+}
+
+fn validate_prepared_schema_versions_in_catalog(
+    schema_versions: &[PreparedRelationVersion],
+    catalog: &dyn CatalogManager,
+) -> Result<()> {
+    for (relation, prepared_version, prepared_storage) in schema_versions {
+        let current = relation_schema_identity(catalog, *relation)?
+            .ok_or_else(prepared_schema_changed_error)?;
+        if current != (*prepared_version, *prepared_storage) {
+            return Err(prepared_schema_changed_error());
+        }
+    }
+    Ok(())
 }
 
 fn prepared_schema_changed_error() -> DbError {
@@ -1948,6 +2151,12 @@ fn collect_bound_statement_objects(
         }
     }
     Ok(())
+}
+
+fn bound_relation_ids(bound: &BoundStatement) -> Result<BTreeSet<TableId>> {
+    let mut references = BoundObjectReferences::default();
+    collect_bound_statement_objects(bound, &mut references)?;
+    Ok(references.relations.into_keys().collect())
 }
 
 fn collect_query_objects(query: &BoundQuery, references: &mut BoundObjectReferences) -> Result<()> {
@@ -2673,6 +2882,13 @@ impl PreparedStatement {
         &self.sql
     }
 
+    pub(crate) fn truncate_tables(&self) -> Option<&[String]> {
+        match self.maintenance.as_ref() {
+            Some(Statement::Truncate { tables }) => Some(tables),
+            _ => None,
+        }
+    }
+
     /// Resolved parameter wire types, by position.
     pub fn param_pg_types(&self) -> &[PgType] {
         &self.param_pg_types
@@ -3272,6 +3488,8 @@ mod tests {
     struct FailingAbortWal {
         next_lsn: AtomicU64,
         fail_abort: AtomicBool,
+        fail_second_truncate: AtomicBool,
+        truncate_records: AtomicUsize,
         statuses: Mutex<HashMap<TxnId, TxnStatus>>,
     }
 
@@ -3280,13 +3498,27 @@ mod tests {
             Self {
                 next_lsn: AtomicU64::new(1),
                 fail_abort: AtomicBool::new(true),
+                fail_second_truncate: AtomicBool::new(false),
+                truncate_records: AtomicUsize::new(0),
                 statuses: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn fail_second_truncate(&self) {
+            self.truncate_records.store(0, Ordering::SeqCst);
+            self.fail_second_truncate.store(true, Ordering::SeqCst);
         }
     }
 
     impl WalManager for FailingAbortWal {
         fn append(&self, record: WalRecord) -> Result<Lsn> {
+            if matches!(record.kind, WalRecordKind::TruncateTable { .. })
+                && self.fail_second_truncate.load(Ordering::SeqCst)
+                && self.truncate_records.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                self.fail_second_truncate.store(false, Ordering::SeqCst);
+                return Err(DbError::io("injected second TRUNCATE append failure"));
+            }
             if matches!(record.kind, WalRecordKind::Abort) && self.fail_abort.load(Ordering::SeqCst)
             {
                 // Mirror `FileWalManager::append`: the in-memory `Aborted` status is
@@ -3371,6 +3603,80 @@ mod tests {
                 .get(&txn_id)
                 .copied()
                 .unwrap_or(TxnStatus::InProgress)
+        }
+    }
+
+    struct FailingCommitWal {
+        inner: FileWalManager,
+        fail_next_commit: AtomicBool,
+    }
+
+    impl FailingCommitWal {
+        fn open(path: &Path) -> Self {
+            Self {
+                inner: FileWalManager::open(path).unwrap(),
+                fail_next_commit: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WalManager for FailingCommitWal {
+        fn append(&self, record: WalRecord) -> Result<Lsn> {
+            if matches!(
+                record.kind,
+                WalRecordKind::Commit | WalRecordKind::CommitWithSubxids { .. }
+            ) && self.fail_next_commit.swap(false, Ordering::SeqCst)
+            {
+                return Err(DbError::io("injected Commit append failure"));
+            }
+            self.inner.append(record)
+        }
+
+        fn flush(&self) -> Result<Lsn> {
+            self.inner.flush()
+        }
+
+        fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
+            self.inner.replay_from(lsn)
+        }
+
+        fn truncate_before(&self, lsn: Lsn) -> Result<()> {
+            self.inner.truncate_before(lsn)
+        }
+
+        fn flushed_lsn(&self) -> Lsn {
+            self.inner.flushed_lsn()
+        }
+
+        fn bytes_after(&self, lsn: Lsn) -> Result<u64> {
+            self.inner.bytes_after(lsn)
+        }
+
+        fn persist_clog(&self, clog_lsn: Lsn) -> Result<()> {
+            self.inner.persist_clog(clog_lsn)
+        }
+
+        fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
+            self.inner.set_vacuum_floor(boundary)
+        }
+
+        fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()> {
+            self.inner
+                .establish_recovery_committed_floor(allocation_boundary)
+        }
+
+        fn resolve_in_flight_as_aborted(&self, writer_xids: &HashSet<u64>) -> Result<()> {
+            self.inner.resolve_in_flight_as_aborted(writer_xids)
+        }
+    }
+
+    impl TxnStatusView for FailingCommitWal {
+        fn status(&self, txn_id: TxnId) -> TxnStatus {
+            self.inner.status(txn_id)
         }
     }
 
@@ -3651,6 +3957,10 @@ mod tests {
             self.inner.apply_truncate_tables(plans)
         }
 
+        fn apply_truncate_updates(&self, updates: &[common::TruncateCatalogUpdate]) -> Result<()> {
+            self.inner.apply_truncate_updates(updates)
+        }
+
         fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
             self.inner.get_index_by_name(name)
         }
@@ -3903,6 +4213,130 @@ mod tests {
     }
 
     #[test]
+    fn transactional_truncate_rollback_takes_relation_publish_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table gated_rollback (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into gated_rollback values (1)")
+            .unwrap();
+
+        let cancel = Arc::new(QueryCancel::new());
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("truncate gated_rollback", slot, &cancel);
+        result.unwrap();
+        let txn = slot.unwrap();
+
+        let publish_reader = app.components.relation_publish_gate.read().unwrap();
+        let service = app.query_service.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let rollback = std::thread::spawn(move || {
+            service.abort_transaction(txn);
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "rollback must wait for the relation publication write side"
+        );
+        drop(publish_reader);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rollback did not resume after relation publication reader released");
+        rollback.join().unwrap();
+
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select id from gated_rollback")
+            ),
+            vec![vec![Value::Integer(1)]],
+        );
+    }
+
+    #[test]
+    fn transactional_truncate_commit_failure_restores_before_unblocking_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let wal: Arc<dyn WalManager> = failing_wal.clone();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table failed_commit_truncate (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into failed_commit_truncate values (1)")
+            .unwrap();
+
+        let cancel = Arc::new(QueryCancel::new());
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple_default(
+            "truncate failed_commit_truncate",
+            slot,
+            &cancel,
+        );
+        result.unwrap();
+
+        let service = app.query_service.clone();
+        let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = service.execute_sql("select id from failed_commit_truncate");
+            reader_tx.send(result).unwrap();
+        });
+        assert!(
+            reader_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "reader must wait while the truncating transaction owns AccessExclusive"
+        );
+
+        failing_wal.fail_next_commit();
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
+        assert!(slot.is_none());
+        assert!(result.is_err(), "the injected Commit failure must surface");
+        let rows = reader_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader did not resume after failed Commit rollback")
+            .unwrap();
+        assert_eq!(result_values(Ok(rows)), vec![vec![Value::Integer(1)]]);
+        reader.join().unwrap();
+        assert!(app.components.active_txns.active_ids().is_empty());
+
+        drop(app);
+        drop(failing_wal);
+        let recovered = crate::recovery::open_app(Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(
+            result_values(
+                recovered
+                    .query_service
+                    .execute_sql("select id from failed_commit_truncate")
+            ),
+            vec![vec![Value::Integer(1)]],
+        );
+    }
+
+    #[test]
     fn direct_query_helpers_reject_copy_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -3977,6 +4411,52 @@ mod tests {
             TxnStatus::Aborted,
             "the abort must be recorded in the in-memory CLOG even when the durable append fails"
         );
+    }
+
+    #[test]
+    fn failed_multi_table_transactional_truncate_takes_write_rollback_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing_wal = Arc::new(FailingAbortWal::default());
+        let wal: Arc<dyn WalManager> = failing_wal.clone();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table first_truncate (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create table second_truncate (id integer primary key)")
+            .unwrap();
+
+        let cancel = Arc::new(QueryCancel::new());
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let txn_id = slot.as_ref().unwrap().txn_id;
+        failing_wal.fail_second_truncate();
+        let (slot, result) = app.query_service.execute_simple_default(
+            "truncate first_truncate, second_truncate",
+            slot,
+            &cancel,
+        );
+        assert!(result.is_err(), "the injected second prepare must fail");
+        assert_eq!(slot_status(&slot), SessionTxnStatus::Failed);
+
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+        assert_eq!(failing_wal.status(txn_id), TxnStatus::Aborted);
+        assert!(app.components.active_txns.active_ids().is_empty());
     }
 
     #[test]

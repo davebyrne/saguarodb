@@ -72,9 +72,21 @@ impl QueryService {
                 };
                 (None, result)
             }
-            (Some(txn), CopySnapshots::Transaction { snapshots, catalog }) => {
-                self.copy_in_transaction(txn, job, session, snapshots, catalog, rx)
-            }
+            (
+                Some(txn),
+                CopySnapshots::Transaction {
+                    snapshots,
+                    catalog,
+                    catalog_is_snapshot,
+                },
+            ) => self.copy_in_transaction(
+                txn,
+                job,
+                session,
+                snapshots,
+                (catalog, catalog_is_snapshot),
+                rx,
+            ),
             (slot, _) => (
                 slot,
                 Err(DbError::internal(
@@ -184,9 +196,10 @@ impl QueryService {
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: TransactionSnapshots,
-        catalog: Arc<dyn catalog::CatalogManager>,
+        catalog: (Arc<dyn catalog::CatalogManager>, bool),
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
+        let (catalog, catalog_is_snapshot) = catalog;
         if txn.write_guard.is_none()
             && let Err(err) = self.acquire_write_guard(&mut txn, session.cancel().as_ref())
         {
@@ -203,7 +216,7 @@ impl QueryService {
         let result = (|| {
             // COPY FROM may run inside a transaction with open savepoints: stamp
             // inserts with the innermost subxid and thread the live (sub)xid set.
-            let ctx = self.execution_context_with_fixed_catalog(
+            let ctx = self.execution_context_with_selected_catalog(
                 ExecutionContextInput {
                     txn_id: txn.writing_xid(),
                     snapshot,
@@ -218,6 +231,7 @@ impl QueryService {
                     ),
                 },
                 catalog,
+                catalog_is_snapshot,
             )?;
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
@@ -266,9 +280,21 @@ impl QueryService {
                 None,
                 self.copy_out_autocommit(job, session, snapshots, catalog, object_guard, frame_tx),
             ),
-            (Some(txn), CopySnapshots::Transaction { snapshots, catalog }) => {
-                self.copy_out_transaction(txn, job, session, snapshots, catalog, frame_tx)
-            }
+            (
+                Some(txn),
+                CopySnapshots::Transaction {
+                    snapshots,
+                    catalog,
+                    catalog_is_snapshot,
+                },
+            ) => self.copy_out_transaction(
+                txn,
+                job,
+                session,
+                snapshots,
+                (catalog, catalog_is_snapshot),
+                frame_tx,
+            ),
             (slot, _) => (
                 slot,
                 Err(DbError::internal(
@@ -322,9 +348,10 @@ impl QueryService {
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: TransactionSnapshots,
-        catalog: Arc<dyn catalog::CatalogManager>,
+        catalog: (Arc<dyn catalog::CatalogManager>, bool),
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
+        let (catalog, catalog_is_snapshot) = catalog;
         let TransactionSnapshots {
             snapshot,
             relations,
@@ -334,7 +361,7 @@ impl QueryService {
         let result = (|| {
             // A read inside a savepoint transaction must see its own subxids' writes,
             // so thread the live (sub)xid set.
-            let ctx = self.execution_context_with_fixed_catalog(
+            let ctx = self.execution_context_with_selected_catalog(
                 ExecutionContextInput {
                     txn_id: txn.writing_xid(),
                     snapshot,
@@ -349,6 +376,7 @@ impl QueryService {
                     ),
                 },
                 catalog,
+                catalog_is_snapshot,
             )?;
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);

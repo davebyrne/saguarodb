@@ -1,6 +1,7 @@
 mod memory;
 mod serialize;
 pub mod system;
+mod truncate_overlay;
 
 pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
 pub use serialize::{deserialize_catalog, serialize_catalog};
@@ -9,6 +10,7 @@ pub use system::{
     attrdef_oid, check_constraint_oid, index_oid, is_system_schema, primary_key_constraint_oid,
     resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
 };
+pub use truncate_overlay::TruncateCatalogOverlay;
 
 use common::{
     ColumnId, CompressionSetting, FileId, IndexConstraintKind, IndexId, IndexSchema,
@@ -153,6 +155,7 @@ pub trait CatalogManager: Send + Sync {
         &self,
         plans: &[TruncateTablePlan],
     ) -> Result<Vec<TruncateCatalogUpdate>>;
+    fn apply_truncate_updates(&self, updates: &[TruncateCatalogUpdate]) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -1456,6 +1459,40 @@ mod tests {
         assert_eq!(
             catalog.get_index_by_name("users_bio").unwrap(),
             Some(expected_index)
+        );
+    }
+
+    #[test]
+    fn apply_prebuilt_truncate_update_validates_then_publishes() {
+        let catalog = catalog_with_users();
+        let original = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+        let plan = catalog.prepare_truncate_table(original.id).unwrap();
+        let update = catalog.build_truncate_table_update(&plan).unwrap();
+
+        let mut malformed = update.clone();
+        malformed.table.name = "renamed_without_ddl".to_string();
+        assert!(catalog.apply_truncate_updates(&[malformed]).is_err());
+        assert_eq!(catalog.get_table(original.id).unwrap(), Some(original));
+        assert_eq!(catalog.get_index(index.id).unwrap(), Some(index));
+
+        catalog
+            .apply_truncate_updates(std::slice::from_ref(&update))
+            .unwrap();
+        assert_eq!(
+            catalog.get_table(update.table.id).unwrap(),
+            Some(update.table)
+        );
+        assert_eq!(
+            catalog.get_index(update.indexes[0].id).unwrap(),
+            Some(update.indexes[0].clone())
         );
     }
 

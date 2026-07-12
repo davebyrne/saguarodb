@@ -724,6 +724,36 @@ fn published_truncate_files_are_not_removed_by_later_rollback_cleanup() {
 }
 
 #[test]
+fn transactional_truncate_publish_restores_original_on_rollback() {
+    let fixture = Fixture::new();
+    let old_row = user_row(1, "alice", "old generation");
+    fixture.insert_committed(200, old_row.clone());
+
+    let txn_id = 400;
+    let plan = truncate_plan();
+    let update = truncate_update();
+    fixture
+        .engine
+        .prepare_truncate_table(&ctx(txn_id), &plan, &update)
+        .unwrap();
+    fixture
+        .engine
+        .publish_truncate_tables_transactional(txn_id, vec![update])
+        .unwrap();
+    assert!(
+        fixture
+            .scan_rows(&ctx(txn_id), fixture.capture_relations().as_ref())
+            .is_empty()
+    );
+
+    <PageBackedStorageEngine as StorageEngine>::rollback_txn(&fixture.engine, txn_id).unwrap();
+    assert_eq!(
+        fixture.scan_rows(&ctx(401), fixture.capture_relations().as_ref()),
+        vec![old_row]
+    );
+}
+
+#[test]
 fn table_handle_fallback_pins_current_generation() {
     let fixture = Fixture::new();
     let mut old_relations = fixture

@@ -435,6 +435,7 @@ impl QueryService {
             dead_versions_pending: 0,
             savepoints: Vec::new(),
             live_subxids: Vec::new(),
+            truncate_updates: std::collections::BTreeMap::new(),
         })
     }
 
@@ -514,7 +515,7 @@ impl QueryService {
     /// transactions can still form edges) and release any SIREAD locks the now-advanced
     /// GC horizon permits; on abort, drop its SSI state immediately (its reads/writes
     /// are void). A no-op for non-serializable transactions (`docs/specs/ssi.md` §8).
-    fn ssi_finish(&self, txn_id: u64, isolation: IsolationLevel, committed: bool) {
+    pub(super) fn ssi_finish(&self, txn_id: u64, isolation: IsolationLevel, committed: bool) {
         if isolation != IsolationLevel::Serializable {
             return;
         }
@@ -561,7 +562,7 @@ impl QueryService {
             // Abort the whole family (mirroring the flush-failure path) and drop its
             // SSI state, then surface 40001.
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_pre_durable_or_die(txn_id, None);
+            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
@@ -572,10 +573,40 @@ impl QueryService {
         // committed transaction into an error.
         if let Err(err) = cancel.check() {
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_pre_durable_or_die(txn_id, None);
+            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
+
+        let truncate_updates = txn.truncate_updates.values().cloned().collect::<Vec<_>>();
+        let publication = (|| {
+            if truncate_updates.is_empty() {
+                return Ok((None, None));
+            }
+            let catalog = self
+                .components
+                .catalog_publication_gate
+                .write()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            let relations = self
+                .components
+                .relation_publish_gate
+                .write()
+                .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
+            Ok((Some(catalog), Some(relations)))
+        })();
+        let (catalog_publication, relation_publication) = match publication {
+            Ok(guards) => guards,
+            Err(err) => {
+                self.abort_subxids(&txn.live_subxids);
+                self.rollback_transaction_pre_durable_or_die(
+                    txn_id,
+                    !txn.truncate_updates.is_empty(),
+                );
+                self.ssi_finish(txn_id, isolation, false);
+                return Err(err);
+            }
+        };
 
         if let Err(err) = self.append_and_flush_commit(txn_id, &txn.live_subxids) {
             // The commit is not durable: abort the whole family instead (append
@@ -583,12 +614,26 @@ impl QueryService {
             // metadata) so its effects are hidden by the CLOG. Abort is status-based
             // — no page-content undo (`docs/specs/mvcc.md` §4 Decision 3).
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_pre_durable_or_die(txn_id, None);
+            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
+            drop(relation_publication);
+            drop(catalog_publication);
+            if !truncate_updates.is_empty() {
+                super::truncate::best_effort_retired_generation_cleanup(&self.components);
+            }
             // The transaction passed its SSI commit check but did not commit durably:
             // drop its (now void) SSI state.
             self.ssi_finish(txn_id, isolation, false);
             // `txn` (and its write guard) drops here, releasing the guard.
             return Err(err);
+        }
+
+        if !truncate_updates.is_empty()
+            && let Err(err) = self
+                .components
+                .catalog
+                .apply_truncate_updates(&truncate_updates)
+        {
+            self.fatal_after_durable_commit(err);
         }
 
         if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
@@ -604,8 +649,14 @@ impl QueryService {
         // Finish the serializable transaction's SSI state (retain its SIREAD locks for
         // concurrent transactions; release whatever the advanced GC horizon permits).
         self.ssi_finish(txn_id, isolation, true);
+        drop(relation_publication);
+        drop(catalog_publication);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
+
+        if !truncate_updates.is_empty() {
+            super::truncate::best_effort_retired_generation_cleanup(&self.components);
+        }
 
         // Fold the committed transaction's dead versions into the auto-prune counter
         // BEFORE the checkpoint trigger (`docs/specs/mvcc.md` §9, F4b): only a durable
@@ -647,7 +698,7 @@ impl QueryService {
         // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
         // VACUUM-reclaimable), then the top-level transaction.
         self.abort_subxids(&txn.live_subxids);
-        self.rollback_pre_durable_or_die(txn_id, None);
+        self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
         // Drop the serializable transaction's SSI state (its reads/writes are void).
         self.ssi_finish(txn_id, isolation, false);
         // `txn` drops here, releasing the exclusive write guard.
@@ -664,7 +715,10 @@ impl QueryService {
             .collect();
         if txn.has_writes {
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_pre_durable_or_die(txn.txn_id, None);
+            self.rollback_transaction_pre_durable_or_die(
+                txn.txn_id,
+                !txn.truncate_updates.is_empty(),
+            );
         } else {
             self.components.active_txns.deregister_all(&family);
             self.components.lock_manager.on_txn_finished();
@@ -951,7 +1005,9 @@ impl QueryService {
         mut input: ExecutionContextInput<'a>,
         catalog: Arc<dyn catalog::CatalogManager>,
     ) -> Result<ExecutionContext<'a>> {
-        if !input.runtime.catalog_introspection_is_explicit {
+        if !input.runtime.catalog_introspection_is_explicit
+            && !Arc::ptr_eq(&catalog, &self.components.catalog)
+        {
             let introspection = Arc::new(super::QueryCatalogIntrospection {
                 source: super::QueryCatalogSource::Fixed(catalog.clone()),
                 session_info: input.runtime.session_info.clone(),
@@ -961,6 +1017,19 @@ impl QueryService {
                 .with_catalog_introspection(introspection, false);
         }
         self.execution_context_with_catalog(input, catalog)
+    }
+
+    pub(super) fn execution_context_with_selected_catalog<'a>(
+        &'a self,
+        input: ExecutionContextInput<'a>,
+        catalog: Arc<dyn catalog::CatalogManager>,
+        is_snapshot: bool,
+    ) -> Result<ExecutionContext<'a>> {
+        if is_snapshot {
+            self.execution_context_with_fixed_catalog(input, catalog)
+        } else {
+            self.execution_context_with_catalog(input, catalog)
+        }
     }
 
     fn execution_context_with_catalog<'a>(
@@ -1108,6 +1177,26 @@ impl QueryService {
         if let Err(rollback_err) = self.rollback_pre_durable(txn_id, catalog_before) {
             self.fatal_pre_durable_rollback_failure(rollback_err);
         }
+    }
+
+    fn rollback_transaction_pre_durable_or_die(
+        &self,
+        txn_id: u64,
+        has_transactional_truncate: bool,
+    ) {
+        if !has_transactional_truncate {
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return;
+        }
+        let relation_publication = match self.components.relation_publish_gate.write() {
+            Ok(guard) => guard,
+            Err(_) => self.fatal_pre_durable_rollback_failure(DbError::internal(
+                "relation publish gate poisoned during transactional TRUNCATE rollback",
+            )),
+        };
+        self.rollback_pre_durable_or_die(txn_id, None);
+        drop(relation_publication);
+        super::truncate::best_effort_retired_generation_cleanup(&self.components);
     }
 
     pub(super) fn rollback_pre_durable(

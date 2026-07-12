@@ -452,6 +452,44 @@ impl Connection {
         Ok(())
     }
 
+    /// Start a named, parameterless portal and stop after suspension without Sync.
+    /// Naming the portal lets later pipelined Bind messages coexist with it.
+    pub async fn begin_named_suspended_execute(
+        &mut self,
+        statement: &str,
+        portal: &str,
+        sql: &str,
+        max_rows: i32,
+    ) -> Result<()> {
+        let mut seq = parse_bytes(statement, sql, &[]);
+        seq.extend(bind_bytes(portal, statement));
+        seq.extend(execute_bytes_with_max(portal, max_rows));
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to start named suspended execute: {err}"))
+        })?;
+        read_until_tag(&mut self.stream, b's').await?;
+        Ok(())
+    }
+
+    /// Pipeline `BEGIN` and one statement before Sync, preserving any named portal
+    /// already suspended on the connection.
+    pub async fn pipelined_begin_then_execute(&mut self, sql: &str) -> Result<QueryOutcome> {
+        let mut seq = parse_bytes("pipelined_begin", "begin", &[]);
+        seq.extend(bind_bytes("pipelined_begin_portal", "pipelined_begin"));
+        seq.extend(execute_bytes("pipelined_begin_portal"));
+        seq.extend(parse_bytes("pipelined_statement", sql, &[]));
+        seq.extend(bind_bytes(
+            "pipelined_statement_portal",
+            "pipelined_statement",
+        ));
+        seq.extend(execute_bytes("pipelined_statement_portal"));
+        seq.extend(sync_bytes());
+        let response = self.extended_raw(seq).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
     /// Resume an unnamed portal opened by [`Self::begin_suspended_execute`], run
     /// it to exhaustion, and Sync the extended protocol.
     pub async fn finish_suspended_execute(&mut self) -> Result<()> {
@@ -502,6 +540,25 @@ impl Connection {
         seq.extend(sync_bytes());
         self.stream.write_all(&seq).await.map_err(|err| {
             common::DbError::io(format!("failed to send extended-protocol execute: {err}"))
+        })?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
+    pub async fn execute_prepared_limited(
+        &mut self,
+        name: &str,
+        max_rows: i32,
+    ) -> Result<QueryOutcome> {
+        let mut seq = bind_bytes("", name);
+        seq.extend(execute_bytes_with_max("", max_rows));
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!(
+                "failed to send limited extended-protocol execute: {err}"
+            ))
         })?;
         let response = read_until_ready(&mut self.stream).await?;
         let status = ready_for_query_status(&response)?;

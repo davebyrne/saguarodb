@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use common::{ColumnInfo, DbError, IsolationLevel, QueryCancel, Result, SqlState};
+use common::{ColumnInfo, DbError, IsolationLevel, Result, SqlState};
 use executor::FetchStatus;
 use parser::{Query, Statement};
 use planner::{logical_plan, physical_plan};
@@ -10,7 +11,7 @@ use tokio::task::JoinHandle;
 use super::{
     ExecutionContextInput, PreparedStatement, QueryService, QuerySessionContext, STREAM_BATCH_ROWS,
     StatementClass, StreamMessage, Transaction, TransactionSnapshots, classify_bound,
-    prepared_schema_versions,
+    prepared_schema_versions, validate_prepared_schema_versions_in_catalog,
 };
 
 pub(crate) enum CursorFetchStatus {
@@ -21,6 +22,7 @@ pub(crate) enum CursorFetchStatus {
 pub(crate) struct StartedCursor {
     pub(crate) handle: QueryCursorHandle,
     pub(crate) columns: Vec<ColumnInfo>,
+    pub(crate) relations: BTreeSet<common::TableId>,
 }
 
 pub(crate) struct QueryCursorHandle {
@@ -63,6 +65,7 @@ struct CursorSetup {
 
 struct StartedCursorSetup {
     columns: Vec<ColumnInfo>,
+    relations: BTreeSet<common::TableId>,
 }
 
 struct CursorWorkerInput {
@@ -135,6 +138,7 @@ impl QueryService {
                         _task: task,
                     },
                     columns: setup.columns,
+                    relations: setup.relations,
                 }),
             ),
             Err(err) => (txn, default_isolation, Err(err)),
@@ -187,6 +191,7 @@ impl QueryService {
                         _task: task,
                     },
                     columns: setup.columns,
+                    relations: setup.relations,
                 }),
             ),
             Err(err) => (txn, default_isolation, Err(err)),
@@ -264,7 +269,6 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
     ) {
         return send_setup_error(setup_tx, None, default_isolation, err);
     }
-    let stream_cancel = session.cancel().clone();
     let runtime = session.statement_runtime(
         default_isolation,
         default_isolation,
@@ -298,12 +302,16 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
         Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
     };
     let columns = query.output_schema().to_vec();
+    let relations = match super::bound_relation_ids(&bound) {
+        Ok(relations) => relations,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
     let _ = setup_tx.send(CursorSetup {
         txn: None,
         default_isolation,
-        result: Ok(StartedCursorSetup { columns }),
+        result: Ok(StartedCursorSetup { columns, relations }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
+    drive_cursor_commands(&mut query, &mut cmd_rx, session.cancel().clone());
 }
 
 fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction) {
@@ -340,14 +348,23 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
             read_only_cursor_error(),
         );
     }
-    let lock_result = match service.object_requests_for_bound(&bound) {
+    let updates = txn.truncate_updates.clone();
+    let requests = service.object_requests_for_bound(&bound);
+    let lock_result = match requests {
         Ok(requests) if requests.is_empty() => {
-            service.validate_prepared_schema_versions(&prepared.schema_versions)
+            service.transaction_catalog(&txn).and_then(|catalog| {
+                validate_prepared_schema_versions_in_catalog(
+                    &prepared.schema_versions,
+                    catalog.as_ref(),
+                )
+                .map(|()| catalog)
+            })
         }
         Ok(_) => match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
-            Ok(owner) => service.lock_prepared_bound(
+            Ok(owner) => service.lock_prepared_bound_in_transaction(
                 &bound,
                 &prepared.schema_versions,
+                &updates,
                 owner,
                 session.cancel().as_ref(),
             ),
@@ -355,25 +372,29 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         },
         Err(err) => Err(err),
     };
-    if let Err(err) = lock_result {
-        if err.code == SqlState::DeadlockDetected {
-            service.abort_deadlock_victim(&mut txn);
+    let validated_catalog = match lock_result {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            if err.code == SqlState::DeadlockDetected {
+                service.abort_deadlock_victim(&mut txn);
+            }
+            return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
         }
-        return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
-    }
+    };
+    let (catalog, catalog_is_snapshot) =
+        match service.transaction_statement_catalog_from_validated(&txn, &bound, validated_catalog)
+        {
+            Ok(catalog) => catalog,
+            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+        };
     let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
         Ok(snapshots) => snapshots,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
     txn.first_statement_ran = true;
-    let schema_versions =
-        match prepared_schema_versions(&bound, service.components.catalog.as_ref()) {
-            Ok(schema_versions) => schema_versions,
-            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
-        };
     if let Err(err) = service.validate_relation_snapshot_schema_versions(
         snapshots.relations.as_ref(),
-        &schema_versions,
+        &prepared.schema_versions,
         true,
     ) {
         return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
@@ -385,13 +406,12 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
     } = snapshots;
     let _cursor_advertised =
         advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
-    let stream_cancel = session.cancel().clone();
     let runtime = session.statement_runtime(
         txn.current_default_isolation(default_isolation),
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
-    let ctx = match service.execution_context_for_bound(
+    let ctx = match service.execution_context_with_selected_catalog(
         ExecutionContextInput {
             txn_id: txn.writing_xid(),
             snapshot,
@@ -401,7 +421,8 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
             live_txns: txn.live_txns(),
             runtime,
         },
-        &bound,
+        catalog.clone(),
+        catalog_is_snapshot,
     ) {
         Ok(ctx) => ctx,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
@@ -410,7 +431,7 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         Ok(logical) => logical,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
-    let physical = match physical_plan(&logical, service.components.catalog.as_ref()) {
+    let physical = match physical_plan(&logical, catalog.as_ref()) {
         Ok(physical) => physical,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
@@ -419,12 +440,16 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
     let columns = query.output_schema().to_vec();
+    let relations = match super::bound_relation_ids(&bound) {
+        Ok(relations) => relations,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
     let _ = setup_tx.send(CursorSetup {
         txn: Some(txn),
         default_isolation,
-        result: Ok(StartedCursorSetup { columns }),
+        result: Ok(StartedCursorSetup { columns, relations }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
+    drive_cursor_commands(&mut query, &mut cmd_rx, session.cancel().clone());
 }
 
 fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
@@ -451,19 +476,29 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
     }
 
     let statement = Statement::Query(query);
-    let locked = match service.bind_with_object_requests(&statement) {
-        Ok((bound, requests)) if requests.is_empty() => service
-            .schema_versions_for_bound(&bound)
-            .map(|versions| (bound, versions)),
-        Ok(_) => match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
-            Ok(owner) => {
-                service.bind_and_lock_unprepared(&statement, owner, session.cancel().as_ref())
+    let initial = service.bind_with_object_requests(&statement);
+    let locked = match initial {
+        Ok((bound, requests)) if requests.is_empty() => {
+            service.transaction_catalog(&txn).and_then(|catalog| {
+                prepared_schema_versions(&bound, catalog.as_ref())
+                    .map(|versions| (bound, versions, catalog))
+            })
+        }
+        Ok(_) => {
+            let updates = txn.truncate_updates.clone();
+            match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
+                Ok(owner) => service.bind_and_lock_unprepared_in_transaction(
+                    &statement,
+                    &updates,
+                    owner,
+                    session.cancel().as_ref(),
+                ),
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        },
+        }
         Err(err) => Err(err),
     };
-    let (bound, schema_versions) = match locked {
+    let (bound, schema_versions, validated_catalog) = match locked {
         Ok(locked) => locked,
         Err(err) => {
             if err.code == SqlState::DeadlockDetected {
@@ -489,6 +524,12 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
     txn.first_statement_ran = true;
+    let (catalog, catalog_is_snapshot) =
+        match service.transaction_statement_catalog_from_validated(&txn, &bound, validated_catalog)
+        {
+            Ok(catalog) => catalog,
+            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+        };
     if let Err(err) = service.validate_relation_snapshot_schema_versions(
         snapshots.relations.as_ref(),
         &schema_versions,
@@ -504,13 +545,12 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
     } = snapshots;
     let _cursor_advertised =
         advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
-    let stream_cancel = session.cancel().clone();
     let runtime = session.statement_runtime(
         txn.current_default_isolation(default_isolation),
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
-    let ctx = match service.execution_context_for_bound(
+    let ctx = match service.execution_context_with_selected_catalog(
         ExecutionContextInput {
             txn_id: txn.writing_xid(),
             snapshot,
@@ -520,7 +560,8 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
             live_txns: txn.live_txns(),
             runtime,
         },
-        &bound,
+        catalog.clone(),
+        catalog_is_snapshot,
     ) {
         Ok(ctx) => ctx,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
@@ -529,7 +570,7 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         Ok(logical) => logical,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
-    let physical = match physical_plan(&logical, service.components.catalog.as_ref()) {
+    let physical = match physical_plan(&logical, catalog.as_ref()) {
         Ok(physical) => physical,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
@@ -538,18 +579,22 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
     let columns = query.output_schema().to_vec();
+    let relations = match super::bound_relation_ids(&bound) {
+        Ok(relations) => relations,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
     let _ = setup_tx.send(CursorSetup {
         txn: Some(txn),
         default_isolation,
-        result: Ok(StartedCursorSetup { columns }),
+        result: Ok(StartedCursorSetup { columns, relations }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
+    drive_cursor_commands(&mut query, &mut cmd_rx, session.cancel().clone());
 }
 
 fn drive_cursor_commands(
     query: &mut executor::OpenQuery<'_>,
     cmd_rx: &mut mpsc::Receiver<CursorCommand>,
-    cancel: Arc<QueryCancel>,
+    cancel: Arc<common::QueryCancel>,
 ) {
     while let Some(command) = cmd_rx.blocking_recv() {
         match command {

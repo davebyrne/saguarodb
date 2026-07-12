@@ -476,6 +476,7 @@ pub enum SqlState {
     CardinalityViolation,
     DependentObjectsStillExist,
     ObjectNotInPrerequisiteState,
+    ObjectInUse,
     InvalidCursorName,
     QueryCanceled,
     FeatureNotSupported,

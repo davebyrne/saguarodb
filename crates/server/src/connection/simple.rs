@@ -77,6 +77,20 @@ impl Session {
                     .await;
             }
             Ok(Some(statement)) => {
+                if let Some(err) = self.transactional_truncate_parked_query_error(&statement)? {
+                    self.mark_current_transaction_failed();
+                    drop(guard);
+                    write_messages(
+                        stream,
+                        codec,
+                        &[
+                            error_response(&err),
+                            ServerMessage::ReadyForQuery(self.status_byte()),
+                        ],
+                    )
+                    .await?;
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let closes_cursors_on_success =
                     matches!(statement, Statement::RollbackToSavepoint { .. });
                 return self
@@ -101,6 +115,45 @@ impl Session {
         }
         self.run_general_simple_query(stream, codec, sql, false, guard)
             .await
+    }
+
+    fn transactional_truncate_parked_query_error(
+        &self,
+        statement: &Statement,
+    ) -> Result<Option<DbError>> {
+        let Statement::Truncate { tables } = statement else {
+            return Ok(None);
+        };
+        if self.txn.as_ref().is_none_or(|txn| txn.is_failed()) {
+            return Ok(None);
+        }
+        self.truncate_targets_parked_query_error(tables)
+    }
+
+    pub(super) fn truncate_targets_parked_query_error(
+        &self,
+        tables: &[String],
+    ) -> Result<Option<DbError>> {
+        let mut targets = std::collections::BTreeSet::new();
+        for name in tables {
+            if let Some(table) = self.app.components.catalog.get_table_by_name(name)? {
+                targets.insert(table.id);
+            }
+        }
+        let portal_overlap = self.portals.values().any(|portal| {
+            matches!(portal, super::Portal::Suspended(portal)
+                if !portal.relations.is_disjoint(&targets))
+        });
+        let cursor_overlap = self
+            .cursors
+            .values()
+            .any(|cursor| !cursor.relations.is_disjoint(&targets));
+        Ok((portal_overlap || cursor_overlap).then(|| {
+            DbError::execute(
+                SqlState::ObjectInUse,
+                "cannot TRUNCATE a table referenced by a parked query",
+            )
+        }))
     }
 
     async fn run_general_simple_query<S>(
@@ -427,6 +480,7 @@ impl Session {
                         handle: Some(started.handle),
                         columns: started.columns,
                         query_text: sql.to_string(),
+                        relations: started.relations,
                     },
                 );
                 wait_cancelable_write(
@@ -628,7 +682,7 @@ enum SqlCursorFetchError {
 }
 
 fn parse_statement_for_connection_routing(sql: &str) -> Result<Option<Statement>> {
-    if !routing_first_keyword_matches(sql, &["declare", "fetch", "close", "rollback"]) {
+    if !routing_first_keyword_matches(sql, &["declare", "fetch", "close", "rollback", "truncate"]) {
         return Ok(None);
     }
     let statement = parser::parse(sql)?;
@@ -636,7 +690,8 @@ fn parse_statement_for_connection_routing(sql: &str) -> Result<Option<Statement>
         Statement::DeclareCursor { .. }
         | Statement::FetchCursor { .. }
         | Statement::CloseCursor { .. }
-        | Statement::RollbackToSavepoint { .. } => Ok(Some(statement)),
+        | Statement::RollbackToSavepoint { .. }
+        | Statement::Truncate { .. } => Ok(Some(statement)),
         _ => Ok(None),
     }
 }

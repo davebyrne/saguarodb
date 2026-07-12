@@ -11,7 +11,7 @@ use super::{
     QueryService, QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome,
     Transaction, TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in,
     exec_or_stream, mark_failed_on_error, object_lock_requests, prepared_schema_versions, run_plan,
-    statement_class,
+    statement_class, validate_prepared_schema_versions_in_catalog,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -119,6 +119,31 @@ impl QueryService {
         // transaction block"). Reject with the open transaction poisoned to the 'E'
         // failed state, matching the DDL-in-block contract.
         if let StatementClass::Maintenance = class {
+            if matches!(statement, Statement::Truncate { .. })
+                && let Some(mut txn) = slot
+            {
+                if txn.failed {
+                    return (
+                        Some(txn),
+                        default_isolation,
+                        Err(DbError::execute(
+                            SqlState::InFailedSqlTransaction,
+                            "current transaction is aborted, commands ignored until end of transaction block",
+                        )),
+                    );
+                }
+                let result = self
+                    .run_truncate_in_transaction(&mut txn, statement, session.cancel().as_ref())
+                    .map(StreamOutcome::Direct);
+                if let Err(err) = &result {
+                    if err.code == SqlState::DeadlockDetected {
+                        self.abort_deadlock_victim(&mut txn);
+                    } else {
+                        txn.failed = true;
+                    }
+                }
+                return (Some(txn), default_isolation, result);
+            }
             if let Some(mut txn) = slot {
                 txn.failed = true;
                 return (
@@ -208,11 +233,14 @@ impl QueryService {
 
         let (bound, snapshots, schema_versions) = match slot.as_mut() {
             Some(txn) => {
+                let updates = txn.truncate_updates.clone();
                 let locked = match self.ensure_transaction_lock_owner(txn, cancel) {
-                    Ok(owner) => self.bind_and_lock_unprepared(&statement, owner, cancel),
+                    Ok(owner) => self.bind_and_lock_unprepared_in_transaction(
+                        &statement, &updates, owner, cancel,
+                    ),
                     Err(err) => Err(err),
                 };
-                let (bound, schema_versions) = match locked {
+                let (bound, schema_versions, validated_catalog) = match locked {
                     Ok(locked) => locked,
                     Err(err) => {
                         if err.code == SqlState::DeadlockDetected {
@@ -231,17 +259,34 @@ impl QueryService {
                         return (slot, default_isolation, Err(err));
                     }
                 };
-                let catalog = match self.snapshot_catalog() {
+                let (catalog, catalog_is_snapshot) = match self
+                    .transaction_statement_catalog_from_validated(txn, &bound, validated_catalog)
+                {
                     Ok(catalog) => catalog,
                     Err(err) => {
                         txn.failed = true;
                         return (slot, default_isolation, Err(err));
                     }
                 };
+                let catalog = if catalog_is_snapshot {
+                    catalog
+                } else {
+                    match self.snapshot_catalog_view(catalog.as_ref()) {
+                        Ok(catalog) => catalog,
+                        Err(err) => {
+                            txn.failed = true;
+                            return (slot, default_isolation, Err(err));
+                        }
+                    }
+                };
                 txn.first_statement_ran = true;
                 (
                     bound,
-                    CopySnapshots::Transaction { snapshots, catalog },
+                    CopySnapshots::Transaction {
+                        snapshots,
+                        catalog,
+                        catalog_is_snapshot: true,
+                    },
                     schema_versions,
                 )
             }
@@ -436,15 +481,23 @@ impl QueryService {
                 let discovery = self.bind_with_object_requests(&statement);
                 match discovery {
                     Ok((bound, requests)) if requests.is_empty() => {
-                        prepared_schema_versions(&bound, self.components.catalog.as_ref())
-                            .map(|versions| (bound, versions))
+                        self.transaction_catalog(&txn).and_then(|catalog| {
+                            prepared_schema_versions(&bound, catalog.as_ref())
+                                .map(|versions| (bound, versions, catalog))
+                        })
                     }
-                    Ok(_) => match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
-                        Ok(owner) => {
-                            self.bind_and_lock_unprepared(&statement, owner, runtime.cancel())
+                    Ok(_) => {
+                        let updates = txn.truncate_updates.clone();
+                        match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
+                            Ok(owner) => self.bind_and_lock_unprepared_in_transaction(
+                                &statement,
+                                &updates,
+                                owner,
+                                runtime.cancel(),
+                            ),
+                            Err(err) => Err(err),
                         }
-                        Err(err) => Err(err),
-                    },
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -452,22 +505,35 @@ impl QueryService {
                 bound,
                 schema_versions,
             } => {
+                let updates = txn.truncate_updates.clone();
                 let requests = self.object_requests_for_bound(&bound);
                 match requests {
-                    Ok(requests) if requests.is_empty() => self
-                        .validate_prepared_schema_versions(&schema_versions)
-                        .map(|()| (bound, schema_versions)),
+                    Ok(requests) if requests.is_empty() => {
+                        self.transaction_catalog(&txn).and_then(|catalog| {
+                            validate_prepared_schema_versions_in_catalog(
+                                &schema_versions,
+                                catalog.as_ref(),
+                            )
+                            .map(|()| (bound, schema_versions, catalog))
+                        })
+                    }
                     Ok(_) => match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
                         Ok(owner) => self
-                            .lock_prepared_bound(&bound, &schema_versions, owner, runtime.cancel())
-                            .map(|()| (bound, schema_versions)),
+                            .lock_prepared_bound_in_transaction(
+                                &bound,
+                                &schema_versions,
+                                &updates,
+                                owner,
+                                runtime.cancel(),
+                            )
+                            .map(|catalog| (bound, schema_versions, catalog)),
                         Err(err) => Err(err),
                     },
                     Err(err) => Err(err),
                 }
             }
         };
-        let (bound, schema_versions) = match locked {
+        let (bound, schema_versions, validated_catalog) = match locked {
             Ok(locked) => locked,
             Err(err) => {
                 if err.code == SqlState::DeadlockDetected {
@@ -524,11 +590,20 @@ impl QueryService {
         // horizon only prunes less, never unsafely (the prune reclaims only dead-to-all
         // versions and mutates one latched page).
         let gc_horizon = self.components.gc_horizon();
+        let (statement_catalog, catalog_is_snapshot) = match self
+            .transaction_statement_catalog_from_validated(&txn, &bound, validated_catalog)
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
+        };
         // The writing xid is the innermost open savepoint's subxid (or `txn_id`),
         // and the live (sub)xid set is threaded for own-write/own-conflict detection
         // (`docs/specs/savepoints.md` §4).
         let result = (|| {
-            let ctx = self.execution_context_for_bound(
+            let ctx = self.execution_context_with_selected_catalog(
                 ExecutionContextInput {
                     txn_id: txn.writing_xid(),
                     snapshot,
@@ -538,7 +613,8 @@ impl QueryService {
                     live_txns: txn.live_txns(),
                     runtime,
                 },
-                &bound,
+                statement_catalog.clone(),
+                catalog_is_snapshot,
             )?;
 
             // Only a read (a plain `SELECT`) streams; a write is materialized, so the
@@ -549,7 +625,7 @@ impl QueryService {
                 &self.engine,
                 &ctx,
                 bound,
-                self.components.catalog.as_ref(),
+                statement_catalog.as_ref(),
                 read_sink,
             );
             // The snapshot can no longer be used to read once `run_plan` has returned.

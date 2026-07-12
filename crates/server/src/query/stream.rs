@@ -94,6 +94,7 @@ pub(crate) enum CopySnapshots {
     Transaction {
         snapshots: TransactionSnapshots,
         catalog: Arc<dyn catalog::CatalogManager>,
+        catalog_is_snapshot: bool,
     },
 }
 

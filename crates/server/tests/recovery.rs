@@ -972,6 +972,86 @@ async fn committed_truncate_survives_restart_and_resets_indexes_and_toast() {
 }
 
 #[tokio::test]
+async fn committed_transactional_truncate_and_copy_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table events (id integer primary key, note text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into events values (1, 'before')")
+            .await
+            .unwrap();
+
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await.rows();
+        conn.ok("truncate events").await.rows();
+        conn.copy_from("copy events from stdin", &[b"2\tafter\n"])
+            .await
+            .unwrap();
+        conn.ok("commit").await.rows();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select id, note from events order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string()), Some("after".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn in_flight_transactional_truncate_preserves_original_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let app = saguarodb_server::recovery::open_app(saguarodb_server::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..saguarodb_server::config::Config::default()
+        })
+        .unwrap();
+        app.query_service
+            .execute_sql("create table events (id integer primary key, note text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into events values (1, 'before')")
+            .unwrap();
+
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+        let isolation = common::IsolationLevel::default();
+        let (slot, _, result) = app
+            .query_service
+            .execute_simple("begin", None, isolation, &cancel);
+        result.unwrap();
+        let (slot, _, result) =
+            app.query_service
+                .execute_simple("truncate events", slot, isolation, &cancel);
+        result.unwrap();
+        assert!(slot.is_some(), "the transaction should remain open");
+        app.components
+            .wal
+            .flush()
+            .expect("uncommitted TRUNCATE WAL records are durable before crash");
+        // Simulate process loss without transaction cleanup or an Abort record.
+        std::mem::forget(slot);
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select id, note from events")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string()), Some("before".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn committed_alter_table_schema_evolution_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     {

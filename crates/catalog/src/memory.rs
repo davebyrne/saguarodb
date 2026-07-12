@@ -863,6 +863,54 @@ impl CatalogManager for MemoryCatalog {
         Ok(updates)
     }
 
+    fn apply_truncate_updates(&self, updates: &[TruncateCatalogUpdate]) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        let plans = updates
+            .iter()
+            .map(|update| TruncateTablePlan {
+                table_id: update.table.id,
+                new_table_storage_id: update.table.storage_id,
+                new_toast_storage_id: update
+                    .toast_table
+                    .as_ref()
+                    .map(|toast| (toast.id, toast.storage_id)),
+                new_index_storage_ids: update
+                    .indexes
+                    .iter()
+                    .map(|index| (index.id, index.storage_id))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        validate_truncate_batch(&plans)?;
+        for (update, plan) in updates.iter().zip(&plans) {
+            if build_truncate_catalog_update(&snapshot, plan)? != *update {
+                return Err(DbError::internal(format!(
+                    "truncate update changed catalog metadata for table {}",
+                    update.table.id
+                )));
+            }
+        }
+        let mut next_storage_id = snapshot.next_storage_id;
+        for update in updates {
+            for storage_id in truncate_update_storage_ids(update) {
+                reserve_storage_id_value(&mut next_storage_id, storage_id)?;
+            }
+        }
+        for update in updates {
+            snapshot
+                .tables_by_id
+                .insert(update.table.id, update.table.clone());
+            if let Some(toast) = &update.toast_table {
+                snapshot.tables_by_id.insert(toast.id, toast.clone());
+            }
+            for index in &update.indexes {
+                snapshot.indexes_by_id.insert(index.id, index.clone());
+            }
+        }
+        snapshot.next_storage_id = next_storage_id;
+        Ok(())
+    }
+
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
         let snapshot = self.read_snapshot()?;
         Ok(snapshot

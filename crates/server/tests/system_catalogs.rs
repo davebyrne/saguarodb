@@ -37,6 +37,44 @@ async fn system_catalog_cursor_uses_one_catalog_snapshot_for_rows_and_functions(
 }
 
 #[tokio::test]
+async fn introspection_only_cursor_keeps_one_lazy_catalog_snapshot() {
+    let server = TestServer::start().await.unwrap();
+    let mut reader = Connection::connect(&server).await.unwrap();
+    let mut ddl = Connection::connect(&server).await.unwrap();
+
+    reader
+        .ok("create table introspection_snapshot_probe (id integer primary key)")
+        .await;
+    let oid = reader
+        .ok("select to_regclass('introspection_snapshot_probe')")
+        .await
+        .rows()[0][0]
+        .clone();
+
+    reader.ok("begin").await;
+    reader
+        .ok("declare introspection_cursor cursor for \
+             select to_regclass('introspection_snapshot_probe') \
+             from (values (1), (2)) as rows(n)")
+        .await;
+    assert_eq!(
+        reader.ok("fetch 1 from introspection_cursor").await.rows(),
+        vec![vec![oid.clone()]]
+    );
+
+    ddl.ok("drop table introspection_snapshot_probe").await;
+
+    assert_eq!(
+        reader
+            .ok("fetch all from introspection_cursor")
+            .await
+            .rows(),
+        vec![vec![oid]]
+    );
+    reader.ok("rollback").await;
+}
+
+#[tokio::test]
 async fn system_catalogs_support_driver_query_shapes() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

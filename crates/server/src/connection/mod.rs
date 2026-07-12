@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -6,7 +7,7 @@ use std::time::Duration;
 
 use common::{
     ColumnInfo, DbError, IsolationLevel, PgType, QueryCancel, Result, Row, SessionInfo,
-    SessionSequenceState, SessionState, SqlState, Value,
+    SessionSequenceState, SessionState, SqlState, TableId, Value,
 };
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -195,12 +196,14 @@ struct SuspendedPortal {
     query_text: String,
     rows_sent: u64,
     transaction_scoped: bool,
+    relations: BTreeSet<TableId>,
 }
 
 struct SqlCursor {
     handle: Option<QueryCursorHandle>,
     columns: Vec<ColumnInfo>,
     query_text: String,
+    relations: BTreeSet<TableId>,
 }
 
 /// The PostgreSQL transaction-block status reported in `ReadyForQuery`. Each

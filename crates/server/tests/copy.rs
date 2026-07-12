@@ -209,6 +209,43 @@ async fn copy_from_applies_expression_default() {
 }
 
 #[tokio::test]
+async fn transactional_copy_freezes_catalog_introspection_after_truncate() {
+    let server = TestServer::start().await.unwrap();
+    let mut copy = Connection::connect(&server).await.unwrap();
+    let mut ddl = Connection::connect(&server).await.unwrap();
+
+    copy.ok("create table copy_catalog_probe (id integer primary key)")
+        .await;
+    let probe_oid = copy
+        .ok("select to_regclass('copy_catalog_probe')")
+        .await
+        .rows()[0][0]
+        .clone();
+    copy.ok("create table copy_catalog_target (\
+             id integer primary key, \
+             probe_oid integer default to_regclass('copy_catalog_probe'))")
+        .await;
+
+    copy.ok("begin").await;
+    copy.ok("truncate copy_catalog_target").await;
+    copy.begin_copy_from("copy copy_catalog_target (id) from stdin")
+        .await
+        .unwrap();
+
+    ddl.ok("drop table copy_catalog_probe").await;
+
+    let completion = copy.finish_copy_from(&[b"1\n2\n"]).await.unwrap();
+    assert_eq!(completion.command_tag.as_deref(), Some("COPY 2"));
+    assert_eq!(
+        copy.ok("select probe_oid from copy_catalog_target order by id")
+            .await
+            .rows(),
+        vec![vec![probe_oid.clone()], vec![probe_oid]]
+    );
+    copy.ok("rollback").await;
+}
+
+#[tokio::test]
 async fn copy_from_keeps_catalog_snapshot_captured_at_protocol_start() {
     let server = TestServer::start().await.unwrap();
     let mut copy = Connection::connect(&server).await.unwrap();

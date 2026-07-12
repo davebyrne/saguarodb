@@ -219,6 +219,7 @@ struct TxnRollback {
     sequences: BTreeMap<SequenceId, Option<SequenceState>>,
     toast_next_value_ids: BTreeMap<TableId, Option<u64>>,
     unpublished_files: Vec<FileId>,
+    superseded_generations: Vec<RetiredGeneration>,
 }
 
 #[derive(Clone)]
@@ -258,6 +259,7 @@ impl RelationSnapshot for PageBackedRelationSnapshot {
     }
 }
 
+#[derive(Clone)]
 struct RetiredGeneration {
     files: Vec<FileId>,
     table_refs: Vec<Weak<TableGeneration>>,
@@ -1627,12 +1629,75 @@ impl PageBackedStorageEngine {
     }
 
     pub fn publish_truncate_tables(&self, updates: Vec<TruncateCatalogUpdate>) -> Result<()> {
+        self.publish_truncate_tables_inner(None, updates)
+    }
+
+    pub fn publish_truncate_tables_transactional(
+        &self,
+        txn_id: u64,
+        updates: Vec<TruncateCatalogUpdate>,
+    ) -> Result<()> {
+        self.publish_truncate_tables_inner(Some(txn_id), updates)
+    }
+
+    fn publish_truncate_tables_inner(
+        &self,
+        txn_id: Option<u64>,
+        updates: Vec<TruncateCatalogUpdate>,
+    ) -> Result<()> {
         let mut state = self.lock_state()?;
         let retired = validate_truncate_batch_for_publish(&state, &updates)?;
         let published_files = updates
             .iter()
             .flat_map(truncate_update_files)
             .collect::<BTreeSet<_>>();
+
+        if let Some(txn_id) = txn_id {
+            let originals = updates
+                .iter()
+                .map(|update| {
+                    let table = state.tables.get(&update.table.id).cloned();
+                    let toast = update
+                        .toast_table
+                        .as_ref()
+                        .map(|schema| (schema.id, state.tables.get(&schema.id).cloned()));
+                    let indexes = update
+                        .indexes
+                        .iter()
+                        .map(|schema| (schema.id, state.indexes.get(&schema.id).cloned()))
+                        .collect::<Vec<_>>();
+                    let toast_next = update.toast_table.as_ref().map(|schema| {
+                        (
+                            schema.id,
+                            state.toast_next_value_ids.get(&schema.id).copied(),
+                        )
+                    });
+                    (table, toast, indexes, toast_next)
+                })
+                .collect::<Vec<_>>();
+            let rollback = state.rollback.entry(txn_id).or_default();
+            for (index, (update, (table, toast, indexes, toast_next))) in
+                updates.iter().zip(originals).enumerate()
+            {
+                let repeated = rollback.tables.contains_key(&update.table.id);
+                rollback.tables.entry(update.table.id).or_insert(table);
+                if let Some((toast_id, previous)) = toast {
+                    rollback.tables.entry(toast_id).or_insert(previous);
+                }
+                for (index_id, previous) in indexes {
+                    rollback.indexes.entry(index_id).or_insert(previous);
+                }
+                if let Some((toast_id, previous)) = toast_next {
+                    rollback
+                        .toast_next_value_ids
+                        .entry(toast_id)
+                        .or_insert(previous);
+                }
+                if repeated {
+                    rollback.superseded_generations.push(retired[index].clone());
+                }
+            }
+        }
 
         for update in &updates {
             self.register_table_compression(&update.table);
@@ -1675,12 +1740,22 @@ impl PageBackedStorageEngine {
             }
         }
 
-        for rollback in state.rollback.values_mut() {
-            rollback
-                .unpublished_files
-                .retain(|file_id| !published_files.contains(file_id));
+        if let Some(txn_id) = txn_id {
+            if let Some(rollback) = state.rollback.get_mut(&txn_id) {
+                rollback
+                    .unpublished_files
+                    .retain(|file_id| !published_files.contains(file_id));
+            }
+        } else {
+            for rollback in state.rollback.values_mut() {
+                rollback
+                    .unpublished_files
+                    .retain(|file_id| !published_files.contains(file_id));
+            }
         }
-        state.retired_generations.extend(retired);
+        if txn_id.is_none() {
+            state.retired_generations.extend(retired);
+        }
         if !updates.is_empty() {
             bump_relation_epoch(&mut state);
         }
@@ -2277,6 +2352,7 @@ impl StorageEngine for PageBackedStorageEngine {
         };
         let relation_metadata_changed = !rollback.tables.is_empty() || !rollback.indexes.is_empty();
         let mut unpublished_files = rollback.unpublished_files;
+        let superseded_generations = rollback.superseded_generations;
         let mut retired = RetiredGeneration {
             files: Vec::new(),
             table_refs: Vec::new(),
@@ -2336,6 +2412,7 @@ impl StorageEngine for PageBackedStorageEngine {
             }
             bump_relation_epoch(&mut state);
         }
+        state.retired_generations.extend(superseded_generations);
         drop(state);
         self.remove_files(unpublished_files)
     }
@@ -2350,6 +2427,7 @@ impl StorageEngine for PageBackedStorageEngine {
             table_refs: Vec::new(),
             index_refs: Vec::new(),
         };
+        let superseded_generations = rollback.superseded_generations;
         for (table_id, previous) in rollback.tables {
             let Some(previous) = previous else {
                 continue;
@@ -2373,6 +2451,7 @@ impl StorageEngine for PageBackedStorageEngine {
         if !retired.files.is_empty() {
             state.retired_generations.push_back(retired);
         }
+        state.retired_generations.extend(superseded_generations);
         Ok(())
     }
 }

@@ -111,6 +111,24 @@ impl Session {
         let result_formats = portal.result_formats.clone();
         let query_text = statement.sql().to_string();
 
+        if self.txn.as_ref().is_some_and(|txn| !txn.is_failed())
+            && let Some(tables) = statement.truncate_tables()
+        {
+            match self.truncate_targets_parked_query_error(tables) {
+                Ok(Some(err)) => {
+                    self.mark_current_transaction_failed();
+                    self.failed = true;
+                    return write_messages(stream, codec, &[error_response(&err)]).await;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.mark_current_transaction_failed();
+                    self.failed = true;
+                    return write_messages(stream, codec, &[error_response(&err)]).await;
+                }
+            }
+        }
+
         let guard = match self.app.components.shutdown.begin_query() {
             Ok(guard) => guard,
             Err(err) => {
@@ -431,6 +449,7 @@ impl Session {
                         query_text,
                         rows_sent: count,
                         transaction_scoped,
+                        relations: started.relations,
                     }),
                 );
                 wait_cancelable_write(
@@ -553,8 +572,14 @@ impl Session {
             .collect::<Result<Vec<_>>>()?;
         let service = self.app.query_service.clone();
         let cancel = self.cancel.clone();
+        let truncate_updates = self.txn.as_ref().map(|txn| txn.truncate_updates.clone());
         let prepared = tokio::task::spawn_blocking(move || {
-            service.prepare_sql_cancelable(&query, &declared, cancel.as_ref())
+            service.prepare_sql_with_truncate_updates_cancelable(
+                &query,
+                &declared,
+                truncate_updates.as_ref(),
+                cancel.as_ref(),
+            )
         })
         .await
         .map_err(|_| DbError::internal("statement preparation panicked"))??;

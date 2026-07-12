@@ -253,6 +253,7 @@ pub trait CatalogManager: Send + Sync {
         &self,
         plans: &[TruncateTablePlan],
     ) -> Result<Vec<TruncateCatalogUpdate>>;
+    fn apply_truncate_updates(&self, updates: &[TruncateCatalogUpdate]) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -417,10 +418,19 @@ write lock. Normal multi-table TRUNCATE uses the batch method;
 recovery keeps applying individual committed logical WAL records whose shared
 transaction outcome makes the batch durable together.
 
+`apply_truncate_updates(updates)` is the top-level commit publication path for
+transactional TRUNCATE. It accepts prebuilt overlay schemas, reconstructs and
+validates the equivalent plans against one current catalog state (including exact
+base/TOAST/index identities and storage-id uniqueness), reserves every replacement
+storage id, and publishes the complete batch under one catalog write lock. A
+validation or allocator failure publishes nothing.
+
 Transactional TRUNCATE validates the same batch but stores its replacement base,
 hidden TOAST, and secondary-index schemas in a transaction-local catalog overlay;
-public catalog maps remain unchanged. Owner binding resolves overlay entries before
-the committed catalog. Top-level commit publishes the complete overlay under the
+public catalog maps remain unchanged. The read-only overlay stores only replacement
+schemas and falls back to the live catalog for unrelated objects, so later statements
+do not clone the full catalog and can resolve unrelated committed DDL. Owner binding
+resolves overlay entries before the committed catalog. Top-level commit publishes the complete overlay under the
 server catalog gate and one catalog write lock; rollback discards it. Allocated ids
 remain burned. Repeated truncates replace the overlay entry with the newest schema
 while storage retains first-before-images. Savepoint-local overlay rollback is out

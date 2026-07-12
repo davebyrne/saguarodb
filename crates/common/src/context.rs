@@ -288,6 +288,10 @@ pub trait SsiTracker: Send + Sync + std::fmt::Debug {
     /// dangerous-structure detection. Returns `Err` with `SerializationFailure`
     /// (`40001`) when `writer` is the SSI victim and must abort; otherwise `Ok`.
     fn note_write(&self, writer: TxnId, table: TableId, key: &Key) -> Result<()>;
+    /// A whole-relation write (for example TRUNCATE): form rw-edges from every
+    /// relation or tuple SIREAD holder and record a relation-granularity writer so
+    /// later reads form conflict-out edges.
+    fn note_relation_write(&self, writer: TxnId, table: TableId) -> Result<()>;
 }
 
 /// The default no-op `SsiTracker` for non-serializable (Read Committed / Repeatable
@@ -302,6 +306,10 @@ impl SsiTracker for NoSsiTracker {
     fn record_tuple_read(&self, _reader: TxnId, _table: TableId, _key: &Key) {}
     fn record_relation_read(&self, _reader: TxnId, _table: TableId) {}
     fn note_write(&self, _writer: TxnId, _table: TableId, _key: &Key) -> Result<()> {
+        Ok(())
+    }
+
+    fn note_relation_write(&self, _writer: TxnId, _table: TableId) -> Result<()> {
         Ok(())
     }
 }

@@ -46,6 +46,9 @@ struct SsiState {
     /// `relation_readers`, consulted at read time for conflict-out (`docs/specs/ssi.md`
     /// §6). Populated by every `note_write`.
     relation_writers: HashMap<TableId, HashSet<TxnId>>,
+    /// `table → serializable whole-relation writers`. Unlike ordinary row writers,
+    /// these conflict with a later tuple read regardless of its key.
+    whole_relation_writers: HashMap<TableId, HashSet<TxnId>>,
     /// `(table, key) → serializable writers` of that row — the dual of `tuple_readers`.
     tuple_writers: HashMap<(TableId, Key), HashSet<TxnId>>,
     /// `table → writers` whose tuple-write keys were invalidated by a primary-key
@@ -75,6 +78,9 @@ struct TxnSsi {
     tuple_locks: HashMap<TableId, HashSet<Key>>,
     /// Tables this transaction wrote a row in (reverse index into `relation_writers`).
     relation_writes: HashSet<TableId>,
+    /// Tables this transaction replaced wholesale (reverse index into
+    /// `whole_relation_writers`).
+    whole_relation_writes: HashSet<TableId>,
     /// Keys this transaction wrote, grouped by table (reverse index into
     /// `tuple_writers`).
     tuple_writes: HashMap<TableId, HashSet<Key>>,
@@ -119,6 +125,7 @@ impl SerializableConflictManager {
             relation_locks: HashSet::new(),
             tuple_locks: HashMap::new(),
             relation_writes: HashSet::new(),
+            whole_relation_writes: HashSet::new(),
             tuple_writes: HashMap::new(),
             out_edges: HashSet::new(),
             in_edges: HashSet::new(),
@@ -293,6 +300,9 @@ fn purge(st: &mut SsiState, top: TxnId, txn: TxnSsi) {
     for table in txn.relation_writes {
         remove_reader(&mut st.relation_writers, &table, top);
     }
+    for table in txn.whole_relation_writes {
+        remove_reader(&mut st.whole_relation_writers, &table, top);
+    }
     for (table, keys) in txn.tuple_writes {
         for key in keys {
             remove_reader(&mut st.tuple_writers, &(table, key), top);
@@ -398,6 +408,9 @@ impl SsiTracker for SerializableConflictManager {
         if let Some(promoted) = st.promoted_tuple_writers.get(&table) {
             writers.extend(promoted.iter().copied());
         }
+        if let Some(whole_relation) = st.whole_relation_writers.get(&table) {
+            writers.extend(whole_relation.iter().copied());
+        }
         for w in writers {
             form_rw_edge(&mut st, top, w);
         }
@@ -481,6 +494,45 @@ impl SsiTracker for SerializableConflictManager {
         // Edge-time detection (§7): the new inbound edges can make the writer a pivot
         // if it already had an outbound edge whose target committed first. The acting
         // writer is the participant aborted.
+        if is_doomed_pivot(&st, writer_top) {
+            return Err(serialization_failure());
+        }
+        Ok(())
+    }
+
+    fn note_relation_write(&self, writer: TxnId, table: TableId) -> Result<()> {
+        let writer_top = self.registry.top_of(writer);
+        let mut st = self.lock();
+        if !st.txns.contains_key(&writer_top) {
+            return Ok(());
+        }
+        let readers = st
+            .relation_readers
+            .get(&table)
+            .into_iter()
+            .chain(
+                st.tuple_readers
+                    .iter()
+                    .filter_map(|((read_table, _), readers)| {
+                        (*read_table == table).then_some(readers)
+                    }),
+            )
+            .flat_map(|readers| readers.iter().copied())
+            .collect::<HashSet<_>>();
+        for reader in readers {
+            form_rw_edge(&mut st, reader, writer_top);
+        }
+        let txn = st.txns.get_mut(&writer_top).expect("tracked above");
+        txn.relation_writes.insert(table);
+        txn.whole_relation_writes.insert(table);
+        st.relation_writers
+            .entry(table)
+            .or_default()
+            .insert(writer_top);
+        st.whole_relation_writers
+            .entry(table)
+            .or_default()
+            .insert(writer_top);
         if is_doomed_pivot(&st, writer_top) {
             return Err(serialization_failure());
         }
@@ -675,6 +727,33 @@ mod tests {
         let st = mgr.lock();
         assert!(st.txns[&10].out_edges.contains(&25), "edge R→W formed");
         assert!(st.txns[&25].in_edges.contains(&10));
+    }
+
+    #[test]
+    fn relation_write_conflicts_with_prior_and_later_reads_at_both_grains() {
+        let mgr = manager();
+        mgr.register(10, snapshot(20));
+        mgr.record_relation_read(10, 7);
+        mgr.register(11, snapshot(20));
+        mgr.record_tuple_read(11, 7, &key(1));
+        mgr.register(25, snapshot(30));
+
+        mgr.note_relation_write(25, 7).unwrap();
+        {
+            let st = mgr.lock();
+            assert!(st.txns[&10].out_edges.contains(&25));
+            assert!(st.txns[&11].out_edges.contains(&25));
+            assert!(st.txns[&25].in_edges.contains(&10));
+            assert!(st.txns[&25].in_edges.contains(&11));
+        }
+
+        mgr.register(30, snapshot_excluding(40, &[25]));
+        mgr.record_relation_read(30, 7);
+        mgr.register(31, snapshot_excluding(40, &[25]));
+        mgr.record_tuple_read(31, 7, &key(999));
+        let st = mgr.lock();
+        assert!(st.txns[&30].out_edges.contains(&25));
+        assert!(st.txns[&31].out_edges.contains(&25));
     }
 
     #[test]

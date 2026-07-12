@@ -1397,21 +1397,26 @@ Transactional TRUNCATE uses a distinct transactional batch publication path.
 It validates the complete update set before mutation, records the old base,
 TOAST, and secondary-index schemas in the transaction's existing storage
 before-image state, records the previous TOAST allocator state, installs every
-replacement generation under one storage state write lock, and deliberately
-keeps the replacement files in the transaction's unpublished-file set. Normal
-`commit_txn` cleanup then retires the old generations and makes the replacements
-permanent; normal `rollback_txn` restores the old schemas and allocator state and
-retires or removes the replacements. The transactional path never appends or
-flushes a Commit record itself. Replacement storage ids remain reserved after
-rollback. See `docs/specs/table-locks.md` for ownership and visibility rules.
+replacement generation under one storage state write lock, and removes the now-live
+replacement files from the unpublished-file set. Normal `commit_txn` cleanup retires
+the old generations and makes the final replacements permanent. Normal
+`rollback_txn` restores the old schemas and allocator state, then queues the outgoing
+replacement generations for reference-aware retirement so a relation snapshot that
+was already using one cannot lose its files. Unpublished preparation files that were
+never installed are removed directly. The transactional path never appends or flushes
+a Commit record itself. Replacement storage ids remain reserved after rollback. See
+`docs/specs/table-locks.md` for ownership and visibility rules.
 
 Before-images use first-write semantics across repeated truncates of one logical
-table. All replacement files remain transaction-tracked. Commit retains the last
-installed generation and retires the original and superseded replacements;
-rollback restores the original and removes every replacement. Restoring the old
-TOAST allocator on rollback is a generation-swap exception to process-monotonic
-allocation: ids consumed only in discarded replacement files may be reused, but
-an id is never reused within any surviving physical generation.
+table. Replacement files remain transaction-tracked either as unpublished
+preparations, the currently installed generation, or reference-counted superseded
+generations. Commit retains the last installed generation and retires the original
+and superseded replacements; rollback restores the original and retires every
+installed replacement. The server runs best-effort retired-generation cleanup only
+after dropping the relation-publication guard. Restoring the old TOAST allocator on
+rollback is a generation-swap exception to process-monotonic allocation: ids consumed
+only in discarded replacement files may be reused, but an id is never reused within
+any surviving physical generation.
 
 `RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, truncate generation publication, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 

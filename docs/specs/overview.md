@@ -2364,6 +2364,7 @@ pub trait CatalogManager: Send + Sync {
         &self,
         plans: &[TruncateTablePlan],
     ) -> Result<Vec<TruncateCatalogUpdate>>;
+    fn apply_truncate_updates(&self, updates: &[TruncateCatalogUpdate]) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -2448,7 +2449,13 @@ against one catalog state, rejects any replacement storage id reused across the
 batch, and publishes the complete set of storage-id swaps under one catalog
 write lock. Storage performs the same global collision check before one-lock
 batch publication. The single-plan apply method remains the recovery path for
-each existing logical WAL record.
+each existing logical WAL record. Transactional top-level commit instead calls
+`apply_truncate_updates` with its prebuilt overlay batch; the method reconstructs
+and validates the equivalent plans against one catalog state, reserves all carried
+storage ids, and atomically publishes every base/TOAST/index schema or none.
+The transaction-local read view stores only those replacement schemas and delegates
+unrelated lookups to the live catalog rather than cloning the complete catalog for
+each statement.
 
 ### Persistence
 
