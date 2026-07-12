@@ -3104,6 +3104,21 @@ fn validate_column_default(
                 column.name, sequence
             )))
         }
+        // A non-finite constant default (e.g. `DEFAULT 1e400`, which parses
+        // to Infinity) would serialize as JSON `null` in both the manifest's
+        // catalog payload and the CreateTable/UpdateTableSchema WAL records —
+        // and `null` fails to deserialize back, making the NEXT STARTUP unable
+        // to load the catalog. Reject it before it can become durable. (No
+        // valid durable artifact can already contain one: it would never have
+        // round-tripped.)
+        Some(ColumnDefault::Const(value)) if !common::value_is_finite(value) => Err(DbError::plan(
+            SqlState::NumericValueOutOfRange,
+            format!(
+                "default for column {} of table {table_name} is out of range: \
+                     non-finite values cannot be a column default",
+                column.name
+            ),
+        )),
         _ => Ok(()),
     }
 }

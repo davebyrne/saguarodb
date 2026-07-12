@@ -3861,6 +3861,33 @@ mod tests {
     }
 
     #[test]
+    fn create_table_rejects_non_finite_constant_defaults() {
+        // A non-finite constant default would serialize as JSON `null` in the
+        // manifest and WAL and fail to load back, bricking the next startup.
+        let catalog = MemoryCatalog::empty();
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let err = catalog
+                .create_table(
+                    "t".to_string(),
+                    vec![ParsedColumnDef {
+                        name: "x".to_string(),
+                        data_type: DataType::Double,
+                        nullable: true,
+                        max_length: None,
+                        default: Some(common::ParsedDefault::Const(Value::Float(OrderedF64::new(
+                            value,
+                        )))),
+                        pg_type: None,
+                    }],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+                .unwrap_err();
+            assert_eq!(err.code, SqlState::NumericValueOutOfRange, "for {value}");
+        }
+    }
+
+    #[test]
     fn truncate_overlay_reads_base_statistics_and_rejects_writes() {
         let catalog = catalog_with_users_without_primary_key();
         let table = catalog.get_table_by_name("users").unwrap().unwrap();

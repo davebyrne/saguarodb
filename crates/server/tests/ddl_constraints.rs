@@ -1689,3 +1689,36 @@ async fn not_null_violation_on_insert_and_update() {
 async fn restart(path: &Path) -> TestServer {
     TestServer::start_with_data_dir(path).await.unwrap()
 }
+
+#[tokio::test]
+async fn non_finite_constant_defaults_are_rejected_and_cannot_poison_the_manifest() {
+    // Regression: `DEFAULT 1e400` parses to Infinity, which serializes as
+    // JSON `null` in the manifest/WAL and fails to load back — one statement
+    // used to make the next startup unable to open the database.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        for sql in [
+            "create table brick (x double precision default 1e400)",
+            "create table brick (x double precision default -1e400)",
+        ] {
+            let outcome = conn.query(sql).await.unwrap();
+            let err = outcome.result.err().expect("non-finite default rejected");
+            assert_eq!(
+                err.code,
+                common::SqlState::NumericValueOutOfRange,
+                "for `{sql}`"
+            );
+        }
+        conn.ok("create table ok_table (x double precision default 1.5)")
+            .await;
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // The database reopens: nothing non-finite reached the durable catalog.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let catalog = &server.app().components.catalog;
+    assert!(catalog.get_table_by_name("ok_table").unwrap().is_some());
+    assert!(catalog.get_table_by_name("brick").unwrap().is_none());
+}
