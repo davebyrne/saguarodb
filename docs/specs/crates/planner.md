@@ -3,6 +3,14 @@
 **Date:** 2026-07-04
 **Status:** Living crate contract
 
+User relation names carry an optional schema qualifier. `BindOptions.search_path`
+contains the effective schema ids captured by the server for the statement. An
+explicit qualifier resolves only in that schema and an unknown schema returns
+`InvalidSchemaName`; an unqualified name searches the path in order. CTEs shadow
+only unqualified catalog names. Creation uses the first effective path schema,
+while stored views persist the path ids used at creation and rebind definitions
+against that path rather than the caller's current path.
+
 ## Purpose
 
 `planner` converts parser AST into executable physical plans through three explicit phases:

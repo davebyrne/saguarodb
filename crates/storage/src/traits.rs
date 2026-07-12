@@ -2,9 +2,9 @@ use std::any::Any;
 use std::sync::Arc;
 
 use common::{
-    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, SequenceId,
-    SequenceSchema, StatementContext, StoredRow, TableId, TableSchema, TruncateCatalogUpdate,
-    ViewSchema,
+    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId, SchemaId,
+    SequenceId, SequenceSchema, StatementContext, StoredRow, TableId, TableSchema,
+    TruncateCatalogUpdate, ViewSchema,
 };
 
 pub trait RowIterator: Send {
@@ -108,6 +108,8 @@ pub trait StorageEngine: Send + Sync {
 }
 
 pub trait SchemaOperations: Send + Sync {
+    fn create_schema(&self, ctx: &StatementContext, schema: &NamespaceSchema) -> Result<()>;
+    fn drop_schema(&self, ctx: &StatementContext, schema: SchemaId) -> Result<()>;
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
     fn update_table_schema(

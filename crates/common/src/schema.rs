@@ -25,6 +25,28 @@ impl QualifiedName {
     }
 }
 
+impl std::fmt::Display for QualifiedName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(schema) = &self.schema {
+            write!(formatter, "{schema}.{}", self.name)
+        } else {
+            formatter.write_str(&self.name)
+        }
+    }
+}
+
+impl PartialEq<str> for QualifiedName {
+    fn eq(&self, other: &str) -> bool {
+        self.schema.is_none() && self.name == other
+    }
+}
+
+impl PartialEq<&str> for QualifiedName {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceSchema {
     pub id: SchemaId,

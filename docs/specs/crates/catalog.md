@@ -86,6 +86,17 @@ captures the schema-id search path used to bind its stored definition. Schema id
 `1` is the built-in mutable `public` namespace; user schema allocation begins at
 `2`. Schema ids are monotonic and never reused.
 
+`CatalogManager` exposes schema-scoped lookup and creation operations for tables,
+indexes, sequences, and views. The legacy bare-name lookup and creation methods
+remain compatibility conveniences for `public`. Scoped index creation identifies
+its target table by stable `TableId`, avoiding ambiguous bare names. Scoped view
+creation records the exact schema-id search path used to bind its definition.
+Relation-name collision checks are per schema, while tables, views, indexes,
+sequences, and generated primary-key index names share one namespace within each
+schema. `create_schema` allocates a monotonic user schema id. `drop_schema` has
+RESTRICT semantics: it rejects a schema containing objects or referenced by a
+stored view definition search path.
+
 The catalog JSON payload has its own format version, independently of the outer
 control-record version. Version 2 stores schemas, tables, views, indexes, and
 sequences as id-sorted arrays plus allocator high-water marks; runtime name maps

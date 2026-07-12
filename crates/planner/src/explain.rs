@@ -46,6 +46,12 @@ fn format_node(
         String::new()
     };
     match plan {
+        PhysicalPlan::CreateSchema { name, .. } => {
+            output.push_str(&format!("{padding}CreateSchema {name}\n"));
+        }
+        PhysicalPlan::DropSchema { name, .. } => {
+            output.push_str(&format!("{padding}DropSchema {name}\n"));
+        }
         PhysicalPlan::CreateTable { name, .. } => {
             output.push_str(&format!("{padding}CreateTable {name}\n"));
         }
@@ -55,7 +61,7 @@ fn format_node(
             let conditional = if *if_exists { " if_exists=true" } else { "" };
             let names = targets
                 .iter()
-                .map(|target| target.name.as_str())
+                .map(|target| target.name.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
             output.push_str(&format!("{padding}DropTable tables={names}{conditional}\n"));
@@ -109,7 +115,9 @@ fn format_node(
         PhysicalPlan::CreateSequence { name, .. } => {
             output.push_str(&format!("{padding}CreateSequence {name}\n"));
         }
-        PhysicalPlan::DropSequence { name, if_exists } => {
+        PhysicalPlan::DropSequence {
+            name, if_exists, ..
+        } => {
             output.push_str(&format!(
                 "{padding}DropSequence {name} if_exists={if_exists}\n"
             ));
@@ -117,7 +125,9 @@ fn format_node(
         PhysicalPlan::CreateView { name, .. } => {
             output.push_str(&format!("{padding}CreateView {name}\n"));
         }
-        PhysicalPlan::DropView { name, if_exists } => {
+        PhysicalPlan::DropView {
+            name, if_exists, ..
+        } => {
             output.push_str(&format!("{padding}DropView {name} if_exists={if_exists}\n"));
         }
         PhysicalPlan::Insert { table, source, .. } => {

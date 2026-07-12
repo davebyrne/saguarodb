@@ -585,6 +585,18 @@ impl StorageEngine for MemoryStorage {
 }
 
 impl SchemaOperations for MemoryStorage {
+    fn create_schema(
+        &self,
+        _ctx: &StatementContext,
+        _schema: &common::NamespaceSchema,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn drop_schema(&self, _ctx: &StatementContext, _schema: common::SchemaId) -> Result<()> {
+        Ok(())
+    }
+
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()> {
         let mut state = self
             .state

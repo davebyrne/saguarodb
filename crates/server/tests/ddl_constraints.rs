@@ -1280,23 +1280,21 @@ async fn prepared_currval_errors_after_sequence_drop() {
 }
 
 #[tokio::test]
-async fn sequence_ddl_inside_transaction_is_rejected() {
+async fn sequence_ddl_is_transactional() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
 
     conn.ok("begin").await;
-    let create = conn.ok("create sequence users_id_seq").await;
-    let err = create
-        .result
-        .err()
-        .expect("sequence DDL inside a transaction should fail");
-    assert!(
-        err.message.to_lowercase().contains("ddl"),
-        "message was: {}",
-        err.message
-    );
-    assert_eq!(create.status, b'E');
+    conn.ok("create sequence users_id_seq").await;
     conn.ok("rollback").await;
+    let missing = conn.ok("select nextval('users_id_seq')").await;
+    assert!(missing.result.is_err());
+    assert_eq!(missing.status, b'I');
+
+    conn.ok("begin").await;
+    conn.ok("create sequence users_id_seq").await;
+    conn.ok("commit").await;
+    conn.ok("select nextval('users_id_seq')").await;
 }
 
 /// A composite `PRIMARY KEY (a, b)` enforces uniqueness over the whole tuple, not

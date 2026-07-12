@@ -687,3 +687,44 @@ async fn prepared_truncate_runs_over_extended_protocol() {
         vec![vec![Some("2".to_string())]],
     );
 }
+
+#[tokio::test]
+async fn later_transactional_ddl_supersedes_pending_truncate_catalog_state() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table dropped_after_truncate (id integer primary key)")
+        .await;
+    conn.ok("begin").await;
+    conn.ok("truncate dropped_after_truncate").await;
+    assert!(
+        conn.ok("drop table dropped_after_truncate")
+            .await
+            .result
+            .is_ok()
+    );
+    conn.ok("commit").await;
+    assert!(
+        conn.ok("select * from dropped_after_truncate")
+            .await
+            .result
+            .is_err()
+    );
+
+    conn.ok("create table altered_after_truncate (id integer primary key)")
+        .await;
+    conn.ok("insert into altered_after_truncate values (1)")
+        .await;
+    conn.ok("begin").await;
+    conn.ok("truncate altered_after_truncate").await;
+    assert!(
+        conn.ok("alter table altered_after_truncate add column note text")
+            .await
+            .result
+            .is_ok()
+    );
+    conn.ok("commit").await;
+    let result = conn.ok("select id, note from altered_after_truncate").await;
+    assert!(result.result.is_ok());
+    assert!(result.rows().is_empty());
+}

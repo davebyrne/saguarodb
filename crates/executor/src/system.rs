@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use catalog::{
     CatalogManager, INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemView,
-    attrdef_oid, check_constraint_oid, index_oid, primary_key_constraint_oid, sequence_oid,
-    synthetic_primary_key_oid, table_oid,
+    attrdef_oid, check_constraint_oid, index_oid, primary_key_constraint_oid, schema_oid,
+    sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 use common::{
     ColumnDef, ColumnDefault, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32,
@@ -25,7 +25,7 @@ pub(crate) fn rows_for(
     ctx: &StatementContext,
 ) -> Result<Vec<Row>> {
     match view {
-        SystemView::PgNamespace => Ok(pg_namespace_rows()),
+        SystemView::PgNamespace => pg_namespace_rows(catalog),
         SystemView::PgClass => pg_class_rows(catalog),
         SystemView::PgAttribute => pg_attribute_rows(catalog),
         SystemView::PgType => Ok(pg_type_rows()),
@@ -38,15 +38,22 @@ pub(crate) fn rows_for(
         SystemView::PgRoles => Ok(pg_roles_rows(ctx)),
         SystemView::PgSettings => Ok(pg_settings_rows(ctx)),
         SystemView::PgStatActivity => Ok(pg_stat_activity_rows(ctx)),
-        SystemView::PgStats => pg_stats_rows(catalog),
-        SystemView::InformationSchemaSchemata => Ok(information_schema_schemata_rows(ctx)),
+        SystemView::InformationSchemaSchemata => information_schema_schemata_rows(catalog, ctx),
         SystemView::InformationSchemaTables => information_schema_tables_rows(catalog, ctx),
         SystemView::InformationSchemaColumns => information_schema_columns_rows(catalog, ctx),
     }
 }
 
-fn pg_namespace_rows() -> Vec<Row> {
-    vec![
+fn namespace_oid(schema_id: common::SchemaId) -> i64 {
+    if schema_id == common::PUBLIC_SCHEMA_ID {
+        PUBLIC_SCHEMA_OID
+    } else {
+        schema_oid(schema_id)
+    }
+}
+
+fn pg_namespace_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
+    let mut rows = vec![
         row(vec![
             int(PG_CATALOG_SCHEMA_OID),
             text("pg_catalog"),
@@ -58,7 +65,18 @@ fn pg_namespace_rows() -> Vec<Row> {
             text("information_schema"),
             int(OWNER_OID),
         ]),
-    ]
+    ];
+    for schema in catalog.list_schemas()? {
+        if schema.id != common::PUBLIC_SCHEMA_ID {
+            rows.push(row(vec![
+                int(namespace_oid(schema.id)),
+                text(&schema.name),
+                int(OWNER_OID),
+            ]));
+        }
+    }
+    rows.sort_by_key(|row| integer_at(row, 0));
+    Ok(rows)
 }
 
 fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
@@ -83,6 +101,7 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 index_oid(index.id),
                 &index.name,
                 index.columns.len(),
+                index.schema_id,
             ));
         }
         if !has_primary_key_index && !table.primary_key.is_empty() {
@@ -90,6 +109,7 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 synthetic_primary_key_oid(table.id),
                 &primary_key_index_name(table),
                 table.primary_key.len(),
+                table.schema_id,
             ));
         }
     }
@@ -124,7 +144,7 @@ fn pg_class_table_row(
     row(vec![
         int(oid),
         text(relation_name(table)),
-        int(PUBLIC_SCHEMA_OID),
+        int(namespace_oid(table.schema_id)),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -154,11 +174,11 @@ fn pg_class_table_row(
     ])
 }
 
-fn pg_class_index_row(oid: i64, name: &str, natts: usize) -> Row {
+fn pg_class_index_row(oid: i64, name: &str, natts: usize, schema_id: common::SchemaId) -> Row {
     row(vec![
         int(oid),
         text(name),
-        int(PUBLIC_SCHEMA_OID),
+        int(namespace_oid(schema_id)),
         int(0),
         int(OWNER_OID),
         int(BTREE_AM_OID),
@@ -190,7 +210,7 @@ fn pg_class_sequence_row(sequence: &SequenceSchema) -> Row {
     row(vec![
         int(oid),
         text(&sequence.name),
-        int(PUBLIC_SCHEMA_OID),
+        int(namespace_oid(sequence.schema_id)),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -222,7 +242,7 @@ fn pg_class_user_view_row(view: &ViewSchema) -> Row {
     row(vec![
         int(oid),
         text(&view.name),
-        int(PUBLIC_SCHEMA_OID),
+        int(namespace_oid(view.schema_id)),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -804,109 +824,20 @@ fn pg_stat_activity_row(session: SessionActivityRow) -> Row {
     ])
 }
 
-/// One `pg_stats` row per analyzed column (`docs/specs/statistics.md` §8),
-/// sorted by table id then column id. MCV/histogram values render in their
-/// wire text form inside PostgreSQL-style `{...}` array text; `n_distinct`
-/// follows the PostgreSQL sign convention (positive count, negative fraction
-/// of the row count); `correlation` is always NULL in v1.
-fn pg_stats_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
-    let mut tables = catalog
-        .list_tables()?
-        .into_iter()
-        .filter(|table| table.relation_kind == RelationKind::User)
-        .collect::<Vec<_>>();
-    tables.sort_unstable_by_key(|table| table.id);
-
-    let mut rows = Vec::new();
-    for table in &tables {
-        let Some(statistics) = catalog.get_table_statistics(table.id)? else {
-            continue;
-        };
-        for column in &table.columns {
-            let Some(column_stats) = statistics.columns.get(&column.id) else {
-                continue;
-            };
-            let n_distinct = match &column_stats.n_distinct {
-                common::NDistinct::Count(count) => *count as f32,
-                common::NDistinct::Fraction(fraction) => -(fraction.get() as f32),
-            };
-            let mcv_vals = non_empty_array_text(
-                column_stats
-                    .most_common
-                    .iter()
-                    .map(|(value, _)| stat_value_text(value)),
-            );
-            let mcv_freqs = non_empty_array_text(
-                column_stats
-                    .most_common
-                    .iter()
-                    .map(|(_, freq)| common::float::format_double(freq.get())),
-            );
-            let histogram =
-                non_empty_array_text(column_stats.histogram_bounds.iter().map(stat_value_text));
-            rows.push(row(vec![
-                text("public"),
-                text(&table.name),
-                text(&column.name),
-                real(column_stats.null_frac.get() as f32),
-                int(i64::from(column_stats.avg_width)),
-                real(n_distinct),
-                nullable_text(mcv_vals),
-                nullable_text(mcv_freqs),
-                nullable_text(histogram),
-                Value::Null,
-            ]));
-        }
-    }
-    Ok(rows)
-}
-
-/// A statistics value's display text: the wire text form (never NULL — MCV
-/// and histogram entries are non-null by construction).
-fn stat_value_text(value: &Value) -> String {
-    crate::copy::value_text(value).unwrap_or_default()
-}
-
-/// PostgreSQL-style array output (`{a,b,c}`), or `None` for an empty list
-/// (rendered as SQL NULL, matching pg_stats for absent statistics).
-fn non_empty_array_text(elements: impl Iterator<Item = String>) -> Option<String> {
-    let mut out = String::from("{");
-    let mut any = false;
-    for element in elements {
-        if any {
-            out.push(',');
-        }
-        any = true;
-        if array_element_needs_quotes(&element) {
-            out.push('"');
-            for ch in element.chars() {
-                if ch == '"' || ch == '\\' {
-                    out.push('\\');
-                }
-                out.push(ch);
-            }
-            out.push('"');
-        } else {
-            out.push_str(&element);
-        }
-    }
-    if !any {
-        return None;
-    }
-    out.push('}');
-    Some(out)
-}
-
-fn array_element_needs_quotes(element: &str) -> bool {
-    element.is_empty()
-        || element.eq_ignore_ascii_case("null")
-        || element
-            .chars()
-            .any(|ch| matches!(ch, '{' | '}' | ',' | '"' | '\\') || ch.is_whitespace())
-}
-
-fn information_schema_schemata_rows(ctx: &StatementContext) -> Vec<Row> {
-    ["pg_catalog", "public", "information_schema"]
+fn information_schema_schemata_rows(
+    catalog: &dyn CatalogManager,
+    ctx: &StatementContext,
+) -> Result<Vec<Row>> {
+    let mut schemas = vec!["pg_catalog".to_string(), "information_schema".to_string()];
+    schemas.extend(
+        catalog
+            .list_schemas()?
+            .into_iter()
+            .map(|schema| schema.name),
+    );
+    schemas.sort();
+    schemas.dedup();
+    Ok(schemas
         .into_iter()
         .map(|schema| {
             row(vec![
@@ -919,7 +850,7 @@ fn information_schema_schemata_rows(ctx: &StatementContext) -> Vec<Row> {
                 Value::Null,
             ])
         })
-        .collect()
+        .collect())
 }
 
 fn information_schema_tables_rows(
@@ -931,9 +862,12 @@ fn information_schema_tables_rows(
         if table.relation_kind != RelationKind::User {
             continue;
         }
+        let schema = catalog
+            .get_schema(table.schema_id)?
+            .ok_or_else(|| common::DbError::internal("table references missing schema"))?;
         rows.push(information_schema_table_row(
             ctx,
-            "public",
+            &schema.name,
             &table.name,
             "BASE TABLE",
             "YES",
@@ -949,8 +883,15 @@ fn information_schema_tables_rows(
         ));
     }
     for view in catalog.list_views()? {
+        let schema = catalog
+            .get_schema(view.schema_id)?
+            .ok_or_else(|| common::DbError::internal("view references missing schema"))?;
         rows.push(information_schema_table_row(
-            ctx, "public", &view.name, "VIEW", "NO",
+            ctx,
+            &schema.name,
+            &view.name,
+            "VIEW",
+            "NO",
         ));
     }
     rows.sort_by_key(|row| (text_at(row, 1).to_string(), text_at(row, 2).to_string()));
@@ -989,11 +930,14 @@ fn information_schema_columns_rows(
         if table.relation_kind != RelationKind::User {
             continue;
         }
+        let schema = catalog
+            .get_schema(table.schema_id)?
+            .ok_or_else(|| common::DbError::internal("table references missing schema"))?;
         for column in &table.columns {
             rows.push(information_schema_column_row(
                 catalog,
                 ctx,
-                "public",
+                &schema.name,
                 &table.name,
                 column,
                 true,
@@ -1013,9 +957,17 @@ fn information_schema_columns_rows(
         }
     }
     for view in catalog.list_views()? {
+        let schema = catalog
+            .get_schema(view.schema_id)?
+            .ok_or_else(|| common::DbError::internal("view references missing schema"))?;
         for column in &view.columns {
             rows.push(information_schema_column_row(
-                catalog, ctx, "public", &view.name, column, false,
+                catalog,
+                ctx,
+                &schema.name,
+                &view.name,
+                column,
+                false,
             )?);
         }
     }

@@ -23,8 +23,10 @@ pub fn parse(sql: &str) -> Result<Statement>;
 
 ```rust
 pub enum Statement {
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
     CreateTable {
-        name: String,
+        name: QualifiedName,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
@@ -36,21 +38,15 @@ pub enum Statement {
         toast: ToastOptionPatch,
         checks: Vec<String>,
     },
-    DropTable { names: Vec<String>, if_exists: bool },
-    AlterTableAddColumn { table: String, if_not_exists: bool, column: ParsedColumnDef },
-    AlterTableDropColumn { table: String, if_exists: bool, column: String },
-    AlterTableRenameColumn { table: String, old_name: String, new_name: String },
-    AlterTableRenameTable { table: String, new_name: String },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
-    DropIndex { name: String },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: Query, definition: String },
-    DropView { name: String, if_exists: bool },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
-    Insert { table: String, columns: Vec<String>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectItem>> },
+    DropTable { names: Vec<QualifiedName>, if_exists: bool },
+    // All relation/object targets use `QualifiedName`; examples abbreviated.
+    AlterTableAddColumn { table: QualifiedName, if_not_exists: bool, column: ParsedColumnDef },
+    CreateIndex { name: QualifiedName, table: QualifiedName, columns: Vec<String>, unique: bool },
+    CreateSequence { name: QualifiedName, options: SequenceOptions },
+    Insert { table: QualifiedName, columns: Vec<String>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectItem>> },
     Query(Query),
-    Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
-    Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
+    Update { table: QualifiedName, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
+    Delete { table: QualifiedName, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     DeclareCursor { name: String, query: Query },
     FetchCursor { name: String, count: FetchCount },
     CloseCursor { name: String },
@@ -92,11 +88,7 @@ pub enum Statement {
     // table). The ANALYZE modifier requests the statistics pass after
     // reclamation (docs/specs/statistics.md §7).
     // `table` is lowercase-normalized; `None` means the whole database.
-    Vacuum { table: Option<String>, analyze: bool },
-    // `ANALYZE [<table>]` — collect optimizer statistics
-    // (docs/specs/statistics.md §5). `table` is lowercase-normalized;
-    // `None` means every user table.
-    Analyze { table: Option<String> },
+    Vacuum { table: Option<QualifiedName> },
     // `TRUNCATE [TABLE] <name> [, ...]`. Targets are lowercase-normalized.
     Truncate { tables: Vec<String> },
     // `ALTER TABLE <name> SET (compression = 'none' | 'zstd')`.
@@ -200,7 +192,13 @@ layer translates both forms; the binder binds and validates each.
 
 Identifiers remain strings in parser output. Name resolution is not a parser responsibility.
 Unquoted relation names in `FROM` may be one or two parts; the parser stores the
-optional schema separately on `FromItem::Table`.
+schema and relation together as `common::QualifiedName` on `FromItem::Table`.
+
+User object and relation targets accept exactly one or two unquoted identifier
+parts. One part produces an unqualified `QualifiedName`; two parts preserve the
+schema and object names. Three or more parts and quoted identifiers are rejected.
+`CREATE SCHEMA [IF NOT EXISTS]` and `DROP SCHEMA [IF EXISTS] [RESTRICT]` are
+supported; `DROP SCHEMA ... CASCADE` is rejected.
 
 ## Expression AST
 

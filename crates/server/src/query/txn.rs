@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use catalog::CatalogManager;
 use common::{
     CatalogIntrospectionProvider, DbError, IsolationLevel, QueryCancel, Result, SequenceManager,
     SessionInfo, SessionSequenceState, Snapshot, SqlState, StatementContext, SystemStateProvider,
@@ -23,6 +24,7 @@ pub(super) struct StatementRuntime<'a> {
     pub(super) cancel: &'a Arc<QueryCancel>,
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
+    search_path_names: Vec<String>,
     system_state: Arc<dyn SystemStateProvider>,
     catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
     catalog_introspection_is_explicit: bool,
@@ -60,6 +62,7 @@ impl<'a> StatementRuntime<'a> {
             cancel,
             session_sequences,
             session_info,
+            search_path_names: vec!["public".to_string()],
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
             catalog_introspection_is_explicit: false,
@@ -68,6 +71,16 @@ impl<'a> StatementRuntime<'a> {
 
     pub(super) fn cancel(&self) -> &QueryCancel {
         self.cancel.as_ref()
+    }
+
+    pub(super) fn search_path_names(&self) -> &[String] {
+        &self.search_path_names
+    }
+
+    #[must_use]
+    pub(super) fn with_search_path_names(mut self, search_path_names: Vec<String>) -> Self {
+        self.search_path_names = search_path_names;
+        self
     }
 
     #[must_use]
@@ -241,6 +254,7 @@ impl QueryService {
                     default_isolation_override: txn.default_isolation_override,
                     statement_timeout_override: txn.statement_timeout_override,
                     truncate_updates: txn.truncate_updates.clone(),
+                    relation_generation_changed: txn.relation_generation_changed,
                     catalog_overlay,
                     storage,
                 });
@@ -282,11 +296,29 @@ impl QueryService {
                         let statement_timeout_override =
                             txn.savepoints[idx].statement_timeout_override;
                         let truncate_updates = txn.savepoints[idx].truncate_updates.clone();
+                        let relation_generation_changed =
+                            txn.savepoints[idx].relation_generation_changed;
                         let catalog_overlay = txn.savepoints[idx].catalog_overlay.clone();
                         let storage = txn.savepoints[idx].storage.clone();
                         if let Err(err) = txn.catalog_overlay.rollback_to(&catalog_overlay) {
                             return (Some(txn), default_isolation, Err(err));
                         }
+                        let relation_publication = if txn.relation_generation_changed {
+                            match self.components.relation_publish_gate.write() {
+                                Ok(guard) => Some(guard),
+                                Err(_) => {
+                                    return (
+                                        Some(txn),
+                                        default_isolation,
+                                        Err(DbError::internal(
+                                            "relation publish gate poisoned during savepoint rollback",
+                                        )),
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         if let Err(err) = self
                             .components
                             .storage
@@ -294,6 +326,7 @@ impl QueryService {
                         {
                             return (Some(txn), default_isolation, Err(err));
                         }
+                        drop(relation_publication);
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -306,6 +339,7 @@ impl QueryService {
                         txn.default_isolation_override = default_isolation_override;
                         txn.statement_timeout_override = statement_timeout_override;
                         txn.truncate_updates = truncate_updates.clone();
+                        txn.relation_generation_changed = relation_generation_changed;
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -316,6 +350,7 @@ impl QueryService {
                             default_isolation_override,
                             statement_timeout_override,
                             truncate_updates,
+                            relation_generation_changed,
                             catalog_overlay,
                             storage,
                         });
@@ -465,6 +500,7 @@ impl QueryService {
             savepoints: Vec::new(),
             live_subxids: Vec::new(),
             truncate_updates: std::collections::BTreeMap::new(),
+            relation_generation_changed: false,
             catalog_overlay: Arc::new(catalog::CatalogOverlay::new(
                 self.components.catalog.clone(),
             )),
@@ -595,7 +631,7 @@ impl QueryService {
             // Abort the whole family (mirroring the flush-failure path) and drop its
             // SSI state, then surface 40001.
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
+            self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
@@ -606,18 +642,13 @@ impl QueryService {
         // committed transaction into an error.
         if let Err(err) = cancel.check() {
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
+            self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
 
         let truncate_updates = txn.truncate_updates.values().cloned().collect::<Vec<_>>();
         let has_catalog_changes = !txn.catalog_overlay.is_empty()?;
-        let combined_catalog = if has_catalog_changes || !truncate_updates.is_empty() {
-            Some(self.transaction_catalog(&txn)?.snapshot()?)
-        } else {
-            None
-        };
         let publication = (|| {
             if truncate_updates.is_empty() && !has_catalog_changes {
                 return Ok((None, None));
@@ -640,11 +671,37 @@ impl QueryService {
                 self.abort_subxids(&txn.live_subxids);
                 self.rollback_transaction_pre_durable_or_die(
                     txn_id,
-                    !txn.truncate_updates.is_empty(),
+                    txn.relation_generation_changed,
                 );
                 self.ssi_finish(txn_id, isolation, false);
                 return Err(err);
             }
+        };
+        let combined_catalog = if has_catalog_changes || !truncate_updates.is_empty() {
+            let materialize = || {
+                let base: Arc<dyn catalog::CatalogManager> =
+                    Arc::new(txn.catalog_overlay.catalog()?);
+                if truncate_updates.is_empty() {
+                    base.snapshot()
+                } else {
+                    catalog::TruncateCatalogOverlay::new(base, truncate_updates.iter().cloned())
+                        .snapshot()
+                }
+            };
+            match materialize() {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    self.abort_subxids(&txn.live_subxids);
+                    self.rollback_transaction_pre_durable_or_die(
+                        txn_id,
+                        txn.relation_generation_changed,
+                    );
+                    self.ssi_finish(txn_id, isolation, false);
+                    return Err(err);
+                }
+            }
+        } else {
+            None
         };
 
         if let Err(err) = self.append_and_flush_commit(txn_id, &txn.live_subxids) {
@@ -656,7 +713,7 @@ impl QueryService {
             self.rollback_pre_durable_or_die(txn_id, None);
             drop(relation_publication);
             drop(catalog_publication);
-            if !truncate_updates.is_empty() {
+            if txn.relation_generation_changed {
                 super::truncate::best_effort_retired_generation_cleanup(&self.components);
             }
             // The transaction passed its SSI commit check but did not commit durably:
@@ -687,10 +744,11 @@ impl QueryService {
         self.ssi_finish(txn_id, isolation, true);
         drop(relation_publication);
         drop(catalog_publication);
+        let relation_generation_changed = txn.relation_generation_changed;
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
 
-        if !truncate_updates.is_empty() {
+        if relation_generation_changed {
             super::truncate::best_effort_retired_generation_cleanup(&self.components);
         }
 
@@ -735,7 +793,7 @@ impl QueryService {
         // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
         // VACUUM-reclaimable), then the top-level transaction.
         self.abort_subxids(&txn.live_subxids);
-        self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
+        self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
         // Drop the serializable transaction's SSI state (its reads/writes are void).
         self.ssi_finish(txn_id, isolation, false);
         // `txn` drops here, releasing the exclusive write guard.
@@ -754,7 +812,7 @@ impl QueryService {
             self.abort_subxids(&txn.live_subxids);
             self.rollback_transaction_pre_durable_or_die(
                 txn.txn_id,
-                !txn.truncate_updates.is_empty(),
+                txn.relation_generation_changed,
             );
         } else {
             self.components.active_txns.deregister_all(&family);
@@ -1010,8 +1068,10 @@ impl QueryService {
         mut input: ExecutionContextInput<'a>,
     ) -> Result<ExecutionContext<'a>> {
         if !input.runtime.catalog_introspection_is_explicit {
-            let introspection =
-                self.catalog_introspection_provider_under_gate(input.runtime.session_info.clone())?;
+            let introspection = self.catalog_introspection_provider_under_gate(
+                input.runtime.session_info.clone(),
+                input.runtime.search_path_names.clone(),
+            )?;
             input.runtime = input
                 .runtime
                 .with_catalog_introspection(introspection, false);
@@ -1029,6 +1089,7 @@ impl QueryService {
             let introspection = Arc::new(super::QueryCatalogIntrospection {
                 source: super::QueryCatalogSource::Fixed(catalog.clone()),
                 session_info: input.runtime.session_info.clone(),
+                search_path_names: input.runtime.search_path_names.clone(),
             });
             input.runtime = input
                 .runtime
@@ -1048,6 +1109,7 @@ impl QueryService {
             let introspection = Arc::new(super::QueryCatalogIntrospection {
                 source: super::QueryCatalogSource::Fixed(catalog.clone()),
                 session_info: input.runtime.session_info.clone(),
+                search_path_names: input.runtime.search_path_names.clone(),
             });
             input.runtime = input
                 .runtime

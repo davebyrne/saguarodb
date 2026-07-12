@@ -576,11 +576,13 @@ impl Session {
             Some(txn) => Some(service.transaction_catalog(txn)?.snapshot()?),
             None => None,
         };
+        let search_path_names = self.session_gucs.search_path_names(&self.session_info.user);
         let prepared = tokio::task::spawn_blocking(move || {
             service.prepare_sql_with_catalog_snapshot_cancelable(
                 &query,
                 &declared,
                 catalog_snapshot,
+                &search_path_names,
                 cancel.as_ref(),
             )
         })

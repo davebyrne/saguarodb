@@ -98,7 +98,9 @@ fn collect_param_uses(statement: &BoundStatement) -> Result<Vec<Option<ParamUse>
 fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     match statement {
         // COPY carries no expressions/parameters.
-        BoundStatement::CreateTable { .. }
+        BoundStatement::CreateSchema { .. }
+        | BoundStatement::DropSchema { .. }
+        | BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
         | BoundStatement::AlterTableAddColumn { .. }
         | BoundStatement::AlterTableDropColumn { .. }
@@ -349,7 +351,9 @@ fn record_param_use(
 
 fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Result<()> {
     match statement {
-        BoundStatement::CreateTable { .. }
+        BoundStatement::CreateSchema { .. }
+        | BoundStatement::DropSchema { .. }
+        | BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
         | BoundStatement::AlterTableAddColumn { .. }
         | BoundStatement::AlterTableDropColumn { .. }

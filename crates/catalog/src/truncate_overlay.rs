@@ -163,8 +163,9 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
-    fn create_table_with_options(
+    fn create_table_in_schema_with_options(
         &self,
+        _schema: SchemaId,
         _name: String,
         _columns: Vec<ParsedColumnDef>,
         _primary_key: Vec<String>,
@@ -353,10 +354,11 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
-    fn create_index_with_constraint(
+    fn create_index_in_schema_with_constraint(
         &self,
+        _schema: SchemaId,
         _name: String,
-        _table: &str,
+        _table: TableId,
         _columns: &[String],
         _unique: bool,
         _constraint: IndexConstraintKind,
@@ -392,8 +394,9 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
-    fn create_sequence(
+    fn create_sequence_in_schema(
         &self,
+        _schema: SchemaId,
         _name: String,
         _options: SequenceOptions,
         _owned: bool,
@@ -417,12 +420,14 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
-    fn create_view(
+    fn create_view_in_schema(
         &self,
+        _schema: SchemaId,
         _name: String,
         _columns: Vec<ViewColumn>,
         _definition: String,
         _dependencies: Vec<ViewDependency>,
+        _definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema> {
         Self::read_only()
     }
@@ -433,6 +438,17 @@ impl CatalogManager for TruncateCatalogOverlay {
         _columns: Vec<ViewColumn>,
         _definition: String,
         _dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema> {
+        Self::read_only()
+    }
+
+    fn replace_view_with_search_path(
+        &self,
+        _id: TableId,
+        _columns: Vec<ViewColumn>,
+        _definition: String,
+        _dependencies: Vec<ViewDependency>,
+        _definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema> {
         Self::read_only()
     }

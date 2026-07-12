@@ -3,7 +3,7 @@ use std::ops::Bound;
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DataType, IndexConstraintKind, IndexId, Key,
-    KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId,
+    KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SchemaId, SequenceOptions, TableId,
     ToastOptions, Value, ViewDependency,
 };
 
@@ -14,7 +14,16 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhysicalPlan {
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -54,6 +63,7 @@ pub enum PhysicalPlan {
         new_name: String,
     },
     CreateIndex {
+        schema: SchemaId,
         name: String,
         table: String,
         columns: Vec<String>,
@@ -63,23 +73,30 @@ pub enum PhysicalPlan {
         index: IndexId,
     },
     CreateSequence {
+        schema: SchemaId,
         name: String,
         options: SequenceOptions,
     },
     DropSequence {
         name: String,
+        search_path: Vec<SchemaId>,
+        sequence: Option<common::SequenceId>,
         if_exists: bool,
     },
     CreateView {
+        schema: SchemaId,
         name: String,
         or_replace: bool,
         columns: Vec<String>,
         query: crate::BoundQuery,
         definition: String,
         dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     },
     DropView {
         name: String,
+        search_path: Vec<SchemaId>,
+        view: Option<TableId>,
         if_exists: bool,
     },
     Insert {
@@ -241,7 +258,19 @@ fn physical_plan_inner(
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<PhysicalPlan> {
     match logical {
+        LogicalPlan::CreateSchema {
+            name,
+            if_not_exists,
+        } => Ok(PhysicalPlan::CreateSchema {
+            name: name.clone(),
+            if_not_exists: *if_not_exists,
+        }),
+        LogicalPlan::DropSchema { name, if_exists } => Ok(PhysicalPlan::DropSchema {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         LogicalPlan::CreateTable {
+            schema,
             name,
             if_not_exists,
             columns,
@@ -251,6 +280,7 @@ fn physical_plan_inner(
             toast,
             checks,
         } => Ok(PhysicalPlan::CreateTable {
+            schema: *schema,
             name: name.clone(),
             if_not_exists: *if_not_exists,
             columns: columns.clone(),
@@ -307,42 +337,67 @@ fn physical_plan_inner(
             new_name: new_name.clone(),
         }),
         LogicalPlan::CreateIndex {
+            schema,
             name,
             table,
             columns,
             unique,
         } => Ok(PhysicalPlan::CreateIndex {
+            schema: *schema,
             name: name.clone(),
             table: table.clone(),
             columns: columns.clone(),
             unique: *unique,
         }),
         LogicalPlan::DropIndex { index } => Ok(PhysicalPlan::DropIndex { index: *index }),
-        LogicalPlan::CreateSequence { name, options } => Ok(PhysicalPlan::CreateSequence {
+        LogicalPlan::CreateSequence {
+            schema,
+            name,
+            options,
+        } => Ok(PhysicalPlan::CreateSequence {
+            schema: *schema,
             name: name.clone(),
             options: options.clone(),
         }),
-        LogicalPlan::DropSequence { name, if_exists } => Ok(PhysicalPlan::DropSequence {
+        LogicalPlan::DropSequence {
+            name,
+            search_path,
+            sequence,
+            if_exists,
+        } => Ok(PhysicalPlan::DropSequence {
             name: name.clone(),
+            search_path: search_path.clone(),
+            sequence: *sequence,
             if_exists: *if_exists,
         }),
         LogicalPlan::CreateView {
+            schema,
             name,
             or_replace,
             columns,
             query,
             definition,
             dependencies,
+            definition_search_path,
         } => Ok(PhysicalPlan::CreateView {
+            schema: *schema,
             name: name.clone(),
             or_replace: *or_replace,
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
             dependencies: dependencies.clone(),
+            definition_search_path: definition_search_path.clone(),
         }),
-        LogicalPlan::DropView { name, if_exists } => Ok(PhysicalPlan::DropView {
+        LogicalPlan::DropView {
+            name,
+            search_path,
+            view,
+            if_exists,
+        } => Ok(PhysicalPlan::DropView {
             name: name.clone(),
+            search_path: search_path.clone(),
+            view: *view,
             if_exists: *if_exists,
         }),
         LogicalPlan::Insert {
@@ -689,9 +744,10 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         }
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
-        | PhysicalPlan::Values { output_schema, .. }
-        | PhysicalPlan::TableFunction { output_schema, .. } => Ok(output_schema.len()),
-        PhysicalPlan::CreateTable { .. }
+        | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::AlterTableAddColumn { .. }
         | PhysicalPlan::AlterTableDropColumn { .. }

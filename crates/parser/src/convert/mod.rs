@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use common::{
-    CompressionSetting, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState,
-    TableOptionPatch, ToastCompression, ToastMode, ToastOptions,
+    CompressionSetting, DbError, IsolationLevel, PgType, QualifiedName, Result, SequenceOptions,
+    SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptions,
 };
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -147,6 +147,23 @@ pub fn parse_expression(sql: &str) -> Result<crate::Expr> {
 
 fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     match statement {
+        sql::Statement::CreateSchema {
+            schema_name,
+            if_not_exists,
+            options,
+            default_collate_spec,
+        } => {
+            if options.is_some() || default_collate_spec.is_some() {
+                return unsupported("unsupported CREATE SCHEMA form");
+            }
+            let sql::SchemaName::Simple(name) = schema_name else {
+                return unsupported("CREATE SCHEMA AUTHORIZATION is not supported");
+            };
+            Ok(Statement::CreateSchema {
+                name: simple_object_name(&name)?,
+                if_not_exists,
+            })
+        }
         sql::Statement::CreateTable(table) => convert_create_table(table),
         sql::Statement::CreateIndex(index) => convert_create_index(index),
         sql::Statement::CreateView {
@@ -206,16 +223,31 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             purge,
             temporary,
         } => {
-            if cascade || restrict || purge || temporary {
+            if cascade || purge || temporary {
                 return unsupported("unsupported DROP form");
             }
             match object_type {
                 sql::ObjectType::Table => {
+                    if restrict {
+                        return unsupported("unsupported DROP form");
+                    }
                     let names = names.iter().map(object_name).collect::<Result<Vec<_>>>()?;
                     reject_duplicate_relation_names(&names, "DROP TABLE")?;
                     Ok(Statement::DropTable { names, if_exists })
                 }
+                sql::ObjectType::Schema => {
+                    if names.len() != 1 {
+                        return unsupported("DROP SCHEMA requires exactly one schema name");
+                    }
+                    Ok(Statement::DropSchema {
+                        name: simple_object_name(&names[0])?,
+                        if_exists,
+                    })
+                }
                 object_type => {
+                    if restrict {
+                        return unsupported("unsupported DROP form");
+                    }
                     if names.len() != 1 {
                         return unsupported("unsupported DROP form");
                     }
@@ -851,25 +883,25 @@ fn column_char_length(data_type: &sql::DataType) -> Result<Option<u32>> {
     }
 }
 
-fn object_name(name: &sql::ObjectName) -> Result<String> {
-    // Paths that still call this helper accept only a single unqualified name.
-    // Relation and function names have their own helpers because they support
-    // limited schema-qualified compatibility forms.
-    let [part] = name.0.as_slice() else {
-        return unsupported("qualified names are not supported in v1");
-    };
-    let ident = part
-        .as_ident()
-        .ok_or_else(|| parse_error("unsupported object name part"))?;
-    ident_name(ident)
+fn object_name(name: &sql::ObjectName) -> Result<QualifiedName> {
+    relation_name(name)
 }
 
-fn reject_duplicate_relation_names(names: &[String], operation: &str) -> Result<()> {
+fn simple_object_name(name: &sql::ObjectName) -> Result<String> {
+    let qualified = relation_name(name)?;
+    if qualified.schema.is_some() {
+        return unsupported("qualified column names are not supported here");
+    }
+    Ok(qualified.name)
+}
+
+fn reject_duplicate_relation_names(names: &[QualifiedName], operation: &str) -> Result<()> {
     let mut seen = HashSet::with_capacity(names.len());
     for name in names {
         if !seen.insert(name) {
             return Err(parse_error(format!(
-                "{operation} target {name} specified more than once"
+                "{operation} target {} specified more than once",
+                name.name
             )));
         }
     }
@@ -905,13 +937,13 @@ fn function_name(name: &sql::ObjectName) -> Result<String> {
     }
 }
 
-fn relation_name(name: &sql::ObjectName) -> Result<(Option<String>, String)> {
+fn relation_name(name: &sql::ObjectName) -> Result<QualifiedName> {
     match name.0.as_slice() {
         [name] => {
             let name = name
                 .as_ident()
                 .ok_or_else(|| parse_error("unsupported relation name part"))?;
-            Ok((None, ident_name(name)?))
+            Ok(QualifiedName::unqualified(ident_name(name)?))
         }
         [schema, name] => {
             let schema = schema
@@ -920,27 +952,17 @@ fn relation_name(name: &sql::ObjectName) -> Result<(Option<String>, String)> {
             let name = name
                 .as_ident()
                 .ok_or_else(|| parse_error("unsupported relation name part"))?;
-            Ok((Some(ident_name(schema)?), ident_name(name)?))
+            Ok(QualifiedName {
+                schema: Some(ident_name(schema)?),
+                name: ident_name(name)?,
+            })
         }
         _ => unsupported("qualified names with more than one schema are not supported"),
     }
 }
 
-fn dml_target_name(name: &sql::ObjectName) -> Result<String> {
-    let (schema, name) = relation_name(name)?;
-    fold_dml_target_name(schema.as_deref(), name)
-}
-
-fn fold_dml_target_name(schema: Option<&str>, name: String) -> Result<String> {
-    match schema {
-        None | Some("public") => Ok(name),
-        Some("pg_catalog" | "information_schema") => {
-            feature_not_supported("system catalogs are read-only")
-        }
-        Some(schema) => Err(invalid_schema_name(format!(
-            "schema \"{schema}\" does not exist"
-        ))),
-    }
+fn dml_target_name(name: &sql::ObjectName) -> Result<QualifiedName> {
+    relation_name(name)
 }
 
 fn ident_name(ident: &sql::Ident) -> Result<String> {
@@ -1282,26 +1304,32 @@ fn is_vacuum_option_keyword(token: &str) -> bool {
 /// (`command` names the statement in error messages). The name must be a
 /// bare unquoted identifier: no parenthesized options, no `schema.table`
 /// qualification, no quoting — consistent with the v1 identifier rules elsewhere.
-fn normalize_maintenance_target(command: &str, target: &str) -> Result<String> {
+fn normalize_vacuum_target(target: &str) -> Result<QualifiedName> {
     if target.starts_with('(') {
         return unsupported(format!("{command} with options is not supported in v1"));
-    }
-    if target.contains('.') {
-        return unsupported("qualified names are not supported in v1");
     }
     if target.contains('"') {
         return Err(parse_error("quoted identifiers are not supported"));
     }
-    let valid = !target.is_empty()
-        && target
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-    if !valid {
-        return unsupported(format!(
-            "{command} target must be a simple table name in v1"
-        ));
+    let parts = target.split('.').collect::<Vec<_>>();
+    if !(1..=2).contains(&parts.len())
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    {
+        return unsupported("VACUUM target must be an unquoted table name with at most one schema");
     }
-    Ok(target.to_ascii_lowercase())
+    Ok(match parts.as_slice() {
+        [name] => QualifiedName::unqualified(name.to_ascii_lowercase()),
+        [schema, name] => QualifiedName {
+            schema: Some(schema.to_ascii_lowercase()),
+            name: name.to_ascii_lowercase(),
+        },
+        _ => unreachable!(),
+    })
 }
 
 /// Intercept only the storage-parameter `ALTER TABLE ... SET (...)` forms that
@@ -1336,7 +1364,8 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     }
     let _only = expect_word(&tokens, &mut i, "only");
     // Table identifier: unquoted word, lowercased (the `ident_name` rule).
-    let table = parse_alter_identifier(&tokens, &mut i, "expected table name after ALTER TABLE")?;
+    let table =
+        parse_alter_qualified_name(&tokens, &mut i, "expected table name after ALTER TABLE")?;
     if !expect_word(&tokens, &mut i, "set") {
         if expect_word(&tokens, &mut i, "add") {
             return try_parse_alter_table_add_primary_key(&tokens, i, table);
@@ -1376,7 +1405,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
 fn try_parse_alter_table_add_primary_key(
     tokens: &[Token],
     i: usize,
-    table: String,
+    table: QualifiedName,
 ) -> Result<Option<Statement>> {
     let mut lookahead = i;
     if expect_word(tokens, &mut lookahead, "constraint") {
@@ -1398,7 +1427,7 @@ fn try_parse_alter_table_add_primary_key(
 fn parse_alter_table_add_primary_key(
     tokens: &[Token],
     mut i: usize,
-    table: String,
+    table: QualifiedName,
 ) -> Result<Option<Statement>> {
     let constraint_name = if expect_word(tokens, &mut i, "constraint") {
         Some(parse_alter_identifier(
@@ -1437,7 +1466,7 @@ fn parse_alter_table_add_primary_key(
 fn try_parse_alter_table_drop_primary_key(
     tokens: &[Token],
     i: usize,
-    table: String,
+    table: QualifiedName,
 ) -> Result<Option<Statement>> {
     if matches!(tokens.get(i), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary") || word.value.eq_ignore_ascii_case("constraint"))
     {
@@ -1449,7 +1478,7 @@ fn try_parse_alter_table_drop_primary_key(
 fn parse_alter_table_drop_primary_key(
     tokens: &[Token],
     mut i: usize,
-    table: String,
+    table: QualifiedName,
 ) -> Result<Option<Statement>> {
     let constraint_name = if expect_word(tokens, &mut i, "primary") {
         if !expect_word(tokens, &mut i, "key") {
@@ -1485,6 +1514,26 @@ fn parse_alter_identifier(tokens: &[Token], i: &mut usize, message: &str) -> Res
     };
     *i += 1;
     Ok(name)
+}
+
+fn parse_alter_qualified_name(
+    tokens: &[Token],
+    i: &mut usize,
+    message: &str,
+) -> Result<QualifiedName> {
+    let first = parse_alter_identifier(tokens, i, message)?;
+    if !matches!(tokens.get(*i), Some(Token::Period)) {
+        return Ok(QualifiedName::unqualified(first));
+    }
+    *i += 1;
+    let name = parse_alter_identifier(tokens, i, "expected table name after schema")?;
+    if matches!(tokens.get(*i), Some(Token::Period)) {
+        return unsupported("qualified names with more than one schema are not supported");
+    }
+    Ok(QualifiedName {
+        schema: Some(first),
+        name,
+    })
 }
 
 fn parse_identifier_list(tokens: &[Token], i: &mut usize, context: &str) -> Result<Vec<String>> {
@@ -1689,10 +1738,15 @@ fn try_parse_create_sequence(sql: &str) -> Result<Option<Statement>> {
         return unsupported("unsupported CREATE SEQUENCE form");
     }
 
-    let name = parser.parse_identifier()?;
-    if parser.consume_token(&Token::Period) {
-        return unsupported("qualified names are not supported in v1");
-    }
+    let first = parser.parse_identifier()?;
+    let name = if parser.consume_token(&Token::Period) {
+        QualifiedName {
+            schema: Some(first),
+            name: parser.parse_identifier()?,
+        }
+    } else {
+        QualifiedName::unqualified(first)
+    };
 
     let mut options = SequenceOptions::default();
     let mut increment_seen = false;
@@ -1843,10 +1897,6 @@ fn matches_word(token: Option<&Token>, expected: &str) -> bool {
 
 fn parse_error(message: impl Into<String>) -> DbError {
     DbError::parse(SqlState::SyntaxError, message)
-}
-
-fn invalid_schema_name(message: impl Into<String>) -> DbError {
-    DbError::parse(SqlState::InvalidSchemaName, message)
 }
 
 fn invalid_parameter_value(message: impl Into<String>) -> DbError {

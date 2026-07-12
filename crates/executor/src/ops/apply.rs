@@ -469,7 +469,8 @@ fn nested_apply_subplans(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
             | PhysicalPlan::SystemScan { .. }
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::Values { .. }
-            | PhysicalPlan::TableFunction { .. }
+            | PhysicalPlan::CreateSchema { .. }
+            | PhysicalPlan::DropSchema { .. }
             | PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::AlterTableAddColumn { .. }

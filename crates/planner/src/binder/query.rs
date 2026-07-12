@@ -1,10 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use catalog::{CatalogManager, SystemView, is_system_schema, resolve_system_view};
 use common::{
     BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId,
     TableSchema, Value, ViewSchema,
 };
 use parser::{
-    Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, Statement,
+    Cte, Distinct, Expr, FromItem, FunctionArg, OrderByItem, Query, QueryBody, Select, SelectItem,
+    Statement,
 };
 
 use crate::{
@@ -25,16 +28,18 @@ use super::{
 /// target type per output column, used only to type a bare `NULL` output column
 /// (from the sibling arm of an enclosing set operation); `None` when there is no
 /// such context.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn bind_query<'a>(
     catalog: &'a dyn CatalogManager,
     query: &Query,
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
     outer: &[OuterLink<'a>],
     pending: &mut Vec<PendingCorrelation>,
 ) -> Result<BoundQuery> {
-    let scope = bind_ctes(catalog, &query.with, ctes, declared)?;
+    let scope = bind_ctes(catalog, &query.with, ctes, declared, search_path)?;
     match &query.body {
         QueryBody::Select(select) => {
             let (bound_select, order_by) = bind_select(
@@ -42,6 +47,7 @@ pub(super) fn bind_query<'a>(
                 select,
                 &query.order_by,
                 declared,
+                search_path,
                 &scope,
                 expected,
                 outer,
@@ -60,7 +66,15 @@ pub(super) fn bind_query<'a>(
             // VALUES output columns by position or name (like a set operation). The
             // CTE scope is threaded in because a subquery inside a VALUES row can
             // reference an enclosing CTE, even though VALUES itself has no FROM.
-            let values = bind_values(catalog, rows, declared, &scope, expected, outer)?;
+            let values = bind_values(
+                catalog,
+                rows,
+                declared,
+                search_path,
+                &scope,
+                expected,
+                outer,
+            )?;
             let mut bound = BoundQuery {
                 body: BoundQueryBody::Values(values),
                 order_by: Vec::new(),
@@ -77,8 +91,16 @@ pub(super) fn bind_query<'a>(
             left,
             right,
         } => {
-            let (left, right) =
-                bind_set_op_arms(catalog, left, right, declared, &scope, expected, outer)?;
+            let (left, right) = bind_set_op_arms(
+                catalog,
+                left,
+                right,
+                declared,
+                search_path,
+                &scope,
+                expected,
+                outer,
+            )?;
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
             // `ORDER BY` over a set operation resolves against the combined output
             // by position or name only (there is no single input scope).
@@ -119,6 +141,7 @@ pub(super) fn bind_correlated_child_query(
             ctx.catalog,
             subquery,
             &ctx.declared_params,
+            &ctx.search_path,
             &ctx.cte_scope,
             None,
             &chain,
@@ -187,11 +210,13 @@ fn rejected_links<'a>(outer: &[OuterLink<'a>], construct: &'static str) -> Vec<O
 /// doubling per nesting level. A column that is a bare `NULL` in *both* arms (or
 /// split across the arms so each needs the other) stays unresolved and is rejected;
 /// an explicit cast is required.
+#[allow(clippy::too_many_arguments)]
 fn bind_set_op_arms<'a>(
     catalog: &'a dyn CatalogManager,
     left: &Query,
     right: &Query,
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
     outer: &[OuterLink<'a>],
@@ -207,6 +232,7 @@ fn bind_set_op_arms<'a>(
             catalog,
             left,
             declared,
+            search_path,
             ctes,
             Some(expected),
             &arm_outer,
@@ -216,6 +242,7 @@ fn bind_set_op_arms<'a>(
             catalog,
             right,
             declared,
+            search_path,
             ctes,
             Some(expected),
             &arm_outer,
@@ -223,13 +250,23 @@ fn bind_set_op_arms<'a>(
         )?;
         return Ok((left, right));
     }
-    match bind_query(catalog, left, declared, ctes, None, &arm_outer, arm_pending) {
+    match bind_query(
+        catalog,
+        left,
+        declared,
+        search_path,
+        ctes,
+        None,
+        &arm_outer,
+        arm_pending,
+    ) {
         Ok(left) => {
             let types = output_column_types(&left);
             let right = bind_query(
                 catalog,
                 right,
                 declared,
+                search_path,
                 ctes,
                 Some(&types),
                 &arm_outer,
@@ -242,6 +279,7 @@ fn bind_set_op_arms<'a>(
                 catalog,
                 right,
                 declared,
+                search_path,
                 ctes,
                 None,
                 &arm_outer,
@@ -254,6 +292,7 @@ fn bind_set_op_arms<'a>(
                 catalog,
                 left,
                 declared,
+                search_path,
                 ctes,
                 Some(&types),
                 &arm_outer,
@@ -283,6 +322,7 @@ fn bind_ctes(
     with: &[Cte],
     enclosing: &CteScope,
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
 ) -> Result<CteScope> {
     let mut scope = enclosing.clone();
     let base = scope.ctes.len();
@@ -296,7 +336,7 @@ fn bind_ctes(
                 format!("WITH query name \"{}\" specified more than once", cte.name),
             ));
         }
-        let bound = bind_cte(catalog, cte, &scope, declared)?;
+        let bound = bind_cte(catalog, cte, &scope, declared, search_path)?;
         scope.ctes.push(bound);
     }
     Ok(scope)
@@ -308,6 +348,7 @@ fn bind_cte(
     cte: &Cte,
     scope: &CteScope,
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
 ) -> Result<CteBinding> {
     // A CTE body is an isolated scope: it sees no enclosing bindings, so an
     // outer reference fails name resolution (matching PostgreSQL).
@@ -315,6 +356,7 @@ fn bind_cte(
         catalog,
         &cte.query,
         declared,
+        search_path,
         scope,
         None,
         &[],
@@ -484,6 +526,7 @@ fn bind_values<'a>(
     catalog: &'a dyn CatalogManager,
     rows: &[Vec<Expr>],
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
     outer: &[OuterLink<'a>],
@@ -513,7 +556,7 @@ fn bind_values<'a>(
             if matches!(row[column], Expr::Literal(Value::Null)) {
                 continue;
             }
-            let mut ctx = BindContext::with_outer(catalog, declared, outer.clone());
+            let mut ctx = BindContext::with_outer(catalog, declared, search_path, outer.clone());
             ctx.cte_scope = ctes.clone();
             data_type = Some(bind_expr(&mut ctx, &row[column], None)?.data_type());
             break;
@@ -546,7 +589,7 @@ fn bind_values<'a>(
         let mut bound_row = Vec::with_capacity(width);
         for (column, expr) in row.iter().enumerate() {
             let data_type = output_schema[column].data_type.clone();
-            let mut ctx = BindContext::with_outer(catalog, declared, outer.clone());
+            let mut ctx = BindContext::with_outer(catalog, declared, search_path, outer.clone());
             ctx.cte_scope = ctes.clone();
             let bound = bind_expr(&mut ctx, expr, Some(data_type.clone()))?;
             reject_aggregate(&bound)?;
@@ -574,12 +617,13 @@ fn bind_select<'a>(
     select: &Select,
     order_by: &[OrderByItem],
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
     outer: &[OuterLink<'a>],
     pending: &mut Vec<PendingCorrelation>,
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
-    let mut ctx = BindContext::with_outer(catalog, declared, outer.to_vec());
+    let mut ctx = BindContext::with_outer(catalog, declared, search_path, outer.to_vec());
     ctx.cte_scope = ctes.clone();
     // A FROM-less SELECT (`SELECT 1`) has no source relation: no bindings are
     // registered, so any column reference correctly fails to resolve.
@@ -748,11 +792,13 @@ pub(super) fn bind_from_item(
     item: &FromItem,
 ) -> Result<BoundFrom> {
     match item {
-        FromItem::Table {
-            schema,
-            name,
+        FromItem::Table { name, alias } => bind_table_or_schema_qualified_name(
+            catalog,
+            ctx,
+            name.schema.as_deref(),
+            &name.name,
             alias,
-        } => bind_table_or_schema_qualified_name(catalog, ctx, schema.as_deref(), name, alias),
+        ),
         FromItem::Derived {
             subquery,
             alias,
@@ -1037,30 +1083,32 @@ fn bind_table_or_schema_qualified_name(
             // is mutated.
             if let Some(cte) = ctx.cte_scope.lookup(name).cloned() {
                 Ok(bind_cte_reference(ctx, cte, alias.clone()))
-            } else if let Some(table) = catalog.get_table_by_name(name)? {
-                Ok(bind_table_from_schema(ctx, table, alias.clone()))
-            } else if let Some(view) = catalog.get_view_by_name(name)? {
-                bind_view_from_schema(catalog, ctx, view, alias.clone())
-            } else if let Some(view) = resolve_system_view(None, name) {
-                Ok(bind_system_view(ctx, view, alias.clone()))
             } else {
-                Err(plan_error(
-                    SqlState::UndefinedTable,
-                    format!("table {name} does not exist"),
-                ))
+                for schema in ctx.search_path.clone() {
+                    if let Some(table) = catalog.get_table_in_schema(schema, name)? {
+                        return Ok(bind_table_from_schema(ctx, table, alias.clone()));
+                    }
+                    if let Some(view) = catalog.get_view_in_schema(schema, name)? {
+                        return bind_view_from_schema(catalog, ctx, view, alias.clone());
+                    }
+                    if catalog.get_index_in_schema(schema, name)?.is_some()
+                        || catalog.get_sequence_in_schema(schema, name)?.is_some()
+                    {
+                        return Err(plan_error(
+                            SqlState::WrongObjectType,
+                            format!("relation {name} is not a table or view"),
+                        ));
+                    }
+                }
+                if let Some(view) = resolve_system_view(None, name) {
+                    Ok(bind_system_view(ctx, view, alias.clone()))
+                } else {
+                    Err(plan_error(
+                        SqlState::UndefinedTable,
+                        format!("table {name} does not exist"),
+                    ))
+                }
             }
-        }
-        Some("public") => {
-            if let Some(table) = catalog.get_table_by_name(name)? {
-                return Ok(bind_table_from_schema(ctx, table, alias.clone()));
-            }
-            if let Some(view) = catalog.get_view_by_name(name)? {
-                return bind_view_from_schema(catalog, ctx, view, alias.clone());
-            }
-            Err(plan_error(
-                SqlState::UndefinedTable,
-                format!("table public.{name} does not exist"),
-            ))
         }
         Some(schema) if is_system_schema(schema) => match resolve_system_view(Some(schema), name) {
             Some(view) => Ok(bind_system_view(ctx, view, alias.clone())),
@@ -1069,10 +1117,24 @@ fn bind_table_or_schema_qualified_name(
                 format!("table {schema}.{name} does not exist"),
             )),
         },
-        Some(schema) => Err(plan_error(
-            SqlState::InvalidSchemaName,
-            format!("schema \"{schema}\" does not exist"),
-        )),
+        Some(schema) => {
+            let namespace = catalog.get_schema_by_name(schema)?.ok_or_else(|| {
+                plan_error(
+                    SqlState::InvalidSchemaName,
+                    format!("schema \"{schema}\" does not exist"),
+                )
+            })?;
+            if let Some(table) = catalog.get_table_in_schema(namespace.id, name)? {
+                return Ok(bind_table_from_schema(ctx, table, alias.clone()));
+            }
+            if let Some(view) = catalog.get_view_in_schema(namespace.id, name)? {
+                return bind_view_from_schema(catalog, ctx, view, alias.clone());
+            }
+            Err(plan_error(
+                SqlState::UndefinedTable,
+                format!("table {schema}.{name} does not exist"),
+            ))
+        }
     }
 }
 
@@ -1092,7 +1154,8 @@ fn bind_view_from_schema(
     view: ViewSchema,
     alias: Option<String>,
 ) -> Result<BoundFrom> {
-    let query_ast = parse_view_query(&view)?;
+    let mut query_ast = parse_view_query(&view)?;
+    stabilize_view_relation_names(catalog, &view, &mut query_ast)?;
     // A stored view definition binds in its own isolated scope. Caller CTEs
     // must not change what base relations the persisted SQL resolves to, and
     // it sees no enclosing bindings (an outer reference in a persisted view
@@ -1101,6 +1164,7 @@ fn bind_view_from_schema(
         catalog,
         &query_ast,
         &ctx.declared_params,
+        &view.definition_search_path,
         &CteScope::default(),
         None,
         &[],
@@ -1139,6 +1203,180 @@ fn bind_view_from_schema(
         alias: visible_name,
         schema: view.columns,
     })
+}
+
+fn stabilize_view_relation_names(
+    catalog: &dyn CatalogManager,
+    view: &ViewSchema,
+    query: &mut Query,
+) -> Result<()> {
+    let mut relations = BTreeMap::new();
+    for schema_id in &view.definition_search_path {
+        for dependency in &view.dependencies {
+            let relation = if let Some(table) = catalog.get_table(dependency.relation)? {
+                Some((table.schema_id, table.name))
+            } else {
+                catalog
+                    .get_view(dependency.relation)?
+                    .map(|view| (view.schema_id, view.name))
+            };
+            let Some((relation_schema, relation_name)) = relation else {
+                continue;
+            };
+            if relation_schema == *schema_id {
+                let Some(schema) = catalog.get_schema(relation_schema)? else {
+                    continue;
+                };
+                relations
+                    .entry(relation_name.clone())
+                    .or_insert((schema.name, relation_name));
+            }
+        }
+    }
+    stabilize_query_relations(query, &relations, &BTreeSet::new());
+    Ok(())
+}
+
+fn stabilize_query_relations(
+    query: &mut Query,
+    relations: &BTreeMap<String, (String, String)>,
+    inherited_ctes: &BTreeSet<String>,
+) {
+    let mut ctes = inherited_ctes.clone();
+    for cte in &mut query.with {
+        stabilize_query_relations(&mut cte.query, relations, &ctes);
+        ctes.insert(cte.name.clone());
+    }
+    match &mut query.body {
+        QueryBody::Select(select) => {
+            for item in &mut select.from {
+                stabilize_from_relations(item, relations, &ctes);
+            }
+            for item in &mut select.columns {
+                if let SelectItem::Expression { expr, .. } = item {
+                    stabilize_expr_relations(expr, relations, &ctes);
+                }
+            }
+            if let Some(filter) = &mut select.filter {
+                stabilize_expr_relations(filter, relations, &ctes);
+            }
+            for expr in &mut select.group_by {
+                stabilize_expr_relations(expr, relations, &ctes);
+            }
+            if let Some(having) = &mut select.having {
+                stabilize_expr_relations(having, relations, &ctes);
+            }
+        }
+        QueryBody::Values(rows) => {
+            for expr in rows.iter_mut().flatten() {
+                stabilize_expr_relations(expr, relations, &ctes);
+            }
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            stabilize_query_relations(left, relations, &ctes);
+            stabilize_query_relations(right, relations, &ctes);
+        }
+    }
+    for order_by in &mut query.order_by {
+        stabilize_expr_relations(&mut order_by.expr, relations, &ctes);
+    }
+}
+
+fn stabilize_from_relations(
+    item: &mut FromItem,
+    relations: &BTreeMap<String, (String, String)>,
+    ctes: &BTreeSet<String>,
+) {
+    match item {
+        FromItem::Table { name, .. } if name.schema.is_none() && !ctes.contains(&name.name) => {
+            if let Some((schema, relation)) = relations.get(&name.name) {
+                name.schema = Some(schema.clone());
+                name.name = relation.clone();
+            }
+        }
+        FromItem::Table { .. } => {}
+        FromItem::Derived { subquery, .. } => stabilize_query_relations(subquery, relations, ctes),
+        FromItem::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            stabilize_from_relations(left, relations, ctes);
+            stabilize_from_relations(right, relations, ctes);
+            if let Some(condition) = condition {
+                stabilize_expr_relations(condition, relations, ctes);
+            }
+        }
+    }
+}
+
+fn stabilize_expr_relations(
+    expr: &mut Expr,
+    relations: &BTreeMap<String, (String, String)>,
+    ctes: &BTreeSet<String>,
+) {
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            stabilize_query_relations(query, relations, ctes);
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            stabilize_expr_relations(expr, relations, ctes);
+            stabilize_query_relations(subquery, relations, ctes);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            stabilize_expr_relations(left, relations, ctes);
+            stabilize_expr_relations(right, relations, ctes);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => stabilize_expr_relations(expr, relations, ctes),
+        Expr::Function { args, .. } => {
+            for arg in args {
+                if let FunctionArg::Expr(expr) = arg {
+                    stabilize_expr_relations(expr, relations, ctes);
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            stabilize_expr_relations(expr, relations, ctes);
+            for item in list {
+                stabilize_expr_relations(item, relations, ctes);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            stabilize_expr_relations(expr, relations, ctes);
+            stabilize_expr_relations(low, relations, ctes);
+            stabilize_expr_relations(high, relations, ctes);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            stabilize_expr_relations(expr, relations, ctes);
+            stabilize_expr_relations(pattern, relations, ctes);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                stabilize_expr_relations(operand, relations, ctes);
+            }
+            for (when, then) in when_clauses {
+                stabilize_expr_relations(when, relations, ctes);
+                stabilize_expr_relations(then, relations, ctes);
+            }
+            if let Some(else_clause) = else_clause {
+                stabilize_expr_relations(else_clause, relations, ctes);
+            }
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => {}
+    }
 }
 
 fn bind_system_view(ctx: &mut BindContext, view: SystemView, alias: Option<String>) -> BoundFrom {
@@ -1253,6 +1491,7 @@ fn bind_derived_table(
             catalog,
             subquery,
             &ctx.declared_params,
+            &ctx.search_path,
             &ctx.cte_scope,
             None,
             &derived_outer,

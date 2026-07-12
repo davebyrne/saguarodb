@@ -3,6 +3,11 @@
 **Date:** 2026-05-03
 **Status:** Living crate contract
 
+`SchemaOperations` includes namespace creation and deletion. These operations
+append `CreateSchema`/`DropSchema` logical WAL records but allocate no relation
+files; recovery applies them only for committed transactions like other logical
+catalog records.
+
 ## Purpose
 
 `storage` owns table files, row serialization, page-backed row storage, the durable on-disk storage-identity and catalog B-tree indexes, normal data operations, sequence runtime state, schema file operations, and recovery apply operations.

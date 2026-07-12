@@ -1,7 +1,8 @@
 use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    IndexId, ParsedColumnDef, SequenceOptions, TableId, TableSchema, ToastOptions, ViewDependency,
+    IndexId, ParsedColumnDef, QualifiedName, SchemaId, SequenceOptions, TableId, TableSchema,
+    ToastOptions, ViewDependency,
 };
 use parser::SetOp;
 
@@ -135,13 +136,23 @@ impl BoundQuery {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropTableTarget {
-    pub name: String,
+    pub name: QualifiedName,
+    pub search_path: Vec<SchemaId>,
     pub table: Option<TableId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -187,6 +198,7 @@ pub enum BoundStatement {
         new_name: String,
     },
     CreateIndex {
+        schema: SchemaId,
         name: String,
         table: String,
         columns: Vec<String>,
@@ -196,23 +208,30 @@ pub enum BoundStatement {
         index: IndexId,
     },
     CreateSequence {
+        schema: SchemaId,
         name: String,
         options: SequenceOptions,
     },
     DropSequence {
         name: String,
+        search_path: Vec<SchemaId>,
+        sequence: Option<common::SequenceId>,
         if_exists: bool,
     },
     CreateView {
+        schema: SchemaId,
         name: String,
         or_replace: bool,
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
         dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     },
     DropView {
         name: String,
+        search_path: Vec<SchemaId>,
+        view: Option<TableId>,
         if_exists: bool,
     },
     Insert {

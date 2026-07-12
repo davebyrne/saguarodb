@@ -480,8 +480,10 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
     }
 
     let statement = Statement::Query(query);
+    let search_path_names = session.gucs.search_path_names(&session.session_info.user);
     let initial = service.transaction_catalog(&txn).and_then(|catalog| {
-        let bound = planner::bind(&statement, catalog.as_ref())?;
+        let options = service.bind_options(catalog.as_ref(), &search_path_names)?;
+        let bound = planner::bind_with_options(&statement, catalog.as_ref(), &options)?;
         let requests = object_lock_requests(&bound, catalog.as_ref())?;
         Ok((bound, requests, catalog))
     });
@@ -498,6 +500,7 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
                     &statement,
                     overlay,
                     updates,
+                    &search_path_names,
                     owner,
                     session.cancel().as_ref(),
                 ),

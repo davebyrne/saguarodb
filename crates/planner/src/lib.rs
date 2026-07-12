@@ -10,7 +10,11 @@ mod physical;
 mod rewrite;
 mod simplify;
 
-pub use binder::{bind, bind_default_expr, bind_parameterized, bind_parameterized_with_pg_types};
+pub use binder::{
+    BindOptions, bind, bind_default_expr, bind_default_expr_with_options, bind_parameterized,
+    bind_parameterized_with_pg_types, bind_parameterized_with_pg_types_and_options,
+    bind_with_options,
+};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
     BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
@@ -30,7 +34,9 @@ pub use rewrite::{rewrite_expr, rewrite_plan_exprs};
 
 pub fn mutates_sequences(statement: &BoundStatement) -> bool {
     match statement {
-        BoundStatement::CreateTable { .. }
+        BoundStatement::CreateSchema { .. }
+        | BoundStatement::DropSchema { .. }
+        | BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
         | BoundStatement::AlterTableAddColumn { .. }
         | BoundStatement::AlterTableDropColumn { .. }
@@ -2633,7 +2639,7 @@ mod tests {
 
         assert!(matches!(
             bound,
-            BoundStatement::CreateIndex { ref name, ref table, ref columns, unique: false }
+            BoundStatement::CreateIndex { ref name, ref table, ref columns, unique: false, .. }
                 if name == "users_name" && table == "users" && columns == &["name".to_string()]
         ));
     }
@@ -2658,7 +2664,8 @@ mod tests {
                 ref targets,
                 if_exists: false,
             } if targets.as_slice() == [DropTableTarget {
-                name: "users".to_string(),
+                name: common::QualifiedName::unqualified("users"),
+                search_path: vec![common::PUBLIC_SCHEMA_ID],
                 table: Some(1),
             }]
         ));
@@ -2676,7 +2683,8 @@ mod tests {
                 ref targets,
                 if_exists: true,
             } if targets.as_slice() == [DropTableTarget {
-                name: "missing".to_string(),
+                name: common::QualifiedName::unqualified("missing"),
+                search_path: vec![common::PUBLIC_SCHEMA_ID],
                 table: None,
             }]
         ));
@@ -2713,11 +2721,13 @@ mod tests {
             targets,
             vec![
                 DropTableTarget {
-                    name: "users".to_string(),
+                    name: common::QualifiedName::unqualified("users"),
+                    search_path: vec![common::PUBLIC_SCHEMA_ID],
                     table: Some(1),
                 },
                 DropTableTarget {
-                    name: "orders".to_string(),
+                    name: common::QualifiedName::unqualified("orders"),
+                    search_path: vec![common::PUBLIC_SCHEMA_ID],
                     table: Some(orders.id),
                 },
             ]

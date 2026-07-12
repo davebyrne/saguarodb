@@ -3,6 +3,14 @@
 **Date:** 2026-05-03
 **Status:** Living crate contract
 
+The server turns the session `search_path` GUC into schema ids against the catalog
+visible to the current transaction and supplies them at every simple, prepared,
+cursor, COPY, and extended-Parse bind site. Missing path entries (including a
+missing `$user` schema) are skipped; explicit missing qualifiers are errors. Schema
+DDL and schema-qualified relation DDL use the transaction catalog overlay and
+schema/name locks, so they remain private until durable commit and roll back with
+transactions and savepoints.
+
 ## Purpose
 
 `server` is the binary crate. It wires all components, runs startup/recovery, owns Tokio networking, bridges protocol messages to query execution, and manages graceful shutdown.

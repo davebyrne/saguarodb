@@ -24,9 +24,13 @@ pub fn parse_expression(sql: &str) -> Result<Expr> {
 mod tests {
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        ParsedColumnDef, ParsedDefault, PgType, SequenceOptions, SqlState, TableOptionPatch,
-        ToastCompression, ToastMode, ToastOptionPatch, Value,
+        ParsedColumnDef, ParsedDefault, PgType, QualifiedName, SequenceOptions, SqlState,
+        TableOptionPatch, ToastCompression, ToastMode, ToastOptionPatch, Value,
     };
+
+    fn qn(name: &str) -> QualifiedName {
+        QualifiedName::unqualified(name)
+    }
 
     use crate::{
         Assignment, BinOp, Expr, FetchCount, FromItem, FunctionArg, InsertSource, JoinType, Query,
@@ -211,10 +215,9 @@ mod tests {
         assert!(matches!(
             select.from.as_slice(),
             [FromItem::Table {
-                schema: None,
                 name,
                 alias: None,
-            }] if name == "users"
+            }] if name == &qn("users")
         ));
 
         for sql in ["FETCH FROM c", "FETCH c", "FETCH FORWARD FROM c"] {
@@ -362,7 +365,7 @@ mod tests {
         assert_eq!(
             parse("alter table users add column if not exists age integer").unwrap(),
             Statement::AlterTableAddColumn {
-                table: "users".to_string(),
+                table: qn("users"),
                 if_not_exists: true,
                 column: ParsedColumnDef {
                     name: "age".to_string(),
@@ -374,7 +377,7 @@ mod tests {
         assert_eq!(
             parse("alter table users drop column if exists age").unwrap(),
             Statement::AlterTableDropColumn {
-                table: "users".to_string(),
+                table: qn("users"),
                 if_exists: true,
                 column: "age".to_string(),
             }
@@ -383,7 +386,7 @@ mod tests {
         assert_eq!(
             parse("alter table users add column nickname text not null default 'anon'").unwrap(),
             Statement::AlterTableAddColumn {
-                table: "users".to_string(),
+                table: qn("users"),
                 if_not_exists: false,
                 column: ParsedColumnDef {
                     name: "nickname".to_string(),
@@ -399,7 +402,7 @@ mod tests {
         assert_eq!(
             parse("alter table users rename column full_name to name").unwrap(),
             Statement::AlterTableRenameColumn {
-                table: "users".to_string(),
+                table: qn("users"),
                 old_name: "full_name".to_string(),
                 new_name: "name".to_string(),
             }
@@ -408,7 +411,7 @@ mod tests {
         assert_eq!(
             parse("alter table users rename to accounts").unwrap(),
             Statement::AlterTableRenameTable {
-                table: "users".to_string(),
+                table: qn("users"),
                 new_name: "accounts".to_string(),
             }
         );
@@ -416,7 +419,7 @@ mod tests {
         assert_eq!(
             parse("truncate table users").unwrap(),
             Statement::Truncate {
-                tables: vec!["users".to_string()],
+                tables: vec![qn("users")],
             }
         );
     }
@@ -450,7 +453,7 @@ mod tests {
         assert_eq!(
             parse("drop view if exists active_users").unwrap(),
             Statement::DropView {
-                name: "active_users".to_string(),
+                name: qn("active_users"),
                 if_exists: true,
             }
         );
@@ -810,7 +813,7 @@ mod tests {
         assert_eq!(
             parse("drop table if exists Users, Orders").unwrap(),
             Statement::DropTable {
-                names: vec!["users".to_string(), "orders".to_string()],
+                names: vec![qn("users"), qn("orders")],
                 if_exists: true,
             }
         );
@@ -1175,8 +1178,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::Vacuum {
-                    table: Some("users".to_string()),
-                    analyze: false,
+                    table: Some(qn("users")),
                 },
                 "for `{sql}`"
             );
@@ -1201,8 +1203,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::Vacuum {
-                    table: Some("users".to_string()),
-                    analyze: true,
+                    table: Some(qn("users")),
                 },
                 "for `{sql}`"
             );
@@ -1250,13 +1251,12 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_vacuum_forms() {
-        // Parenthesized options, multiple tables, qualified/quoted names, and a glued
+        // Parenthesized options, multiple tables, quoted names, and a glued
         // keyword argument are all rejected as parse errors.
         for sql in [
             "vacuum (full) users",         // parenthesized options
             "vacuum full",                 // FULL keyword as a bare second token
             "vacuum users orders",         // multiple tables
-            "vacuum public.users",         // qualified name
             "vacuum \"Users\"",            // quoted identifier
             "vacuum analyze users orders", // too many ANALYZE arguments
             "vacuum analyze full",         // unsupported second option
@@ -1277,7 +1277,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::Truncate {
-                    tables: vec!["users".to_string()],
+                    tables: vec![qn("users")],
                 },
                 "for `{sql}`"
             );
@@ -1289,7 +1289,7 @@ mod tests {
         assert_eq!(
             parse("truncate table Users, Orders").unwrap(),
             Statement::Truncate {
-                tables: vec!["users".to_string(), "orders".to_string()],
+                tables: vec![qn("users"), qn("orders")],
             }
         );
 
@@ -1331,11 +1331,10 @@ mod tests {
             assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
         }
 
-        for sql in ["truncate public.users", "truncate \"Users\""] {
-            let err = parse(sql).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
-            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
-        }
+        let sql = "truncate \"Users\"";
+        let err = parse(sql).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+        assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
     }
 
     #[test]
@@ -1343,8 +1342,8 @@ mod tests {
         assert_eq!(
             parse("create index users_name on users (name)").unwrap(),
             Statement::CreateIndex {
-                name: "users_name".to_string(),
-                table: "users".to_string(),
+                name: qn("users_name"),
+                table: qn("users"),
                 columns: vec!["name".to_string()],
                 unique: false,
             }
@@ -1352,8 +1351,8 @@ mod tests {
         assert_eq!(
             parse("create unique index uq on users (tenant, name)").unwrap(),
             Statement::CreateIndex {
-                name: "uq".to_string(),
-                table: "users".to_string(),
+                name: qn("uq"),
+                table: qn("users"),
                 columns: vec!["tenant".to_string(), "name".to_string()],
                 unique: true,
             }
@@ -1381,7 +1380,7 @@ mod tests {
         assert_eq!(
             parse("create sequence users_id_seq").unwrap(),
             Statement::CreateSequence {
-                name: "users_id_seq".to_string(),
+                name: qn("users_id_seq"),
                 options: SequenceOptions::default(),
             }
         );
@@ -1391,7 +1390,7 @@ mod tests {
             )
             .unwrap(),
             Statement::CreateSequence {
-                name: "s".to_string(),
+                name: qn("s"),
                 options: SequenceOptions {
                     increment: -2,
                     start: Some(10),
@@ -1404,7 +1403,7 @@ mod tests {
         assert_eq!(
             parse("drop sequence if exists s").unwrap(),
             Statement::DropSequence {
-                name: "s".to_string(),
+                name: qn("s"),
                 if_exists: true,
             }
         );
@@ -1450,10 +1449,9 @@ mod tests {
         assert!(matches!(
             select.from[0],
             FromItem::Table {
-                schema: None,
                 ref name,
                 alias: Some(ref alias)
-            } if name == "users" && alias == "u"
+            } if name == &qn("users") && alias == "u"
         ));
 
         let err = parse("select \"id\" from users").unwrap_err();
@@ -1474,10 +1472,9 @@ mod tests {
         assert!(matches!(
             select.from[0],
             FromItem::Table {
-                schema: Some(ref schema),
                 ref name,
                 alias: None
-            } if schema == "public" && name == "users"
+            } if name == &QualifiedName { schema: Some("public".to_string()), name: "users".to_string() }
         ));
 
         let stmt = parse("select c.oid from pg_catalog.pg_class as c").unwrap();
@@ -1491,11 +1488,56 @@ mod tests {
         assert!(matches!(
             select.from[0],
             FromItem::Table {
-                schema: Some(ref schema),
                 ref name,
                 alias: Some(ref alias)
-            } if schema == "pg_catalog" && name == "pg_class" && alias == "c"
+            } if name == &QualifiedName { schema: Some("pg_catalog".to_string()), name: "pg_class".to_string() } && alias == "c"
         ));
+    }
+
+    #[test]
+    fn parses_schema_ddl_and_qualified_object_targets() {
+        assert_eq!(
+            parse("create schema if not exists App").unwrap(),
+            Statement::CreateSchema {
+                name: "app".to_string(),
+                if_not_exists: true
+            }
+        );
+        assert_eq!(
+            parse("drop schema if exists app restrict").unwrap(),
+            Statement::DropSchema {
+                name: "app".to_string(),
+                if_exists: true
+            }
+        );
+        assert!(parse("drop schema app cascade").is_err());
+
+        let Statement::CreateTable { name, .. } = parse("create table app.users (id int)").unwrap()
+        else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(
+            name,
+            QualifiedName {
+                schema: Some("app".to_string()),
+                name: "users".to_string()
+            }
+        );
+        let Statement::AlterTableSetCompression { table, .. } =
+            parse("alter table app.users set (compression = none)").unwrap()
+        else {
+            panic!("expected ALTER TABLE")
+        };
+        assert_eq!(table.schema.as_deref(), Some("app"));
+
+        for sql in [
+            "select * from db.app.users",
+            "create table db.app.users (id int)",
+            "truncate db.app.users",
+            "vacuum db.app.users",
+        ] {
+            assert!(parse(sql).is_err(), "for `{sql}`");
+        }
     }
 
     #[test]
@@ -1506,11 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn folds_public_dml_targets_and_rejects_system_or_unknown_schemas() {
+    fn preserves_qualified_dml_targets() {
         assert_eq!(
             parse("insert into public.users values (1)").unwrap(),
             Statement::Insert {
-                table: "users".to_string(),
+                table: QualifiedName {
+                    schema: Some("public".to_string()),
+                    name: "users".to_string()
+                },
                 columns: vec![],
                 source: InsertSource::Values(vec![vec![Expr::Literal(Value::Integer(1))]]),
                 on_conflict: None,
@@ -1518,18 +1563,13 @@ mod tests {
             }
         );
 
-        let err = parse("insert into pg_catalog.pg_class values (1)").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
-
-        let err = parse("insert into nosuch.users values (1)").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::InvalidSchemaName);
-
         assert_eq!(
             parse("update public.users set name = 'Ada'").unwrap(),
             Statement::Update {
-                table: "users".to_string(),
+                table: QualifiedName {
+                    schema: Some("public".to_string()),
+                    name: "users".to_string()
+                },
                 assignments: vec![Assignment {
                     column: "name".to_string(),
                     value: Expr::Literal(Value::Text("Ada".to_string())),
@@ -1540,18 +1580,13 @@ mod tests {
             }
         );
 
-        let err = parse("delete from pg_catalog.pg_class").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
-
-        let err = parse("copy nosuch.users from stdin").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::InvalidSchemaName);
-
         assert_eq!(
             parse("copy public.users to stdout").unwrap(),
             Statement::Copy {
-                table: "users".to_string(),
+                table: QualifiedName {
+                    schema: Some("public".to_string()),
+                    name: "users".to_string()
+                },
                 columns: vec![],
                 direction: CopyDirection::To,
                 options: CopyOptions::defaults_for(CopyFormat::Text),
@@ -2424,7 +2459,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::AlterTableSetCompression {
-                    table: "users".to_string(),
+                    table: qn("users"),
                     compression,
                 },
                 "for `{sql}`"
@@ -2450,7 +2485,7 @@ mod tests {
             )
             .unwrap(),
             Statement::AlterTableSetOptions {
-                table: "users".to_string(),
+                table: qn("users"),
                 options: expected,
             }
         );
@@ -2461,7 +2496,7 @@ mod tests {
         assert_eq!(
             parse("alter table users add primary key (id)").unwrap(),
             Statement::AlterTableAddPrimaryKey {
-                table: "users".to_string(),
+                table: qn("users"),
                 columns: vec!["id".to_string()],
                 constraint_name: None,
             }
@@ -2470,7 +2505,7 @@ mod tests {
             parse("ALTER TABLE ONLY Users ADD CONSTRAINT users_pkey PRIMARY KEY (Id, Tenant);")
                 .unwrap(),
             Statement::AlterTableAddPrimaryKey {
-                table: "users".to_string(),
+                table: qn("users"),
                 columns: vec!["id".to_string(), "tenant".to_string()],
                 constraint_name: Some("users_pkey".to_string()),
             }
@@ -2478,14 +2513,14 @@ mod tests {
         assert_eq!(
             parse("alter table users drop primary key").unwrap(),
             Statement::AlterTableDropPrimaryKey {
-                table: "users".to_string(),
+                table: qn("users"),
                 constraint_name: None,
             }
         );
         assert_eq!(
             parse("alter table only users drop constraint users_pkey").unwrap(),
             Statement::AlterTableDropPrimaryKey {
-                table: "users".to_string(),
+                table: qn("users"),
                 constraint_name: Some("users_pkey".to_string()),
             }
         );
@@ -2529,7 +2564,7 @@ mod tests {
         assert_eq!(
             parse("copy users from stdin").unwrap(),
             Statement::Copy {
-                table: "users".to_string(),
+                table: qn("users"),
                 columns: vec![],
                 direction: CopyDirection::From,
                 options: CopyOptions::defaults_for(CopyFormat::Text),
@@ -2542,7 +2577,7 @@ mod tests {
         assert_eq!(
             parse("copy pgbench_accounts from stdin with (freeze on)").unwrap(),
             Statement::Copy {
-                table: "pgbench_accounts".to_string(),
+                table: qn("pgbench_accounts"),
                 columns: vec![],
                 direction: CopyDirection::From,
                 options: CopyOptions::defaults_for(CopyFormat::Text),

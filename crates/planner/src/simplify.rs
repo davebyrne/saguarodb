@@ -210,7 +210,9 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             joined_source,
             returning,
         },
-        ddl @ (LogicalPlan::CreateTable { .. }
+        ddl @ (LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
+        | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTableAddColumn { .. }
         | LogicalPlan::AlterTableDropColumn { .. }

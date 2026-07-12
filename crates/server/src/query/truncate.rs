@@ -3,8 +3,8 @@ use std::sync::{Arc, atomic::Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    DbError, IsolationLevel, PUBLIC_SCHEMA_ID, QueryCancel, RelationKind, Result, SqlState,
-    SsiTracker, StatementContext, TableSchema, TruncateTablePlan,
+    DbError, IsolationLevel, PUBLIC_SCHEMA_ID, QualifiedName, QueryCancel, RelationKind, Result,
+    SqlState, SsiTracker, StatementContext, TableSchema, TruncateTablePlan,
 };
 use executor::ExecutionResult;
 use parser::Statement;
@@ -60,10 +60,12 @@ impl QueryService {
             };
             let baseline = object_guard.snapshot();
             let (catalog_publication, current) = loop {
-                let mut requests = vec![ObjectLockRequest::schema(
-                    PUBLIC_SCHEMA_ID,
-                    CatalogLockMode::Exclusive,
-                )];
+                let mut requests = schemas
+                    .iter()
+                    .map(|schema| {
+                        ObjectLockRequest::schema(schema.schema_id, CatalogLockMode::Access)
+                    })
+                    .collect::<Vec<_>>();
                 requests.extend(
                     schemas
                         .iter()
@@ -198,10 +200,10 @@ impl QueryService {
         let objects = self.ensure_transaction_lock_owner(txn, cancel)?;
         let baseline = objects.snapshot();
         let (schemas, catalog) = loop {
-            let mut requests = vec![ObjectLockRequest::schema(
-                PUBLIC_SCHEMA_ID,
-                CatalogLockMode::Exclusive,
-            )];
+            let mut requests = schemas
+                .iter()
+                .map(|schema| ObjectLockRequest::schema(schema.schema_id, CatalogLockMode::Access))
+                .collect::<Vec<_>>();
             requests.extend(
                 schemas
                     .iter()
@@ -277,6 +279,7 @@ impl QueryService {
         for update in updates {
             txn.truncate_updates.insert(update.table.id, update);
         }
+        txn.relation_generation_changed = true;
 
         Ok(ExecutionResult::Modified {
             command: "TRUNCATE TABLE".to_string(),
@@ -311,17 +314,38 @@ fn allocate_transactional_truncate_plan(
 
 fn resolve_truncate_tables(
     catalog: &dyn CatalogManager,
-    tables: &[String],
+    tables: &[QualifiedName],
 ) -> Result<Vec<common::TableSchema>> {
     let mut schemas = Vec::with_capacity(tables.len());
     let mut target_ids = HashSet::with_capacity(tables.len());
     for table in tables {
-        let schema = match catalog.get_table_by_name(table)? {
+        let namespace = match &table.schema {
+            Some(schema) => catalog
+                .get_schema_by_name(schema)?
+                .map(|schema| schema.id)
+                .ok_or_else(|| {
+                    DbError::plan(
+                        SqlState::InvalidSchemaName,
+                        format!("schema {schema} does not exist"),
+                    )
+                })?,
+            None => PUBLIC_SCHEMA_ID,
+        };
+        let schema = match catalog.get_table_in_schema(namespace, &table.name)? {
             Some(schema) => schema,
-            None if catalog.get_view_by_name(table)?.is_some() => {
+            None if catalog
+                .get_view_in_schema(namespace, &table.name)?
+                .is_some()
+                || catalog
+                    .get_index_in_schema(namespace, &table.name)?
+                    .is_some()
+                || catalog
+                    .get_sequence_in_schema(namespace, &table.name)?
+                    .is_some() =>
+            {
                 return Err(DbError::plan(
                     SqlState::WrongObjectType,
-                    format!("relation {table} is a view, not a table"),
+                    format!("relation {table} is not a table"),
                 ));
             }
             None => {

@@ -160,6 +160,27 @@ async fn ddl_inside_transaction_is_transactional() {
     conn.ok("select * from users").await;
 }
 
+#[tokio::test]
+async fn concurrent_nonconflicting_ddl_commits_do_not_lose_catalog_changes() {
+    let server = TestServer::start().await.unwrap();
+    let mut first = Connection::connect(&server).await.unwrap();
+    let mut second = Connection::connect(&server).await.unwrap();
+
+    first.ok("begin").await;
+    second.ok("begin").await;
+    first
+        .ok("create table first_table (id integer primary key)")
+        .await;
+    second
+        .ok("create table second_table (id integer primary key)")
+        .await;
+    second.ok("commit").await;
+    first.ok("commit").await;
+
+    first.ok("select * from first_table").await;
+    first.ok("select * from second_table").await;
+}
+
 /// COMMIT/ROLLBACK with no open transaction are no-ops that stay 'I'.
 #[tokio::test]
 async fn commit_or_rollback_without_transaction_is_noop() {

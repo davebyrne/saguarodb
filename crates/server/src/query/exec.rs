@@ -147,6 +147,16 @@ impl QueryService {
                         )),
                     );
                 }
+                let statement = match self.transaction_catalog(&txn).and_then(|catalog| {
+                    self.qualify_maintenance_statement(
+                        statement,
+                        catalog.as_ref(),
+                        &session.gucs.search_path_names(&session.session_info.user),
+                    )
+                }) {
+                    Ok(statement) => statement,
+                    Err(err) => return (Some(txn), default_isolation, Err(err)),
+                };
                 let result = self
                     .run_truncate_in_transaction(&mut txn, statement, session.cancel().as_ref())
                     .map(StreamOutcome::Direct);
@@ -170,6 +180,14 @@ impl QueryService {
                     )),
                 );
             }
+            let statement = match self.qualify_maintenance_statement(
+                statement,
+                self.components.catalog.as_ref(),
+                &session.gucs.search_path_names(&session.session_info.user),
+            ) {
+                Ok(statement) => statement,
+                Err(err) => return (None, default_isolation, Err(err)),
+            };
             return (
                 None,
                 default_isolation,
@@ -188,13 +206,8 @@ impl QueryService {
         // rebound/revalidated before its snapshots are captured and carried into
         // the streaming driver.
         if let StatementClass::Copy(direction) = class {
-            let (slot, default_isolation, result) = self.dispatch_copy(
-                direction,
-                statement,
-                slot,
-                default_isolation,
-                session.cancel(),
-            );
+            let (slot, default_isolation, result) =
+                self.dispatch_copy(direction, statement, slot, default_isolation, session);
             return (slot, default_isolation, result);
         }
 
@@ -227,8 +240,9 @@ impl QueryService {
         statement: Statement,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<QueryCancel>,
+        session: &QuerySessionContext,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+        let cancel = session.cancel();
         if let Some(txn) = &slot
             && txn.failed
         {
@@ -243,7 +257,10 @@ impl QueryService {
         }
 
         let mut slot = slot;
-        if let Err(err) = self.bind_with_object_requests(&statement) {
+        if let Err(err) = self.bind_with_object_requests_for_path(
+            &statement,
+            &session.gucs.search_path_names(&session.session_info.user),
+        ) {
             if let Some(txn) = slot.as_mut() {
                 txn.failed = true;
             }
@@ -254,9 +271,14 @@ impl QueryService {
             Some(txn) => {
                 let overlay = txn.catalog_overlay.clone();
                 let updates = txn.truncate_updates.clone();
-                let locked = match self.ensure_transaction_lock_owner(txn, cancel) {
+                let locked = match self.ensure_transaction_lock_owner(txn, session.cancel()) {
                     Ok(owner) => self.bind_and_lock_unprepared_in_transaction(
-                        &statement, overlay, updates, owner, cancel,
+                        &statement,
+                        overlay,
+                        updates,
+                        &session.gucs.search_path_names(&session.session_info.user),
+                        owner,
+                        session.cancel(),
                     ),
                     Err(err) => Err(err),
                 };
@@ -328,15 +350,19 @@ impl QueryService {
                         return (None, default_isolation, Err(err));
                     }
                 };
-                let (bound, schema_versions) =
-                    match self.bind_and_lock_unprepared(&statement, &mut object_guard, cancel) {
-                        Ok(locked) => locked,
-                        Err(err) => {
-                            drop(object_guard);
-                            self.rollback_pre_durable_or_die(txn_id, None);
-                            return (None, default_isolation, Err(err));
-                        }
-                    };
+                let (bound, schema_versions) = match self.bind_and_lock_unprepared_for_path(
+                    &statement,
+                    &session.gucs.search_path_names(&session.session_info.user),
+                    &mut object_guard,
+                    cancel,
+                ) {
+                    Ok(locked) => locked,
+                    Err(err) => {
+                        drop(object_guard);
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return (None, default_isolation, Err(err));
+                    }
+                };
                 let snapshots = match self.capture_consistent_snapshots_cancelable(txn_id, cancel) {
                     Ok(snapshots) => snapshots,
                     Err(err) => {
@@ -371,11 +397,15 @@ impl QueryService {
             }
             None => {
                 let mut object_guard = self.components.lock_manager.statement_owner();
-                let (bound, schema_versions) =
-                    match self.bind_and_lock_unprepared(&statement, &mut object_guard, cancel) {
-                        Ok(locked) => locked,
-                        Err(err) => return (None, default_isolation, Err(err)),
-                    };
+                let (bound, schema_versions) = match self.bind_and_lock_unprepared_for_path(
+                    &statement,
+                    &session.gucs.search_path_names(&session.session_info.user),
+                    &mut object_guard,
+                    cancel,
+                ) {
+                    Ok(locked) => locked,
+                    Err(err) => return (None, default_isolation, Err(err)),
+                };
                 let snapshots = match self.capture_consistent_snapshots_cancelable(0, cancel) {
                     Ok(snapshots) => snapshots,
                     Err(err) => return (None, default_isolation, Err(err)),
@@ -483,7 +513,9 @@ impl QueryService {
         let locked = match source {
             BindSource::Unbound(statement) => {
                 let discovery = self.transaction_catalog(&txn).and_then(|catalog| {
-                    let bound = planner::bind(&statement, catalog.as_ref())?;
+                    let options =
+                        self.bind_options(catalog.as_ref(), runtime.search_path_names())?;
+                    let bound = planner::bind_with_options(&statement, catalog.as_ref(), &options)?;
                     let requests = object_lock_requests(&bound, catalog.as_ref())?;
                     Ok((bound, requests, catalog))
                 });
@@ -500,6 +532,7 @@ impl QueryService {
                                 &statement,
                                 overlay,
                                 updates,
+                                runtime.search_path_names(),
                                 owner,
                                 runtime.cancel(),
                             ),
@@ -663,10 +696,11 @@ impl QueryService {
                             return (Some(txn), Err(err));
                         }
                     };
-                    if let Err(err) = txn.catalog_overlay.absorb(snapshot) {
+                    if let Err(err) = txn.catalog_overlay.absorb(snapshot.clone()) {
                         txn.failed = true;
                         return (Some(txn), Err(err));
                     }
+                    reconcile_truncate_updates_after_ddl(&mut txn.truncate_updates, &snapshot);
                 }
                 // Accumulate this statement's dead-version count on the transaction
                 // (`docs/specs/mvcc.md` §9, F4b). It is folded into the server-wide
@@ -721,7 +755,10 @@ impl QueryService {
     ) -> Result<StreamOutcome> {
         match class {
             StatementClass::Read => {
-                let (initial, requests) = self.bind_with_object_requests(&statement)?;
+                let (initial, requests) = self.bind_with_object_requests_for_path(
+                    &statement,
+                    &session.gucs.search_path_names(&session.session_info.user),
+                )?;
                 if matches!(classify_bound(class, &initial), StatementClass::Write) {
                     return self
                         .autocommit_write(
@@ -738,8 +775,9 @@ impl QueryService {
                     (initial, None)
                 } else {
                     let mut guard = self.components.lock_manager.statement_owner();
-                    let (bound, _) = self.bind_and_lock_unprepared(
+                    let (bound, _) = self.bind_and_lock_unprepared_for_path(
                         &statement,
+                        &session.gucs.search_path_names(&session.session_info.user),
                         &mut guard,
                         session.cancel().as_ref(),
                     )?;
@@ -889,7 +927,8 @@ impl QueryService {
         statement: Statement,
         runtime: StatementRuntime<'_>,
     ) -> Result<ExecutionResult> {
-        let (_, _, catalog_noop) = self.bind_with_object_requests_and_preflight(&statement)?;
+        let (_, _, catalog_noop) =
+            self.bind_with_object_requests_and_preflight(&statement, runtime.search_path_names())?;
         if catalog_noop {
             return Ok(ExecutionResult::Modified {
                 command: "ALTER TABLE".to_string(),
@@ -916,15 +955,19 @@ impl QueryService {
             }
         };
         let object_baseline = object_guard.snapshot();
-        let (bound, schema_versions) =
-            match self.bind_and_lock_unprepared(&statement, &mut object_guard, runtime.cancel()) {
-                Ok(locked) => locked,
-                Err(err) => {
-                    drop(object_guard);
-                    self.rollback_pre_durable_or_die(txn_id, None);
-                    return Err(err);
-                }
-            };
+        let (bound, schema_versions) = match self.bind_and_lock_unprepared_for_path(
+            &statement,
+            runtime.search_path_names(),
+            &mut object_guard,
+            runtime.cancel(),
+        ) {
+            Ok(locked) => locked,
+            Err(err) => {
+                drop(object_guard);
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
         self.autocommit_bound_write_with_guard(
             bound,
             guard,
@@ -1203,4 +1246,28 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
             | BoundStatement::CreateView { .. }
             | BoundStatement::DropView { .. }
     )
+}
+
+fn reconcile_truncate_updates_after_ddl(
+    updates: &mut std::collections::BTreeMap<common::TableId, common::TruncateCatalogUpdate>,
+    snapshot: &catalog::CatalogSnapshot,
+) {
+    updates.retain(|table_id, update| {
+        let Some(table) = snapshot.tables_by_id.get(table_id) else {
+            return false;
+        };
+        update.table = table.clone();
+        update.toast_table = table
+            .toast_table_id
+            .and_then(|toast_id| snapshot.tables_by_id.get(&toast_id).cloned());
+        let mut indexes = snapshot
+            .indexes_by_id
+            .values()
+            .filter(|index| index.table == *table_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        indexes.sort_unstable_by_key(|index| index.id);
+        update.indexes = indexes;
+        true
+    });
 }

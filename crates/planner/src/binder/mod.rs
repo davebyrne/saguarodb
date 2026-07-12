@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use catalog::{CatalogManager, resolve_system_view};
+use catalog::{CatalogManager, is_system_schema, resolve_system_view};
 use common::{
-    BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault, PgType,
-    RelationKind, Result, SqlState, TableId, TableSchema, Value, ViewDependency,
+    BindingId, ColumnDef, ColumnId, DataType, DbError, PUBLIC_SCHEMA_ID, ParsedColumnDef,
+    ParsedDefault, PgType, QualifiedName, RelationKind, Result, SchemaId, SqlState, TableId,
+    TableSchema, Value, ViewDependency,
 };
 use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statement};
 
@@ -87,6 +88,7 @@ struct PendingCorrelation {
 struct BindContext<'a> {
     /// The catalog, carried so expression binding can resolve a subquery's tables.
     catalog: &'a dyn CatalogManager,
+    search_path: Vec<SchemaId>,
     bindings: Vec<Binding>,
     next_binding: BindingId,
     next_slot: usize,
@@ -117,16 +119,18 @@ struct BindContext<'a> {
 
 impl<'a> BindContext<'a> {
     fn new(catalog: &'a dyn CatalogManager, declared_params: &[Option<PgType>]) -> Self {
-        Self::with_outer(catalog, declared_params, Vec::new())
+        Self::with_outer(catalog, declared_params, &[PUBLIC_SCHEMA_ID], Vec::new())
     }
 
     fn with_outer(
         catalog: &'a dyn CatalogManager,
         declared_params: &[Option<PgType>],
+        search_path: &[SchemaId],
         outer: Vec<OuterLink<'a>>,
     ) -> Self {
         Self {
             catalog,
+            search_path: search_path.to_vec(),
             bindings: Vec::new(),
             next_binding: 0,
             next_slot: 0,
@@ -162,10 +166,31 @@ impl<'a> BindContext<'a> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindOptions {
+    pub search_path: Vec<SchemaId>,
+}
+
+impl Default for BindOptions {
+    fn default() -> Self {
+        Self {
+            search_path: vec![PUBLIC_SCHEMA_ID],
+        }
+    }
+}
+
 /// Bind a statement from the simple query protocol. Query parameters are not
 /// allowed here.
 pub fn bind(statement: &Statement, catalog: &dyn CatalogManager) -> Result<BoundStatement> {
-    let bound = bind_inner(statement, catalog, &[])?;
+    bind_with_options(statement, catalog, &BindOptions::default())
+}
+
+pub fn bind_with_options(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    options: &BindOptions,
+) -> Result<BoundStatement> {
+    let bound = bind_inner(statement, catalog, &[], options)?;
     if !crate::params::collect_param_types(&bound, &[])?.is_empty() {
         return Err(plan_error(
             SqlState::SyntaxError,
@@ -195,7 +220,21 @@ pub fn bind_parameterized_with_pg_types(
     catalog: &dyn CatalogManager,
     declared_param_types: &[Option<PgType>],
 ) -> Result<(BoundStatement, Vec<DataType>)> {
-    let bound = bind_inner(statement, catalog, declared_param_types)?;
+    bind_parameterized_with_pg_types_and_options(
+        statement,
+        catalog,
+        declared_param_types,
+        &BindOptions::default(),
+    )
+}
+
+pub fn bind_parameterized_with_pg_types_and_options(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared_param_types: &[Option<PgType>],
+    options: &BindOptions,
+) -> Result<(BoundStatement, Vec<DataType>)> {
+    let bound = bind_inner(statement, catalog, declared_param_types, options)?;
     let declared_data_types: Vec<_> = declared_param_types
         .iter()
         .map(|pg_type| pg_type.as_ref().map(PgType::data_type))
@@ -208,8 +247,20 @@ fn bind_inner(
     statement: &Statement,
     catalog: &dyn CatalogManager,
     declared: &[Option<PgType>],
+    options: &BindOptions,
 ) -> Result<BoundStatement> {
     match statement {
+        Statement::CreateSchema {
+            name,
+            if_not_exists,
+        } => Ok(BoundStatement::CreateSchema {
+            name: name.clone(),
+            if_not_exists: *if_not_exists,
+        }),
+        Statement::DropSchema { name, if_exists } => Ok(BoundStatement::DropSchema {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         Statement::CreateTable {
             name,
             if_not_exists,
@@ -230,7 +281,7 @@ fn bind_inner(
                 }
             }
             for column in columns {
-                validate_default_value(catalog, column)?;
+                validate_default_value(catalog, &options.search_path, column)?;
             }
             // Validate each CHECK against the (not-yet-created) columns: it must
             // parse, bind, be boolean, and be constraint-safe. The bound form is
@@ -238,10 +289,11 @@ fn bind_inner(
             // INSERT/UPDATE (matching how expression DEFAULTs are handled).
             let check_columns = parsed_columns_as_column_defs(columns);
             for check in checks {
-                bind_check_expr(catalog, name, &check_columns, check)?;
+                bind_check_expr(catalog, &name.name, &check_columns, check)?;
             }
             Ok(BoundStatement::CreateTable {
-                name: name.clone(),
+                schema: resolve_schema_id(catalog, name, &options.search_path)?,
+                name: name.name.clone(),
                 if_not_exists: *if_not_exists,
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
@@ -254,18 +306,39 @@ fn bind_inner(
         Statement::DropTable { names, if_exists } => {
             let mut targets = Vec::with_capacity(names.len());
             for name in names {
-                let table = if *if_exists {
-                    None
-                } else if catalog.get_view_by_name(name)?.is_some() {
+                let search_path = name_search_path(catalog, name, &options.search_path)?;
+                let mut table = None;
+                for schema in &search_path {
+                    if let Some(found) = catalog.get_table_in_schema(*schema, &name.name)? {
+                        table = Some(found.id);
+                        break;
+                    }
+                    if catalog.get_view_in_schema(*schema, &name.name)?.is_some() {
+                        return Err(plan_error(
+                            SqlState::WrongObjectType,
+                            format!("relation {name} is a view, not a table"),
+                        ));
+                    }
+                    if catalog.get_index_in_schema(*schema, &name.name)?.is_some()
+                        || catalog
+                            .get_sequence_in_schema(*schema, &name.name)?
+                            .is_some()
+                    {
+                        return Err(plan_error(
+                            SqlState::WrongObjectType,
+                            format!("relation {name} is not a table"),
+                        ));
+                    }
+                }
+                if table.is_none() && !if_exists {
                     return Err(plan_error(
-                        SqlState::WrongObjectType,
-                        format!("relation {name} is a view, not a table"),
+                        SqlState::UndefinedTable,
+                        format!("table {name} does not exist"),
                     ));
-                } else {
-                    Some(require_table(catalog, name)?.id)
-                };
+                }
                 targets.push(crate::DropTableTarget {
                     name: name.clone(),
+                    search_path,
                     table,
                 });
             }
@@ -279,17 +352,17 @@ fn bind_inner(
             if_not_exists,
             column,
         } => {
-            validate_default_value(catalog, column)?;
+            validate_default_value(catalog, &options.search_path, column)?;
             if matches!(column.default, Some(ParsedDefault::Serial)) {
                 return Err(plan_error(
                     SqlState::FeatureNotSupported,
                     "ALTER TABLE ADD COLUMN does not support SERIAL columns yet",
                 ));
             }
-            let table_schema = require_table(catalog, table)?;
+            let table_schema = require_table(catalog, table, &options.search_path)?;
             Ok(BoundStatement::AlterTableAddColumn {
                 table: table_schema.id,
-                table_name: table.clone(),
+                table_name: table.name.clone(),
                 if_not_exists: *if_not_exists,
                 column: column.clone(),
             })
@@ -299,10 +372,10 @@ fn bind_inner(
             if_exists,
             column,
         } => {
-            let table_schema = require_table(catalog, table)?;
+            let table_schema = require_table(catalog, table, &options.search_path)?;
             Ok(BoundStatement::AlterTableDropColumn {
                 table: table_schema.id,
-                table_name: table.clone(),
+                table_name: table.name.clone(),
                 if_exists: *if_exists,
                 column: column.clone(),
             })
@@ -312,19 +385,19 @@ fn bind_inner(
             old_name,
             new_name,
         } => {
-            let table_schema = require_table(catalog, table)?;
+            let table_schema = require_table(catalog, table, &options.search_path)?;
             Ok(BoundStatement::AlterTableRenameColumn {
                 table: table_schema.id,
-                table_name: table.clone(),
+                table_name: table.name.clone(),
                 old_name: old_name.clone(),
                 new_name: new_name.clone(),
             })
         }
         Statement::AlterTableRenameTable { table, new_name } => {
-            let table_schema = require_table(catalog, table)?;
+            let table_schema = require_table(catalog, table, &options.search_path)?;
             Ok(BoundStatement::AlterTableRenameTable {
                 table: table_schema.id,
-                table_name: table.clone(),
+                table_name: table.name.clone(),
                 new_name: new_name.clone(),
             })
         }
@@ -333,24 +406,66 @@ fn bind_inner(
             table,
             columns,
             unique,
-        } => Ok(BoundStatement::CreateIndex {
-            name: name.clone(),
-            table: table.clone(),
-            columns: columns.clone(),
-            unique: *unique,
-        }),
+        } => {
+            let table_schema = require_table(catalog, table, &options.search_path)?;
+            let index_schema = resolve_schema_id(catalog, name, &options.search_path)?;
+            if index_schema != table_schema.schema_id {
+                return Err(plan_error(
+                    SqlState::InvalidSchemaName,
+                    "index and table must be in the same schema",
+                ));
+            }
+            Ok(BoundStatement::CreateIndex {
+                schema: index_schema,
+                name: name.name.clone(),
+                table: table_schema.name,
+                columns: columns.clone(),
+                unique: *unique,
+            })
+        }
         Statement::DropIndex { name } => {
-            let index = require_index(catalog, name)?;
+            let index = require_index(catalog, name, &options.search_path)?;
             Ok(BoundStatement::DropIndex { index: index.id })
         }
-        Statement::CreateSequence { name, options } => Ok(BoundStatement::CreateSequence {
-            name: name.clone(),
-            options: options.clone(),
+        Statement::CreateSequence {
+            name,
+            options: sequence_options,
+        } => Ok(BoundStatement::CreateSequence {
+            schema: resolve_schema_id(catalog, name, &options.search_path)?,
+            name: name.name.clone(),
+            options: sequence_options.clone(),
         }),
-        Statement::DropSequence { name, if_exists } => Ok(BoundStatement::DropSequence {
-            name: name.clone(),
-            if_exists: *if_exists,
-        }),
+        Statement::DropSequence { name, if_exists } => {
+            let search_path = name_search_path(catalog, name, &options.search_path)?;
+            let mut sequence = None;
+            for schema in &search_path {
+                if let Some(found) = catalog.get_sequence_in_schema(*schema, &name.name)? {
+                    sequence = Some(found.id);
+                    break;
+                }
+                if catalog.get_table_in_schema(*schema, &name.name)?.is_some()
+                    || catalog.get_view_in_schema(*schema, &name.name)?.is_some()
+                    || catalog.get_index_in_schema(*schema, &name.name)?.is_some()
+                {
+                    return Err(plan_error(
+                        SqlState::WrongObjectType,
+                        format!("relation {name} is not a sequence"),
+                    ));
+                }
+            }
+            if sequence.is_none() && !if_exists {
+                return Err(plan_error(
+                    SqlState::UndefinedTable,
+                    format!("sequence {name} does not exist"),
+                ));
+            }
+            Ok(BoundStatement::DropSequence {
+                name: name.name.clone(),
+                search_path,
+                sequence,
+                if_exists: *if_exists,
+            })
+        }
         Statement::CreateView {
             name,
             or_replace,
@@ -374,26 +489,69 @@ fn bind_inner(
                 catalog,
                 query,
                 declared,
+                &options.search_path,
                 &CteScope::default(),
                 None,
                 &[],
                 &mut Vec::new(),
             )?;
             validate_create_view_columns(columns, &bound_query)?;
-            let dependencies = collect_view_dependencies(catalog, declared, query, &bound_query)?;
+            let dependencies = collect_view_dependencies(
+                catalog,
+                declared,
+                &options.search_path,
+                query,
+                &bound_query,
+            )?;
             Ok(BoundStatement::CreateView {
-                name: name.clone(),
+                schema: resolve_schema_id(catalog, name, &options.search_path)?,
+                name: name.name.clone(),
                 or_replace: *or_replace,
                 columns: columns.clone(),
                 query: bound_query,
                 definition: definition.clone(),
                 dependencies,
+                definition_search_path: options.search_path.clone(),
             })
         }
-        Statement::DropView { name, if_exists } => Ok(BoundStatement::DropView {
-            name: name.clone(),
-            if_exists: *if_exists,
-        }),
+        Statement::DropView { name, if_exists } => {
+            let search_path = name_search_path(catalog, name, &options.search_path)?;
+            let mut view = None;
+            for schema in &search_path {
+                if let Some(found) = catalog.get_view_in_schema(*schema, &name.name)? {
+                    view = Some(found.id);
+                    break;
+                }
+                if catalog.get_table_in_schema(*schema, &name.name)?.is_some() {
+                    return Err(plan_error(
+                        SqlState::WrongObjectType,
+                        format!("relation {name} is a table, not a view"),
+                    ));
+                }
+                if catalog.get_index_in_schema(*schema, &name.name)?.is_some()
+                    || catalog
+                        .get_sequence_in_schema(*schema, &name.name)?
+                        .is_some()
+                {
+                    return Err(plan_error(
+                        SqlState::WrongObjectType,
+                        format!("relation {name} is not a view"),
+                    ));
+                }
+            }
+            if view.is_none() && !if_exists {
+                return Err(plan_error(
+                    SqlState::UndefinedTable,
+                    format!("view {name} does not exist"),
+                ));
+            }
+            Ok(BoundStatement::DropView {
+                name: name.name.clone(),
+                search_path,
+                view,
+                if_exists: *if_exists,
+            })
+        }
         Statement::Insert {
             table,
             columns,
@@ -403,6 +561,7 @@ fn bind_inner(
         } => bind_insert(
             catalog,
             table,
+            &options.search_path,
             columns,
             source,
             on_conflict.as_ref(),
@@ -413,6 +572,7 @@ fn bind_inner(
             catalog,
             query,
             declared,
+            &options.search_path,
             &CteScope::default(),
             None,
             &[],
@@ -428,6 +588,7 @@ fn bind_inner(
         } => bind_update(
             catalog,
             table,
+            &options.search_path,
             assignments,
             from,
             filter.as_ref(),
@@ -442,13 +603,14 @@ fn bind_inner(
         } => bind_delete(
             catalog,
             table,
+            &options.search_path,
             using,
             filter.as_ref(),
             returning.as_deref(),
             declared,
         ),
         Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
-            inner, catalog, declared,
+            inner, catalog, declared, options,
         )?))),
         // Transaction control is dispatched before binding (see `statement_class`
         // in the server), so the binder should not normally see these; this
@@ -494,49 +656,137 @@ fn bind_inner(
             table,
             columns,
             direction,
-            options,
-        } => bind_copy(catalog, table, columns, *direction, options),
+            options: copy_options,
+        } => bind_copy(
+            catalog,
+            table,
+            &options.search_path,
+            columns,
+            *direction,
+            copy_options,
+        ),
     }
 }
 
-fn require_table(catalog: &dyn CatalogManager, name: &str) -> Result<TableSchema> {
-    let table = match catalog.get_table_by_name(name)? {
-        Some(table) => table,
-        None if catalog.get_view_by_name(name)?.is_some() => {
+fn resolve_schema_id(
+    catalog: &dyn CatalogManager,
+    name: &QualifiedName,
+    search_path: &[SchemaId],
+) -> Result<SchemaId> {
+    match &name.schema {
+        Some(schema) => catalog
+            .get_schema_by_name(schema)?
+            .map(|schema| schema.id)
+            .ok_or_else(|| {
+                plan_error(
+                    SqlState::InvalidSchemaName,
+                    format!("schema \"{schema}\" does not exist"),
+                )
+            }),
+        None => search_path.first().copied().ok_or_else(|| {
+            plan_error(
+                SqlState::InvalidSchemaName,
+                "no schema has been selected to create in",
+            )
+        }),
+    }
+}
+
+fn name_search_path(
+    catalog: &dyn CatalogManager,
+    name: &QualifiedName,
+    search_path: &[SchemaId],
+) -> Result<Vec<SchemaId>> {
+    if name.schema.is_some() {
+        Ok(vec![resolve_schema_id(catalog, name, search_path)?])
+    } else {
+        Ok(search_path.to_vec())
+    }
+}
+
+fn require_table(
+    catalog: &dyn CatalogManager,
+    name: &QualifiedName,
+    search_path: &[SchemaId],
+) -> Result<TableSchema> {
+    if name.schema.as_deref().is_some_and(is_system_schema) {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "cannot modify system catalog",
+        ));
+    }
+    let schemas = match &name.schema {
+        Some(_) => vec![resolve_schema_id(catalog, name, search_path)?],
+        None => search_path.to_vec(),
+    };
+    for schema in schemas {
+        if let Some(found) = catalog.get_table_in_schema(schema, &name.name)? {
+            if matches!(found.relation_kind, RelationKind::Toast { .. }) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "hidden TOAST relations are not queryable",
+                ));
+            }
+            return Ok(found);
+        }
+        if catalog.get_view_in_schema(schema, &name.name)?.is_some() {
             return Err(plan_error(
                 SqlState::FeatureNotSupported,
                 "cannot modify view",
             ));
         }
-        None if resolve_system_view(None, name).is_some() => {
+        if catalog.get_index_in_schema(schema, &name.name)?.is_some()
+            || catalog
+                .get_sequence_in_schema(schema, &name.name)?
+                .is_some()
+        {
             return Err(plan_error(
-                SqlState::FeatureNotSupported,
-                "cannot modify system catalog",
+                SqlState::WrongObjectType,
+                format!("relation {name} is not a table"),
             ));
         }
-        None => {
-            return Err(plan_error(
-                SqlState::UndefinedTable,
-                format!("table {name} does not exist"),
-            ));
-        }
-    };
-    if matches!(table.relation_kind, RelationKind::Toast { .. }) {
+    }
+    if name.schema.is_none() && resolve_system_view(None, &name.name).is_some() {
         return Err(plan_error(
             SqlState::FeatureNotSupported,
-            "hidden TOAST relations are not queryable",
+            "cannot modify system catalog",
         ));
     }
-    Ok(table)
+    Err(plan_error(
+        SqlState::UndefinedTable,
+        format!("table {name} does not exist"),
+    ))
 }
 
-fn require_index(catalog: &dyn CatalogManager, name: &str) -> Result<common::IndexSchema> {
-    catalog.get_index_by_name(name)?.ok_or_else(|| {
-        plan_error(
-            SqlState::UndefinedTable,
-            format!("index {name} does not exist"),
-        )
-    })
+fn require_index(
+    catalog: &dyn CatalogManager,
+    name: &QualifiedName,
+    search_path: &[SchemaId],
+) -> Result<common::IndexSchema> {
+    let schemas = match &name.schema {
+        Some(_) => vec![resolve_schema_id(catalog, name, search_path)?],
+        None => search_path.to_vec(),
+    };
+    for schema in schemas {
+        if let Some(index) = catalog.get_index_in_schema(schema, &name.name)? {
+            return Ok(index);
+        }
+        if catalog.get_table_in_schema(schema, &name.name)?.is_some()
+            || catalog.get_view_in_schema(schema, &name.name)?.is_some()
+            || catalog
+                .get_sequence_in_schema(schema, &name.name)?
+                .is_some()
+        {
+            return Err(plan_error(
+                SqlState::WrongObjectType,
+                format!("relation {name} is not an index"),
+            ));
+        }
+    }
+    Err(plan_error(
+        SqlState::UndefinedTable,
+        format!("index {name} does not exist"),
+    ))
 }
 
 fn input_ref(binding: &Binding, column: &ColumnDef) -> BoundExpr {
@@ -633,7 +883,45 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
 /// is a constant folded by the parser; it must have the same type as the column
 /// (no implicit casts), except `NULL` is accepted only when the column is
 /// nullable (a `NULL` default on a `NOT NULL` column is rejected up front).
-fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef) -> Result<()> {
+fn resolve_sequence_literal(
+    catalog: &dyn CatalogManager,
+    search_path: &[SchemaId],
+    name: &str,
+) -> Result<Option<common::SequenceSchema>> {
+    if let Some((schema, relation)) = name.split_once('.') {
+        if schema.is_empty() || relation.is_empty() {
+            return Err(plan_error(SqlState::SyntaxError, "invalid sequence name"));
+        }
+        let namespace = catalog.get_schema_by_name(schema)?.ok_or_else(|| {
+            plan_error(
+                SqlState::InvalidSchemaName,
+                format!("schema {schema} does not exist"),
+            )
+        })?;
+        return catalog.get_sequence_in_schema(namespace.id, relation);
+    }
+    for schema in search_path {
+        if let Some(sequence) = catalog.get_sequence_in_schema(*schema, name)? {
+            return Ok(Some(sequence));
+        }
+        if catalog.get_table_in_schema(*schema, name)?.is_some()
+            || catalog.get_view_in_schema(*schema, name)?.is_some()
+            || catalog.get_index_in_schema(*schema, name)?.is_some()
+        {
+            return Err(plan_error(
+                SqlState::WrongObjectType,
+                format!("relation {name} is not a sequence"),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_default_value(
+    catalog: &dyn CatalogManager,
+    search_path: &[SchemaId],
+    column: &ParsedColumnDef,
+) -> Result<()> {
     let Some(default) = &column.default else {
         return Ok(());
     };
@@ -665,7 +953,7 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
             // `DEFAULT nextval` may not borrow a SERIAL-owned sequence) is validated
             // authoritatively by the catalog at CREATE TABLE
             // (`resolve_sequence_default`), so it is not duplicated here.
-            if catalog.get_sequence_by_name(name)?.is_none() {
+            if resolve_sequence_literal(catalog, search_path, name)?.is_none() {
                 return Err(plan_error(
                     SqlState::UndefinedTable,
                     format!("sequence {name} does not exist"),
@@ -687,7 +975,13 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
             // assignable to the column. It is bound again per row at INSERT time; a
             // NULL result is caught then by the NOT NULL check, so it is not
             // rejected here (matching PostgreSQL).
-            let bound = bind_default_expr(catalog, text)?;
+            let bound = bind_default_expr_with_options(
+                catalog,
+                text,
+                &BindOptions {
+                    search_path: search_path.to_vec(),
+                },
+            )?;
             let expr_type = bound.data_type();
             if !default_expr_type_matches(&column.data_type, &expr_type) {
                 return Err(plan_error(
@@ -759,8 +1053,16 @@ fn default_expr_type_matches(column_type: &DataType, expr_type: &DataType) -> bo
 /// an unresolved column). Forms not valid in a constraint context — aggregates,
 /// subqueries, and query parameters — are rejected.
 pub fn bind_default_expr(catalog: &dyn CatalogManager, text: &str) -> Result<BoundExpr> {
+    bind_default_expr_with_options(catalog, text, &BindOptions::default())
+}
+
+pub fn bind_default_expr_with_options(
+    catalog: &dyn CatalogManager,
+    text: &str,
+    options: &BindOptions,
+) -> Result<BoundExpr> {
     let parsed = parser::parse_expression(text)?;
-    let mut ctx = BindContext::new(catalog, &[]);
+    let mut ctx = BindContext::with_outer(catalog, &[], &options.search_path, Vec::new());
     let bound = expr::bind_expr(&mut ctx, &parsed, None)?;
     reject_non_constraint_safe(&bound)?;
     Ok(bound)
@@ -990,6 +1292,7 @@ struct DependencyBinding {
 #[derive(Default)]
 struct ViewDependencyBuilder {
     dependencies: BTreeMap<TableId, ViewDependencyColumns>,
+    search_path: Vec<SchemaId>,
 }
 
 enum ViewDependencyColumns {
@@ -1054,10 +1357,14 @@ impl ViewDependencyBuilder {
 fn collect_view_dependencies(
     catalog: &dyn CatalogManager,
     declared: &[Option<PgType>],
+    search_path: &[SchemaId],
     ast: &Query,
     bound: &BoundQuery,
 ) -> Result<Vec<ViewDependency>> {
-    let mut builder = ViewDependencyBuilder::default();
+    let mut builder = ViewDependencyBuilder {
+        dependencies: BTreeMap::new(),
+        search_path: search_path.to_vec(),
+    };
     collect_query_dependencies(ast, bound, &mut builder);
     collect_bound_but_unretained_cte_dependencies(
         catalog,
@@ -1175,6 +1482,7 @@ fn collect_bound_but_unretained_cte_dependencies(
             catalog,
             &cte.query,
             declared,
+            &builder.search_path,
             &scope,
             None,
             &[],

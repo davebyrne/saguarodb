@@ -1,6 +1,6 @@
 use common::{
     CompressionSetting, CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef,
-    PgType, SequenceOptions, TableOptionPatch, ToastOptionPatch, Value,
+    PgType, QualifiedName, SequenceOptions, TableOptionPatch, ToastOptionPatch, Value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,8 +11,16 @@ pub enum SetScope {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
-    CreateTable {
+    CreateSchema {
         name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
+    CreateTable {
+        name: QualifiedName,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
@@ -34,47 +42,47 @@ pub enum Statement {
         checks: Vec<String>,
     },
     DropTable {
-        names: Vec<String>,
+        names: Vec<QualifiedName>,
         if_exists: bool,
     },
     AlterTableAddColumn {
-        table: String,
+        table: QualifiedName,
         if_not_exists: bool,
         column: ParsedColumnDef,
     },
     AlterTableDropColumn {
-        table: String,
+        table: QualifiedName,
         if_exists: bool,
         column: String,
     },
     AlterTableRenameColumn {
-        table: String,
+        table: QualifiedName,
         old_name: String,
         new_name: String,
     },
     AlterTableRenameTable {
-        table: String,
+        table: QualifiedName,
         new_name: String,
     },
     CreateIndex {
-        name: String,
-        table: String,
+        name: QualifiedName,
+        table: QualifiedName,
         columns: Vec<String>,
         unique: bool,
     },
     DropIndex {
-        name: String,
+        name: QualifiedName,
     },
     CreateSequence {
-        name: String,
+        name: QualifiedName,
         options: SequenceOptions,
     },
     DropSequence {
-        name: String,
+        name: QualifiedName,
         if_exists: bool,
     },
     CreateView {
-        name: String,
+        name: QualifiedName,
         or_replace: bool,
         columns: Vec<String>,
         query: Query,
@@ -83,11 +91,11 @@ pub enum Statement {
         definition: String,
     },
     DropView {
-        name: String,
+        name: QualifiedName,
         if_exists: bool,
     },
     Insert {
-        table: String,
+        table: QualifiedName,
         columns: Vec<String>,
         source: InsertSource,
         /// `INSERT ... ON CONFLICT ...`. `None` when absent. The arbiter is the
@@ -100,7 +108,7 @@ pub enum Statement {
     },
     Query(Query),
     Update {
-        table: String,
+        table: QualifiedName,
         assignments: Vec<Assignment>,
         /// `UPDATE ... FROM <items>`: extra relations joined with the target
         /// (`docs/specs/subqueries.md` §8). Empty when absent.
@@ -110,7 +118,7 @@ pub enum Statement {
         returning: Option<Vec<SelectItem>>,
     },
     Delete {
-        table: String,
+        table: QualifiedName,
         /// `DELETE ... USING <items>` (`docs/specs/subqueries.md` §8).
         using: Vec<FromItem>,
         filter: Option<Expr>,
@@ -213,50 +221,39 @@ pub enum Statement {
     /// identifier, `None` for the whole database. sqlparser 0.56 does not parse
     /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
     Vacuum {
-        table: Option<String>,
-        analyze: bool,
-    },
-    /// `ANALYZE` (all user tables) or `ANALYZE <table>` (one table) — collect
-    /// optimizer statistics (`docs/specs/statistics.md` §5). A maintenance
-    /// command that does not bind/plan relationally; `table` is the
-    /// lowercase-normalized identifier, `None` for the whole database.
-    /// Intercepted in `parse_statement` like `VACUUM` (statement-initial
-    /// keyword only, so `EXPLAIN ANALYZE` still reaches — and is rejected by —
-    /// the EXPLAIN path).
-    Analyze {
-        table: Option<String>,
+        table: Option<QualifiedName>,
     },
     /// `TRUNCATE [TABLE] <name> [, ...]` — immediate table truncation. A
     /// maintenance command that does not bind/plan relationally. Targets retain
     /// input order; duplicate normalized names and unsupported PostgreSQL options
     /// such as ONLY, identity handling, and cascade are rejected by the parser.
     Truncate {
-        tables: Vec<String>,
+        tables: Vec<QualifiedName>,
     },
     /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')`. Intercepted
     /// before sqlparser because sqlparser does not parse PostgreSQL storage
     /// parameters consistently; schema-evolution `ALTER TABLE` forms are parsed
     /// through sqlparser.
     AlterTableSetCompression {
-        table: String,
+        table: QualifiedName,
         compression: CompressionSetting,
     },
     /// `ALTER TABLE <name> SET (...)` with at least one TOAST option. Parsed as
     /// maintenance; execution applies the future-write-only TOAST metadata change.
     AlterTableSetOptions {
-        table: String,
+        table: QualifiedName,
         options: TableOptionPatch,
     },
     /// `ALTER TABLE [ONLY] <name> ADD [CONSTRAINT <name>] PRIMARY KEY (cols...)`.
     AlterTableAddPrimaryKey {
-        table: String,
+        table: QualifiedName,
         columns: Vec<String>,
         constraint_name: Option<String>,
     },
     /// `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY` or
     /// `ALTER TABLE [ONLY] <name> DROP CONSTRAINT <name>`.
     AlterTableDropPrimaryKey {
-        table: String,
+        table: QualifiedName,
         constraint_name: Option<String>,
     },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
@@ -265,7 +262,7 @@ pub enum Statement {
     /// unsupported options; `options` is the normalized result. `columns` empty
     /// means all table columns in catalog order. See `docs/specs/copy.md`.
     Copy {
-        table: String,
+        table: QualifiedName,
         columns: Vec<String>,
         direction: CopyDirection,
         options: CopyOptions,
@@ -407,8 +404,7 @@ pub enum SelectItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FromItem {
     Table {
-        schema: Option<String>,
-        name: String,
+        name: QualifiedName,
         alias: Option<String>,
     },
     /// A derived table: `[LATERAL] (SELECT ...) AS alias [(col, ...)]`. A

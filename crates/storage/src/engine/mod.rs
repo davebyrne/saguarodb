@@ -2662,6 +2662,28 @@ impl StorageEngine for PageBackedStorageEngine {
 }
 
 impl SchemaOperations for PageBackedStorageEngine {
+    fn create_schema(
+        &self,
+        ctx: &StatementContext,
+        schema: &common::NamespaceSchema,
+    ) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(
+            &state,
+            ctx,
+            WalRecordKind::CreateSchema {
+                schema: schema.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn drop_schema(&self, ctx: &StatementContext, schema: common::SchemaId) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(&state, ctx, WalRecordKind::DropSchema { schema })?;
+        Ok(())
+    }
+
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()> {
         {
             let mut state = self.lock_state()?;

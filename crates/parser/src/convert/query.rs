@@ -6,11 +6,8 @@ use crate::{
     SelectItem, SetOp,
 };
 
-use super::expr::{convert_expr, convert_function_arg};
-use super::{
-    fold_dml_target_name, function_name, ident_name, object_name, parse_error, relation_name,
-    unsupported,
-};
+use super::expr::convert_expr;
+use super::{ident_name, parse_error, relation_name, simple_object_name, unsupported};
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
 /// `WITH` CTEs and query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's
@@ -234,7 +231,7 @@ pub(super) fn convert_select_item(item: &sql::SelectItem) -> Result<SelectItem> 
             let sql::SelectItemQualifiedWildcardKind::ObjectName(name) = kind else {
                 return unsupported("unsupported qualified wildcard");
             };
-            Ok(SelectItem::QualifiedWildcard(object_name(name)?))
+            Ok(SelectItem::QualifiedWildcard(simple_object_name(name)?))
         }
         sql::SelectItem::UnnamedExpr(expr) => Ok(SelectItem::Expression {
             expr: convert_expr(expr)?,
@@ -342,10 +339,8 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 return unsupported("WITH ORDINALITY requires a table function");
             }
             let alias = alias.as_ref().map(table_alias_name).transpose()?;
-            let (schema, name) = relation_name(name)?;
             Ok(FromItem::Table {
-                schema,
-                name,
+                name: relation_name(name)?,
                 alias,
             })
         }
@@ -444,19 +439,16 @@ fn table_alias_column_name(column: &sql::TableAliasColumnDef) -> Result<String> 
     ident_name(&column.name)
 }
 
-pub(super) fn table_name_from_table_with_joins(table: &sql::TableWithJoins) -> Result<String> {
+pub(super) fn table_name_from_table_with_joins(
+    table: &sql::TableWithJoins,
+) -> Result<common::QualifiedName> {
     if !table.joins.is_empty() {
         return unsupported("joins are not supported here");
     }
-    let FromItem::Table {
-        schema,
-        name,
-        alias: None,
-    } = convert_table_factor(&table.relation)?
-    else {
+    let FromItem::Table { name, alias: None } = convert_table_factor(&table.relation)? else {
         return unsupported("expected table name");
     };
-    fold_dml_target_name(schema.as_deref(), name)
+    Ok(name)
 }
 
 fn convert_order_by(order_by: sql::OrderBy) -> Result<Vec<OrderByItem>> {
@@ -514,7 +506,7 @@ pub(super) fn convert_assignment(assignment: sql::Assignment) -> Result<Assignme
     };
 
     Ok(Assignment {
-        column: object_name(&column)?,
+        column: simple_object_name(&column)?,
         value: convert_expr(&assignment.value)?,
     })
 }

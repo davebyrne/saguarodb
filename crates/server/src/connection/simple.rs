@@ -132,12 +132,36 @@ impl Session {
 
     pub(super) fn truncate_targets_parked_query_error(
         &self,
-        tables: &[String],
+        tables: &[common::QualifiedName],
     ) -> Result<Option<DbError>> {
+        let catalog = match self.txn.as_ref() {
+            Some(txn) => self.app.query_service.transaction_catalog(txn)?,
+            None => self.app.components.catalog.clone(),
+        };
+        let search_path = self.session_gucs.search_path_names(&self.session_info.user);
         let mut targets = std::collections::BTreeSet::new();
         for name in tables {
-            if let Some(table) = self.app.components.catalog.get_table_by_name(name)? {
-                targets.insert(table.id);
+            let schema_ids = match &name.schema {
+                Some(schema) => catalog
+                    .get_schema_by_name(schema)?
+                    .map(|schema| vec![schema.id])
+                    .unwrap_or_default(),
+                None => search_path
+                    .iter()
+                    .filter_map(|schema| catalog.get_schema_by_name(schema).transpose())
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .map(|schema| schema.id)
+                    .collect(),
+            };
+            for schema_id in schema_ids {
+                if let Some(table) = catalog.get_table_in_schema(schema_id, &name.name)? {
+                    targets.insert(table.id);
+                    break;
+                }
+                if catalog.get_view_in_schema(schema_id, &name.name)?.is_some() {
+                    break;
+                }
             }
         }
         let portal_overlap = self.portals.values().any(|portal| {

@@ -3,6 +3,13 @@
 **Date:** 2026-05-03
 **Status:** Living crate contract
 
+DDL physical plans carry resolved schema ids. CREATE TABLE/INDEX/SEQUENCE/VIEW
+uses schema-scoped catalog creation, CREATE/DROP SCHEMA emits the corresponding
+logical WAL through `SchemaOperations`, and conditional drops resolve within the
+qualified schema. CREATE VIEW persists the effective definition search path.
+`pg_namespace` includes user schemas and `pg_class.relnamespace` reflects each
+user object's schema.
+
 ## Purpose
 
 `executor` evaluates `PhysicalPlan` values. It owns physical operators, expression evaluation, DML/DDL orchestration, and conversion to `ExecutionResult`.

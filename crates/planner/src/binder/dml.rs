@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use catalog::CatalogManager;
 use common::{
     ColumnDef, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError,
-    PgType, Result, SqlState, TableSchema,
+    PgType, QualifiedName, Result, SqlState, TableSchema,
 };
 use parser::{
     Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, Query, SelectItem,
@@ -29,12 +29,13 @@ use super::{BindContext, CteScope, plan_error, reject_aggregate, require_table};
 /// per row (matching PostgreSQL) when the row's NULL fails `validate_not_null`.
 pub(super) fn bind_copy(
     catalog: &dyn CatalogManager,
-    table_name: &str,
+    table_name: &QualifiedName,
+    search_path: &[common::SchemaId],
     column_names: &[String],
     direction: CopyDirection,
     options: &CopyOptions,
 ) -> Result<BoundStatement> {
-    let table = require_table(catalog, table_name)?;
+    let table = require_table(catalog, table_name, search_path)?;
     let columns = insert_columns(&table, column_names)?;
     // COPY FROM inserts rows, so — like INSERT — it needs the omitted columns'
     // expression defaults evaluated per row and the table's CHECK constraints
@@ -57,16 +58,18 @@ pub(super) fn bind_copy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn bind_insert(
     catalog: &dyn CatalogManager,
-    table_name: &str,
+    table_name: &QualifiedName,
+    search_path: &[common::SchemaId],
     column_names: &[String],
     source: &InsertSource,
     on_conflict: Option<&OnConflict>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
-    let table = require_table(catalog, table_name)?;
+    let table = require_table(catalog, table_name, search_path)?;
     let columns = insert_columns(&table, column_names)?;
     validate_insert_omissions(&table, &columns)?;
 
@@ -75,7 +78,7 @@ pub(super) fn bind_insert(
             bind_insert_values(catalog, &table, &columns, rows, declared)?
         }
         InsertSource::Query(select) => {
-            bind_insert_query(catalog, &table, &columns, select, declared)?
+            bind_insert_query(catalog, &table, &columns, select, declared, search_path)?
         }
     };
 
@@ -111,7 +114,16 @@ fn bind_omitted_expr_defaults(
             continue;
         }
         if let Some(ColumnDefault::Expr(text)) = &column.default {
-            defaults.push((column.id, super::bind_default_expr(catalog, text)?));
+            defaults.push((
+                column.id,
+                super::bind_default_expr_with_options(
+                    catalog,
+                    text,
+                    &super::BindOptions {
+                        search_path: vec![table.schema_id],
+                    },
+                )?,
+            ));
         }
     }
     Ok(defaults)
@@ -331,6 +343,7 @@ fn bind_insert_query(
     columns: &[ColumnId],
     subquery: &Query,
     declared: &[Option<PgType>],
+    search_path: &[common::SchemaId],
 ) -> Result<BoundInsertSource> {
     // The INSERT source is a top-level query; it carries its own `WITH` (if any),
     // has no enclosing CTE scope, and gets no external `expected` types.
@@ -338,6 +351,7 @@ fn bind_insert_query(
         catalog,
         subquery,
         declared,
+        search_path,
         &CteScope::default(),
         None,
         &[],
@@ -357,16 +371,18 @@ fn bind_insert_query(
     Ok(BoundInsertSource::Query(Box::new(query)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn bind_update(
     catalog: &dyn CatalogManager,
-    table_name: &str,
+    table_name: &QualifiedName,
+    search_path: &[common::SchemaId],
     assignments: &[Assignment],
     from_items: &[parser::FromItem],
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
-    let table = require_table(catalog, table_name)?;
+    let table = require_table(catalog, table_name, search_path)?;
     // RETURNING binds against the target table only: it is evaluated over the
     // updated (new) row, which carries no FROM columns
     // (docs/specs/subqueries.md section 8 — a documented divergence from
@@ -424,13 +440,14 @@ pub(super) fn bind_update(
 
 pub(super) fn bind_delete(
     catalog: &dyn CatalogManager,
-    table_name: &str,
+    table_name: &QualifiedName,
+    search_path: &[common::SchemaId],
     using: &[parser::FromItem],
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
-    let table = require_table(catalog, table_name)?;
+    let table = require_table(catalog, table_name, search_path)?;
     let returning = bind_returning(catalog, &table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);

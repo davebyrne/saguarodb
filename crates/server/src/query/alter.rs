@@ -1,9 +1,10 @@
 use std::sync::{Arc, RwLockWriteGuard, atomic::Ordering};
 
 use common::{
-    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema, QueryCancel,
-    RelationKind, Result, SqlState, StatementContext, TableId, TableOptionPatch, TableSchema,
-    ToastCompression, ToastOptions, WriteGuard, needs_toast_relation, toast_schema,
+    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema,
+    QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext, TableId,
+    TableOptionPatch, TableSchema, ToastCompression, ToastOptions, WriteGuard,
+    needs_toast_relation, toast_schema,
 };
 use executor::ExecutionResult;
 use parser::Statement;
@@ -57,7 +58,7 @@ struct LockedMaintenanceTable<'a> {
 impl QueryService {
     fn lock_maintenance_table<'a>(
         &'a self,
-        table: &str,
+        table: &QualifiedName,
         cancel: &QueryCancel,
     ) -> Result<LockedMaintenanceTable<'a>> {
         let components = &self.components;
@@ -87,9 +88,14 @@ impl QueryService {
         };
         let baseline = objects.snapshot();
         let (catalog_publication, schema) = loop {
-            let request =
-                ObjectLockRequest::table(discovered.id, RelationLockMode::AccessExclusive);
-            if let Err(err) = objects.acquire_many(&[request], cancel) {
+            let requests = [
+                ObjectLockRequest::schema(
+                    discovered.schema_id,
+                    crate::lock_manager::CatalogLockMode::Access,
+                ),
+                ObjectLockRequest::table(discovered.id, RelationLockMode::AccessExclusive),
+            ];
+            if let Err(err) = objects.acquire_many(&requests, cancel) {
                 self.rollback_pre_durable_or_die(txn_id, None);
                 return Err(err);
             }
@@ -525,7 +531,11 @@ impl QueryService {
                 let index_name = constraint_name
                     .clone()
                     .unwrap_or_else(|| format!("{}_pkey", schema.name));
-                if components.catalog.get_index_by_name(&index_name)?.is_some() {
+                if components
+                    .catalog
+                    .get_index_in_schema(schema.schema_id, &index_name)?
+                    .is_some()
+                {
                     return Err(DbError::plan(
                         SqlState::DuplicateTable,
                         format!("index {index_name} already exists"),
@@ -533,7 +543,7 @@ impl QueryService {
                 }
                 let index = IndexSchema {
                     id: catalog_snapshot.next_index_id,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
+                    schema_id: schema.schema_id,
                     storage_id: catalog_snapshot.next_storage_id,
                     table: schema.id,
                     name: index_name,
@@ -725,17 +735,55 @@ impl QueryService {
         })
     }
 
-    fn require_user_table(&self, table: &str) -> Result<TableSchema> {
-        let schema = self
+    fn require_user_table(&self, table: &QualifiedName) -> Result<TableSchema> {
+        let schema_id = match &table.schema {
+            Some(schema) => self
+                .components
+                .catalog
+                .get_schema_by_name(schema)?
+                .map(|schema| schema.id)
+                .ok_or_else(|| {
+                    DbError::plan(
+                        SqlState::InvalidSchemaName,
+                        format!("schema {schema} does not exist"),
+                    )
+                })?,
+            None => common::PUBLIC_SCHEMA_ID,
+        };
+        let schema = match self
             .components
             .catalog
-            .get_table_by_name(table)?
-            .ok_or_else(|| {
-                DbError::plan(
+            .get_table_in_schema(schema_id, &table.name)?
+        {
+            Some(schema) => schema,
+            None if self
+                .components
+                .catalog
+                .get_view_in_schema(schema_id, &table.name)?
+                .is_some()
+                || self
+                    .components
+                    .catalog
+                    .get_index_in_schema(schema_id, &table.name)?
+                    .is_some()
+                || self
+                    .components
+                    .catalog
+                    .get_sequence_in_schema(schema_id, &table.name)?
+                    .is_some() =>
+            {
+                return Err(DbError::plan(
+                    SqlState::WrongObjectType,
+                    format!("relation {table} is not a table"),
+                ));
+            }
+            None => {
+                return Err(DbError::plan(
                     SqlState::UndefinedTable,
                     format!("table {table} does not exist"),
-                )
-            })?;
+                ));
+            }
+        };
         if schema.relation_kind != RelationKind::User {
             return Err(DbError::plan(
                 SqlState::FeatureNotSupported,

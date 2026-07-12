@@ -63,6 +63,25 @@ impl SessionGucs {
         self.lock().get(name).cloned()
     }
 
+    pub fn search_path_names(&self, user: &str) -> Vec<String> {
+        self.get("search_path")
+            .unwrap_or_else(|| "\"$user\", public".to_string())
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let unquoted = entry
+                    .strip_prefix('"')
+                    .and_then(|entry| entry.strip_suffix('"'))
+                    .unwrap_or(entry);
+                let name = if unquoted == "$user" { user } else { unquoted };
+                (!name.is_empty()).then(|| name.to_ascii_lowercase())
+            })
+            .collect()
+    }
+
     pub fn reset(&self, name: &str) {
         let mut settings = self.lock();
         match self.defaults.get(name) {
@@ -740,6 +759,15 @@ mod tests {
 
         gucs.reset("my_app.batch_size");
         assert_eq!(gucs.get("my_app.batch_size"), None);
+    }
+
+    #[test]
+    fn search_path_names_expand_user_and_normalize_entries() {
+        let gucs = SessionGucs::default();
+        assert_eq!(gucs.search_path_names("Alice"), ["alice", "public"]);
+
+        gucs.set("search_path", "app, Reporting".to_string());
+        assert_eq!(gucs.search_path_names("Alice"), ["app", "reporting"]);
     }
 
     #[test]

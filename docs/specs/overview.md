@@ -3,6 +3,12 @@
 **Date:** 2026-07-04
 **Status:** Living system contract
 
+The user catalog is schema-aware. `public` exists by default; `CREATE SCHEMA` and
+restrictive `DROP SCHEMA` are transactional, one- and two-part user relation names
+are supported, and unqualified names follow the session `search_path`. Catalog
+objects remain ID-based after binding, while views persist their definition search
+path by schema id so later session changes cannot retarget them.
+
 ## 1. Overview
 
 SaguaroDB is a SQL-compatible relational database written in Rust. It is a standalone server that accepts client connections over a network, executes SQL queries against a page-oriented storage engine, and returns results over the PostgreSQL wire protocol.

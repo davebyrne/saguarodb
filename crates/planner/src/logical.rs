@@ -1,6 +1,6 @@
 use catalog::SystemView;
 use common::{
-    ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result,
+    ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result, SchemaId,
     SequenceOptions, TableId, ToastOptions, ViewDependency,
 };
 
@@ -12,7 +12,16 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalPlan {
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -52,6 +61,7 @@ pub enum LogicalPlan {
         new_name: String,
     },
     CreateIndex {
+        schema: SchemaId,
         name: String,
         table: String,
         columns: Vec<String>,
@@ -61,23 +71,30 @@ pub enum LogicalPlan {
         index: IndexId,
     },
     CreateSequence {
+        schema: SchemaId,
         name: String,
         options: SequenceOptions,
     },
     DropSequence {
         name: String,
+        search_path: Vec<SchemaId>,
+        sequence: Option<common::SequenceId>,
         if_exists: bool,
     },
     CreateView {
+        schema: SchemaId,
         name: String,
         or_replace: bool,
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
         dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     },
     DropView {
         name: String,
+        search_path: Vec<SchemaId>,
+        view: Option<TableId>,
         if_exists: bool,
     },
     Insert {
@@ -198,7 +215,19 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
 
 fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
     match bound {
+        BoundStatement::CreateSchema {
+            name,
+            if_not_exists,
+        } => Ok(LogicalPlan::CreateSchema {
+            name: name.clone(),
+            if_not_exists: *if_not_exists,
+        }),
+        BoundStatement::DropSchema { name, if_exists } => Ok(LogicalPlan::DropSchema {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         BoundStatement::CreateTable {
+            schema,
             name,
             if_not_exists,
             columns,
@@ -208,6 +237,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             toast,
             checks,
         } => Ok(LogicalPlan::CreateTable {
+            schema: *schema,
             name: name.clone(),
             if_not_exists: *if_not_exists,
             columns: columns.clone(),
@@ -264,42 +294,67 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             new_name: new_name.clone(),
         }),
         BoundStatement::CreateIndex {
+            schema,
             name,
             table,
             columns,
             unique,
         } => Ok(LogicalPlan::CreateIndex {
+            schema: *schema,
             name: name.clone(),
             table: table.clone(),
             columns: columns.clone(),
             unique: *unique,
         }),
         BoundStatement::DropIndex { index } => Ok(LogicalPlan::DropIndex { index: *index }),
-        BoundStatement::CreateSequence { name, options } => Ok(LogicalPlan::CreateSequence {
+        BoundStatement::CreateSequence {
+            schema,
+            name,
+            options,
+        } => Ok(LogicalPlan::CreateSequence {
+            schema: *schema,
             name: name.clone(),
             options: options.clone(),
         }),
-        BoundStatement::DropSequence { name, if_exists } => Ok(LogicalPlan::DropSequence {
+        BoundStatement::DropSequence {
+            name,
+            search_path,
+            sequence,
+            if_exists,
+        } => Ok(LogicalPlan::DropSequence {
             name: name.clone(),
+            search_path: search_path.clone(),
+            sequence: *sequence,
             if_exists: *if_exists,
         }),
         BoundStatement::CreateView {
+            schema,
             name,
             or_replace,
             columns,
             query,
             definition,
             dependencies,
+            definition_search_path,
         } => Ok(LogicalPlan::CreateView {
+            schema: *schema,
             name: name.clone(),
             or_replace: *or_replace,
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
             dependencies: dependencies.clone(),
+            definition_search_path: definition_search_path.clone(),
         }),
-        BoundStatement::DropView { name, if_exists } => Ok(LogicalPlan::DropView {
+        BoundStatement::DropView {
+            name,
+            search_path,
+            view,
+            if_exists,
+        } => Ok(LogicalPlan::DropView {
             name: name.clone(),
+            search_path: search_path.clone(),
+            view: *view,
             if_exists: *if_exists,
         }),
         BoundStatement::Insert {

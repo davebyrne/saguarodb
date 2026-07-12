@@ -101,15 +101,37 @@ pub trait CatalogManager: Send + Sync {
             "catalog does not support schema mutation",
         ))
     }
+    fn create_schema(&self, _name: String) -> Result<NamespaceSchema> {
+        Err(DbError::internal(
+            "catalog does not support schema mutation",
+        ))
+    }
     fn apply_drop_schema(&self, _id: SchemaId) -> Result<()> {
         Err(DbError::internal(
             "catalog does not support schema mutation",
         ))
     }
+    fn drop_schema(&self, id: SchemaId) -> Result<()> {
+        self.apply_drop_schema(id)
+    }
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
+    fn get_table_in_schema(&self, schema: SchemaId, name: &str) -> Result<Option<TableSchema>> {
+        Ok(self
+            .snapshot()?
+            .tables_by_id
+            .into_values()
+            .find(|table| table.schema_id == schema && table.name == name))
+    }
     fn get_table(&self, id: TableId) -> Result<Option<TableSchema>>;
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
     fn get_view_by_name(&self, name: &str) -> Result<Option<ViewSchema>>;
+    fn get_view_in_schema(&self, schema: SchemaId, name: &str) -> Result<Option<ViewSchema>> {
+        Ok(self
+            .snapshot()?
+            .views_by_id
+            .into_values()
+            .find(|view| view.schema_id == schema && view.name == name))
+    }
     fn get_view(&self, id: TableId) -> Result<Option<ViewSchema>>;
     fn list_views(&self) -> Result<Vec<ViewSchema>>;
     fn snapshot(&self) -> Result<CatalogSnapshot>;
@@ -141,6 +163,27 @@ pub trait CatalogManager: Send + Sync {
     }
     fn create_table_with_options(
         &self,
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
+        checks: Vec<String>,
+    ) -> Result<TableSchema> {
+        self.create_table_in_schema_with_options(
+            common::PUBLIC_SCHEMA_ID,
+            name,
+            columns,
+            primary_key,
+            compression,
+            toast,
+            checks,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_table_in_schema_with_options(
+        &self,
+        schema: SchemaId,
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
@@ -245,6 +288,13 @@ pub trait CatalogManager: Send + Sync {
     fn apply_truncate_updates(&self, updates: &[TruncateCatalogUpdate]) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
+    fn get_index_in_schema(&self, schema: SchemaId, name: &str) -> Result<Option<IndexSchema>> {
+        Ok(self
+            .snapshot()?
+            .indexes_by_id
+            .into_values()
+            .find(|index| index.schema_id == schema && index.name == name))
+    }
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
     fn reserve_index_id(&self, id: IndexId) -> Result<()>;
@@ -267,10 +317,45 @@ pub trait CatalogManager: Send + Sync {
         columns: &[String],
         unique: bool,
         constraint: IndexConstraintKind,
+    ) -> Result<IndexSchema> {
+        let table = self.get_table_by_name(table)?.ok_or_else(|| {
+            DbError::plan(
+                common::SqlState::UndefinedTable,
+                format!("table {table} does not exist"),
+            )
+        })?;
+        self.create_index_in_schema_with_constraint(
+            common::PUBLIC_SCHEMA_ID,
+            name,
+            table.id,
+            columns,
+            unique,
+            constraint,
+        )
+    }
+    fn create_index_in_schema_with_constraint(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
+        unique: bool,
+        constraint: IndexConstraintKind,
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
 
     fn get_sequence_by_name(&self, name: &str) -> Result<Option<SequenceSchema>>;
+    fn get_sequence_in_schema(
+        &self,
+        schema: SchemaId,
+        name: &str,
+    ) -> Result<Option<SequenceSchema>> {
+        Ok(self
+            .snapshot()?
+            .sequences_by_id
+            .into_values()
+            .find(|sequence| sequence.schema_id == schema && sequence.name == name))
+    }
     fn get_sequence(&self, id: SequenceId) -> Result<Option<SequenceSchema>>;
     fn list_sequences(&self) -> Result<Vec<SequenceSchema>>;
     fn reserve_sequence_id(&self, id: SequenceId) -> Result<()>;
@@ -278,6 +363,15 @@ pub trait CatalogManager: Send + Sync {
     fn apply_drop_sequence(&self, id: SequenceId) -> Result<()>;
     fn create_sequence(
         &self,
+        name: String,
+        options: SequenceOptions,
+        owned: bool,
+    ) -> Result<SequenceSchema> {
+        self.create_sequence_in_schema(common::PUBLIC_SCHEMA_ID, name, options, owned)
+    }
+    fn create_sequence_in_schema(
+        &self,
+        schema: SchemaId,
         name: String,
         options: SequenceOptions,
         owned: bool,
@@ -293,6 +387,25 @@ pub trait CatalogManager: Send + Sync {
         columns: Vec<ViewColumn>,
         definition: String,
         dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema> {
+        self.create_view_in_schema(
+            common::PUBLIC_SCHEMA_ID,
+            name,
+            columns,
+            definition,
+            dependencies,
+            vec![common::PUBLIC_SCHEMA_ID],
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_view_in_schema(
+        &self,
+        schema: SchemaId,
+        name: String,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema>;
     fn replace_view(
         &self,
@@ -300,6 +413,14 @@ pub trait CatalogManager: Send + Sync {
         columns: Vec<ViewColumn>,
         definition: String,
         dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema>;
+    fn replace_view_with_search_path(
+        &self,
+        id: TableId,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema>;
     fn drop_view(&self, id: TableId) -> Result<()>;
 }
@@ -3845,5 +3966,135 @@ mod tests {
                 .apply_update_table_and_index_schemas(first, &[index])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn schema_scoped_creation_and_lookups_allow_matching_names() {
+        let catalog = MemoryCatalog::empty();
+        let app = catalog.create_schema("app".to_string()).unwrap();
+        let public_table = catalog
+            .create_table(
+                "items".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let app_table = catalog
+            .create_table_in_schema_with_options(
+                app.id,
+                "items".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+                ToastOptions::legacy_catalog_default(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.get_table_by_name("items").unwrap(),
+            Some(public_table)
+        );
+        assert_eq!(
+            catalog.get_table_in_schema(app.id, "items").unwrap(),
+            Some(app_table.clone())
+        );
+
+        let public_sequence = catalog
+            .create_sequence("item_ids".to_string(), SequenceOptions::default(), false)
+            .unwrap();
+        let app_sequence = catalog
+            .create_sequence_in_schema(
+                app.id,
+                "item_ids".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.get_sequence_by_name("item_ids").unwrap(),
+            Some(public_sequence)
+        );
+        assert_eq!(
+            catalog.get_sequence_in_schema(app.id, "item_ids").unwrap(),
+            Some(app_sequence)
+        );
+
+        let app_index = catalog
+            .create_index_in_schema_with_constraint(
+                app.id,
+                "items_id_idx".to_string(),
+                app_table.id,
+                &["id".to_string()],
+                false,
+                IndexConstraintKind::None,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.get_index_in_schema(app.id, "items_id_idx").unwrap(),
+            Some(app_index)
+        );
+        assert!(catalog.get_index_by_name("items_id_idx").unwrap().is_none());
+
+        catalog
+            .create_view_in_schema(
+                app.id,
+                "item_view".to_string(),
+                vec![view_column("id", DataType::Integer, false)],
+                "SELECT id FROM items".to_string(),
+                vec![ViewDependency {
+                    relation: app_table.id,
+                    columns: vec![0],
+                    all_columns: false,
+                }],
+                vec![app.id, common::PUBLIC_SCHEMA_ID],
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .get_view_in_schema(app.id, "item_view")
+                .unwrap()
+                .is_some()
+        );
+        assert!(catalog.get_view_by_name("item_view").unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_schema_restricts_owned_objects_and_view_search_path_dependencies() {
+        let catalog = MemoryCatalog::empty();
+        let app = catalog.create_schema("app".to_string()).unwrap();
+        let table = catalog
+            .create_table_in_schema_with_options(
+                app.id,
+                "items".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+                ToastOptions::legacy_catalog_default(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.drop_schema(app.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        catalog.drop_table(table.id).unwrap();
+
+        let view = catalog
+            .create_view_in_schema(
+                common::PUBLIC_SCHEMA_ID,
+                "uses_app_path".to_string(),
+                vec![view_column("id", DataType::Integer, false)],
+                "SELECT 1 AS id".to_string(),
+                Vec::new(),
+                vec![app.id, common::PUBLIC_SCHEMA_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.drop_schema(app.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        catalog.drop_view(view.id).unwrap();
+        catalog.drop_schema(app.id).unwrap();
     }
 }

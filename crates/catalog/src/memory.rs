@@ -250,6 +250,27 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
+    fn create_schema(&self, name: String) -> Result<NamespaceSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        if snapshot.schemas_by_name.contains_key(&name) {
+            return Err(DbError::plan(
+                SqlState::DuplicateSchema,
+                format!("schema {name} already exists"),
+            ));
+        }
+        let id = snapshot.next_schema_id;
+        validate_user_schema_id(id)?;
+        snapshot.next_schema_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog schema id overflow"))?;
+        let schema = NamespaceSchema { id, name };
+        snapshot
+            .schemas_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.schemas_by_id.insert(schema.id, schema.clone());
+        Ok(schema)
+    }
+
     fn apply_drop_schema(&self, id: SchemaId) -> Result<()> {
         if id == PUBLIC_SCHEMA_ID {
             return Err(DbError::plan(
@@ -482,8 +503,9 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_table_with_options(
+    fn create_table_in_schema_with_options(
         &self,
+        schema_id: SchemaId,
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
@@ -492,7 +514,8 @@ impl CatalogManager for MemoryCatalog {
         checks: Vec<String>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_relation_name(&snapshot, "table", &name)?;
+        require_schema(&snapshot, schema_id, "table", &name)?;
+        reject_duplicate_relation_name_in_schema(&snapshot, schema_id, "table", &name)?;
 
         let table_id = snapshot.next_table_id;
         reject_duplicate_relation_id(&snapshot, table_id)?;
@@ -507,6 +530,7 @@ impl CatalogManager for MemoryCatalog {
             BuildSchemaInput {
                 table_id,
                 storage_id: table_storage_id,
+                schema_id,
                 name,
                 columns,
                 primary_key,
@@ -515,6 +539,7 @@ impl CatalogManager for MemoryCatalog {
                 checks,
             },
         )?;
+        schema.schema_id = schema_id;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
         validate_toast_options(&schema)?;
         let hidden_toast = if needs_toast_relation(&schema) {
@@ -536,9 +561,11 @@ impl CatalogManager for MemoryCatalog {
         };
         reject_index_name_matching_synthetic_primary_key(&snapshot, &schema)?;
 
-        snapshot
-            .tables_by_name
-            .insert(schema.name.clone(), schema.id);
+        if schema_id == PUBLIC_SCHEMA_ID {
+            snapshot
+                .tables_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
         if let Some(hidden_toast) = hidden_toast {
             snapshot.tables_by_id.insert(hidden_toast.id, hidden_toast);
         }
@@ -1221,15 +1248,17 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_index_with_constraint(
+    fn create_index_in_schema_with_constraint(
         &self,
+        schema_id: SchemaId,
         name: String,
-        table: &str,
+        table: TableId,
         columns: &[String],
         unique: bool,
         constraint: IndexConstraintKind,
     ) -> Result<IndexSchema> {
         let mut snapshot = self.write_snapshot()?;
+        require_schema(&snapshot, schema_id, "index", &name)?;
 
         let index_id = snapshot.next_index_id;
         let next_index_id = index_id
@@ -1240,11 +1269,16 @@ impl CatalogManager for MemoryCatalog {
 
         let schema = {
             let table_schema = snapshot
-                .tables_by_name
-                .get(table)
-                .and_then(|id| snapshot.tables_by_id.get(id))
-                .ok_or_else(|| undefined_table(format!("table {table} does not exist")))?;
-            build_index_schema(
+                .tables_by_id
+                .get(&table)
+                .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+            if table_schema.schema_id != schema_id {
+                return Err(DbError::plan(
+                    SqlState::InvalidSchemaName,
+                    "index and table must be in the same schema",
+                ));
+            }
+            let mut schema = build_index_schema(
                 index_id,
                 storage_id,
                 name,
@@ -1252,15 +1286,19 @@ impl CatalogManager for MemoryCatalog {
                 columns,
                 unique,
                 constraint,
-            )?
+            )?;
+            schema.schema_id = schema_id;
+            schema
         };
         validate_index_schema(&schema, &snapshot.tables_by_id)?;
         reject_duplicate_index_name_for_schema(&snapshot, &schema)?;
         reject_duplicate_primary_key_constraint_index(&snapshot, &schema)?;
 
-        snapshot
-            .indexes_by_name
-            .insert(schema.name.clone(), schema.id);
+        if schema_id == PUBLIC_SCHEMA_ID {
+            snapshot
+                .indexes_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
         snapshot.indexes_by_id.insert(schema.id, schema.clone());
         snapshot.next_index_id = next_index_id;
         snapshot.next_storage_id = next_storage_id;
@@ -1345,24 +1383,29 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_sequence(
+    fn create_sequence_in_schema(
         &self,
+        schema_id: SchemaId,
         name: String,
         options: SequenceOptions,
         owned: bool,
     ) -> Result<SequenceSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_sequence_name(&snapshot, &name)?;
+        require_schema(&snapshot, schema_id, "sequence", &name)?;
+        reject_duplicate_relation_name_in_schema(&snapshot, schema_id, "sequence", &name)?;
         let id = snapshot.next_sequence_id;
         reject_duplicate_sequence_id(&snapshot, id)?;
         let next_sequence_id = id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog sequence id overflow"))?;
-        let schema = build_sequence_schema(id, name, options, owned)?;
+        let mut schema = build_sequence_schema(id, name, options, owned)?;
+        schema.schema_id = schema_id;
         validate_sequence_schema(&schema)?;
-        snapshot
-            .sequences_by_name
-            .insert(schema.name.clone(), schema.id);
+        if schema_id == PUBLIC_SCHEMA_ID {
+            snapshot
+                .sequences_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
         snapshot.sequences_by_id.insert(schema.id, schema.clone());
         snapshot.next_sequence_id = next_sequence_id;
         Ok(schema)
@@ -1460,25 +1503,32 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_view(
+    fn create_view_in_schema(
         &self,
+        schema_id: SchemaId,
         name: String,
         columns: Vec<ViewColumn>,
         definition: String,
         dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_relation_name(&snapshot, "view", &name)?;
+        require_schema(&snapshot, schema_id, "view", &name)?;
+        reject_duplicate_relation_name_in_schema(&snapshot, schema_id, "view", &name)?;
         let id = snapshot.next_table_id;
         reject_duplicate_relation_id(&snapshot, id)?;
         let next_table_id = id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog view id overflow"))?;
-        let schema = build_view_schema(id, name, columns, definition, dependencies)?;
+        let mut schema = build_view_schema(id, name, columns, definition, dependencies)?;
+        schema.schema_id = schema_id;
+        schema.definition_search_path = definition_search_path;
         validate_live_view_schema(&schema, &snapshot)?;
-        snapshot
-            .views_by_name
-            .insert(schema.name.clone(), schema.id);
+        if schema_id == PUBLIC_SCHEMA_ID {
+            snapshot
+                .views_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
         snapshot.views_by_id.insert(schema.id, schema.clone());
         snapshot.next_table_id = next_table_id;
         Ok(schema)
@@ -1491,6 +1541,21 @@ impl CatalogManager for MemoryCatalog {
         definition: String,
         dependencies: Vec<ViewDependency>,
     ) -> Result<ViewSchema> {
+        let search_path = self
+            .get_view(id)?
+            .map(|view| view.definition_search_path)
+            .ok_or_else(|| undefined_view(format!("view id {id} does not exist")))?;
+        self.replace_view_with_search_path(id, columns, definition, dependencies, search_path)
+    }
+
+    fn replace_view_with_search_path(
+        &self,
+        id: TableId,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+        definition_search_path: Vec<SchemaId>,
+    ) -> Result<ViewSchema> {
         let mut snapshot = self.write_snapshot()?;
         let old = snapshot
             .views_by_id
@@ -1498,6 +1563,8 @@ impl CatalogManager for MemoryCatalog {
             .cloned()
             .ok_or_else(|| undefined_view(format!("view id {id} does not exist")))?;
         let mut schema = build_view_schema(id, old.name, columns, definition, dependencies)?;
+        schema.schema_id = old.schema_id;
+        schema.definition_search_path = definition_search_path;
         schema.schema_version = old.schema_version;
         bump_schema_version(&mut schema.schema_version)?;
         validate_live_view_schema(&schema, &snapshot)?;
@@ -1996,6 +2063,7 @@ fn validate_truncate_storage_ids_available(
 struct BuildSchemaInput {
     table_id: TableId,
     storage_id: FileId,
+    schema_id: SchemaId,
     name: String,
     columns: Vec<ParsedColumnDef>,
     primary_key: Vec<String>,
@@ -2008,6 +2076,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
     let BuildSchemaInput {
         table_id,
         storage_id,
+        schema_id,
         name,
         columns,
         primary_key,
@@ -2032,7 +2101,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
             .try_into()
             .map_err(|_| DbError::internal("catalog column id overflow"))?;
         column_ids_by_name.insert(column.name.clone(), column_id);
-        let default = convert_column_default(snapshot, column.default)?;
+        let default = convert_column_default(snapshot, schema_id, column.default)?;
         if matches!(default, Some(ColumnDefault::Nextval(_)))
             && column.data_type != DataType::Integer
         {
@@ -2082,7 +2151,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
 
     Ok(TableSchema {
         id: table_id,
-        schema_id: common::PUBLIC_SCHEMA_ID,
+        schema_id,
         storage_id,
         name,
         columns: assigned_columns,
@@ -2099,6 +2168,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
 
 fn convert_column_default(
     snapshot: &CatalogSnapshot,
+    schema_id: SchemaId,
     default: Option<ParsedDefault>,
 ) -> Result<Option<ColumnDefault>> {
     match default {
@@ -2106,8 +2176,12 @@ fn convert_column_default(
         Some(ParsedDefault::Serial) => Err(DbError::internal(
             "unresolved SERIAL default reached catalog create_table",
         )),
-        Some(ParsedDefault::Nextval(name)) => resolve_sequence_default(snapshot, name, false),
-        Some(ParsedDefault::OwnedNextval(name)) => resolve_sequence_default(snapshot, name, true),
+        Some(ParsedDefault::Nextval(name)) => {
+            resolve_sequence_default(snapshot, schema_id, name, false)
+        }
+        Some(ParsedDefault::OwnedNextval(name)) => {
+            resolve_sequence_default(snapshot, schema_id, name, true)
+        }
         // A non-constant expression default is stored as canonical SQL text; the
         // binder validated it against the column at CREATE TABLE time.
         Some(ParsedDefault::Expr(text)) => Ok(Some(ColumnDefault::Expr(text))),
@@ -2150,7 +2224,7 @@ fn validate_add_table_column(
         .len()
         .try_into()
         .map_err(|_| DbError::internal("catalog column id overflow"))?;
-    let default = convert_column_default(snapshot, column.default.clone())?;
+    let default = convert_column_default(snapshot, schema.schema_id, column.default.clone())?;
     if matches!(default, Some(ColumnDefault::Nextval(_))) && column.data_type != DataType::Integer {
         return Err(DbError::plan(
             SqlState::DatatypeMismatch,
@@ -2294,16 +2368,22 @@ fn build_view_schema(
 
 fn resolve_sequence_default(
     snapshot: &CatalogSnapshot,
+    schema_id: SchemaId,
     name: String,
     allow_owned: bool,
 ) -> Result<Option<ColumnDefault>> {
-    let id = snapshot.sequences_by_name.get(&name).ok_or_else(|| {
-        DbError::plan(
-            SqlState::UndefinedTable,
-            format!("sequence {name} does not exist"),
-        )
-    })?;
-    let sequence = snapshot.sequences_by_id.get(id).ok_or_else(|| {
+    let id = snapshot
+        .sequences_by_id
+        .values()
+        .find(|sequence| sequence.schema_id == schema_id && sequence.name == name)
+        .map(|sequence| sequence.id)
+        .ok_or_else(|| {
+            DbError::plan(
+                SqlState::UndefinedTable,
+                format!("sequence {name} does not exist"),
+            )
+        })?;
+    let sequence = snapshot.sequences_by_id.get(&id).ok_or_else(|| {
         DbError::internal(format!(
             "catalog sequence name {name} points to missing sequence id {id}",
         ))
@@ -2319,7 +2399,7 @@ fn resolve_sequence_default(
             "SERIAL default {name} resolved to a non-owned sequence"
         )));
     }
-    Ok(Some(ColumnDefault::Nextval(*id)))
+    Ok(Some(ColumnDefault::Nextval(id)))
 }
 
 fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) -> Result<()> {
@@ -2410,6 +2490,7 @@ pub fn validate_create_table_definition(
         BuildSchemaInput {
             table_id: 0,
             storage_id: 1,
+            schema_id: PUBLIC_SCHEMA_ID,
             name: name.to_string(),
             columns: columns_for_shape,
             primary_key: primary_key.to_vec(),
@@ -3922,10 +4003,6 @@ fn reject_duplicate_relation_id(snapshot: &CatalogSnapshot, id: TableId) -> Resu
     Ok(())
 }
 
-fn reject_duplicate_sequence_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
-    reject_duplicate_relation_name(snapshot, "sequence", name)
-}
-
 fn reject_duplicate_sequence_id(snapshot: &CatalogSnapshot, id: SequenceId) -> Result<()> {
     if snapshot.sequences_by_id.contains_key(&id) {
         return Err(DbError::plan(
@@ -4017,10 +4094,10 @@ fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {
         .map(|(id, _)| *id)
         .collect();
     for id in dropped {
-        if let Some(schema) = snapshot.indexes_by_id.remove(&id) {
-            if schema.schema_id == PUBLIC_SCHEMA_ID {
-                snapshot.indexes_by_name.remove(&schema.name);
-            }
+        if let Some(schema) = snapshot.indexes_by_id.remove(&id)
+            && schema.schema_id == PUBLIC_SCHEMA_ID
+        {
+            snapshot.indexes_by_name.remove(&schema.name);
         }
     }
 }

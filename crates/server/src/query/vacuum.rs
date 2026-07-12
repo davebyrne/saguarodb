@@ -1,7 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLockReadGuard};
 
-use common::{DbError, QueryCancel, RelationKind, Result, SqlState, StatementContext, TableSchema};
+use common::{
+    DbError, QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext,
+    TableSchema,
+};
 use executor::ExecutionResult;
 use parser::Statement;
 use storage::StorageEngine;
@@ -12,20 +15,82 @@ use crate::app::ServerComponents;
 use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
 
 impl QueryService {
+    pub(super) fn qualify_maintenance_statement(
+        &self,
+        mut statement: Statement,
+        catalog: &dyn catalog::CatalogManager,
+        search_path_names: &[String],
+    ) -> Result<Statement> {
+        let qualify = |name: &mut QualifiedName| -> Result<()> {
+            if name.schema.is_some() {
+                return Ok(());
+            }
+            for schema_name in search_path_names {
+                let Some(schema) = catalog.get_schema_by_name(schema_name)? else {
+                    continue;
+                };
+                if catalog
+                    .get_table_in_schema(schema.id, &name.name)?
+                    .is_some()
+                    || catalog.get_view_in_schema(schema.id, &name.name)?.is_some()
+                    || catalog
+                        .get_index_in_schema(schema.id, &name.name)?
+                        .is_some()
+                    || catalog
+                        .get_sequence_in_schema(schema.id, &name.name)?
+                        .is_some()
+                {
+                    name.schema = Some(schema.name);
+                    break;
+                }
+            }
+            Ok(())
+        };
+        match &mut statement {
+            Statement::Vacuum { table: Some(table) }
+            | Statement::AlterTableSetCompression { table, .. }
+            | Statement::AlterTableSetOptions { table, .. }
+            | Statement::AlterTableAddPrimaryKey { table, .. }
+            | Statement::AlterTableDropPrimaryKey { table, .. } => qualify(table)?,
+            Statement::Truncate { tables } => {
+                for table in tables {
+                    qualify(table)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(statement)
+    }
+
     /// Run a prepared (extended-protocol) maintenance command. The statement
-    /// carries no bound payload — it is the raw maintenance `Statement` parsed at
-    /// `prepare_sql` time. `statistics_target` is the session's
-    /// `default_statistics_target`, consumed only by ANALYZE.
+    /// carries no bound payload; unqualified targets were resolved against the
+    /// effective search path at extended-protocol Parse time.
     pub(super) fn run_prepared_maintenance(
         &self,
         prepared: &PreparedStatement,
-        cancel: &Arc<QueryCancel>,
-        statistics_target: u32,
+        session: &super::QuerySessionContext,
     ) -> Result<ExecutionResult> {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
             DbError::internal("maintenance prepared statement has no carried payload")
         })?;
-        self.run_maintenance(statement.clone(), cancel, statistics_target)
+        let mut identity_guard = self.components.lock_manager.statement_owner();
+        let mut identity_requests = Vec::new();
+        for name in maintenance_target_names(statement) {
+            let Some(schema_name) = name.schema.as_deref() else {
+                continue;
+            };
+            let Some(schema) = self.components.catalog.get_schema_by_name(schema_name)? else {
+                continue;
+            };
+            identity_requests.push(ObjectLockRequest::schema(
+                schema.id,
+                crate::lock_manager::CatalogLockMode::Access,
+            ));
+            identity_requests.push(ObjectLockRequest::catalog_name(schema.id, &name.name));
+        }
+        identity_guard.acquire_many(&identity_requests, session.cancel())?;
+        self.validate_prepared_schema_versions(&prepared.schema_versions)?;
+        self.run_maintenance(statement.clone(), session.cancel())
     }
 
     /// Shared entry point for every maintenance command: dispatches to the
@@ -113,7 +178,7 @@ impl QueryService {
                 .catalog_publication_gate
                 .read()
                 .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-            resolve_vacuum_tables(components, table.as_deref())?
+            resolve_vacuum_tables(components, table.as_ref())?
         };
         let txn_id = components
             .active_txns
@@ -147,7 +212,7 @@ impl QueryService {
                 self.rollback_pre_durable_or_die(txn_id, None);
                 return Err(err);
             }
-            let revalidated = match revalidate_vacuum_targets(components, table.as_deref()) {
+            let revalidated = match revalidate_vacuum_targets(components, table.as_ref()) {
                 Ok(state) => state,
                 Err(err) => {
                     self.rollback_pre_durable_or_die(txn_id, None);
@@ -211,6 +276,18 @@ impl QueryService {
     }
 }
 
+fn maintenance_target_names(statement: &Statement) -> Vec<&QualifiedName> {
+    match statement {
+        Statement::Vacuum { table: Some(table) }
+        | Statement::AlterTableSetCompression { table, .. }
+        | Statement::AlterTableSetOptions { table, .. }
+        | Statement::AlterTableAddPrimaryKey { table, .. }
+        | Statement::AlterTableDropPrimaryKey { table, .. } => vec![table],
+        Statement::Truncate { tables } => tables.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
 struct RevalidatedVacuum<'a> {
     catalog_read: RwLockReadGuard<'a, ()>,
     tables: Vec<TableSchema>,
@@ -220,7 +297,7 @@ struct RevalidatedVacuum<'a> {
 
 fn revalidate_vacuum_targets<'a>(
     components: &'a ServerComponents,
-    table: Option<&str>,
+    table: Option<&QualifiedName>,
 ) -> Result<RevalidatedVacuum<'a>> {
     let catalog_read = components
         .catalog_publication_gate
@@ -244,19 +321,49 @@ fn revalidate_vacuum_targets<'a>(
 
 fn resolve_vacuum_tables(
     components: &ServerComponents,
-    table: Option<&str>,
+    table: Option<&QualifiedName>,
 ) -> Result<Vec<TableSchema>> {
     match table {
-        Some(name) => components
-            .catalog
-            .get_table_by_name(name)?
-            .map(|schema| vec![schema])
-            .ok_or_else(|| {
-                DbError::plan(
+        Some(name) => {
+            let schema = match &name.schema {
+                Some(schema) => components
+                    .catalog
+                    .get_schema_by_name(schema)?
+                    .map(|schema| schema.id)
+                    .ok_or_else(|| {
+                        DbError::plan(
+                            SqlState::InvalidSchemaName,
+                            format!("schema {schema} does not exist"),
+                        )
+                    })?,
+                None => common::PUBLIC_SCHEMA_ID,
+            };
+            match components.catalog.get_table_in_schema(schema, &name.name)? {
+                Some(table) => Ok(vec![table]),
+                None if components
+                    .catalog
+                    .get_view_in_schema(schema, &name.name)?
+                    .is_some()
+                    || components
+                        .catalog
+                        .get_index_in_schema(schema, &name.name)?
+                        .is_some()
+                    || components
+                        .catalog
+                        .get_sequence_in_schema(schema, &name.name)?
+                        .is_some() =>
+                {
+                    Err(DbError::plan(
+                        SqlState::WrongObjectType,
+                        format!("relation {name} is not a table"),
+                    ))
+                }
+                None => Err(DbError::plan(
                     SqlState::UndefinedTable,
                     format!("table {name} does not exist"),
-                )
-            }),
+                )),
+            }
+        }
         None => {
             let mut tables = components
                 .catalog

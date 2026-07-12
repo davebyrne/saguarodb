@@ -6,11 +6,13 @@ use catalog::{CatalogManager, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault,
-    QueryCancel, Result, Row, SequenceOptions, SequenceSchema, SqlState, StatementContext,
-    StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, Value, ViewColumn,
+    QueryCancel, Result, Row, SchemaId, SequenceOptions, SequenceSchema, SqlState,
+    StatementContext, StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, Value,
+    ViewColumn,
 };
 use planner::{
-    BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, PhysicalPlan, bind_default_expr,
+    BindOptions, BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, PhysicalPlan,
+    bind_default_expr_with_options,
 };
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
@@ -266,7 +268,15 @@ impl QueryEngine {
         let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
         let plan = &resolved;
         match plan {
+            PhysicalPlan::CreateSchema {
+                name,
+                if_not_exists,
+            } => execute_create_schema(ctx, name, *if_not_exists),
+            PhysicalPlan::DropSchema { name, if_exists } => {
+                execute_drop_schema(ctx, name, *if_exists)
+            }
             PhysicalPlan::CreateTable {
+                schema,
                 name,
                 if_not_exists,
                 columns,
@@ -277,6 +287,7 @@ impl QueryEngine {
                 checks,
             } => execute_create_table(
                 ctx,
+                *schema,
                 name,
                 *if_not_exists,
                 columns,
@@ -313,35 +324,50 @@ impl QueryEngine {
                 new_name,
             } => execute_alter_table_rename_table(ctx, *table, new_name),
             PhysicalPlan::CreateView {
+                schema,
                 name,
                 or_replace,
                 columns,
                 query,
                 definition,
                 dependencies,
+                definition_search_path,
             } => execute_create_view(
                 ctx,
+                *schema,
                 name,
                 *or_replace,
                 columns,
                 query,
                 definition,
                 dependencies,
+                definition_search_path,
             ),
-            PhysicalPlan::DropView { name, if_exists } => execute_drop_view(ctx, name, *if_exists),
+            PhysicalPlan::DropView {
+                name,
+                search_path,
+                view,
+                if_exists,
+            } => execute_drop_view(ctx, name, search_path, *view, *if_exists),
             PhysicalPlan::CreateIndex {
+                schema,
                 name,
                 table,
                 columns,
                 unique,
-            } => execute_create_index(ctx, name, table, columns, *unique),
+            } => execute_create_index(ctx, *schema, name, table, columns, *unique),
             PhysicalPlan::DropIndex { index } => execute_drop_index(ctx, *index),
-            PhysicalPlan::CreateSequence { name, options } => {
-                execute_create_sequence(ctx, name, options)
-            }
-            PhysicalPlan::DropSequence { name, if_exists } => {
-                execute_drop_sequence(ctx, name, *if_exists)
-            }
+            PhysicalPlan::CreateSequence {
+                schema,
+                name,
+                options,
+            } => execute_create_sequence(ctx, *schema, name, options),
+            PhysicalPlan::DropSequence {
+                name,
+                search_path,
+                sequence,
+                if_exists,
+            } => execute_drop_sequence(ctx, name, search_path, *sequence, *if_exists),
             PhysicalPlan::Insert {
                 table,
                 columns,
@@ -656,7 +682,9 @@ pub(crate) fn build_executor<'a>(
             build_executor(ctx, left)?,
             build_executor(ctx, right)?,
         ))),
-        PhysicalPlan::CreateTable { .. }
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::AlterTableAddColumn { .. }
         | PhysicalPlan::AlterTableDropColumn { .. }
@@ -1351,9 +1379,63 @@ fn execute_delete(
     close_after(executor.as_mut(), result)
 }
 
+fn execute_create_schema(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    if_not_exists: bool,
+) -> Result<ExecutionResult> {
+    if ctx.catalog.get_schema_by_name(name)?.is_some() {
+        if if_not_exists {
+            return Ok(ExecutionResult::Modified {
+                command: "CREATE SCHEMA".to_string(),
+                count: 0,
+            });
+        }
+        return Err(DbError::plan(
+            SqlState::DuplicateSchema,
+            format!("schema {name} already exists"),
+        ));
+    }
+    let schema = ctx.catalog.create_schema(name.to_string())?;
+    if let Err(err) = ctx.schema_ops.create_schema(&ctx.statement, &schema) {
+        let _ = ctx.catalog.apply_drop_schema(schema.id);
+        return Err(err);
+    }
+    Ok(ExecutionResult::Modified {
+        command: "CREATE SCHEMA".to_string(),
+        count: 0,
+    })
+}
+
+fn execute_drop_schema(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecutionResult> {
+    let Some(schema) = ctx.catalog.get_schema_by_name(name)? else {
+        if if_exists {
+            return Ok(ExecutionResult::Modified {
+                command: "DROP SCHEMA".to_string(),
+                count: 0,
+            });
+        }
+        return Err(DbError::plan(
+            SqlState::InvalidSchemaName,
+            format!("schema {name} does not exist"),
+        ));
+    };
+    ctx.schema_ops.drop_schema(&ctx.statement, schema.id)?;
+    ctx.catalog.drop_schema(schema.id)?;
+    Ok(ExecutionResult::Modified {
+        command: "DROP SCHEMA".to_string(),
+        count: 0,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_create_table(
     ctx: &ExecutionContext<'_>,
+    namespace: SchemaId,
     name: &str,
     if_not_exists: bool,
     columns: &[ParsedColumnDef],
@@ -1365,13 +1447,13 @@ fn execute_create_table(
 ) -> Result<ExecutionResult> {
     if if_not_exists {
         catalog::validate_create_table_definition(name, columns, primary_key, unique)?;
-        if ctx.catalog.get_table_by_name(name)?.is_some() {
+        if ctx.catalog.get_table_in_schema(namespace, name)?.is_some() {
             return Ok(ExecutionResult::Modified {
                 command: "CREATE TABLE".to_string(),
                 count: 0,
             });
         }
-        if ctx.catalog.get_view_by_name(name)?.is_some() {
+        if ctx.catalog.get_view_in_schema(namespace, name)?.is_some() {
             return Err(DbError::plan(
                 SqlState::DuplicateTable,
                 format!("relation {name} already exists"),
@@ -1379,10 +1461,10 @@ fn execute_create_table(
         }
     }
 
-    let serial = resolve_serial_columns(ctx.catalog.as_ref(), name, columns)?;
+    let serial = resolve_serial_columns(ctx.catalog.as_ref(), namespace, name, columns)?;
     let mut created_sequences = Vec::new();
     for serial_column in &serial {
-        match create_owned_serial_sequence(ctx, &serial_column.sequence) {
+        match create_owned_serial_sequence(ctx, namespace, &serial_column.sequence) {
             Ok(sequence) => created_sequences.push(sequence),
             Err(err) => {
                 cleanup_serial_sequences(ctx, &created_sequences);
@@ -1392,7 +1474,8 @@ fn execute_create_table(
     }
 
     let columns = columns_with_serial_defaults(columns, &serial)?;
-    let schema = match ctx.catalog.create_table_with_options(
+    let schema = match ctx.catalog.create_table_in_schema_with_options(
+        namespace,
         name.to_string(),
         columns,
         primary_key.to_vec(),
@@ -1464,6 +1547,7 @@ struct ResolvedSerialColumn {
 /// owned-sequence name for each. No parallel list is threaded through the plan.
 fn resolve_serial_columns(
     catalog: &dyn CatalogManager,
+    schema: SchemaId,
     table: &str,
     columns: &[ParsedColumnDef],
 ) -> Result<Vec<ResolvedSerialColumn>> {
@@ -1473,7 +1557,8 @@ fn resolve_serial_columns(
         if !matches!(column.default, Some(ParsedDefault::Serial)) {
             continue;
         }
-        let sequence = choose_serial_sequence_name(catalog, &mut generated, table, &column.name)?;
+        let sequence =
+            choose_serial_sequence_name(catalog, schema, &mut generated, table, &column.name)?;
         resolved.push(ResolvedSerialColumn { index, sequence });
     }
     Ok(resolved)
@@ -1481,6 +1566,7 @@ fn resolve_serial_columns(
 
 fn choose_serial_sequence_name(
     catalog: &dyn CatalogManager,
+    schema: SchemaId,
     generated: &mut HashSet<String>,
     table: &str,
     column: &str,
@@ -1493,7 +1579,11 @@ fn choose_serial_sequence_name(
         } else {
             format!("{base}{suffix}")
         };
-        if !generated.contains(&candidate) && catalog.get_sequence_by_name(&candidate)?.is_none() {
+        if !generated.contains(&candidate)
+            && catalog
+                .get_sequence_in_schema(schema, &candidate)?
+                .is_none()
+        {
             generated.insert(candidate.clone());
             return Ok(candidate);
         }
@@ -1503,10 +1593,17 @@ fn choose_serial_sequence_name(
     }
 }
 
-fn create_owned_serial_sequence(ctx: &ExecutionContext<'_>, name: &str) -> Result<SequenceSchema> {
-    let sequence =
-        ctx.catalog
-            .create_sequence(name.to_string(), SequenceOptions::default(), true)?;
+fn create_owned_serial_sequence(
+    ctx: &ExecutionContext<'_>,
+    schema: SchemaId,
+    name: &str,
+) -> Result<SequenceSchema> {
+    let sequence = ctx.catalog.create_sequence_in_schema(
+        schema,
+        name.to_string(),
+        SequenceOptions::default(),
+        true,
+    )?;
     if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &sequence) {
         let _ = ctx.catalog.apply_drop_sequence(sequence.id);
         return Err(err);
@@ -1558,9 +1655,10 @@ fn create_unique_constraint_index(
     columns: &[String],
 ) -> Result<()> {
     let name = format!("{}_{}_key", schema.name, columns.join("_"));
-    let index = ctx.catalog.create_index_with_constraint(
+    let index = ctx.catalog.create_index_in_schema_with_constraint(
+        schema.schema_id,
         name,
-        &schema.name,
+        schema.id,
         columns,
         true,
         IndexConstraintKind::Unique,
@@ -1581,9 +1679,10 @@ fn create_primary_key_constraint_index(
     columns: &[String],
 ) -> Result<()> {
     let name = format!("{}_pkey", schema.name);
-    let index = ctx.catalog.create_index_with_constraint(
+    let index = ctx.catalog.create_index_in_schema_with_constraint(
+        schema.schema_id,
         name,
-        &schema.name,
+        schema.id,
         columns,
         true,
         IndexConstraintKind::PrimaryKey,
@@ -1607,16 +1706,30 @@ fn execute_drop_tables(
     for target in targets {
         let table = match target.table {
             Some(table) => table,
-            None if if_exists => match ctx.catalog.get_table_by_name(&target.name)? {
-                Some(table) => table.id,
-                None if ctx.catalog.get_view_by_name(&target.name)?.is_some() => {
-                    return Err(DbError::plan(
-                        SqlState::WrongObjectType,
-                        format!("relation {} is a view, not a table", target.name),
-                    ));
+            None if if_exists => {
+                let mut found = None;
+                for namespace in &target.search_path {
+                    if let Some(table) = ctx
+                        .catalog
+                        .get_table_in_schema(*namespace, &target.name.name)?
+                    {
+                        found = Some(table.id);
+                        break;
+                    }
+                    if ctx
+                        .catalog
+                        .get_view_in_schema(*namespace, &target.name.name)?
+                        .is_some()
+                    {
+                        return Err(DbError::plan(
+                            SqlState::WrongObjectType,
+                            format!("relation {} is a view, not a table", target.name),
+                        ));
+                    }
                 }
-                None => continue,
-            },
+                let Some(table) = found else { continue };
+                table
+            }
             None => {
                 return Err(DbError::plan(
                     SqlState::UndefinedTable,
@@ -1685,7 +1798,7 @@ fn execute_alter_table_add_column(
         .columns
         .last()
         .ok_or_else(|| DbError::internal("ALTER TABLE ADD COLUMN produced no column"))?;
-    let default_exprs = expression_default_for_column(ctx, added_column)?;
+    let default_exprs = expression_default_for_column(ctx, schema.schema_id, added_column)?;
     ctx.schema_ops
         .update_table_schema(&ctx.statement, &schema, &indexes)?;
     let rewrite_relations = ctx.storage.capture_relation_snapshot()?;
@@ -1818,23 +1931,27 @@ fn alter_table_result() -> ExecutionResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_create_view(
     ctx: &ExecutionContext<'_>,
+    namespace: SchemaId,
     name: &str,
     or_replace: bool,
     columns: &[String],
     query: &planner::BoundQuery,
     definition: &str,
     dependencies: &[common::ViewDependency],
+    definition_search_path: &[SchemaId],
 ) -> Result<ExecutionResult> {
     let output = create_view_output_columns(columns, query);
-    let schema = match ctx.catalog.get_view_by_name(name)? {
+    let schema = match ctx.catalog.get_view_in_schema(namespace, name)? {
         Some(existing) if or_replace => {
-            let replaced = ctx.catalog.replace_view(
+            let replaced = ctx.catalog.replace_view_with_search_path(
                 existing.id,
                 output,
                 definition.to_string(),
                 dependencies.to_vec(),
+                definition_search_path.to_vec(),
             )?;
             if let Err(err) = ctx.schema_ops.replace_view(&ctx.statement, &replaced) {
                 let _ = ctx.catalog.apply_replace_view(existing);
@@ -1849,11 +1966,13 @@ fn execute_create_view(
             ));
         }
         None => {
-            let schema = ctx.catalog.create_view(
+            let schema = ctx.catalog.create_view_in_schema(
+                namespace,
                 name.to_string(),
                 output,
                 definition.to_string(),
                 dependencies.to_vec(),
+                definition_search_path.to_vec(),
             )?;
             if let Err(err) = ctx.schema_ops.create_view(&ctx.statement, &schema) {
                 let _ = ctx.catalog.apply_drop_view(schema.id);
@@ -1890,28 +2009,39 @@ fn create_view_output_columns(columns: &[String], query: &planner::BoundQuery) -
 fn execute_drop_view(
     ctx: &ExecutionContext<'_>,
     name: &str,
+    search_path: &[SchemaId],
+    bound_view: Option<TableId>,
     if_exists: bool,
 ) -> Result<ExecutionResult> {
-    let view = match ctx.catalog.get_view_by_name(name)? {
-        Some(view) => view,
-        None if ctx.catalog.get_table_by_name(name)?.is_some() => {
-            return Err(DbError::plan(
-                SqlState::WrongObjectType,
-                format!("relation {name} is a table, not a view"),
-            ));
+    let mut view = bound_view
+        .map(|view| ctx.catalog.get_view(view))
+        .transpose()?
+        .flatten();
+    if view.is_none() {
+        for namespace in search_path {
+            if let Some(found) = ctx.catalog.get_view_in_schema(*namespace, name)? {
+                view = Some(found);
+                break;
+            }
+            if ctx.catalog.get_table_in_schema(*namespace, name)?.is_some() {
+                return Err(DbError::plan(
+                    SqlState::WrongObjectType,
+                    format!("relation {name} is a table, not a view"),
+                ));
+            }
         }
-        None if if_exists => {
+    }
+    let Some(view) = view else {
+        if if_exists {
             return Ok(ExecutionResult::Modified {
                 command: "DROP VIEW".to_string(),
                 count: 0,
             });
         }
-        None => {
-            return Err(DbError::plan(
-                SqlState::UndefinedTable,
-                format!("view {name} does not exist"),
-            ));
-        }
+        return Err(DbError::plan(
+            SqlState::UndefinedTable,
+            format!("view {name} does not exist"),
+        ));
     };
     ctx.schema_ops.drop_view(&ctx.statement, view.id)?;
     ctx.catalog.drop_view(view.id)?;
@@ -1923,12 +2053,19 @@ fn execute_drop_view(
 
 fn expression_default_for_column(
     ctx: &ExecutionContext<'_>,
+    schema: SchemaId,
     column: &common::ColumnDef,
 ) -> Result<Vec<(ColumnId, BoundExpr)>> {
     match &column.default {
         Some(ColumnDefault::Expr(text)) => Ok(vec![(
             column.id,
-            bind_default_expr(ctx.catalog.as_ref(), text)?,
+            bind_default_expr_with_options(
+                ctx.catalog.as_ref(),
+                text,
+                &BindOptions {
+                    search_path: vec![schema],
+                },
+            )?,
         )]),
         _ => Ok(Vec::new()),
     }
@@ -1958,6 +2095,7 @@ fn owned_sequences_for_table(
 
 fn execute_create_index(
     ctx: &ExecutionContext<'_>,
+    namespace: SchemaId,
     name: &str,
     table: &str,
     columns: &[String],
@@ -1965,7 +2103,21 @@ fn execute_create_index(
 ) -> Result<ExecutionResult> {
     let schema = ctx
         .catalog
-        .create_index(name.to_string(), table, columns, unique)?;
+        .get_table_in_schema(namespace, table)?
+        .ok_or_else(|| {
+            DbError::plan(
+                SqlState::UndefinedTable,
+                format!("table {table} does not exist"),
+            )
+        })?;
+    let schema = ctx.catalog.create_index_in_schema_with_constraint(
+        namespace,
+        name.to_string(),
+        schema.id,
+        columns,
+        unique,
+        IndexConstraintKind::None,
+    )?;
     if let Err(err) = ctx
         .schema_ops
         .create_index(&ctx.statement, &schema, ctx.gc_horizon)
@@ -2000,12 +2152,16 @@ fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<Exec
 
 fn execute_create_sequence(
     ctx: &ExecutionContext<'_>,
+    namespace: SchemaId,
     name: &str,
     options: &common::SequenceOptions,
 ) -> Result<ExecutionResult> {
-    let schema = ctx
-        .catalog
-        .create_sequence(name.to_string(), options.clone(), false)?;
+    let schema = ctx.catalog.create_sequence_in_schema(
+        namespace,
+        name.to_string(),
+        options.clone(),
+        false,
+    )?;
     if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &schema) {
         let _ = ctx.catalog.drop_sequence(schema.id);
         return Err(err);
@@ -2019,9 +2175,22 @@ fn execute_create_sequence(
 fn execute_drop_sequence(
     ctx: &ExecutionContext<'_>,
     name: &str,
+    search_path: &[SchemaId],
+    bound_sequence: Option<common::SequenceId>,
     if_exists: bool,
 ) -> Result<ExecutionResult> {
-    let sequence = ctx.catalog.get_sequence_by_name(name)?;
+    let mut sequence = bound_sequence
+        .map(|sequence| ctx.catalog.get_sequence(sequence))
+        .transpose()?
+        .flatten();
+    if sequence.is_none() {
+        for namespace in search_path {
+            if let Some(found) = ctx.catalog.get_sequence_in_schema(*namespace, name)? {
+                sequence = Some(found);
+                break;
+            }
+        }
+    }
     let Some(sequence) = sequence else {
         if if_exists {
             return Ok(ExecutionResult::Modified {

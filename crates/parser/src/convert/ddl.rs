@@ -9,7 +9,7 @@ use crate::{Expr, Statement, UnaryOp};
 use super::{
     column_char_length, compression_from_str, convert_expr, convert_pg_type, convert_query,
     feature_not_supported, ident_name, object_name, parse_error, reject_duplicate_relation_names,
-    serial_pg_type, unsupported,
+    serial_pg_type, simple_object_name, unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -127,7 +127,7 @@ pub(super) fn convert_alter_table(
         sql::AlterTableOperation::RenameTable { table_name } => {
             Ok(Statement::AlterTableRenameTable {
                 table,
-                new_name: object_name(&table_name)?,
+                new_name: simple_object_name(&table_name)?,
             })
         }
         _ => unsupported("unsupported ALTER TABLE operation"),

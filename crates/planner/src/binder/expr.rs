@@ -843,7 +843,51 @@ fn resolve_sequence_name(
             format!("{function} requires a string literal sequence name"),
         ));
     };
-    let sequence = ctx.catalog.get_sequence_by_name(name)?.ok_or_else(|| {
+    let (schema, relation) = match name.split_once('.') {
+        Some((schema, relation)) if !schema.is_empty() && !relation.is_empty() => {
+            (Some(schema), relation)
+        }
+        None => (None, name.as_str()),
+        _ => {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                format!("invalid sequence name {name}"),
+            ));
+        }
+    };
+    let mut sequence = None;
+    if let Some(schema) = schema {
+        let namespace = ctx.catalog.get_schema_by_name(schema)?.ok_or_else(|| {
+            plan_error(
+                SqlState::InvalidSchemaName,
+                format!("schema {schema} does not exist"),
+            )
+        })?;
+        sequence = ctx.catalog.get_sequence_in_schema(namespace.id, relation)?;
+    } else {
+        for schema in &ctx.search_path {
+            if let Some(found) = ctx.catalog.get_sequence_in_schema(*schema, relation)? {
+                sequence = Some(found);
+                break;
+            }
+            if ctx
+                .catalog
+                .get_table_in_schema(*schema, relation)?
+                .is_some()
+                || ctx.catalog.get_view_in_schema(*schema, relation)?.is_some()
+                || ctx
+                    .catalog
+                    .get_index_in_schema(*schema, relation)?
+                    .is_some()
+            {
+                return Err(plan_error(
+                    SqlState::WrongObjectType,
+                    format!("relation {name} is not a sequence"),
+                ));
+            }
+        }
+    }
+    let sequence = sequence.ok_or_else(|| {
         plan_error(
             SqlState::UndefinedTable,
             format!("sequence {name} does not exist"),

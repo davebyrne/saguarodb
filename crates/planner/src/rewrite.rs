@@ -23,7 +23,9 @@ pub fn rewrite_plan_exprs(
     f: &mut impl FnMut(&BoundExpr) -> Result<Option<BoundExpr>>,
 ) -> Result<PhysicalPlan> {
     Ok(match plan {
-        PhysicalPlan::CreateTable { .. }
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::AlterTableAddColumn { .. }
         | PhysicalPlan::AlterTableDropColumn { .. }
