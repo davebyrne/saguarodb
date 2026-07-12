@@ -4,7 +4,9 @@ use sqlparser::ast as sql;
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
 use super::query::{convert_query, convert_set_expr_to_query};
-use super::{convert_pg_type, function_name, ident_name, parse_error, unsupported};
+use super::{
+    convert_pg_type, custom_type_name, function_name, ident_name, parse_error, unsupported,
+};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
     match expr {
@@ -121,8 +123,16 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             data_type,
             format,
         } => {
-            if *kind != sql::CastKind::Cast || format.is_some() {
+            if !matches!(kind, sql::CastKind::Cast | sql::CastKind::DoubleColon) || format.is_some()
+            {
                 return unsupported("unsupported CAST form");
+            }
+            if is_regclass_type(data_type)? {
+                return Ok(Expr::Function {
+                    name: "to_regclass".to_string(),
+                    args: vec![FunctionArg::Expr(convert_expr(expr)?)],
+                    distinct: false,
+                });
             }
             // A CAST reports the target's wire type but does not enforce a declared
             // length, so character targets carry no typmod (kind only).
@@ -174,6 +184,22 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }
         _ => unsupported("unsupported expression"),
     }
+}
+
+fn is_regclass_type(data_type: &sql::DataType) -> Result<bool> {
+    if matches!(data_type, sql::DataType::Regclass) {
+        return Ok(true);
+    }
+    let sql::DataType::Custom(name, modifiers) = data_type else {
+        return Ok(false);
+    };
+    if !modifiers.is_empty() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        custom_type_name(name)?.as_str(),
+        "regclass" | "pg_catalog.regclass"
+    ))
 }
 
 /// Normalize `EXTRACT(field FROM source)` into `extract('field', source)`, where

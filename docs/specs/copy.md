@@ -27,6 +27,8 @@ protocol. It reuses the normal MVCC write path (`COPY FROM`) and scan path
 - `WITH` options: `FORMAT`, `DELIMITER`, `NULL`, `HEADER`, and (CSV only)
   `QUOTE` and `ESCAPE`, in both the modern parenthesized form
   (`WITH (FORMAT csv, HEADER true)`) and the legacy bare form (`WITH CSV HEADER`).
+- The exact pgbench initialization option `WITH (FREEZE ON)` is accepted as a
+  compatibility no-op; other `FREEZE` spellings remain unsupported.
 - Autocommit (standalone) COPY and COPY inside an explicit `BEGIN`/`COMMIT`
   block.
 
@@ -37,6 +39,8 @@ protocol. It reuses the normal MVCC write path (`COPY FROM`) and scan path
   the server filesystem is out of scope.
 - `COPY (query) TO STDOUT` (`FeatureNotSupported`). Only whole-table export.
 - `FORMAT binary` (`FeatureNotSupported`).
+- `FREEZE` except for the exact pgbench compatibility form above
+  (`FeatureNotSupported`).
 - COPY through the extended query protocol (`Parse`/`Bind`/`Execute`)
   (`FeatureNotSupported`) — matches PostgreSQL, which only allows COPY via a
   simple `Query`.
@@ -119,10 +123,10 @@ output, `Text` = raw UTF-8. Field parsing on input:
   decoded on input). On output the backslash, the active delimiter, LF, CR, and
   TAB inside a field are escaped. An unrecognized `\x` decodes to the literal
   character `x` (PostgreSQL behavior).
-- `CopyDone` is the sole end-of-data terminator. The legacy `\.` marker is **not**
-  treated specially in either format: `psql` consumes it client-side and never
-  sends it as data over the v3 protocol, so honoring it would add streaming-drain
-  complexity for a case that does not occur.
+- `CopyDone` remains the protocol terminator. In text format, a raw one-field `\.`
+  record is also consumed as the legacy data terminator because pgbench 18 sends
+  it before `CopyDone`; later `CopyData` is rejected. The escaped data spelling
+  `\\.` remains an ordinary literal `\.` value. CSV does not recognize the marker.
 
 ### 3.2 CSV format
 

@@ -75,6 +75,24 @@ async fn introspection_only_cursor_keeps_one_lazy_catalog_snapshot() {
 }
 
 #[tokio::test]
+async fn pgbench_parameterized_regclass_probe_resolves_relation() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table pgbench_regclass_probe (id integer)")
+        .await;
+
+    let outcome = conn
+        .extended_execute_text_param(
+            "select relkind from pg_catalog.pg_class \
+             where oid = $1::pg_catalog.regclass",
+            "pgbench_regclass_probe",
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.rows(), vec![vec![Some("r".to_string())]]);
+}
+
+#[tokio::test]
 async fn system_catalogs_support_driver_query_shapes() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

@@ -115,6 +115,29 @@ async fn canceled_copy_in_write_transaction_stays_in_flight_until_drain() {
 }
 
 #[tokio::test]
+async fn pgbench_copy_freeze_and_legacy_marker_are_compatible() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table pgbench_copy_probe (id integer, balance integer)")
+        .await;
+
+    let copy = conn
+        .copy_from(
+            "copy pgbench_copy_probe from stdin with (freeze on)",
+            &[b"1\t0\n2\t0\n\\.\n"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 2"));
+    assert_eq!(
+        conn.ok("select id from pgbench_copy_probe order by id")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn copy_from_stdin_csv_skips_header_and_splits_chunks() {
     let (_server, mut conn) = server_with_table().await;
 

@@ -1660,6 +1660,29 @@ mod tests {
     }
 
     #[test]
+    fn lowers_regclass_casts_to_catalog_lookup() {
+        for sql in [
+            "select $1::pg_catalog.regclass",
+            "select cast($1 as regclass)",
+        ] {
+            let Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) = parse(sql).unwrap()
+            else {
+                panic!("expected SELECT for {sql}");
+            };
+            assert!(matches!(
+                &select.columns[0],
+                SelectItem::Expression {
+                    expr: Expr::Function { name, args, .. },
+                    ..
+                } if name == "to_regclass" && args.len() == 1
+            ));
+        }
+    }
+
+    #[test]
     fn serial_family_maps_to_integer_serial_columns() {
         let Statement::CreateTable { columns, .. } = parse(
             "create table ids (a serial, b bigserial, c smallserial, d serial2, e serial4, f serial8)",
@@ -2465,6 +2488,35 @@ mod tests {
                 options: CopyOptions::defaults_for(CopyFormat::Text),
             }
         );
+    }
+
+    #[test]
+    fn accepts_pgbench_copy_freeze_on_as_compatibility_noop() {
+        assert_eq!(
+            parse("copy pgbench_accounts from stdin with (freeze on)").unwrap(),
+            Statement::Copy {
+                table: "pgbench_accounts".to_string(),
+                columns: vec![],
+                direction: CopyDirection::From,
+                options: CopyOptions::defaults_for(CopyFormat::Text),
+            }
+        );
+
+        let err = parse("copy pgbench_accounts from stdin with (freeze true)").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        let err = parse("copy pgbench_accounts to stdout with (freeze on)").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        for sql in [
+            "copy pgbench_accounts from stdin with (format csv, freeze on)",
+            "copy pgbench_accounts from stdin with (freeze on, format csv)",
+            "copy\npgbench_accounts from stdin with (freeze on)",
+            "/* compatibility probe */ copy pgbench_accounts from stdin with (freeze on)",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "for {sql}");
+        }
     }
 
     #[test]

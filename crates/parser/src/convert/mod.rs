@@ -55,7 +55,8 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     // statement terminator. We stream copy-in over the wire and never carry
     // inline data, so ensure the statement is terminated. A trailing `;` is a
     // no-op for every other statement and never introduces a second one.
-    let trimmed = sql.trim_end();
+    let copy_compat = normalize_pgbench_copy_freeze(sql)?;
+    let trimmed = copy_compat.as_deref().unwrap_or(sql).trim_end();
     let normalized = if trimmed.ends_with(';') {
         trimmed.to_string()
     } else {
@@ -71,6 +72,54 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     }
 
     convert_statement(statements.remove(0))
+}
+
+/// pgbench 18 uses `COPY ... FROM STDIN WITH (FREEZE ON)` during client-side
+/// initialization. SaguaroDB has no frozen-xid storage state, so accept only that
+/// exact compatibility suffix and discard it before sqlparser (which does not
+/// accept PostgreSQL's `ON` boolean spelling in this position).
+fn normalize_pgbench_copy_freeze(sql: &str) -> Result<Option<String>> {
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    let lower = body.to_ascii_lowercase();
+    const SUFFIX: &str = " with (freeze on)";
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, body)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to tokenize COPY: {err}")))?;
+    let starts_with_copy = tokens.iter().find_map(|token| match token {
+        Token::Whitespace(_) => None,
+        Token::Word(word) => Some(word.value.eq_ignore_ascii_case("copy")),
+        _ => Some(false),
+    });
+    if starts_with_copy != Some(true) {
+        return Ok(None);
+    }
+    if lower.starts_with("copy ") && lower.ends_with(SUFFIX) {
+        let copy = &lower[..lower.len() - SUFFIX.len()];
+        if !copy.ends_with(" from stdin") {
+            return feature_not_supported("COPY FREEZE is supported only for pgbench FROM STDIN");
+        }
+        return Ok(Some(format!(
+            "{};",
+            body[..body.len() - SUFFIX.len()].trim_end()
+        )));
+    }
+
+    let mut after_with = false;
+    for token in tokens {
+        let Token::Word(word) = token else {
+            continue;
+        };
+        if word.value.eq_ignore_ascii_case("with") {
+            after_with = true;
+        } else if after_with && word.value.eq_ignore_ascii_case("freeze") {
+            return feature_not_supported(
+                "COPY FREEZE is supported only as the pgbench compatibility option",
+            );
+        }
+    }
+    Ok(None)
 }
 
 /// Parse a single SQL scalar expression (not a statement). Used to re-parse the

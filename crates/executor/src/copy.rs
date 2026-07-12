@@ -25,6 +25,9 @@ pub struct CopyParser {
     /// When the COPY has `HEADER`, the first record is the header line and is
     /// skipped (no `MATCH` validation).
     skip_header: bool,
+    /// PostgreSQL's legacy text terminator was consumed. pgbench still sends it
+    /// before `CopyDone`; any later CopyData is malformed.
+    saw_end_marker: bool,
 }
 
 impl CopyParser {
@@ -35,11 +38,19 @@ impl CopyParser {
             column_types,
             buffer: Vec::new(),
             skip_header,
+            saw_end_marker: false,
         }
     }
 
     /// Feed a chunk and return every row that is now complete.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<Value>>> {
+        if self.saw_end_marker {
+            return if chunk.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(malformed("COPY data follows the \\. end marker"))
+            };
+        }
         self.buffer.extend_from_slice(chunk);
         self.extract(false)
     }
@@ -71,12 +82,21 @@ impl CopyParser {
             let remaining = &text[cursor..];
             let record = match self.options.format {
                 CopyFormat::Text => next_text_record(remaining, &self.options, at_eof)?,
-                CopyFormat::Csv => next_csv_record(remaining, &self.options, at_eof)?,
+                CopyFormat::Csv => next_csv_record(remaining, &self.options, at_eof)?
+                    .map(|(fields, consumed)| (CopyRecord::Row(fields), consumed)),
             };
-            let Some((fields, consumed)) = record else {
+            let Some((record, consumed)) = record else {
                 break;
             };
             cursor += consumed;
+
+            let CopyRecord::Row(fields) = record else {
+                self.saw_end_marker = true;
+                if !text[cursor..].is_empty() {
+                    return Err(malformed("COPY data follows the \\. end marker"));
+                }
+                break;
+            };
 
             if self.skip_header {
                 self.skip_header = false;
@@ -166,22 +186,37 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
 
 // ---- text format ----
 
+enum CopyRecord {
+    Row(Vec<Option<String>>),
+    EndMarker,
+}
+
 /// Take the next `\n`-terminated text record, or (at EOF) the non-empty leftover.
 /// A raw `\n` always ends a text record (an in-field newline is the escape `\n`).
 fn next_text_record(
     text: &str,
     options: &CopyOptions,
     at_eof: bool,
-) -> Result<Option<(Vec<Option<String>>, usize)>> {
+) -> Result<Option<(CopyRecord, usize)>> {
     if let Some(newline) = text.find('\n') {
         let mut line = &text[..newline];
         if let Some(stripped) = line.strip_suffix('\r') {
             line = stripped;
         }
-        Ok(Some((parse_text_fields(line, options), newline + 1)))
+        let record = if line == r"\." {
+            CopyRecord::EndMarker
+        } else {
+            CopyRecord::Row(parse_text_fields(line, options))
+        };
+        Ok(Some((record, newline + 1)))
     } else if at_eof && !text.is_empty() {
         let line = text.strip_suffix('\r').unwrap_or(text);
-        Ok(Some((parse_text_fields(line, options), text.len())))
+        let record = if line == r"\." {
+            CopyRecord::EndMarker
+        } else {
+            CopyRecord::Row(parse_text_fields(line, options))
+        };
+        Ok(Some((record, text.len())))
     } else {
         Ok(None)
     }
@@ -523,6 +558,26 @@ mod tests {
         assert_eq!(wire, b"\\\\N\n");
         let rows = parse_all(&wire, vec![DataType::Text], text_opts()).unwrap();
         assert_eq!(rows, vec![vec![value]]);
+    }
+
+    #[test]
+    fn pgbench_text_end_marker_is_consumed_without_hiding_escaped_data() {
+        let rows = parse_all(b"1\tann\n\\.\n", int_text(), text_opts()).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::Integer(1), Value::Text("ann".to_string())]]
+        );
+
+        let rows = parse_all(b"\\\\.\n", vec![DataType::Text], text_opts()).unwrap();
+        assert_eq!(rows, vec![vec![Value::Text("\\.".to_string())]]);
+    }
+
+    #[test]
+    fn text_end_marker_rejects_later_copy_data() {
+        let mut parser = CopyParser::new(int_text(), text_opts());
+        assert!(parser.push(b"\\.\n").unwrap().is_empty());
+        let err = parser.push(b"1\tlate\n").unwrap_err();
+        assert_eq!(err.code, SqlState::BadCopyFileFormat);
     }
 
     #[test]
