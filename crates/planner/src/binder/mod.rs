@@ -857,7 +857,8 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
         BoundExpr::Array { elements, .. } => elements.iter().any(contains_aggregate),
         BoundExpr::ArraySubscript {
@@ -1933,7 +1934,10 @@ fn collect_expr_dependencies(
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => collect_expr_dependencies(expr, bindings, builder),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => {
+            collect_expr_dependencies(expr, bindings, builder)
+        }
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 collect_expr_dependencies(arg, bindings, builder);

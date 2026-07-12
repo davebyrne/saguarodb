@@ -1569,6 +1569,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | Uses `work_mem`-bounded rewindable tapes for both inputs and streams matches/NULL extension; right/full unmatched detection uses externally sorted matched ordinals without re-evaluating predicates. |
 | `HashJoinOp` | Builds the planner-selected side (right by default; left when statistics estimate it is smaller) in a reservation-accounted, key-sorted contiguous table while it fits, then releases it and falls back to a bounded rewindable spill-tape probe; NULL keys never match and output remains logical left ++ right. |
+| `ApplyOp` / `LateralApplyOp` | Use one operator-local `work_mem` account for LRU correlation metadata and spillable scalar-column/row results; LATERAL replays one inner row at a time and preserves outer identity. |
 | `MergeJoinOp` | Stable-sorts both inputs with one shared `work_mem` account; NULL-bearing keys never match. Rewindable spill tapes and externally sorted match ordinals bound duplicate groups while residuals run once per pair; output identity is cleared. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |

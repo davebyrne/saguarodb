@@ -8,6 +8,66 @@ use crate::error::{DbError, Result};
 use crate::ids::{SequenceId, TableId, TxnId};
 use crate::mvcc::{IsolationLevel, Snapshot};
 use crate::row::Key;
+use crate::value::Value;
+
+pub type RuntimeValueSetId = u64;
+
+pub trait RuntimeValueSet: Send + Sync + std::fmt::Debug {
+    fn evaluate(&self, operand: &Value, negated: bool) -> Result<Value>;
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeValueSetRegistry {
+    inner: Mutex<RuntimeValueSetRegistryInner>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeValueSetRegistryInner {
+    next_id: RuntimeValueSetId,
+    sets: HashMap<RuntimeValueSetId, Arc<dyn RuntimeValueSet>>,
+}
+
+impl RuntimeValueSetRegistry {
+    pub fn watermark(&self) -> RuntimeValueSetId {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next_id
+    }
+
+    pub fn remove_since(&self, watermark: RuntimeValueSetId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sets
+            .retain(|id, _| *id < watermark);
+    }
+
+    pub fn register(&self, set: Arc<dyn RuntimeValueSet>) -> Result<RuntimeValueSetId> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = inner.next_id;
+        inner.next_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("runtime value-set ID overflow"))?;
+        inner.sets.insert(id, set);
+        Ok(id)
+    }
+
+    pub fn evaluate(&self, id: RuntimeValueSetId, operand: &Value, negated: bool) -> Result<Value> {
+        let set = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sets
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("unknown runtime value-set ID {id}")))?;
+        set.evaluate(operand, negated)
+    }
+}
 
 /// Blocks a writer that hit an in-progress row-lock conflict until the holder
 /// finishes, so the writer can re-check (`docs/specs/deadlock.md`). The storage
@@ -387,6 +447,7 @@ pub struct StatementContext {
     pub system_state: Arc<dyn SystemStateProvider>,
     /// Rendered catalog facts for PostgreSQL-compatible introspection functions.
     pub catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    pub runtime_value_sets: Arc<RuntimeValueSetRegistry>,
 }
 
 impl StatementContext {
@@ -411,6 +472,7 @@ impl StatementContext {
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
+            runtime_value_sets: Arc::new(RuntimeValueSetRegistry::default()),
         }
     }
 
@@ -434,6 +496,7 @@ impl StatementContext {
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
+            runtime_value_sets: Arc::new(RuntimeValueSetRegistry::default()),
         }
     }
 
@@ -459,6 +522,7 @@ impl StatementContext {
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
+            runtime_value_sets: Arc::new(RuntimeValueSetRegistry::default()),
         }
     }
 

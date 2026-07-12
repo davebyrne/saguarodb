@@ -33,9 +33,10 @@ pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };
 pub use context::{
-    CatalogIntrospectionProvider, ConflictWaiter, GucSetting, SequenceManager, SessionActivityRow,
-    SessionInfo, SessionSequenceState, SessionState, SsiTracker, StatementContext,
-    SystemStateProvider, no_catalog_introspection, no_system_state,
+    CatalogIntrospectionProvider, ConflictWaiter, GucSetting, RuntimeValueSet, RuntimeValueSetId,
+    RuntimeValueSetRegistry, SequenceManager, SessionActivityRow, SessionInfo,
+    SessionSequenceState, SessionState, SsiTracker, StatementContext, SystemStateProvider,
+    no_catalog_introspection, no_system_state,
 };
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};

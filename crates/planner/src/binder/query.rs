@@ -1839,7 +1839,8 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => validate_grouped_expr(expr, group_by),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => validate_grouped_expr(expr, group_by),
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 validate_grouped_expr(arg, group_by)?;
@@ -1945,7 +1946,8 @@ fn references_input(expr: &BoundExpr) -> bool {
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => references_input(expr),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => references_input(expr),
         BoundExpr::Function { args, .. } => args.iter().any(references_input),
         BoundExpr::Array { elements, .. } => elements.iter().any(references_input),
         BoundExpr::ArraySubscript {

@@ -89,24 +89,39 @@ impl<'a> AggregateOp<'a> {
     fn finish_distinct(
         states: &mut [AggregateState],
         distinct: Vec<Option<ValueSorter>>,
+        spill_ctx: &SpillContext,
     ) -> Result<()> {
         for (state, sorter) in states.iter_mut().zip(distinct) {
             let Some(sorter) = sorter else { continue };
             let mut values = sorter.finish()?;
+            let mut first_occurrences = ExternalSorter::new(
+                spill_ctx.clone(),
+                Box::new(|left: &SpillRow, right: &SpillRow| left.ordinal.cmp(&right.ordinal))
+                    as Box<dyn Fn(&SpillRow, &SpillRow) -> Ordering>,
+            );
             let mut previous = None;
             while let Some(record) = values.next_record()? {
                 let value = record
                     .row
                     .row
                     .values
-                    .into_iter()
-                    .next()
+                    .first()
                     .ok_or_else(|| DbError::internal("empty distinct aggregate record"))?;
-                if previous.as_ref() == Some(&value) {
+                if previous.as_ref() == Some(value) {
                     continue;
                 }
                 previous = Some(value.clone());
-                state.step(Some(&value))?;
+                first_occurrences.push(record)?;
+            }
+            let mut first_occurrences = first_occurrences.finish()?;
+            while let Some(record) = first_occurrences.next_record()? {
+                let value = record
+                    .row
+                    .row
+                    .values
+                    .first()
+                    .ok_or_else(|| DbError::internal("empty distinct aggregate record"))?;
+                state.step(Some(value))?;
             }
         }
         Ok(())
@@ -137,7 +152,11 @@ impl PlanExecutor for AggregateOp<'_> {
                     aggregate.distinct.then(|| {
                         ExternalSorter::new(
                             order_ctx.clone(),
-                            Box::new(|left: &SpillRow, right: &SpillRow| left.keys.cmp(&right.keys))
+                            Box::new(|left: &SpillRow, right: &SpillRow| {
+                                left.keys
+                                    .cmp(&right.keys)
+                                    .then_with(|| left.ordinal.cmp(&right.ordinal))
+                            })
                                 as Box<dyn Fn(&SpillRow, &SpillRow) -> Ordering>,
                         )
                     })
@@ -159,7 +178,7 @@ impl PlanExecutor for AggregateOp<'_> {
                         &mut ordinal,
                     )?;
                 }
-                Self::finish_distinct(&mut states, distinct)?;
+                Self::finish_distinct(&mut states, distinct, &order_ctx)?;
                 let values = states
                     .into_iter()
                     .map(AggregateState::finish)
@@ -173,7 +192,9 @@ impl PlanExecutor for AggregateOp<'_> {
             return Ok(());
         }
         let mut sorter = ExternalSorter::new(order_ctx, |left: &SpillRow, right: &SpillRow| {
-            left.keys.cmp(&right.keys)
+            left.keys
+                .cmp(&right.keys)
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
         });
         open_executor(self.source.as_mut())?;
         let result = (|| {
@@ -233,8 +254,11 @@ impl PlanExecutor for AggregateOp<'_> {
                 aggregate.distinct.then(|| {
                     ExternalSorter::new(
                         spill_ctx.clone(),
-                        Box::new(|left: &SpillRow, right: &SpillRow| left.keys.cmp(&right.keys))
-                            as Box<dyn Fn(&SpillRow, &SpillRow) -> Ordering>,
+                        Box::new(|left: &SpillRow, right: &SpillRow| {
+                            left.keys
+                                .cmp(&right.keys)
+                                .then_with(|| left.ordinal.cmp(&right.ordinal))
+                        }) as Box<dyn Fn(&SpillRow, &SpillRow) -> Ordering>,
                     )
                 })
             })
@@ -259,7 +283,7 @@ impl PlanExecutor for AggregateOp<'_> {
             }
         }
 
-        Self::finish_distinct(&mut states, distinct)?;
+        Self::finish_distinct(&mut states, distinct, &spill_ctx)?;
         let mut values = group_key;
         for state in states {
             values.push(state.finish()?);

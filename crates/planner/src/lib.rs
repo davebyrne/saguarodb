@@ -219,7 +219,8 @@ fn expr_sequences(expr: &BoundExpr, scan: SequenceScan) -> bool {
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => expr_sequences(expr, scan),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => expr_sequences(expr, scan),
         BoundExpr::Function { args, .. } => args.iter().any(|arg| expr_sequences(arg, scan)),
         BoundExpr::Array { elements, .. } => {
             elements.iter().any(|element| expr_sequences(element, scan))
@@ -2355,7 +2356,7 @@ mod tests {
             let bound = bind(&parse(&sql).unwrap(), &catalog).unwrap();
             let logical = logical_plan(&bound).unwrap();
             let physical = physical_plan(&logical, &catalog).unwrap();
-            let text = format_explain(&physical);
+            let text = format_explain(&physical, &catalog);
             assert!(
                 text.contains(&format!("MergeJoin type={label} keys=1 residual=yes")),
                 "{text}"

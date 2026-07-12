@@ -314,6 +314,32 @@ impl SpillRecord for ExecRow {
     }
 }
 
+impl SpillRecord for Value {
+    fn encoded_len(&self) -> Result<u64> {
+        codec::value_len(self)
+    }
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
+        codec::encode_value(self, writer)
+    }
+    fn decode<R: Read>(reader: &mut R, _payload_len: u64) -> Result<Self> {
+        codec::decode_value(reader)
+    }
+}
+
+impl SpillRecord for Row {
+    fn encoded_len(&self) -> Result<u64> {
+        codec::values_len(&self.values)
+    }
+    fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
+        codec::encode_values(&self.values, writer)
+    }
+    fn decode<R: Read>(reader: &mut R, _payload_len: u64) -> Result<Self> {
+        Ok(Row {
+            values: codec::decode_values(reader)?,
+        })
+    }
+}
+
 fn write_record<T: SpillRecord>(file: &mut File, record: &T, ctx: &SpillContext) -> Result<()> {
     ctx.check_canceled()?;
     let len = record.encoded_len()?;
@@ -1090,7 +1116,7 @@ pub mod codec {
         })
     }
 
-    fn value_len(value: &Value) -> Result<u64> {
+    pub fn value_len(value: &Value) -> Result<u64> {
         Ok(1 + match value {
             Value::Null => 0,
             Value::Boolean(_) => 1,
@@ -1106,7 +1132,7 @@ pub mod codec {
         })
     }
 
-    fn encode_value<W: Write>(value: &Value, w: &mut W) -> Result<()> {
+    pub fn encode_value<W: Write>(value: &Value, w: &mut W) -> Result<()> {
         let tag = match value {
             Value::Null => 0,
             Value::Boolean(_) => 1,
@@ -1168,7 +1194,7 @@ pub mod codec {
         Ok(())
     }
 
-    fn decode_value<R: Read>(r: &mut R) -> Result<Value> {
+    pub fn decode_value<R: Read>(r: &mut R) -> Result<Value> {
         let mut tag = [0];
         r.read_exact(&mut tag).map_err(io_error)?;
         Ok(match tag[0] {
@@ -1516,5 +1542,56 @@ mod tests {
         let decoded = codec::decode_exec_row(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded, row);
         assert!(matches!(decoded.row.values[0],Value::Float(v) if v.0.is_nan()));
+    }
+
+    #[test]
+    fn value_and_row_tapes_round_trip_every_value_variant() {
+        let values = vec![
+            Value::Null,
+            Value::Boolean(true),
+            Value::Integer(i64::MIN),
+            Value::Float(f64::INFINITY.into()),
+            Value::Float((-0.0).into()),
+            Value::Real(f32::NEG_INFINITY.into()),
+            Value::Numeric(Decimal::new(-12345, 3)),
+            Value::Text("héllo".into()),
+            Value::Date(-12),
+            Value::Timestamp(123_456),
+            Value::Time(42),
+            Value::TimestampTz(-987_654),
+            Value::Interval(common::Interval {
+                months: -2,
+                days: 3,
+                micros: -4,
+            }),
+            Value::Bytes(vec![0, 1, 255]),
+            Value::Uuid([0xab; 16]),
+            Value::Array(
+                SqlArray::new(
+                    DataType::Integer,
+                    vec![ArrayDimension::new(3, -1)],
+                    vec![Value::Integer(7), Value::Null, Value::Integer(9)],
+                )
+                .unwrap(),
+            ),
+        ];
+        let config = SpillConfig::new(MIN_WORK_MEM_BYTES, std::env::temp_dir());
+        let ctx = config.for_operator(Arc::new(QueryCancel::new()));
+        let mut value_tape = SpillTape::disk_only(ctx.clone()).unwrap();
+        for value in &values {
+            value_tape.push(value.clone()).unwrap();
+        }
+        value_tape.finish().unwrap();
+        let mut reader = value_tape.reader().unwrap();
+        for value in &values {
+            assert_eq!(reader.next_record().unwrap().as_ref(), Some(value));
+        }
+        assert_eq!(reader.next_record().unwrap(), None);
+
+        let row = Row { values };
+        let mut row_tape = SpillTape::disk_only(ctx).unwrap();
+        row_tape.push(row.clone()).unwrap();
+        row_tape.finish().unwrap();
+        assert_eq!(row_tape.reader().unwrap().next_record().unwrap(), Some(row));
     }
 }

@@ -550,7 +550,7 @@ pub(crate) fn for_each_child(
     match expr {
         // The subquery body is reached via `subquery_select`, not as a BoundExpr
         // child; only `InSubquery`'s left operand is a direct child here.
-        BoundExpr::InSubquery { expr, .. } => f(expr),
+        BoundExpr::InSubquery { expr, .. } | BoundExpr::RuntimeInSet { expr, .. } => f(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
@@ -652,7 +652,7 @@ fn for_each_child_mut(
     f: &mut impl FnMut(&mut BoundExpr) -> Result<()>,
 ) -> Result<()> {
     match expr {
-        BoundExpr::InSubquery { expr, .. } => f(expr),
+        BoundExpr::InSubquery { expr, .. } | BoundExpr::RuntimeInSet { expr, .. } => f(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }

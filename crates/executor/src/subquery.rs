@@ -15,8 +15,12 @@
 //! appear sits in an unsupported position and is rejected
 //! (`docs/specs/subqueries.md` §5).
 
-use common::{DataType, DbError, Result, Row, SqlState, Value};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use common::{DataType, DbError, Result, Row, RuntimeValueSet, SqlState, Value};
 use planner::{BoundExpr, BoundQuery, BoundStatement, PhysicalPlan, logical_plan, physical_plan};
+use spill::{SpillTape, SpillTapeReader};
 
 use planner::rewrite_plan_exprs;
 
@@ -62,7 +66,7 @@ fn resolve_subquery_expr(
             nullable,
         } => {
             reject_correlated(query)?;
-            let exists = !materialize_subquery(ctx, query)?.is_empty();
+            let exists = run_exists_subquery(ctx, query)?;
             Ok(Some(BoundExpr::Literal {
                 value: Value::Boolean(exists ^ *negated),
                 data_type: data_type.clone(),
@@ -77,21 +81,28 @@ fn resolve_subquery_expr(
             nullable,
         } => {
             reject_correlated(query)?;
-            let column_type = subquery_column_type(query)?;
-            let rows = materialize_subquery(ctx, query)?;
-            let list = rows
-                .into_iter()
-                .map(|row| {
-                    Ok(BoundExpr::Literal {
-                        value: single_value(row)?,
-                        data_type: column_type.clone(),
-                        nullable: true,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some(BoundExpr::InList {
+            subquery_column_type(query)?;
+            let mut executor = build_subquery_executor(ctx, query)?;
+            crate::query::open_executor(executor.as_mut())?;
+            let spill_ctx = ctx.spill.for_operator(ctx.statement.cancel.clone());
+            let mut tape = SpillTape::new(spill_ctx);
+            let result = (|| {
+                while let Some(row) = executor.next()? {
+                    tape.push(single_value(row.row)?)?;
+                }
+                tape.finish()?;
+                Ok(tape)
+            })();
+            let tape = crate::query::close_after(executor.as_mut(), result)?;
+            let set = ctx
+                .statement
+                .runtime_value_sets
+                .register(Arc::new(SpillValueSet {
+                    tape: Mutex::new(tape),
+                }))?;
+            Ok(Some(BoundExpr::RuntimeInSet {
                 expr: operand.clone(),
-                list,
+                set,
                 negated: *negated,
                 data_type: data_type.clone(),
                 nullable: *nullable,
@@ -126,28 +137,70 @@ fn reject_correlated(query: &BoundQuery) -> Result<()> {
 /// Execute a scalar subquery: at most one row (else a `CardinalityViolation`),
 /// returning its single column value, or `NULL` when the result is empty.
 fn run_scalar_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<Value> {
-    let mut rows = materialize_subquery(ctx, query)?;
-    if rows.len() > 1 {
-        return Err(DbError::execute(
-            SqlState::CardinalityViolation,
-            "more than one row returned by a subquery used as an expression",
-        ));
-    }
-    match rows.pop() {
-        Some(row) => single_value(row),
-        None => Ok(Value::Null),
-    }
+    let mut executor = build_subquery_executor(ctx, query)?;
+    crate::query::open_executor(executor.as_mut())?;
+    let result = (|| {
+        let first = executor.next()?;
+        if executor.next()?.is_some() {
+            return Err(DbError::execute(
+                SqlState::CardinalityViolation,
+                "more than one row returned by a subquery used as an expression",
+            ));
+        }
+        first.map_or(Ok(Value::Null), |row| single_value(row.row))
+    })();
+    crate::query::close_after(executor.as_mut(), result)
 }
 
-/// Plan and run a subquery's bound query, returning its materialized rows.
-fn materialize_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<Vec<Row>> {
+fn run_exists_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<bool> {
+    let mut executor = build_subquery_executor(ctx, query)?;
+    crate::query::open_executor(executor.as_mut())?;
+    let result = executor.next().map(|row| row.is_some());
+    crate::query::close_after(executor.as_mut(), result)
+}
+
+fn build_subquery_executor<'a>(
+    ctx: &'a ExecutionContext<'a>,
+    query: &BoundQuery,
+) -> Result<Box<dyn crate::query::PlanExecutor + 'a>> {
     let statement = BoundStatement::Query(query.clone());
     let logical = logical_plan(&statement)?;
     let physical = physical_plan(&logical, ctx.catalog.as_ref())?;
     let resolved = resolve_plan_subqueries(ctx, &physical)?;
-    let mut executor = build_executor(ctx, &resolved)?;
-    let rows = crate::query::collect_all_cancelable(executor.as_mut(), ctx.cancel)?;
-    Ok(rows.into_iter().map(|row| row.row).collect())
+    build_executor(ctx, &resolved)
+}
+
+struct SpillValueSet {
+    tape: Mutex<SpillTape<Value>>,
+}
+
+impl fmt::Debug for SpillValueSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpillValueSet").finish_non_exhaustive()
+    }
+}
+
+impl RuntimeValueSet for SpillValueSet {
+    fn evaluate(&self, operand: &Value, negated: bool) -> Result<Value> {
+        let mut tape = self
+            .tape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut reader: SpillTapeReader<Value> = tape.reader()?;
+        let mut saw_null = matches!(operand, Value::Null);
+        while let Some(value) = reader.next_record()? {
+            if matches!(value, Value::Null) {
+                saw_null = true;
+            } else if !matches!(operand, Value::Null) && value == *operand {
+                return Ok(Value::Boolean(!negated));
+            }
+        }
+        if saw_null {
+            Ok(Value::Null)
+        } else {
+            Ok(Value::Boolean(negated))
+        }
+    }
 }
 
 /// The single column's type of a single-column subquery (validated by the

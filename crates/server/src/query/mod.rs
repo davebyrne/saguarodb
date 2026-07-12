@@ -2667,7 +2667,8 @@ fn collect_expr_objects(expr: &BoundExpr, references: &mut BoundObjectReferences
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => collect_expr_objects(expr, references)?,
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => collect_expr_objects(expr, references)?,
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 collect_expr_objects(arg, references)?;

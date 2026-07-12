@@ -122,6 +122,13 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    RuntimeInSet {
+        expr: Box<BoundExpr>,
+        set: common::RuntimeValueSetId,
+        negated: bool,
+        data_type: DataType,
+        nullable: bool,
+    },
     Between {
         expr: Box<BoundExpr>,
         low: Box<BoundExpr>,
@@ -337,6 +344,7 @@ impl BoundExpr {
             | BoundExpr::IsNull { data_type, .. }
             | BoundExpr::IsNotNull { data_type, .. }
             | BoundExpr::InList { data_type, .. }
+            | BoundExpr::RuntimeInSet { data_type, .. }
             | BoundExpr::Between { data_type, .. }
             | BoundExpr::Like { data_type, .. }
             | BoundExpr::Case { data_type, .. }
@@ -369,6 +377,7 @@ impl BoundExpr {
             | BoundExpr::IsNull { nullable, .. }
             | BoundExpr::IsNotNull { nullable, .. }
             | BoundExpr::InList { nullable, .. }
+            | BoundExpr::RuntimeInSet { nullable, .. }
             | BoundExpr::Between { nullable, .. }
             | BoundExpr::Like { nullable, .. }
             | BoundExpr::Case { nullable, .. }

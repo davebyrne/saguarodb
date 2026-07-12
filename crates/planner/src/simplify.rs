@@ -524,6 +524,19 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             data_type,
             nullable,
         },
+        BoundExpr::RuntimeInSet {
+            expr,
+            set,
+            negated,
+            data_type,
+            nullable,
+        } => BoundExpr::RuntimeInSet {
+            expr: Box::new(fold_expr(*expr)),
+            set,
+            negated,
+            data_type,
+            nullable,
+        },
         BoundExpr::Between {
             expr,
             low,

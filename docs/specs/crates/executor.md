@@ -288,7 +288,11 @@ Uncorrelated subqueries are resolved to constants by a one-time pre-pass over th
 
 - A scalar subquery `(SELECT ...)` is executed under the statement's snapshot; an empty result becomes `NULL`, exactly one row becomes its single column value (as a typed literal), and more than one row returns `SqlState::CardinalityViolation` (`21000`).
 - `[NOT] EXISTS (...)` becomes a boolean literal: whether the sub-plan produced at least one row, negated for `NOT EXISTS`.
-- `expr [NOT] IN (SELECT ...)` materializes the subquery's single column into an `InList` of literals, so the existing `IN`/`NOT IN` three-valued-logic evaluation applies unchanged (including `NULL` items).
+- `expr [NOT] IN (SELECT ...)` drains the single column once into a
+  `work_mem`-bounded spill tape registered in the statement's query-local
+  runtime value-set registry. The transient expression references that set and
+  preserves the existing three-valued behavior, including the project's empty
+  set behavior. Scalar subqueries pull at most two rows and `EXISTS` at most one.
 
 Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and executed once; the pass recurses so nested subqueries are resolved bottom-up. Because the subqueries are uncorrelated, a single execution under the statement snapshot is correct; correlated subqueries are not yet supported.
 

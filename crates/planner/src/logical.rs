@@ -1004,7 +1004,8 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => collect_aggregates(expr, output),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => collect_aggregates(expr, output),
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 collect_aggregates(arg, output);
@@ -1259,6 +1260,19 @@ fn rewrite_aggregate_expr(
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
+        BoundExpr::RuntimeInSet {
+            expr,
+            set,
+            negated,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::RuntimeInSet {
+            expr: Box::new(rewrite_aggregate_expr(expr, group_by, aggregates)?),
+            set: *set,
+            negated: *negated,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
         BoundExpr::Between {
             expr,
             low,
@@ -1435,7 +1449,8 @@ pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::RuntimeInSet { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
         BoundExpr::Array { elements, .. } => elements.iter().any(contains_aggregate),
         BoundExpr::ArraySubscript {

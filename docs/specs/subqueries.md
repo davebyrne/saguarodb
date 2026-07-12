@@ -260,12 +260,14 @@ turn, so nesting works at any depth.
 - **Per outer row**: evaluates the `correlations` expressions against the
   outer row, substitutes `OuterRef { slot }` → `Literal` throughout a clone of
   the template, builds the inner executor, and runs it. `Exists` pulls at most
-  one row; `Scalar` errors on a second row (21000); `In` materializes the
-  single inner column and applies the existing three-valued `InList`
-  evaluation.
-- **Memoization**: results are cached keyed by the tuple of correlation
-  values, only when the template is volatile-free (§2). The cache is
-  per-operator, bounded only by the statement's lifetime.
+  one row; `Scalar` errors on a second row (21000); `In` drains the single
+  inner column into a rewindable spill tape and applies the existing
+  three-valued membership semantics through a fresh reader.
+- **Memoization**: results are cached in an LRU hash map keyed by the tuple of
+  correlation values, only when the template is volatile-free (§2). Keys,
+  entries, scalar heap data, and map capacity share the operator's `work_mem`
+  account; column and row results are rewindable spill tapes using that same
+  account. Entries are evicted when metadata cannot fit.
 - Rebuilding the inner executor per outer row is the accepted v1 cost; reusing
   a built executor via re-`open` is a deferred optimization (§12 S6,
   `overview.md` §13) and must not change behavior.
@@ -348,7 +350,9 @@ row yields one output row (`left_join` emits one null-padded row when none
 match). The `ON` condition evaluates per combined (outer ++ inner) row inside
 the operator — its slots are the FROM scope's, which already match. The memo
 stores the **unfiltered** inner rows per correlation key, since the condition
-may reference outer columns.
+may reference outer columns. Those rows live in rewindable spill tapes, and the
+operator reads one row per `next()` call instead of buffering a pending output
+queue.
 
 Restrictions:
 

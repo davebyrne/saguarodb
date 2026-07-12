@@ -107,6 +107,12 @@ fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> R
                 Ok(result)
             }
         }
+        BoundExpr::RuntimeInSet {
+            expr, set, negated, ..
+        } => {
+            let operand = eval_expr_inner(ctx, expr, row)?;
+            ctx.runtime_value_sets.evaluate(*set, &operand, *negated)
+        }
         BoundExpr::Between {
             expr,
             low,

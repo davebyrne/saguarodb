@@ -26,7 +26,12 @@ executor operators and future storage/index builders can reuse it.
   are never fsynced or WAL-logged, and disappear when their handles are dropped.
 - Spill files use `SGSP`, version `1`, length-framed records, and explicit binary
   encodings that preserve every `Value`, including non-finite floats and signed
-  zero. The format is not durable across server versions.
+  zero. Array values carry their scalar element type, dimensions/lower bounds,
+  and recursively encoded flattened elements. The format is not durable across
+  server versions.
+- `Value`, `Row`, and `ExecRow` are directly usable as tape records. Their
+  ephemeral codecs reuse the common value encoding; selecting a record type is
+  the caller's responsibility and does not change the file version.
 - External sort is stable, cancellation-aware, and consolidates runs through
   binary merges. I/O or codec failures return structured `IoError` values; a
   sorter that loses run state during a failed merge is poisoned against reuse.

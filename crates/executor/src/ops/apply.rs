@@ -2,10 +2,12 @@
 //! correlated subquery template (`docs/specs/subqueries.md` §5.2).
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
 use common::{ColumnInfo, DataType, DbError, ExecRow, Result, Row, SqlState, Value};
 use planner::{ApplyKind, BoundExpr, PhysicalPlan, rewrite_plan_exprs};
+use spill::{Reservation, RetainedSize, SpillContext, SpillTape, SpillTapeReader};
 
 use crate::expr::{compare_values, eval_expr};
 use crate::query::{
@@ -15,9 +17,136 @@ use crate::query::{
 /// One memoized subplan result, keyed by the correlation-value tuple. The
 /// `In` kind memoizes the materialized column — not the membership verdict —
 /// because the operand is evaluated per outer row independently of the key.
-enum MemoEntry {
-    Value(Value),
-    Column(Rc<Vec<Value>>),
+#[derive(Clone)]
+enum MemoPayload {
+    Scalar(Value),
+    Column(Arc<Mutex<SpillTape<Value>>>),
+    Rows(Arc<Mutex<SpillTape<Row>>>),
+}
+
+struct MemoEntry {
+    payload: MemoPayload,
+    last_used: u64,
+    metadata_charge: u64,
+}
+
+struct ApplyMemo {
+    entries: HashMap<Vec<Value>, MemoEntry>,
+    reservation: Reservation,
+    access: u64,
+}
+
+impl ApplyMemo {
+    fn new(ctx: &SpillContext) -> Self {
+        Self {
+            entries: HashMap::new(),
+            reservation: ctx.reserve(0).expect("zero reservation"),
+            access: 0,
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        if let Some(next) = self.access.checked_add(1) {
+            self.access = next;
+            return next;
+        }
+        let mut order = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.last_used))
+            .collect::<Vec<_>>();
+        order.sort_unstable_by_key(|(_, used)| *used);
+        for (index, (key, _)) in order.into_iter().enumerate() {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.last_used = index as u64 + 1;
+            }
+        }
+        self.access = self.entries.len() as u64 + 1;
+        self.access
+    }
+
+    fn get(&mut self, key: &[Value]) -> Option<MemoPayload> {
+        let used = self.tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = used;
+        Some(entry.payload.clone())
+    }
+
+    fn insert(&mut self, key: Vec<Value>, payload: MemoPayload) -> bool {
+        let scalar_heap = match &payload {
+            MemoPayload::Scalar(value) => value
+                .retained_size()
+                .saturating_sub(size_of::<Value>() as u64),
+            _ => 0,
+        };
+        let charge = key
+            .retained_size()
+            .saturating_add(size_of::<MemoEntry>() as u64)
+            .saturating_add(scalar_heap)
+            .saturating_add(1);
+        while !self.reservation.try_grow(charge) {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                return false;
+            };
+            if let Some(entry) = self.entries.remove(&victim) {
+                self.reservation.shrink(entry.metadata_charge);
+            }
+        }
+        if self.entries.len() == self.entries.capacity() {
+            let old = self.entries.capacity();
+            let unit = size_of::<(Vec<Value>, MemoEntry)>() as u64 + 1;
+            let conservative_capacity = self
+                .entries
+                .len()
+                .saturating_add(1)
+                .next_power_of_two()
+                .saturating_mul(2);
+            let map_charge = conservative_capacity.saturating_sub(old) as u64 * unit;
+            let mut growth_charged = false;
+            while self.entries.len() == self.entries.capacity() {
+                if self.reservation.try_grow(map_charge) {
+                    growth_charged = true;
+                    break;
+                }
+                let Some(victim) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| key.clone())
+                else {
+                    self.reservation.shrink(charge);
+                    return false;
+                };
+                if let Some(entry) = self.entries.remove(&victim) {
+                    self.reservation.shrink(entry.metadata_charge);
+                }
+            }
+            if growth_charged && self.entries.try_reserve(1).is_err() {
+                self.reservation.shrink(charge + map_charge);
+                return false;
+            }
+            if growth_charged {
+                let actual_charge = self.entries.capacity().saturating_sub(old) as u64 * unit;
+                self.reservation
+                    .shrink(map_charge.saturating_sub(actual_charge));
+            }
+        }
+        let used = self.tick();
+        self.entries.insert(
+            key,
+            MemoEntry {
+                payload,
+                last_used: used,
+                metadata_charge: charge,
+            },
+        );
+        true
+    }
 }
 
 pub struct ApplyOp<'a> {
@@ -34,7 +163,8 @@ pub struct ApplyOp<'a> {
     output_schema: Vec<ColumnInfo>,
     /// `None` when the template contains a sequence function — such a subplan
     /// re-executes for every outer row (`docs/specs/subqueries.md` §2).
-    memo: Option<HashMap<Vec<Value>, MemoEntry>>,
+    memo: Option<ApplyMemo>,
+    spill_ctx: SpillContext,
 }
 
 impl<'a> ApplyOp<'a> {
@@ -60,10 +190,11 @@ impl<'a> ApplyOp<'a> {
         };
         let mut output_schema = input.output_schema().to_vec();
         output_schema.push(appended);
+        let spill_ctx = ctx.spill.for_operator(ctx.statement.cancel.clone());
         let memo = if plan_has_volatile_exprs(&subplan) {
             None
         } else {
-            Some(HashMap::new())
+            Some(ApplyMemo::new(&spill_ctx))
         };
         Self {
             ctx,
@@ -73,6 +204,7 @@ impl<'a> ApplyOp<'a> {
             kind,
             output_schema,
             memo,
+            spill_ctx,
         }
     }
 
@@ -84,18 +216,24 @@ impl<'a> ApplyOp<'a> {
     }
 
     /// Compute (or recall) the subplan result for one correlation-value tuple.
-    fn subplan_result(&mut self, key: Vec<Value>) -> Result<MemoEntry> {
-        if let Some(memo) = &self.memo
-            && let Some(entry) = memo.get(&key)
-        {
-            return Ok(match entry {
-                MemoEntry::Value(value) => MemoEntry::Value(value.clone()),
-                MemoEntry::Column(column) => MemoEntry::Column(Rc::clone(column)),
-            });
+    fn subplan_result(&mut self, key: Vec<Value>) -> Result<MemoPayload> {
+        if let Some(payload) = self.memo.as_mut().and_then(|memo| memo.get(&key)) {
+            return Ok(payload);
         }
 
-        let mut inner = self.build_inner(&key)?;
-        open_executor(inner.as_mut())?;
+        let registry = &self.ctx.statement.runtime_value_sets;
+        let watermark = registry.watermark();
+        let mut inner = match self.build_inner(&key) {
+            Ok(inner) => inner,
+            Err(err) => {
+                registry.remove_since(watermark);
+                return Err(err);
+            }
+        };
+        if let Err(err) = open_executor(inner.as_mut()) {
+            registry.remove_since(watermark);
+            return Err(err);
+        }
         let kind = &self.kind;
         let result = (|| {
             Ok(match kind {
@@ -112,35 +250,32 @@ impl<'a> ApplyOp<'a> {
                             single_value(row.row)?
                         }
                     };
-                    MemoEntry::Value(value)
+                    MemoPayload::Scalar(value)
                 }
                 ApplyKind::Exists { negated } => {
                     let exists = inner.next()?.is_some();
-                    MemoEntry::Value(Value::Boolean(exists ^ *negated))
+                    MemoPayload::Scalar(Value::Boolean(exists ^ *negated))
                 }
                 ApplyKind::In { .. } => {
-                    let mut column = Vec::new();
+                    let mut column = SpillTape::new(self.spill_ctx.clone());
                     while let Some(row) = inner.next()? {
                         check_canceled(self.ctx)?;
-                        column.push(single_value(row.row)?);
+                        column.push(single_value(row.row)?)?;
                     }
-                    MemoEntry::Column(Rc::new(column))
+                    column.finish()?;
+                    MemoPayload::Column(Arc::new(Mutex::new(column)))
                 }
                 ApplyKind::Lateral { .. } => {
                     unreachable!("Lateral applies are built as LateralApplyOp")
                 }
             })
         })();
-        let entry = close_after(inner.as_mut(), result)?;
+        let entry = close_after(inner.as_mut(), result);
+        registry.remove_since(watermark);
+        let entry = entry?;
 
         if let Some(memo) = &mut self.memo {
-            memo.insert(
-                key,
-                match &entry {
-                    MemoEntry::Value(value) => MemoEntry::Value(value.clone()),
-                    MemoEntry::Column(column) => MemoEntry::Column(Rc::clone(column)),
-                },
-            );
+            memo.insert(key, entry.clone());
         }
         Ok(entry)
     }
@@ -177,10 +312,16 @@ impl PlanExecutor for ApplyOp<'_> {
         let entry = self.subplan_result(key)?;
 
         let appended = match (&self.kind, entry) {
-            (ApplyKind::Scalar { .. } | ApplyKind::Exists { .. }, MemoEntry::Value(value)) => value,
-            (ApplyKind::In { operand, negated }, MemoEntry::Column(column)) => {
+            (ApplyKind::Scalar { .. } | ApplyKind::Exists { .. }, MemoPayload::Scalar(value)) => {
+                value
+            }
+            (ApplyKind::In { operand, negated }, MemoPayload::Column(column)) => {
                 let operand = eval_expr(statement, operand, &outer)?;
-                in_membership(&operand, &column, *negated)?
+                let mut tape = column
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut reader = tape.reader()?;
+                in_membership(&operand, &mut reader, *negated)?
             }
             _ => return Err(DbError::internal("apply result shape mismatch")),
         };
@@ -234,9 +375,12 @@ pub struct LateralApplyOp<'a> {
     condition: Option<BoundExpr>,
     output_schema: Vec<ColumnInfo>,
     inner_width: usize,
-    memo: Option<HashMap<Vec<Value>, Rc<Vec<Row>>>>,
-    /// Combined rows for the current outer row, emitted one per `next` call.
-    pending: std::collections::VecDeque<ExecRow>,
+    memo: Option<ApplyMemo>,
+    spill_ctx: SpillContext,
+    current_outer: Option<ExecRow>,
+    current_reader: Option<SpillTapeReader<Row>>,
+    current_owned_tape: Option<Arc<Mutex<SpillTape<Row>>>>,
+    current_matched: bool,
 }
 
 impl<'a> LateralApplyOp<'a> {
@@ -253,10 +397,11 @@ impl<'a> LateralApplyOp<'a> {
         let mut output_schema = input.output_schema().to_vec();
         let inner_width = inner_schema.len();
         output_schema.extend(inner_schema);
+        let spill_ctx = ctx.spill.for_operator(ctx.statement.cancel.clone());
         let memo = if plan_has_volatile_exprs(&subplan) {
             None
         } else {
-            Some(HashMap::new())
+            Some(ApplyMemo::new(&spill_ctx))
         };
         Self {
             ctx,
@@ -268,31 +413,47 @@ impl<'a> LateralApplyOp<'a> {
             output_schema,
             inner_width,
             memo,
-            pending: std::collections::VecDeque::new(),
+            spill_ctx,
+            current_outer: None,
+            current_reader: None,
+            current_owned_tape: None,
+            current_matched: false,
         }
     }
 
     /// The template's materialized rows for one correlation-value tuple.
-    fn inner_rows(&mut self, key: Vec<Value>) -> Result<Rc<Vec<Row>>> {
-        if let Some(memo) = &self.memo
-            && let Some(rows) = memo.get(&key)
-        {
-            return Ok(Rc::clone(rows));
+    fn inner_rows(&mut self, key: Vec<Value>) -> Result<Arc<Mutex<SpillTape<Row>>>> {
+        if let Some(MemoPayload::Rows(rows)) = self.memo.as_mut().and_then(|memo| memo.get(&key)) {
+            return Ok(rows);
         }
+        let registry = &self.ctx.statement.runtime_value_sets;
+        let watermark = registry.watermark();
         let substituted = substitute_template(&self.subplan, &key)?;
-        let mut inner = build_executor(self.ctx, &substituted)?;
-        open_executor(inner.as_mut())?;
+        let mut inner = match build_executor(self.ctx, &substituted) {
+            Ok(inner) => inner,
+            Err(err) => {
+                registry.remove_since(watermark);
+                return Err(err);
+            }
+        };
+        if let Err(err) = open_executor(inner.as_mut()) {
+            registry.remove_since(watermark);
+            return Err(err);
+        }
         let result = (|| {
-            let mut rows = Vec::new();
+            let mut rows = SpillTape::new(self.spill_ctx.clone());
             while let Some(row) = inner.next()? {
                 check_canceled(self.ctx)?;
-                rows.push(row.row);
+                rows.push(row.row)?;
             }
+            rows.finish()?;
             Ok(rows)
         })();
-        let rows = Rc::new(close_after(inner.as_mut(), result)?);
+        let rows = close_after(inner.as_mut(), result);
+        registry.remove_since(watermark);
+        let rows = Arc::new(Mutex::new(rows?));
         if let Some(memo) = &mut self.memo {
-            memo.insert(key, Rc::clone(&rows));
+            memo.insert(key, MemoPayload::Rows(Arc::clone(&rows)));
         }
         Ok(rows)
     }
@@ -304,19 +465,52 @@ impl PlanExecutor for LateralApplyOp<'_> {
     }
 
     fn open(&mut self) -> Result<()> {
-        self.pending.clear();
+        self.current_reader = None;
+        self.current_owned_tape = None;
+        self.current_outer = None;
         self.input.open()
     }
 
     fn close(&mut self) -> Result<()> {
-        self.pending.clear();
+        self.current_reader = None;
+        self.current_owned_tape = None;
+        self.current_outer = None;
         self.input.close()
     }
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
         loop {
-            if let Some(row) = self.pending.pop_front() {
-                return Ok(Some(row));
+            check_canceled(self.ctx)?;
+            if let Some(reader) = &mut self.current_reader {
+                while let Some(inner) = reader.next_record()? {
+                    check_canceled(self.ctx)?;
+                    let outer = self.current_outer.as_ref().expect("reader has outer row");
+                    let mut values = outer.row.values.clone();
+                    values.extend(inner.values);
+                    let combined = ExecRow {
+                        row: Row { values },
+                        identity: outer.identity.clone(),
+                    };
+                    let matches = self.condition.as_ref().map_or(Ok(true), |condition| {
+                        eval_expr(&self.ctx.statement, condition, &combined)
+                            .map(|value| matches!(value, Value::Boolean(true)))
+                    })?;
+                    if matches {
+                        self.current_matched = true;
+                        return Ok(Some(combined));
+                    }
+                }
+                self.current_reader = None;
+                self.current_owned_tape = None;
+                let outer = self.current_outer.take().expect("reader has outer row");
+                if self.left_join && !self.current_matched {
+                    let mut values = outer.row.values;
+                    values.extend(std::iter::repeat_n(Value::Null, self.inner_width));
+                    return Ok(Some(ExecRow {
+                        row: Row { values },
+                        identity: outer.identity,
+                    }));
+                }
             }
             let Some(outer) = self.input.next()? else {
                 return Ok(None);
@@ -329,37 +523,14 @@ impl PlanExecutor for LateralApplyOp<'_> {
                 .map(|expr| eval_expr(statement, expr, &outer))
                 .collect::<Result<Vec<_>>>()?;
             let rows = self.inner_rows(key)?;
-
-            for inner in rows.iter() {
-                let mut values = outer.row.values.clone();
-                values.extend(inner.values.iter().cloned());
-                let combined = ExecRow {
-                    row: Row { values },
-                    // Physical row identity passes through from the outer
-                    // side, as for every Apply.
-                    identity: outer.identity.clone(),
-                };
-                let matches = match &self.condition {
-                    Some(condition) => {
-                        matches!(
-                            eval_expr(statement, condition, &combined)?,
-                            Value::Boolean(true)
-                        )
-                    }
-                    None => true,
-                };
-                if matches {
-                    self.pending.push_back(combined);
-                }
-            }
-            if self.pending.is_empty() && self.left_join {
-                let mut values = outer.row.values;
-                values.extend(std::iter::repeat_n(Value::Null, self.inner_width));
-                self.pending.push_back(ExecRow {
-                    row: Row { values },
-                    identity: outer.identity,
-                });
-            }
+            let reader = rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reader()?;
+            self.current_outer = Some(outer);
+            self.current_reader = Some(reader);
+            self.current_owned_tape = Some(rows);
+            self.current_matched = false;
         }
     }
 }
@@ -369,19 +540,23 @@ impl PlanExecutor for LateralApplyOp<'_> {
 /// a `NULL` operand or a `NULL` element makes the result `NULL`, else
 /// `false`. `NOT IN` negates through three-valued `NOT` (`NULL` stays
 /// `NULL`).
-fn in_membership(operand: &Value, column: &[Value], negated: bool) -> Result<Value> {
+fn in_membership(
+    operand: &Value,
+    column: &mut SpillTapeReader<Value>,
+    negated: bool,
+) -> Result<Value> {
     if matches!(operand, Value::Null) {
         return Ok(Value::Null);
     }
     let mut saw_null = false;
     let mut found = false;
-    for value in column {
+    while let Some(value) = column.next_record()? {
         if matches!(value, Value::Null) {
             saw_null = true;
             continue;
         }
         if matches!(
-            compare_values(operand, planner::BinOp::Eq, value)?,
+            compare_values(operand, planner::BinOp::Eq, &value)?,
             Value::Boolean(true)
         ) {
             found = true;

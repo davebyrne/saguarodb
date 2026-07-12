@@ -661,6 +661,12 @@ remains a leaf crate. Default contexts install a no-op provider that returns
 real providers return `Result` so catalog-read failures propagate instead of
 being flattened into "object not found". Default contexts install loud/no-op test
 implementations where appropriate. `StatementContext` is `Clone` but not `Copy`.
+Each newly constructed context owns a fresh query-local
+`RuntimeValueSetRegistry`; its clones share the registry through `Arc`.
+Monotonically assigned IDs resolve executor-created transient membership sets,
+and the registry is excluded from context equality like other runtime providers.
+Prepared-plan reuse constructs a new statement context, so sets never cross
+executions.
 
 ```rust
 pub struct GucSetting {

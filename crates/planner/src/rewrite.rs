@@ -22,6 +22,14 @@ pub fn rewrite_plan_exprs(
     plan: &PhysicalPlan,
     f: &mut impl FnMut(&BoundExpr) -> Result<Option<BoundExpr>>,
 ) -> Result<PhysicalPlan> {
+    rewrite_plan_exprs_impl(plan, f, false)
+}
+
+fn rewrite_plan_exprs_impl(
+    plan: &PhysicalPlan,
+    f: &mut impl FnMut(&BoundExpr) -> Result<Option<BoundExpr>>,
+    descend_apply_subplans: bool,
+) -> Result<PhysicalPlan> {
     Ok(match plan {
         PhysicalPlan::CreateSchema { .. }
         | PhysicalPlan::DropSchema { .. }
@@ -49,7 +57,7 @@ pub fn rewrite_plan_exprs(
         } => PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             on_conflict: rewrite_on_conflict(on_conflict, f)?,
             returning: rewrite_returning(returning, f)?,
             default_exprs: rewrite_assignments(default_exprs, f)?,
@@ -65,7 +73,7 @@ pub fn rewrite_plan_exprs(
         } => PhysicalPlan::Update {
             table: *table,
             assignments: rewrite_assignments(assignments, f)?,
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             joined_source: *joined_source,
             returning: rewrite_returning(returning, f)?,
             check_exprs: rewrite_vec(check_exprs, f)?,
@@ -77,7 +85,7 @@ pub fn rewrite_plan_exprs(
             returning,
         } => PhysicalPlan::Delete {
             table: *table,
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             joined_source: *joined_source,
             returning: rewrite_returning(returning, f)?,
         },
@@ -121,8 +129,8 @@ pub fn rewrite_plan_exprs(
             join_type,
             identity_from,
         } => PhysicalPlan::NestedLoopJoin {
-            left: Box::new(rewrite_plan_exprs(left, f)?),
-            right: Box::new(rewrite_plan_exprs(right, f)?),
+            left: Box::new(rewrite_plan_exprs_impl(left, f, descend_apply_subplans)?),
+            right: Box::new(rewrite_plan_exprs_impl(right, f, descend_apply_subplans)?),
             condition: rewrite_opt(condition, f)?,
             join_type: *join_type,
             identity_from: *identity_from,
@@ -136,8 +144,8 @@ pub fn rewrite_plan_exprs(
             identity_from,
             build_left,
         } => PhysicalPlan::HashJoin {
-            left: Box::new(rewrite_plan_exprs(left, f)?),
-            right: Box::new(rewrite_plan_exprs(right, f)?),
+            left: Box::new(rewrite_plan_exprs_impl(left, f, descend_apply_subplans)?),
+            right: Box::new(rewrite_plan_exprs_impl(right, f, descend_apply_subplans)?),
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
             join_type: *join_type,
@@ -152,8 +160,8 @@ pub fn rewrite_plan_exprs(
             residual,
             join_type,
         } => PhysicalPlan::MergeJoin {
-            left: Box::new(rewrite_plan_exprs(left, f)?),
-            right: Box::new(rewrite_plan_exprs(right, f)?),
+            left: Box::new(rewrite_plan_exprs_impl(left, f, descend_apply_subplans)?),
+            right: Box::new(rewrite_plan_exprs_impl(right, f, descend_apply_subplans)?),
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
             residual: rewrite_opt(residual, f)?,
@@ -169,8 +177,12 @@ pub fn rewrite_plan_exprs(
             correlations,
             kind,
         } => PhysicalPlan::Apply {
-            input: Box::new(rewrite_plan_exprs(input, f)?),
-            subplan: subplan.clone(),
+            input: Box::new(rewrite_plan_exprs_impl(input, f, descend_apply_subplans)?),
+            subplan: if descend_apply_subplans {
+                Box::new(rewrite_plan_exprs_impl(subplan, f, true)?)
+            } else {
+                subplan.clone()
+            },
             correlations: rewrite_vec(correlations, f)?,
             kind: match kind {
                 ApplyKind::In { operand, negated } => ApplyKind::In {
@@ -193,7 +205,7 @@ pub fn rewrite_plan_exprs(
             },
         },
         PhysicalPlan::Filter { source, predicate } => PhysicalPlan::Filter {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             predicate: rewrite_expr(predicate, f)?,
         },
         PhysicalPlan::Projection {
@@ -201,12 +213,12 @@ pub fn rewrite_plan_exprs(
             expressions,
             output_schema,
         } => PhysicalPlan::Projection {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             expressions: rewrite_vec(expressions, f)?,
             output_schema: output_schema.clone(),
         },
         PhysicalPlan::Sort { source, order_by } => PhysicalPlan::Sort {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             order_by: order_by
                 .iter()
                 .map(|item| {
@@ -219,7 +231,7 @@ pub fn rewrite_plan_exprs(
                 .collect::<Result<Vec<_>>>()?,
         },
         PhysicalPlan::Distinct { source, on_keys } => PhysicalPlan::Distinct {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             on_keys: rewrite_vec(on_keys, f)?,
         },
         PhysicalPlan::Limit {
@@ -227,7 +239,7 @@ pub fn rewrite_plan_exprs(
             count,
             offset,
         } => PhysicalPlan::Limit {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             count: *count,
             offset: *offset,
         },
@@ -237,7 +249,7 @@ pub fn rewrite_plan_exprs(
             aggregates,
             output_schema,
         } => PhysicalPlan::Aggregate {
-            source: Box::new(rewrite_plan_exprs(source, f)?),
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             group_by: rewrite_vec(group_by, f)?,
             aggregates: aggregates
                 .iter()
@@ -284,8 +296,8 @@ pub fn rewrite_plan_exprs(
         } => PhysicalPlan::SetOp {
             op: *op,
             all: *all,
-            left: Box::new(rewrite_plan_exprs(left, f)?),
-            right: Box::new(rewrite_plan_exprs(right, f)?),
+            left: Box::new(rewrite_plan_exprs_impl(left, f, descend_apply_subplans)?),
+            right: Box::new(rewrite_plan_exprs_impl(right, f, descend_apply_subplans)?),
         },
     })
 }
@@ -456,6 +468,19 @@ fn rewrite_children(
         } => BoundExpr::InList {
             expr: Box::new(rewrite_expr(expr, f)?),
             list: rewrite_vec(list, f)?,
+            negated: *negated,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        },
+        BoundExpr::RuntimeInSet {
+            expr,
+            set,
+            negated,
+            data_type,
+            nullable,
+        } => BoundExpr::RuntimeInSet {
+            expr: Box::new(rewrite_expr(expr, f)?),
+            set: *set,
             negated: *negated,
             data_type: data_type.clone(),
             nullable: *nullable,
