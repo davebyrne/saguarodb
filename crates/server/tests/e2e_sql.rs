@@ -94,6 +94,20 @@ async fn e2e_unnest_and_generate_series_table_functions() {
         .err()
         .expect("table function must not cross an explicit join boundary");
     assert_eq!(err.code, common::SqlState::FeatureNotSupported);
+
+    server
+        .simple_query(
+            "create view flattened_values as \
+             select value from series_inputs, unnest(series_inputs.values) as u(value)",
+        )
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("alter table series_inputs drop column values")
+        .await
+        .err()
+        .expect("lateral table-function column dependency should block DROP COLUMN");
+    assert_eq!(err.code, common::SqlState::DependentObjectsStillExist);
 }
 
 #[tokio::test]

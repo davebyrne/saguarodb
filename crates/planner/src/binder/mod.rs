@@ -1105,7 +1105,9 @@ fn collect_select_dependencies(
         .as_ref()
         .map(|from| {
             collect_from_dependencies(from, builder);
-            visible_relation_bindings(from)
+            let bindings = visible_relation_bindings(from);
+            collect_table_function_dependencies(from, &bindings, builder);
+            bindings
         })
         .unwrap_or_default();
     for item in &ast.columns {
@@ -1375,12 +1377,7 @@ fn collect_from_dependencies(from: &BoundFrom, builder: &mut ViewDependencyBuild
     match from {
         BoundFrom::Table { table, .. } => builder.add_relation(*table),
         BoundFrom::System { .. } => {}
-        BoundFrom::TableFunction { args, .. } => {
-            let bindings = visible_relation_bindings(from);
-            for arg in args {
-                collect_expr_dependencies(arg, &bindings, builder);
-            }
-        }
+        BoundFrom::TableFunction { .. } => {}
         BoundFrom::Derived { query, .. } => collect_bound_query_dependencies(query, builder),
         BoundFrom::View { view, query, .. } => {
             builder.add_relation(*view);
@@ -1425,7 +1422,9 @@ fn collect_bound_select_dependencies(
         .as_ref()
         .map(|from| {
             collect_from_dependencies(from, builder);
-            visible_relation_bindings(from)
+            let bindings = visible_relation_bindings(from);
+            collect_table_function_dependencies(from, &bindings, builder);
+            bindings
         })
         .unwrap_or_default();
     for item in &select.columns {
@@ -1452,6 +1451,28 @@ fn collect_bound_select_dependencies(
     }
     for order_by in order_by {
         collect_expr_dependencies(&order_by.expr, &relation_bindings, builder);
+    }
+}
+
+fn collect_table_function_dependencies(
+    from: &BoundFrom,
+    bindings: &[DependencyBinding],
+    builder: &mut ViewDependencyBuilder,
+) {
+    let mut stack = vec![from];
+    while let Some(item) = stack.pop() {
+        match item {
+            BoundFrom::TableFunction { args, .. } => {
+                for arg in args {
+                    collect_expr_dependencies(arg, bindings, builder);
+                }
+            }
+            BoundFrom::Join { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            _ => {}
+        }
     }
 }
 
