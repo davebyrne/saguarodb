@@ -1107,8 +1107,8 @@ fn type_entries() -> Vec<TypeEntry> {
         type_entry(PgType::OidVector, "oidvector", "A", false, 26, 0),
         type_entry(PgType::Float4, "float4", "N", true, 0, 0),
         type_entry(PgType::Float8, "float8", "N", true, 0, 0),
-        type_entry(PgType::Int2Array, "_int2", "A", false, 21, 0),
-        type_entry(PgType::OidArray, "_oid", "A", false, 26, 0),
+        type_entry(PgType::CatalogInt2ArrayText, "_int2", "A", false, 21, 0),
+        type_entry(PgType::CatalogOidArrayText, "_oid", "A", false, 26, 0),
         type_entry(PgType::Bpchar(None), "bpchar", "S", false, 0, 0),
         type_entry(PgType::Varchar(None), "varchar", "S", false, 0, 0),
         type_entry(PgType::Date, "date", "D", true, 0, 0),
@@ -1186,8 +1186,8 @@ fn type_storage(pg_type: &PgType) -> &'static str {
         | PgType::Bytea
         | PgType::OidVector
         | PgType::Int2Vector
-        | PgType::OidArray
-        | PgType::Int2Array
+        | PgType::CatalogOidArrayText
+        | PgType::CatalogInt2ArrayText
         | PgType::Array(_) => "x",
         _ => "p",
     }
@@ -1225,8 +1225,8 @@ fn sql_data_type(pg_type: &PgType) -> String {
         PgType::Interval => "interval",
         PgType::OidVector => "oidvector",
         PgType::Int2Vector => "int2vector",
-        PgType::OidArray => "oid[]",
-        PgType::Int2Array => "smallint[]",
+        PgType::CatalogOidArrayText => "oid[]",
+        PgType::CatalogInt2ArrayText => "smallint[]",
         PgType::Array(_) => unreachable!("handled above"),
     }
     .to_string()
@@ -1257,8 +1257,8 @@ fn pg_type_name(pg_type: &PgType) -> String {
         PgType::Interval => "interval",
         PgType::OidVector => "oidvector",
         PgType::Int2Vector => "int2vector",
-        PgType::OidArray => "_oid",
-        PgType::Int2Array => "_int2",
+        PgType::CatalogOidArrayText => "_oid",
+        PgType::CatalogInt2ArrayText => "_int2",
         PgType::Array(_) => unreachable!("handled above"),
     }
     .to_string()

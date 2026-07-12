@@ -550,11 +550,11 @@ fn int2vector_col(id: u16, name: &str) -> ColumnDef {
 }
 
 fn nullable_oid_array_col(id: u16, name: &str) -> ColumnDef {
-    col(id, name, DataType::Text, PgType::OidArray, true)
+    col(id, name, DataType::Text, PgType::CatalogOidArrayText, true)
 }
 
 fn nullable_int2_array_col(id: u16, name: &str) -> ColumnDef {
-    col(id, name, DataType::Text, PgType::Int2Array, true)
+    col(id, name, DataType::Text, PgType::CatalogInt2ArrayText, true)
 }
 
 fn bool_col(id: u16, name: &str) -> ColumnDef {

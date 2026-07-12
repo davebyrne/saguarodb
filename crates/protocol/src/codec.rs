@@ -646,7 +646,10 @@ pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Re
     let value_format = ValueFormat::from_code(format)?;
     if matches!(
         pg_type,
-        PgType::Int2Vector | PgType::OidVector | PgType::Int2Array | PgType::OidArray
+        PgType::Int2Vector
+            | PgType::OidVector
+            | PgType::CatalogInt2ArrayText
+            | PgType::CatalogOidArrayText
     ) && value_format == ValueFormat::Binary
     {
         return Err(protocol_error(
@@ -942,8 +945,8 @@ mod integer_param_tests {
         for pg_type in [
             PgType::Int2Vector,
             PgType::OidVector,
-            PgType::Int2Array,
-            PgType::OidArray,
+            PgType::CatalogInt2ArrayText,
+            PgType::CatalogOidArrayText,
         ] {
             assert_eq!(
                 decode_value_with_type(b"1 2", &pg_type, 0).unwrap(),

@@ -784,7 +784,10 @@ fn resolve_result_format_for_type(formats: &[i16], index: usize, wire_type: &PgT
 fn binary_result_output_uses_text(wire_type: &PgType) -> bool {
     matches!(
         wire_type,
-        PgType::OidVector | PgType::Int2Vector | PgType::OidArray | PgType::Int2Array
+        PgType::OidVector
+            | PgType::Int2Vector
+            | PgType::CatalogOidArrayText
+            | PgType::CatalogInt2ArrayText
     )
 }
 

@@ -297,7 +297,7 @@ fn catalog_vector_and_array_results_stay_text_when_binary_is_requested() {
             data_type: DataType::Text,
             table_id: None,
             column_id: None,
-            pg_type: Some(PgType::Int2Array),
+            pg_type: Some(PgType::CatalogInt2ArrayText),
         },
         ColumnInfo {
             name: "n".to_string(),

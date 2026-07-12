@@ -44,10 +44,11 @@ pub enum PgType {
     Interval,
     OidVector,
     Int2Vector,
-    OidArray,
-    Int2Array,
-    /// A real PostgreSQL array wire type. The pre-existing `Int2Array` and
-    /// `OidArray` variants remain as durable aliases for their element types.
+    /// Historical virtual-catalog field: semantic TEXT encoded with oid[] OID.
+    CatalogOidArrayText,
+    /// Historical virtual-catalog field: semantic TEXT encoded with int2[] OID.
+    CatalogInt2ArrayText,
+    /// A real PostgreSQL array wire type.
     Array(PgArrayType),
 }
 
@@ -203,8 +204,8 @@ impl PgType {
             PgType::Interval => "interval".to_string(),
             PgType::OidVector => "oidvector".to_string(),
             PgType::Int2Vector => "int2vector".to_string(),
-            PgType::OidArray => "oid[]".to_string(),
-            PgType::Int2Array => "smallint[]".to_string(),
+            PgType::CatalogOidArrayText => "oid[]".to_string(),
+            PgType::CatalogInt2ArrayText => "smallint[]".to_string(),
             PgType::Array(element) => format!("{}[]", element.0.format_type_name()),
         }
     }
@@ -232,8 +233,8 @@ impl PgType {
             PgType::Interval => 1186,
             PgType::OidVector => 30,
             PgType::Int2Vector => 22,
-            PgType::OidArray => 1028,
-            PgType::Int2Array => 1005,
+            PgType::CatalogOidArrayText => 1028,
+            PgType::CatalogInt2ArrayText => 1005,
             PgType::Array(element) => array_oid(&element.0)
                 .expect("PgArrayType construction guarantees a supported scalar element"),
         }
@@ -258,8 +259,8 @@ impl PgType {
             | PgType::Bytea
             | PgType::OidVector
             | PgType::Int2Vector
-            | PgType::OidArray
-            | PgType::Int2Array => -1,
+            | PgType::CatalogOidArrayText
+            | PgType::CatalogInt2ArrayText => -1,
             PgType::Array(_) => -1,
         }
     }
@@ -316,8 +317,8 @@ impl PgType {
             | PgType::Bpchar(_)
             | PgType::OidVector
             | PgType::Int2Vector
-            | PgType::OidArray
-            | PgType::Int2Array => DataType::Text,
+            | PgType::CatalogOidArrayText
+            | PgType::CatalogInt2ArrayText => DataType::Text,
             PgType::Array(element) => DataType::Array(
                 crate::ArrayType::new(element.0.data_type())
                     .expect("PgArrayType always contains a scalar element"),
@@ -374,8 +375,8 @@ impl<'de> Deserialize<'de> for PgType {
             Interval,
             OidVector,
             Int2Vector,
-            OidArray,
-            Int2Array,
+            CatalogOidArrayText,
+            CatalogInt2ArrayText,
             Array(Box<SerializedPgType>),
         }
 
@@ -403,8 +404,8 @@ impl<'de> Deserialize<'de> for PgType {
                 SerializedPgType::Interval => PgType::Interval,
                 SerializedPgType::OidVector => PgType::OidVector,
                 SerializedPgType::Int2Vector => PgType::Int2Vector,
-                SerializedPgType::OidArray => PgType::OidArray,
-                SerializedPgType::Int2Array => PgType::Int2Array,
+                SerializedPgType::CatalogOidArrayText => PgType::CatalogOidArrayText,
+                SerializedPgType::CatalogInt2ArrayText => PgType::CatalogInt2ArrayText,
                 SerializedPgType::Array(element) => PgType::array(convert::<E>(*element)?)
                     .map_err(|error| E::custom(error.to_string()))?,
             };
@@ -468,7 +469,7 @@ impl PgType {
     pub fn array(element: PgType) -> crate::Result<Self> {
         if matches!(
             element,
-            PgType::Array(_) | PgType::Int2Array | PgType::OidArray
+            PgType::Array(_) | PgType::CatalogInt2ArrayText | PgType::CatalogOidArrayText
         ) {
             return Err(crate::DbError::plan(
                 crate::SqlState::DatatypeMismatch,
@@ -530,8 +531,8 @@ mod tests {
             (PgType::Bool, 16, 1),
             (PgType::Float4, 700, 4),
             (PgType::Float8, 701, 8),
-            (PgType::Int2Array, 1005, -1),
-            (PgType::OidArray, 1028, -1),
+            (PgType::CatalogInt2ArrayText, 1005, -1),
+            (PgType::CatalogOidArrayText, 1028, -1),
             (
                 PgType::Numeric {
                     precision: None,
@@ -780,13 +781,23 @@ mod tests {
             PgType::Bpchar(None),
             PgType::OidVector,
             PgType::Int2Vector,
-            PgType::OidArray,
-            PgType::Int2Array,
+            PgType::CatalogOidArrayText,
+            PgType::CatalogInt2ArrayText,
         ] {
             assert_eq!(pg_type.data_type(), DataType::Text);
         }
         assert_eq!(PgType::Float4.data_type(), DataType::Real);
         assert_eq!(PgType::Float8.data_type(), DataType::Double);
+
+        // These two pseudo-types exist only for historical text-backed virtual
+        // catalog columns. OID lookup intentionally resolves to the real array
+        // type, so callers must not normalize pseudo-types through their OID.
+        for pseudo_type in [PgType::CatalogInt2ArrayText, PgType::CatalogOidArrayText] {
+            let real_type = PgType::from_oid_typmod(i64::from(pseudo_type.oid()), -1).unwrap();
+            assert_ne!(real_type, pseudo_type);
+            assert!(matches!(real_type.data_type(), DataType::Array(_)));
+            assert_eq!(pseudo_type.data_type(), DataType::Text);
+        }
 
         // `data_type()` is a left inverse of the label-free `From` for every type.
         let all = [
