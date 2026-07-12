@@ -76,7 +76,16 @@ impl QueryService {
         }
 
         if let StatementClass::SessionConfig = class {
+            if let Err(err) = session.cancel().check() {
+                return (mark_failed_on_error(slot), default_isolation, Err(err));
+            }
             let resets_session_objects = matches!(statement, Statement::DiscardAll);
+            let mutates_session = matches!(
+                statement,
+                Statement::SetVariable { .. }
+                    | Statement::ResetVariable { .. }
+                    | Statement::DiscardAll
+            );
             let (slot, default_isolation, result) = self.handle_session_config(
                 statement,
                 slot,
@@ -87,6 +96,8 @@ impl QueryService {
             let result = result.map(|result| {
                 if resets_session_objects {
                     StreamOutcome::SessionReset(result)
+                } else if mutates_session {
+                    StreamOutcome::Durable(result)
                 } else {
                     StreamOutcome::Direct(result)
                 }
@@ -98,9 +109,12 @@ impl QueryService {
         // transaction lifecycle like transaction control; the op + name are read
         // from the parsed statement (`docs/specs/savepoints.md`).
         if let StatementClass::Savepoint = class {
+            if let Err(err) = session.cancel().check() {
+                return (mark_failed_on_error(slot), default_isolation, Err(err));
+            }
             let (slot, default_isolation, result) =
                 self.handle_savepoint(statement, slot, default_isolation);
-            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+            return (slot, default_isolation, result.map(StreamOutcome::Durable));
         }
 
         if let StatementClass::SqlCursor = class {

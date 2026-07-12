@@ -614,7 +614,7 @@ impl QueryService {
             // metadata) so its effects are hidden by the CLOG. Abort is status-based
             // — no page-content undo (`docs/specs/mvcc.md` §4 Decision 3).
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(txn_id, !txn.truncate_updates.is_empty());
+            self.rollback_pre_durable_or_die(txn_id, None);
             drop(relation_publication);
             drop(catalog_publication);
             if !truncate_updates.is_empty() {
