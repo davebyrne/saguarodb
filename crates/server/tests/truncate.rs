@@ -443,20 +443,29 @@ async fn repeatable_read_owner_sees_transactional_truncate_replacement() {
 }
 
 #[tokio::test]
-async fn transactional_truncate_rejects_open_savepoint() {
+async fn rollback_to_savepoint_discards_transactional_truncate() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
     conn.ok("create table savepoint_truncate (id integer primary key)")
         .await
         .rows();
+    conn.ok("insert into savepoint_truncate values (1)")
+        .await
+        .rows();
     conn.ok("begin").await.rows();
     conn.ok("savepoint s").await.rows();
-    let outcome = conn.query("truncate savepoint_truncate").await.unwrap();
-    assert_eq!(
-        outcome.result.err().expect("TRUNCATE must fail").code,
-        common::SqlState::FeatureNotSupported
+    conn.ok("truncate savepoint_truncate").await.rows();
+    assert!(
+        conn.ok("select id from savepoint_truncate")
+            .await
+            .rows()
+            .is_empty()
     );
-    assert_eq!(outcome.status, b'E');
+    conn.ok("rollback to savepoint s").await.rows();
+    assert_eq!(
+        conn.ok("select id from savepoint_truncate").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
     conn.ok("rollback").await.rows();
 }
 

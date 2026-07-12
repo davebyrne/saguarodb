@@ -212,7 +212,7 @@ impl SequenceState {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TxnRollback {
     tables: BTreeMap<TableId, Option<Arc<TableGeneration>>>,
     indexes: BTreeMap<IndexId, Option<Arc<IndexGeneration>>>,
@@ -220,6 +220,15 @@ struct TxnRollback {
     toast_next_value_ids: BTreeMap<TableId, Option<u64>>,
     unpublished_files: Vec<FileId>,
     superseded_generations: Vec<RetiredGeneration>,
+}
+
+#[derive(Clone)]
+pub struct StorageSavepoint {
+    rollback: Option<TxnRollback>,
+    tables: BTreeMap<TableId, Option<Arc<TableGeneration>>>,
+    indexes: BTreeMap<IndexId, Option<Arc<IndexGeneration>>>,
+    sequences: BTreeMap<SequenceId, Option<SequenceState>>,
+    toast_next_value_ids: BTreeMap<TableId, Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -1650,6 +1659,190 @@ impl PageBackedStorageEngine {
         updates: Vec<TruncateCatalogUpdate>,
     ) -> Result<()> {
         self.publish_truncate_tables_inner(Some(txn_id), updates)
+    }
+
+    pub fn savepoint(&self, txn_id: u64) -> Result<StorageSavepoint> {
+        let state = self.lock_state()?;
+        let rollback = state.rollback.get(&txn_id).cloned();
+        Ok(StorageSavepoint {
+            tables: rollback
+                .iter()
+                .flat_map(|rollback| rollback.tables.keys())
+                .map(|id| (*id, state.tables.get(id).cloned()))
+                .collect(),
+            indexes: rollback
+                .iter()
+                .flat_map(|rollback| rollback.indexes.keys())
+                .map(|id| (*id, state.indexes.get(id).cloned()))
+                .collect(),
+            sequences: rollback
+                .iter()
+                .flat_map(|rollback| rollback.sequences.keys())
+                .map(|id| (*id, state.sequences.get(id).cloned()))
+                .collect(),
+            toast_next_value_ids: rollback
+                .iter()
+                .flat_map(|rollback| rollback.toast_next_value_ids.keys())
+                .map(|id| (*id, state.toast_next_value_ids.get(id).copied()))
+                .collect(),
+            rollback,
+        })
+    }
+
+    pub fn rollback_to_savepoint(&self, txn_id: u64, savepoint: &StorageSavepoint) -> Result<()> {
+        let mut state = self.lock_state()?;
+        let current = state.rollback.get(&txn_id).cloned().unwrap_or_default();
+        let mut retired = RetiredGeneration {
+            files: current.unpublished_files.clone(),
+            table_refs: Vec::new(),
+            index_refs: Vec::new(),
+        };
+        if let Some(previous) = &savepoint.rollback {
+            let retained: BTreeSet<_> = previous.unpublished_files.iter().copied().collect();
+            retired.files.retain(|file| !retained.contains(file));
+        }
+
+        let table_ids: BTreeSet<_> = current
+            .tables
+            .keys()
+            .chain(
+                savepoint
+                    .rollback
+                    .iter()
+                    .flat_map(|state| state.tables.keys()),
+            )
+            .copied()
+            .collect();
+        for id in table_ids {
+            let target = savepoint
+                .tables
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| current.tables.get(&id).cloned().unwrap_or(None));
+            if let Some(current) = state.tables.get(&id).cloned() {
+                retire_replaced_table_generation(&mut retired, &current, target.as_ref());
+            }
+            match target {
+                Some(table) => {
+                    state.tables.insert(id, table);
+                }
+                None => {
+                    state.tables.remove(&id);
+                }
+            }
+        }
+        let index_ids: BTreeSet<_> = current
+            .indexes
+            .keys()
+            .chain(
+                savepoint
+                    .rollback
+                    .iter()
+                    .flat_map(|state| state.indexes.keys()),
+            )
+            .copied()
+            .collect();
+        for id in index_ids {
+            let target = savepoint
+                .indexes
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| current.indexes.get(&id).cloned().unwrap_or(None));
+            if let Some(current) = state.indexes.get(&id).cloned() {
+                retire_replaced_index_generation(&mut retired, &current, target.as_ref());
+            }
+            match target {
+                Some(index) => {
+                    state.indexes.insert(id, index);
+                }
+                None => {
+                    state.indexes.remove(&id);
+                }
+            }
+        }
+        let sequence_ids: BTreeSet<_> = current
+            .sequences
+            .keys()
+            .chain(
+                savepoint
+                    .rollback
+                    .iter()
+                    .flat_map(|state| state.sequences.keys()),
+            )
+            .copied()
+            .collect();
+        for id in sequence_ids {
+            let target = savepoint
+                .sequences
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| current.sequences.get(&id).cloned().unwrap_or(None));
+            match target {
+                Some(sequence) => {
+                    state.sequences.insert(id, sequence);
+                }
+                None => {
+                    state.sequences.remove(&id);
+                }
+            }
+        }
+        let toast_ids: BTreeSet<_> = current
+            .toast_next_value_ids
+            .keys()
+            .chain(
+                savepoint
+                    .rollback
+                    .iter()
+                    .flat_map(|state| state.toast_next_value_ids.keys()),
+            )
+            .copied()
+            .collect();
+        for id in toast_ids {
+            let target = savepoint
+                .toast_next_value_ids
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| {
+                    current
+                        .toast_next_value_ids
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(None)
+                });
+            match target {
+                Some(next) => {
+                    state.toast_next_value_ids.insert(id, next);
+                }
+                None => {
+                    state.toast_next_value_ids.remove(&id);
+                }
+            }
+        }
+        match &savepoint.rollback {
+            Some(rollback) => {
+                state.rollback.insert(txn_id, rollback.clone());
+            }
+            None => {
+                state.rollback.remove(&txn_id);
+            }
+        }
+        let retained_superseded = savepoint
+            .rollback
+            .as_ref()
+            .map_or(0, |rollback| rollback.superseded_generations.len());
+        state.retired_generations.extend(
+            current
+                .superseded_generations
+                .into_iter()
+                .skip(retained_superseded),
+        );
+        if !retired.files.is_empty() {
+            retired.files.sort_unstable();
+            retired.files.dedup();
+            state.retired_generations.push_back(retired);
+        }
+        bump_relation_epoch(&mut state);
+        Ok(())
     }
 
     fn publish_truncate_tables_inner(

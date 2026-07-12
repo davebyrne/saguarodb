@@ -225,6 +225,14 @@ impl QueryService {
                 if txn.failed {
                     return (Some(txn), default_isolation, Err(failed_block_error()));
                 }
+                let catalog_overlay = match txn.catalog_overlay.savepoint() {
+                    Ok(savepoint) => savepoint,
+                    Err(err) => return (Some(txn), default_isolation, Err(err)),
+                };
+                let storage = match self.components.storage.savepoint(txn.txn_id) {
+                    Ok(savepoint) => savepoint,
+                    Err(err) => return (Some(txn), default_isolation, Err(err)),
+                };
                 let subxid = self.register_active_subxid(txn.txn_id);
                 txn.live_subxids.push(subxid);
                 txn.savepoints.push(SavepointLevel {
@@ -232,6 +240,9 @@ impl QueryService {
                     subxid,
                     default_isolation_override: txn.default_isolation_override,
                     statement_timeout_override: txn.statement_timeout_override,
+                    truncate_updates: txn.truncate_updates.clone(),
+                    catalog_overlay,
+                    storage,
                 });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
             }
@@ -270,6 +281,19 @@ impl QueryService {
                             txn.savepoints[idx].default_isolation_override;
                         let statement_timeout_override =
                             txn.savepoints[idx].statement_timeout_override;
+                        let truncate_updates = txn.savepoints[idx].truncate_updates.clone();
+                        let catalog_overlay = txn.savepoints[idx].catalog_overlay.clone();
+                        let storage = txn.savepoints[idx].storage.clone();
+                        if let Err(err) = txn.catalog_overlay.rollback_to(&catalog_overlay) {
+                            return (Some(txn), default_isolation, Err(err));
+                        }
+                        if let Err(err) = self
+                            .components
+                            .storage
+                            .rollback_to_savepoint(txn.txn_id, &storage)
+                        {
+                            return (Some(txn), default_isolation, Err(err));
+                        }
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -281,6 +305,7 @@ impl QueryService {
                         txn.savepoints.truncate(idx);
                         txn.default_isolation_override = default_isolation_override;
                         txn.statement_timeout_override = statement_timeout_override;
+                        txn.truncate_updates = truncate_updates.clone();
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -290,6 +315,9 @@ impl QueryService {
                             subxid: fresh,
                             default_isolation_override,
                             statement_timeout_override,
+                            truncate_updates,
+                            catalog_overlay,
+                            storage,
                         });
                         // ROLLBACK TO recovers a failed ('E') block to this savepoint.
                         txn.failed = false;
@@ -437,6 +465,9 @@ impl QueryService {
             savepoints: Vec::new(),
             live_subxids: Vec::new(),
             truncate_updates: std::collections::BTreeMap::new(),
+            catalog_overlay: Arc::new(catalog::CatalogOverlay::new(
+                self.components.catalog.clone(),
+            )),
         })
     }
 
@@ -581,8 +612,9 @@ impl QueryService {
         }
 
         let truncate_updates = txn.truncate_updates.values().cloned().collect::<Vec<_>>();
+        let has_catalog_changes = !txn.catalog_overlay.is_empty()?;
         let publication = (|| {
-            if truncate_updates.is_empty() {
+            if truncate_updates.is_empty() && !has_catalog_changes {
                 return Ok((None, None));
             }
             let catalog = self
@@ -635,6 +667,9 @@ impl QueryService {
                 .catalog
                 .apply_truncate_updates(&truncate_updates)
         {
+            self.fatal_after_durable_commit(err);
+        }
+        if has_catalog_changes && let Err(err) = txn.catalog_overlay.publish() {
             self.fatal_after_durable_commit(err);
         }
 

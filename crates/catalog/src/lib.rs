@@ -4,7 +4,7 @@ mod serialize;
 pub mod system;
 mod truncate_overlay;
 
-pub use catalog_overlay::CatalogOverlay;
+pub use catalog_overlay::{CatalogOverlay, CatalogOverlaySavepoint};
 pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{

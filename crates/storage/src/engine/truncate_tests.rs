@@ -757,6 +757,36 @@ fn transactional_truncate_publish_restores_original_on_rollback() {
 }
 
 #[test]
+fn rollback_to_savepoint_restores_pre_truncate_generation() {
+    let fixture = Fixture::new();
+    let old_row = user_row(1, "alice", "old generation");
+    fixture.insert_committed(200, old_row.clone());
+
+    let txn_id = 400;
+    let savepoint = fixture.engine.savepoint(txn_id).unwrap();
+    let plan = truncate_plan();
+    let update = truncate_update();
+    fixture
+        .engine
+        .prepare_truncate_table(&ctx(txn_id), &plan, &update)
+        .unwrap();
+    fixture
+        .engine
+        .publish_truncate_tables_transactional(txn_id, vec![update])
+        .unwrap();
+    fixture
+        .engine
+        .rollback_to_savepoint(txn_id, &savepoint)
+        .unwrap();
+
+    assert_eq!(
+        fixture.scan_rows(&ctx(txn_id), fixture.capture_relations().as_ref()),
+        vec![old_row]
+    );
+    assert!(fixture.engine.try_cleanup_retired_generations().unwrap() >= 1);
+}
+
+#[test]
 fn table_handle_fallback_pins_current_generation() {
     let fixture = Fixture::new();
     let mut old_relations = fixture

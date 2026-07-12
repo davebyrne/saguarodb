@@ -88,6 +88,14 @@ top-level allocation at `BEGIN`; lazy assignment is a future optimization).
 A write statement stamps the current writing xid as the tuple's `xmin`
 (`xmax` for deletes), unchanged from today — a subxid is just an xid.
 
+Each savepoint level also snapshots transaction-local catalog state. This
+includes the general transactional catalog overlay and the current TRUNCATE
+generation map. `ROLLBACK TO` restores those snapshots before re-establishing
+the level; `RELEASE` discards the snapshot while retaining the current changes.
+Allocator high-water reservations are deliberately not rewound, so rolled-back
+DDL leaves harmless id gaps rather than permitting durable identity reuse. WAL
+and heap row effects continue to use the subxid/CLOG mechanism below.
+
 The transaction also keeps a **live-(sub)xid set** = `T` plus every subxid not
 rolled back (open *and* released). It is what visibility and the conflict
 classifiers treat as "self" (§4), and its members stay registered in the active

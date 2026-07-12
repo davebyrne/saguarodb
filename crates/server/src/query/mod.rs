@@ -3,9 +3,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use catalog::{
-    CatalogManager, MemoryCatalog, TruncateCatalogOverlay, check_constraint_oid, index_oid,
-    primary_key_constraint_oid, resolve_system_view, sequence_oid, synthetic_primary_key_oid,
-    table_oid,
+    CatalogManager, CatalogOverlay, CatalogOverlaySavepoint, MemoryCatalog, TruncateCatalogOverlay,
+    check_constraint_oid, index_oid, primary_key_constraint_oid, resolve_system_view, sequence_oid,
+    synthetic_primary_key_oid, table_oid,
 };
 use common::{
     CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
@@ -644,6 +644,7 @@ pub struct Transaction {
     /// TRUNCATE, keyed by logical table id. Rebuilt over the live catalog for each
     /// later statement and published atomically only after durable COMMIT.
     pub(crate) truncate_updates: BTreeMap<TableId, TruncateCatalogUpdate>,
+    pub(crate) catalog_overlay: Arc<CatalogOverlay>,
 }
 
 #[derive(Clone, Copy)]
@@ -664,6 +665,9 @@ struct SavepointLevel {
     subxid: u64,
     default_isolation_override: Option<DefaultIsolationOverride>,
     statement_timeout_override: Option<StatementTimeoutOverride>,
+    truncate_updates: BTreeMap<TableId, TruncateCatalogUpdate>,
+    catalog_overlay: CatalogOverlaySavepoint,
+    storage: storage::StorageSavepoint,
 }
 
 impl Transaction {
@@ -811,7 +815,14 @@ impl QueryService {
             .catalog_publication_gate
             .read()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-        self.catalog_with_truncate_updates_under_gate(&txn.truncate_updates)
+        let base: Arc<dyn CatalogManager> = Arc::new(txn.catalog_overlay.catalog()?);
+        if txn.truncate_updates.is_empty() {
+            return Ok(base);
+        }
+        Ok(Arc::new(TruncateCatalogOverlay::new(
+            base,
+            txn.truncate_updates.values().cloned(),
+        )))
     }
 
     fn transaction_statement_catalog_from_validated(

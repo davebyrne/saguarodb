@@ -10,7 +10,7 @@ use common::{
 
 use crate::{CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CatalogDelta {
     schemas: BTreeMap<SchemaId, Option<NamespaceSchema>>,
     tables: BTreeMap<TableId, Option<TableSchema>>,
@@ -24,6 +24,9 @@ struct CatalogDelta {
     next_dictionary_id: u32,
     next_storage_id: u32,
 }
+
+#[derive(Clone)]
+pub struct CatalogOverlaySavepoint(CatalogDelta);
 
 /// Writable transaction-local catalog state.
 ///
@@ -91,6 +94,24 @@ impl CatalogOverlay {
             && delta.views.is_empty()
             && delta.indexes.is_empty()
             && delta.sequences.is_empty())
+    }
+
+    pub fn savepoint(&self) -> Result<CatalogOverlaySavepoint> {
+        Ok(CatalogOverlaySavepoint(
+            self.delta
+                .read()
+                .map_err(|_| DbError::internal("catalog overlay read lock poisoned"))?
+                .clone(),
+        ))
+    }
+
+    pub fn rollback_to(&self, savepoint: &CatalogOverlaySavepoint) -> Result<()> {
+        *self
+            .delta
+            .write()
+            .map_err(|_| DbError::internal("catalog overlay write lock poisoned"))? =
+            savepoint.0.clone();
+        Ok(())
     }
 }
 
@@ -421,5 +442,43 @@ mod tests {
         second.publish().unwrap();
         assert!(base.get_table_by_name("first").unwrap().is_some());
         assert!(base.get_table_by_name("second").unwrap().is_some());
+    }
+
+    #[test]
+    fn rollback_to_savepoint_restores_delta_without_reusing_ids() {
+        let base: Arc<dyn CatalogManager> = Arc::new(MemoryCatalog::empty());
+        let overlay = CatalogOverlay::new(base.clone());
+        let savepoint = overlay.savepoint().unwrap();
+        let created = overlay
+            .apply(|catalog| {
+                catalog.create_table(
+                    "discarded".to_string(),
+                    vec![column()],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+            })
+            .unwrap();
+        overlay.rollback_to(&savepoint).unwrap();
+        assert!(
+            overlay
+                .catalog()
+                .unwrap()
+                .get_table(created.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let next = overlay
+            .apply(|catalog| {
+                catalog.create_table(
+                    "next".to_string(),
+                    vec![column()],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+            })
+            .unwrap();
+        assert!(next.id > created.id);
     }
 }

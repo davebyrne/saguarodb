@@ -182,13 +182,6 @@ impl QueryService {
                 "run_truncate_in_transaction called with a non-TRUNCATE statement",
             ));
         };
-        if !txn.savepoints.is_empty() {
-            return Err(DbError::plan(
-                SqlState::FeatureNotSupported,
-                "TRUNCATE is not supported while a savepoint is open",
-            ));
-        }
-
         let updates_before = txn.truncate_updates.clone();
         let mut schemas = {
             let _catalog_read = self
