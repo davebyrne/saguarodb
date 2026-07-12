@@ -424,19 +424,25 @@ impl<'a> TextParser<'a> {
             }
             if byte == b'\\' {
                 self.offset += 1;
-                output.push(self.take_byte()?);
+                output.push((self.take_byte()?, true));
             } else {
                 self.offset += 1;
-                output.push(byte);
+                output.push((byte, false));
             }
         }
         if self.offset == start {
             return Err(array_error("array element is empty"));
         }
-        let value = String::from_utf8(output)
-            .map_err(|_| array_error("array element is not UTF-8"))?
-            .trim()
-            .to_string();
+        let first = output
+            .iter()
+            .position(|(byte, escaped)| *escaped || !byte.is_ascii_whitespace())
+            .unwrap_or(output.len());
+        let last = output
+            .iter()
+            .rposition(|(byte, escaped)| *escaped || !byte.is_ascii_whitespace())
+            .map_or(first, |index| index + 1);
+        let value = String::from_utf8(output[first..last].iter().map(|(byte, _)| *byte).collect())
+            .map_err(|_| array_error("array element is not UTF-8"))?;
         if value.is_empty() {
             return Err(array_error("unquoted array element is empty"));
         }
@@ -590,6 +596,16 @@ mod tests {
         );
         let encoded = encode(&decoded, &PgType::Text, false).unwrap();
         assert_eq!(decode(&encoded, &PgType::Text, false).unwrap(), decoded);
+
+        let spaces = decode(br"{\ foo,foo\ ,  bar  }", &PgType::Text, false).unwrap();
+        assert_eq!(
+            spaces.elements(),
+            &[
+                Value::Text(" foo".to_string()),
+                Value::Text("foo ".to_string()),
+                Value::Text("bar".to_string()),
+            ]
+        );
     }
 
     #[test]
