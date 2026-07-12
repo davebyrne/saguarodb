@@ -745,10 +745,12 @@ pub enum PhysicalPlan {
 - Parser emits `Statement::Explain(inner)`.
 - Binder emits `BoundStatement::Explain(inner_bound)`.
 - `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly; callers must unwrap and plan the inner bound statement.
-- The planner crate exposes `format_explain(plan: &PhysicalPlan) -> String`.
+- The planner crate exposes `format_explain(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> String` and `estimated_rows(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> u64` (the cardinality estimator, `docs/specs/statistics.md` §9.1).
 - The server `QueryService` handles the outer `EXPLAIN` statement by binding and object-locking the inner statement, building logical and physical plans for that inner statement, formatting the physical plan with `format_explain`, and returning `ExecutionResult::Explanation` without invoking the executor.
 
 The executor crate is not called for `EXPLAIN`.
+
+`format_explain` appends ` (rows=N)` — the estimated output row count — to every data-producing node line (scans, joins, Apply, filters, projections, sorts, distinct, limits, aggregates, `Values`, set operations, and the `Insert`/`Update`/`Delete` heads); DDL nodes carry no estimate. Estimates come from `planner::estimate` reading ANALYZE statistics through the catalog: base scans use the stored `row_count` (default 1000 when never analyzed), scan-level predicates resolve `column op literal` shapes against MCVs, histograms, and null fractions, and every unresolvable shape uses fixed defaults (equality `0.005`, ranges `1/3`, other predicates `0.5`, join-key/grouping distinct counts `200`, semi/anti joins keep half the left side, system views `100` rows). Upper `Filter` nodes estimate from predicate shape alone — column statistics resolve only at scan level in v1. Estimates are advisory and never affect correctness.
 
 `format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 

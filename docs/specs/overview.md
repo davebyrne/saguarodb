@@ -22,7 +22,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
   stays `VACUUM`); standalone `ANALYZE [table]` collects statistics only. The
   sample size follows the `default_statistics_target` session parameter
   (default `100`, range `1..=1000`). See `docs/specs/statistics.md`.
-- Rule-based query planner (no cost-based optimization)
+- Rule-based query planner (no cost-based optimization; ANALYZE statistics feed advisory cardinality estimates shown as `rows=` in `EXPLAIN` — `docs/specs/statistics.md` §9)
 - Transaction-owned table locks coordinate reads, writes, DDL, and maintenance by
   logical `TableId`, share the row-lock deadlock graph, and provide transactional
   multi-table TRUNCATE; see `docs/specs/table-locks.md`.

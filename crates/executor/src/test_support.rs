@@ -124,7 +124,7 @@ impl ExecutorHarness {
         let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.catalog.as_ref())?;
-        Ok(format_explain(&physical))
+        Ok(format_explain(&physical, self.catalog.as_ref()))
     }
 
     /// Stream a read query through `execute_query_streamed`, driving the provided

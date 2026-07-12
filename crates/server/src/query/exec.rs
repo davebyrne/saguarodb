@@ -1160,7 +1160,7 @@ impl QueryService {
         let logical = logical_plan(inner)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         Ok(ExecutionResult::Explanation {
-            text: format_explain(&physical),
+            text: format_explain(&physical, self.components.catalog.as_ref()),
         })
     }
 }

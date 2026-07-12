@@ -2694,7 +2694,7 @@ fn run_plan(
         let logical = logical_plan(inner.as_ref())?;
         let physical = physical_plan(&logical, catalog)?;
         return Ok(StreamOutcome::Direct(ExecutionResult::Explanation {
-            text: format_explain(&physical),
+            text: format_explain(&physical, catalog),
         }));
     }
     let logical = logical_plan(&bound)?;

@@ -306,21 +306,30 @@ every physical plan node:
 - Filter selectivity on `col op literal`:
   - `=`: MCV hit → its frequency; miss → `(1 − Σ mcv_freqs − null_frac) /
     max(n_distinct − |mcv|, 1)`. No statistics → `0.005`.
-  - `<`, `<=`, `>`, `>=`: sum of qualifying MCV frequencies + histogram
-    fraction (linear interpolation inside the boundary bucket). No
+  - `<`, `<=`, `>`, `>=`: sum of qualifying MCV frequencies (filtered by the
+    operator's strictness, so a boundary MCV counts only for the inclusive
+    forms) + histogram fraction (linear interpolation inside the boundary
+    bucket; the boundary's histogram mass is treated as noise). No
     statistics → `1/3`.
-  - `IS NULL` → `null_frac`; `IS NOT NULL` → `1 − null_frac`.
+  - `IS NULL` → `null_frac`; `IS NOT NULL` → `1 − null_frac`; `<>` →
+    `1 − null_frac − eq` (NULL rows never pass), while the NULL-safe
+    `IS DISTINCT FROM` keeps the plain complement `1 − eq`.
   - `AND` multiplies, `OR` is `a + b − ab`, `NOT` complements; everything
     clamps to `[0, 1]` (independence assumption).
   - Anything else (LIKE, expressions, subquery results): fixed defaults.
 - Join output: equi-join selectivity `1 / max(nd_left, nd_right)`; cross join
   multiplies; semi/anti and outer joins get simple bounded rules.
-- Aggregate/Distinct output: n_distinct of the grouping keys when available,
-  capped by input estimate.
+- Aggregate/Distinct output: the product of the grouping keys' distinct
+  counts, resolved through the same scan-level descent as hash-join keys when
+  a key is a plain column (`200` per key otherwise), capped by the input
+  estimate.
 
-`EXPLAIN` appends ` (rows=N)` to every plan node line. This changes visible
-EXPLAIN output; the format is specified in `planner.md` and existing tests are
-updated in the same milestone.
+`EXPLAIN` appends ` (rows=N)` to every **data-producing** plan node line
+(scans, joins, filters, projections, sorts, aggregates, DML heads; DDL nodes
+carry no estimate). Column statistics resolve at scan level (scan filters and
+the hash-join key descent through Filter/plain-column-Projection nodes);
+upper `Filter` nodes estimate from predicate shape alone in v1. This changes
+visible EXPLAIN output; the format is specified in `planner.md`.
 
 ### 9.2 First cost-based decisions (Milestone G)
 
