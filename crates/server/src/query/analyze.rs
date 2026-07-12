@@ -16,10 +16,11 @@ use storage::{PageBackedStorageEngine, RelationSnapshot, StorageEngine};
 use wal::{WalRecord, WalRecordKind};
 
 use super::QueryService;
+use super::gucs::DEFAULT_STATISTICS_TARGET_DEFAULT;
 use super::txn::CapturedSnapshots;
 use super::vacuum::{
     append_and_flush_maintenance_commit, cleanup_after_durable_maintenance_commit,
-    fatal_after_durable_maintenance_commit,
+    fatal_after_durable_maintenance_commit, rollback_maintenance_txn_or_die,
 };
 use crate::app::ServerComponents;
 use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
@@ -518,8 +519,84 @@ impl QueryService {
         drop(advertised);
         drop(object_guard);
         drop(writer_guard);
+        // A full pass refreshed every table, so the auto-analyze accumulator
+        // restarts (docs/specs/statistics.md §10); a single-table ANALYZE
+        // leaves it alone.
+        if table.is_none() {
+            components
+                .rows_changed_since_analyze
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
+}
+
+/// Checkpoint auto-analyze (`docs/specs/statistics.md` §10): re-collect and
+/// durably publish statistics for every user table, with the built-in default
+/// statistics target and one committed maintenance transaction.
+///
+/// **Caller contract (like the checkpoint auto-prune):** the caller MUST hold
+/// the EXCLUSIVE checkpoint guard, so no writer is in flight — the
+/// sees-all-committed context is then exact — and MUST call this BEFORE the
+/// checkpoint's `wal.flush()`/catalog snapshot, so the pass's WAL records are
+/// flushed by this checkpoint and the manifest it writes carries the fresh
+/// statistics (making the truncated records redundant).
+pub(crate) fn checkpoint_auto_analyze(components: &ServerComponents) -> Result<()> {
+    let tables = resolve_analyze_tables(components, None)?;
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let txn_id = components
+        .active_txns
+        .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+    let ctx = StatementContext::new(txn_id);
+    let result = (|| {
+        let relations = components.storage.capture_relation_snapshot()?;
+        let seed = analyze_seed()?;
+        let mut collected = Vec::with_capacity(tables.len());
+        for schema in &tables {
+            collected.push(collect_table_statistics(
+                &components.storage,
+                relations.as_ref(),
+                &ctx,
+                schema,
+                DEFAULT_STATISTICS_TARGET_DEFAULT,
+                seed,
+            )?);
+        }
+        let _catalog_write = components
+            .catalog_publication_gate
+            .write()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        for (schema, statistics) in tables.iter().zip(&collected) {
+            components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::UpdateTableStatistics {
+                    table_id: schema.id,
+                    statistics: statistics.clone(),
+                },
+            })?;
+            components
+                .catalog
+                .set_table_statistics(schema.id, statistics.clone())?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        rollback_maintenance_txn_or_die(components, txn_id);
+        return Err(err);
+    }
+    if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
+        rollback_maintenance_txn_or_die(components, txn_id);
+        return Err(err);
+    }
+    if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
+        fatal_after_durable_maintenance_commit(components, err);
+    }
+    components.active_txns.deregister(txn_id);
+    components.lock_manager.on_txn_finished();
+    Ok(())
 }
 
 /// One named live user table, or every user table sorted by id. Hidden TOAST

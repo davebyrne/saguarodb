@@ -143,7 +143,8 @@ cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev -
 - Defaults are `--data-dir ./data`, `--port 5433`,
   `--buffer-pool-frames 1024`, `--checkpoint-every-n-commits 100`,
   `--checkpoint-wal-bytes 67108864`, `--auto-vacuum-dead-rows 10000`,
-  `--shutdown-timeout-ms 30000`, and `--deadlock-timeout-ms 1000`.
+  `--auto-analyze-changed-rows 10000`, `--shutdown-timeout-ms 30000`, and
+  `--deadlock-timeout-ms 1000`.
   `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead
   versions since the last auto-prune; `0` disables auto-prune).
   `--deadlock-timeout-ms` is how long a writer blocked on a row lock waits before

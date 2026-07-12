@@ -7,6 +7,7 @@ mod support;
 use std::time::Duration;
 
 use common::{NDistinct, SqlState, TableStatistics};
+use saguarodb_server::config::Config;
 use support::{Connection, TestServer, command_tags};
 
 fn table_statistics(server: &TestServer, table: &str) -> Option<TableStatistics> {
@@ -387,4 +388,144 @@ async fn analyze_runs_through_the_extended_protocol() {
     assert!(outcome.result.is_ok(), "extended ANALYZE should succeed");
     let stats = table_statistics(&server, "ext").expect("statistics");
     assert_eq!(stats.row_count, 1);
+}
+
+/// A config that never checkpoints on its own; tests drive checkpoints
+/// explicitly so the auto-analyze gating is deterministic (mirroring the
+/// auto-prune tests in `vacuum.rs`).
+fn auto_analyze_config(threshold: u64) -> Config {
+    Config {
+        buffer_pool_frames: 64,
+        checkpoint_every_n_commits: 1_000_000,
+        checkpoint_wal_bytes: 1 << 40,
+        auto_vacuum_dead_rows: 0,
+        auto_analyze_changed_rows: threshold,
+        shutdown_timeout_ms: 1_000,
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_auto_analyze_fires_at_the_changed_rows_threshold() {
+    let server = TestServer::start_with_config(auto_analyze_config(50))
+        .await
+        .unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    let mut insert = String::from("insert into t (id) values ");
+    for id in 0..30 {
+        if id > 0 {
+            insert.push(',');
+        }
+        insert.push_str(&format!("({id})"));
+    }
+    conn.ok(&insert).await;
+    server.force_checkpoint().await.unwrap();
+    assert_eq!(
+        table_statistics(&server, "t"),
+        None,
+        "30 changed rows stay under the 50-row threshold"
+    );
+
+    let mut insert = String::from("insert into t (id) values ");
+    for id in 30..60 {
+        if id > 30 {
+            insert.push(',');
+        }
+        insert.push_str(&format!("({id})"));
+    }
+    conn.ok(&insert).await;
+    server.force_checkpoint().await.unwrap();
+    let stats = table_statistics(&server, "t").expect("threshold crossed: statistics collected");
+    assert_eq!(stats.row_count, 60);
+    assert_eq!(
+        server
+            .app()
+            .components
+            .rows_changed_since_analyze
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the accumulator resets after the pass"
+    );
+
+    // Under-threshold churn leaves the statistics alone.
+    conn.ok("insert into t (id) values (100)").await;
+    server.force_checkpoint().await.unwrap();
+    let stats = table_statistics(&server, "t").unwrap();
+    assert_eq!(stats.row_count, 60, "no refresh below the threshold");
+}
+
+#[tokio::test]
+async fn auto_analyze_zero_threshold_disables_and_manual_full_analyze_resets() {
+    let server = TestServer::start_with_config(auto_analyze_config(0))
+        .await
+        .unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+    let mut insert = String::from("insert into t (id) values ");
+    for id in 0..100 {
+        if id > 0 {
+            insert.push(',');
+        }
+        insert.push_str(&format!("({id})"));
+    }
+    conn.ok(&insert).await;
+    server.force_checkpoint().await.unwrap();
+    assert_eq!(
+        table_statistics(&server, "t"),
+        None,
+        "0 disables auto-analyze"
+    );
+
+    // The changed-rows accumulator still counts, and a manual full ANALYZE
+    // resets it (docs/specs/statistics.md §10).
+    let counter = &server.app().components.rows_changed_since_analyze;
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 100);
+    conn.ok("analyze t").await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Acquire),
+        100,
+        "a single-table ANALYZE leaves the accumulator alone"
+    );
+    conn.ok("analyze").await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a full ANALYZE resets the accumulator"
+    );
+}
+
+#[tokio::test]
+async fn copy_from_rows_count_toward_auto_analyze() {
+    let server = TestServer::start_with_config(auto_analyze_config(0))
+        .await
+        .unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, name text)")
+        .await;
+    let counter = &server.app().components.rows_changed_since_analyze;
+
+    // Autocommit COPY FROM: counted on its durable commit.
+    let copy = conn
+        .copy_from("copy t from stdin", &[b"1\tann\n2\tbob\n"])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 2"));
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 2);
+
+    // COPY inside an explicit transaction: folded only on COMMIT.
+    conn.ok("begin").await;
+    let copy = conn
+        .copy_from("copy t from stdin", &[b"3\tcarol\n"])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 1"));
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "in-transaction COPY counts only at COMMIT"
+    );
+    conn.ok("commit").await;
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 3);
 }

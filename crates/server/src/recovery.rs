@@ -231,6 +231,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
         dead_rows_since_vacuum: AtomicU64::new(0),
+        rows_changed_since_analyze: AtomicU64::new(0),
         active_txns,
         catalog_publication_gate: Arc::new(RwLock::new(())),
         relation_publish_gate: RwLock::new(()),

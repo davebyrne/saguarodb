@@ -370,10 +370,13 @@ Mirrors checkpoint auto-prune:
   points as `dead_rows_since_vacuum`).
 - New startup option `--auto-analyze-changed-rows <n>` (default `10000`,
   `0` disables).
-- `run_checkpoint` gains a step after auto-prune: when the counter exceeds
-  the threshold, run the ANALYZE pass over all user tables under the already
-  held exclusive checkpoint guard, then reset the counter. Uses the built-in
-  default statistics target (no session).
+- `run_checkpoint` gains a step after auto-prune: when the counter reaches
+  the threshold, re-collect statistics for every user table under the already
+  held exclusive checkpoint guard (one committed maintenance transaction; its
+  `UpdateTableStatistics` records precede the checkpoint's WAL flush so the
+  manifest carries the results), then reset the counter. Uses the built-in
+  default statistics target (no session). A manual full `ANALYZE` (no table)
+  also resets the counter; a single-table ANALYZE does not.
 
 Like auto-prune, this fires only on the commit path — a known limitation
 shared with checkpointing itself, resolved by a future background scheduler.

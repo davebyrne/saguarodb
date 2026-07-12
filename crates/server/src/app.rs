@@ -45,6 +45,14 @@ pub struct ServerComponents {
     /// prune, and over-counting (e.g. a version a live snapshot still pins, so it is
     /// not yet reclaimable) only triggers an extra, harmless pass.
     pub dead_rows_since_vacuum: AtomicU64,
+    /// Rows changed by committed statements since the last auto-analyze
+    /// (`docs/specs/statistics.md` §10): each committed `INSERT`, `UPDATE`,
+    /// `DELETE`, and `COPY FROM` row counts once (incremented only on a
+    /// successful commit, never on abort). When a checkpoint runs and this
+    /// reaches `config.auto_analyze_changed_rows`, the checkpoint re-collects
+    /// statistics for every user table under its exclusive guard and resets
+    /// this to 0; a manual full `ANALYZE` (no table) also resets it.
+    pub rows_changed_since_analyze: AtomicU64,
     /// In-progress transaction ids. The CLOG (in the WAL manager) records settled
     /// outcomes; this registry tracks which transactions are still running, for
     /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
@@ -129,6 +137,17 @@ impl ServerComponents {
     pub fn add_dead_versions(&self, count: u64) {
         if count != 0 {
             self.dead_rows_since_vacuum
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Add `count` committed changed rows to the auto-analyze accumulator
+    /// (`rows_changed_since_analyze`, `docs/specs/statistics.md` §10). Called
+    /// by the commit paths only on a successful, durable commit. A zero
+    /// `count` is a cheap no-op.
+    pub fn add_changed_rows(&self, count: u64) {
+        if count != 0 {
+            self.rows_changed_since_analyze
                 .fetch_add(count, Ordering::Relaxed);
         }
     }

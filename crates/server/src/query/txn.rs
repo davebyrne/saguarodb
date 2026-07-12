@@ -433,6 +433,7 @@ impl QueryService {
             rr_snapshot: None,
             rr_advertised: None,
             dead_versions_pending: 0,
+            changed_rows_pending: 0,
             savepoints: Vec::new(),
             live_subxids: Vec::new(),
             truncate_updates: std::collections::BTreeMap::new(),
@@ -533,6 +534,7 @@ impl QueryService {
         let txn_id = txn.txn_id;
         let isolation = txn.isolation;
         let dead_versions = txn.dead_versions_pending;
+        let changed_rows = txn.changed_rows_pending;
         // The whole family `{top} ∪ subxids` settles together. Compute it before any
         // settle so the atomic family-deregister (`docs/specs/savepoints.md` §3) can
         // run after the CLOG is marked committed.
@@ -662,6 +664,7 @@ impl QueryService {
         // BEFORE the checkpoint trigger (`docs/specs/mvcc.md` §9, F4b): only a durable
         // commit reaches here, so an aborted transaction never advances the counter.
         self.components.add_dead_versions(dead_versions);
+        self.components.add_changed_rows(changed_rows);
 
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
         Ok(())

@@ -83,6 +83,27 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
             .store(0, Ordering::Release);
     }
 
+    // Checkpoint auto-analyze (`docs/specs/statistics.md` §10): when enough
+    // committed rows changed since the last pass, re-collect statistics for
+    // every user table. Like the auto-prune above, it runs BEFORE
+    // `wal.flush()` and the catalog snapshot: its `UpdateTableStatistics`
+    // records are flushed by this checkpoint and sit below `checkpoint_lsn`,
+    // and the manifest written below carries the fresh statistics — so
+    // truncating those records is safe (their effect is already durable).
+    let analyze_threshold = components.config.auto_analyze_changed_rows;
+    if analyze_threshold != 0
+        && components
+            .rows_changed_since_analyze
+            .load(Ordering::Acquire)
+            >= analyze_threshold
+    {
+        crate::query::checkpoint_auto_analyze(components)?;
+        // Reset the accumulator: churn from here on counts toward the next pass.
+        components
+            .rows_changed_since_analyze
+            .store(0, Ordering::Release);
+    }
+
     // The WAL must be durable before any page it describes is written to the heap.
     // With the relaxed flush gate (`docs/specs/mvcc.md` §8, Milestone D1) this
     // spills ALL WAL-durable dirty pages — committed, aborted, and (under Stage-2)

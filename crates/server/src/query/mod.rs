@@ -41,6 +41,7 @@ mod truncate;
 mod txn;
 mod vacuum;
 
+pub(crate) use analyze::checkpoint_auto_analyze;
 pub use copy::CopyInChunk;
 pub(crate) use cursor::{CursorFetchStatus, QueryCursorHandle, StartedCursor};
 pub use gucs::SessionGucs;
@@ -622,6 +623,10 @@ pub struct Transaction {
     /// old versions it superseded stay live), so a rolled-back DELETE/UPDATE produces
     /// no committed dead version and this is discarded.
     dead_versions_pending: u64,
+    /// Rows changed (inserted/updated/deleted/copied) by this transaction's
+    /// statements so far, folded into the server-wide auto-analyze counter
+    /// only on a durable COMMIT (`docs/specs/statistics.md` §10).
+    changed_rows_pending: u64,
     /// The OPEN savepoint stack, outermost first (`docs/specs/savepoints.md` §3).
     /// Each level owns a subxid; the innermost level's subxid is the current
     /// writing xid (`writing_xid`), or `txn_id` when the stack is empty. `SAVEPOINT`
@@ -2750,6 +2755,23 @@ fn dead_versions_in(result: &ExecutionResult) -> u64 {
     }
 }
 
+/// The number of changed rows a statement's result implies, for the
+/// auto-analyze threshold (`docs/specs/statistics.md` §10): every committed
+/// `INSERT`, `UPDATE`, or `DELETE` row shifts the statistics. `COPY FROM`
+/// rows are accounted at the COPY driver. Counted only on a successful
+/// commit by the callers.
+fn changed_rows_in(result: &ExecutionResult) -> u64 {
+    match result {
+        ExecutionResult::Modified { command, count }
+        | ExecutionResult::ModifiedReturning { command, count, .. }
+            if command == "INSERT" || command == "UPDATE" || command == "DELETE" =>
+        {
+            *count
+        }
+        _ => 0,
+    }
+}
+
 /// Poison an open transaction's slot to the failed state on a statement error
 /// (parse/classification before the lifecycle handler runs). Autocommit
 /// (`None`) is unaffected.
@@ -3469,6 +3491,7 @@ mod tests {
             shutdown: Arc::new(ShutdownState::new()),
             next_txn_id: AtomicU64::new(common::ids::FIRST_NORMAL_XID),
             dead_rows_since_vacuum: AtomicU64::new(0),
+            rows_changed_since_analyze: AtomicU64::new(0),
             active_txns,
             catalog_publication_gate: Arc::new(RwLock::new(())),
             relation_publish_gate: RwLock::new(()),

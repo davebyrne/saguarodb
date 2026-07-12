@@ -9,9 +9,10 @@ use planner::{BoundStatement, format_explain, logical_plan, physical_plan};
 use super::{
     AutocommitCopyWrite, BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput,
     QueryService, QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome,
-    Transaction, TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in,
-    exec_or_stream, mark_failed_on_error, object_lock_requests, prepared_schema_versions, run_plan,
-    statement_class, validate_prepared_schema_versions_in_catalog,
+    Transaction, TransactionSnapshots, WriteUnitGuard, changed_rows_in, classify_bound,
+    dead_versions_in, exec_or_stream, mark_failed_on_error, object_lock_requests,
+    prepared_schema_versions, run_plan, statement_class,
+    validate_prepared_schema_versions_in_catalog,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -669,6 +670,14 @@ impl QueryService {
                     StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. } => 0,
                 };
                 txn.dead_versions_pending = txn.dead_versions_pending.saturating_add(dead);
+                let changed = match &outcome {
+                    StreamOutcome::Streamed { .. } => 0,
+                    StreamOutcome::Direct(result)
+                    | StreamOutcome::Durable(result)
+                    | StreamOutcome::SessionReset(result) => changed_rows_in(result),
+                    StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. } => 0,
+                };
+                txn.changed_rows_pending = txn.changed_rows_pending.saturating_add(changed);
                 (Some(txn), Ok(outcome))
             }
             Err(err) => {
@@ -1144,6 +1153,7 @@ impl QueryService {
         // durable commit reaches here; an aborted statement returned above without
         // counting.
         self.components.add_dead_versions(dead_versions_in(&result));
+        self.components.add_changed_rows(changed_rows_in(&result));
 
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
 

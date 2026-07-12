@@ -380,7 +380,7 @@ fn delete_toast_values_pending_parent_vacuum(
     {
         Ok(deleted) => deleted,
         Err(err) => {
-            rollback_toast_cleanup_txn_or_die(components, txn_id);
+            rollback_maintenance_txn_or_die(components, txn_id);
             return Err(err);
         }
     };
@@ -391,7 +391,7 @@ fn delete_toast_values_pending_parent_vacuum(
     }
 
     if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
-        rollback_toast_cleanup_txn_or_die(components, txn_id);
+        rollback_maintenance_txn_or_die(components, txn_id);
         return Err(err);
     }
     if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
@@ -416,13 +416,13 @@ pub(super) fn append_and_flush_maintenance_commit(
     Ok(())
 }
 
-fn rollback_toast_cleanup_txn_or_die(components: &ServerComponents, txn_id: u64) {
+pub(super) fn rollback_maintenance_txn_or_die(components: &ServerComponents, txn_id: u64) {
     if let Err(err) = components.wal.append(WalRecord {
         lsn: 0,
         txn_id,
         kind: WalRecordKind::Abort,
     }) {
-        eprintln!("failed to append Abort record for TOAST cleanup txn {txn_id}: {err}");
+        eprintln!("failed to append Abort record for maintenance txn {txn_id}: {err}");
     }
     components.active_txns.deregister(txn_id);
     components.lock_manager.on_txn_finished();
@@ -431,7 +431,7 @@ fn rollback_toast_cleanup_txn_or_die(components: &ServerComponents, txn_id: u64)
     }
     if let Err(err) = components.buffer_pool.rollback(txn_id) {
         fatal_pre_durable_maintenance_rollback(DbError::internal(format!(
-            "buffer rollback failed for TOAST cleanup txn {txn_id}: {err}",
+            "buffer rollback failed for maintenance txn {txn_id}: {err}",
         )));
     }
 }

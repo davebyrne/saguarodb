@@ -16,7 +16,7 @@ const DEFAULT_STATISTICS_TARGET: &str = "default_statistics_target";
 /// ANALYZE samples `300 x default_statistics_target` rows
 /// (`docs/specs/statistics.md` §6); the range mirrors a bounded slice of
 /// PostgreSQL's 1..=10000.
-const DEFAULT_STATISTICS_TARGET_DEFAULT: u32 = 100;
+pub(crate) const DEFAULT_STATISTICS_TARGET_DEFAULT: u32 = 100;
 const STATISTICS_TARGET_RANGE: std::ops::RangeInclusive<i64> = 1..=1000;
 
 /// Per-connection accept-all GUC store for driver compatibility.

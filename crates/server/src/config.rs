@@ -14,6 +14,9 @@ pub struct Config {
     /// dirty pages (`docs/specs/mvcc.md` §9, Milestone F4b). `0` disables
     /// auto-prune entirely (space is then bounded only by explicit `VACUUM`).
     pub auto_vacuum_dead_rows: u64,
+    /// Checkpoint auto-analyze threshold (`docs/specs/statistics.md` §10):
+    /// committed changed rows since the last auto-analyze. `0` disables.
+    pub auto_analyze_changed_rows: u64,
     pub shutdown_timeout_ms: u64,
     /// How long a writer blocked on an in-progress row-lock holder waits before the
     /// deadlock detector runs a wait-for-graph cycle check (`docs/specs/deadlock.md`).
@@ -32,6 +35,7 @@ impl Default for Config {
             checkpoint_every_n_commits: 100,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
             auto_vacuum_dead_rows: 10000,
+            auto_analyze_changed_rows: 10000,
             shutdown_timeout_ms: 30000,
             deadlock_timeout_ms: 1000,
             tls_cert_file: None,
@@ -103,6 +107,13 @@ where
                 let value = next_value(&mut args, "--auto-vacuum-dead-rows")?;
                 config.auto_vacuum_dead_rows = parse_u64(&value, "--auto-vacuum-dead-rows")?;
             }
+            "--auto-analyze-changed-rows" => {
+                // 0 is allowed and disables auto-analyze
+                // (see Config::auto_analyze_changed_rows).
+                let value = next_value(&mut args, "--auto-analyze-changed-rows")?;
+                config.auto_analyze_changed_rows =
+                    parse_u64(&value, "--auto-analyze-changed-rows")?;
+            }
             "--shutdown-timeout-ms" => {
                 let value = next_value(&mut args, "--shutdown-timeout-ms")?;
                 config.shutdown_timeout_ms = parse_positive_u64(&value, "--shutdown-timeout-ms")?;
@@ -139,6 +150,7 @@ pub fn usage(program: &str) -> String {
            --checkpoint-every-n-commits <N>   default 100\n\
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
            --auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)\n\
+           --auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
            --deadlock-timeout-ms <MS>         default 1000\n\
            --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)\n\
@@ -208,6 +220,7 @@ mod tests {
         assert_eq!(config.checkpoint_every_n_commits, 100);
         assert_eq!(config.checkpoint_wal_bytes, 64 * 1024 * 1024);
         assert_eq!(config.auto_vacuum_dead_rows, 10000);
+        assert_eq!(config.auto_analyze_changed_rows, 10000);
         assert_eq!(config.shutdown_timeout_ms, 30000);
         assert_eq!(config.deadlock_timeout_ms, 1000);
         assert_eq!(config.tls_cert_file, None);

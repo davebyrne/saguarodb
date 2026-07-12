@@ -181,8 +181,12 @@ impl QueryService {
         self.components.lock_manager.on_txn_finished();
         ownership.disarm();
         drop(ownership);
-        // COPY FROM only inserts, so it produces no committed dead versions; still
-        // count the commit toward the checkpoint trigger.
+        // COPY FROM only inserts, so it produces no committed dead versions, but
+        // every inserted row counts toward the auto-analyze threshold — BEFORE
+        // the checkpoint trigger, so a checkpoint fired by this same commit
+        // observes the count (docs/specs/statistics.md §10). Still count the
+        // commit toward the checkpoint trigger.
+        self.components.add_changed_rows(count);
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
         Ok(count)
     }
@@ -239,8 +243,13 @@ impl QueryService {
         })();
         drop(advertised);
         match result {
-            // COPY FROM inserts produce no committed dead versions (dead_versions += 0).
-            Ok(count) => (Some(txn), Ok(count)),
+            // COPY FROM inserts produce no committed dead versions
+            // (dead_versions += 0), but every inserted row counts toward the
+            // auto-analyze threshold once the transaction commits.
+            Ok(count) => {
+                txn.changed_rows_pending = txn.changed_rows_pending.saturating_add(count);
+                (Some(txn), Ok(count))
+            }
             Err(CopyInError::Db(err)) => {
                 if err.code == SqlState::DeadlockDetected {
                     self.abort_deadlock_victim(&mut txn);
