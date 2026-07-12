@@ -122,6 +122,22 @@ impl PgType {
             "int2vector" => 22,
             "int2[]" | "smallint[]" | "_int2" => 1005,
             "oid[]" | "_oid" => 1028,
+            "bool[]" | "boolean[]" | "_bool" => 1000,
+            "bytea[]" | "_bytea" => 1001,
+            "int4[]" | "integer[]" | "int[]" | "_int4" => 1007,
+            "text[]" | "_text" => 1009,
+            "bpchar[]" | "char[]" | "character[]" | "_bpchar" => 1014,
+            "varchar[]" | "character varying[]" | "_varchar" => 1015,
+            "int8[]" | "bigint[]" | "_int8" => 1016,
+            "float4[]" | "real[]" | "_float4" => 1021,
+            "float8[]" | "double precision[]" | "float[]" | "_float8" => 1022,
+            "timestamp[]" | "timestamp without time zone[]" | "_timestamp" => 1115,
+            "date[]" | "_date" => 1182,
+            "time[]" | "time without time zone[]" | "_time" => 1183,
+            "timestamptz[]" | "timestamp with time zone[]" | "_timestamptz" => 1185,
+            "interval[]" | "_interval" => 1187,
+            "numeric[]" | "decimal[]" | "_numeric" => 1231,
+            "uuid[]" | "_uuid" => 2951,
             "float4" | "real" => 700,
             "float8" | "double precision" | "float" => 701,
             "bpchar" | "char" | "character" => 1042,
@@ -203,7 +219,8 @@ impl PgType {
             PgType::Int2Vector => 22,
             PgType::OidArray => 1028,
             PgType::Int2Array => 1005,
-            PgType::Array(element) => array_oid(element).unwrap_or(0),
+            PgType::Array(element) => array_oid(element)
+                .expect("PgType::Array must contain a supported scalar element type"),
         }
     }
 
@@ -371,6 +388,15 @@ impl PgType {
                 "array elements cannot themselves be arrays",
             ));
         }
+        if array_oid(&element).is_none() && !matches!(element, PgType::Int2 | PgType::Oid) {
+            return Err(crate::DbError::plan(
+                crate::SqlState::DatatypeMismatch,
+                format!(
+                    "{} cannot be used as an array element type",
+                    element.format_type_name()
+                ),
+            ));
+        }
         Ok(match element {
             PgType::Int2 => PgType::Int2Array,
             PgType::Oid => PgType::OidArray,
@@ -383,6 +409,7 @@ fn array_oid(element: &PgType) -> Option<i32> {
     Some(match element {
         PgType::Bool => 1000,
         PgType::Bytea => 1001,
+        PgType::Int2 => 1005,
         PgType::Int4 => 1007,
         PgType::Text => 1009,
         PgType::Bpchar(_) => 1014,
@@ -390,6 +417,7 @@ fn array_oid(element: &PgType) -> Option<i32> {
         PgType::Int8 => 1016,
         PgType::Float4 => 1021,
         PgType::Float8 => 1022,
+        PgType::Oid => 1028,
         PgType::Timestamp => 1115,
         PgType::Date => 1182,
         PgType::Time => 1183,
@@ -458,6 +486,45 @@ mod tests {
         assert_eq!(PgType::oid_for_name("pg_catalog._oid"), Some(1028));
         assert_eq!(PgType::oid_for_name("PG_CATALOG.INTEGER"), Some(23));
         assert_eq!(PgType::oid_for_name("public.int4"), None);
+    }
+
+    #[test]
+    fn supported_array_types_round_trip_between_name_oid_and_type() {
+        let cases = [
+            ("_bool", 1000),
+            ("_bytea", 1001),
+            ("_int2", 1005),
+            ("_int4", 1007),
+            ("_text", 1009),
+            ("_bpchar", 1014),
+            ("_varchar", 1015),
+            ("_int8", 1016),
+            ("_float4", 1021),
+            ("_float8", 1022),
+            ("_oid", 1028),
+            ("_timestamp", 1115),
+            ("_date", 1182),
+            ("_time", 1183),
+            ("_timestamptz", 1185),
+            ("_interval", 1187),
+            ("_numeric", 1231),
+            ("_uuid", 2951),
+        ];
+        for (name, oid) in cases {
+            assert_eq!(PgType::oid_for_name(name), Some(oid), "name {name}");
+            let pg_type = PgType::from_oid_typmod(oid, -1).unwrap();
+            assert_eq!(pg_type.oid(), i32::try_from(oid).unwrap(), "OID {oid}");
+        }
+    }
+
+    #[test]
+    fn array_constructor_rejects_non_scalar_wire_types() {
+        assert!(PgType::array(PgType::OidVector).is_err());
+        assert!(PgType::array(PgType::Int2Vector).is_err());
+        assert!(PgType::array(PgType::Array(Box::new(PgType::Text))).is_err());
+        assert_eq!(PgType::array(PgType::Int2).unwrap(), PgType::Int2Array);
+        assert_eq!(PgType::array(PgType::Oid).unwrap(), PgType::OidArray);
+        assert_eq!(PgType::array(PgType::Text).unwrap().oid(), 1009);
     }
 
     #[test]

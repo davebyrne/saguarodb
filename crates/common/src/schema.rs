@@ -8,7 +8,7 @@ fn initial_schema_version() -> u64 {
     INITIAL_SCHEMA_VERSION
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum DataType {
     Integer,
     Text,
@@ -45,6 +45,61 @@ pub enum DataType {
     /// A rectangular PostgreSQL array. Multidimensionality belongs to the value's
     /// shape; the boxed type is always a non-array scalar element type.
     Array(Box<DataType>),
+}
+
+impl<'de> Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum SerializedDataType {
+            Integer,
+            Text,
+            Boolean,
+            Date,
+            Timestamp,
+            Time,
+            TimestampTz,
+            Interval,
+            Bytea,
+            Uuid,
+            Double,
+            Real,
+            Numeric { precision: Option<u32>, scale: u32 },
+            Array(Box<SerializedDataType>),
+        }
+
+        fn convert<E: serde::de::Error>(value: SerializedDataType) -> Result<DataType, E> {
+            let value = match value {
+                SerializedDataType::Integer => DataType::Integer,
+                SerializedDataType::Text => DataType::Text,
+                SerializedDataType::Boolean => DataType::Boolean,
+                SerializedDataType::Date => DataType::Date,
+                SerializedDataType::Timestamp => DataType::Timestamp,
+                SerializedDataType::Time => DataType::Time,
+                SerializedDataType::TimestampTz => DataType::TimestampTz,
+                SerializedDataType::Interval => DataType::Interval,
+                SerializedDataType::Bytea => DataType::Bytea,
+                SerializedDataType::Uuid => DataType::Uuid,
+                SerializedDataType::Double => DataType::Double,
+                SerializedDataType::Real => DataType::Real,
+                SerializedDataType::Numeric { precision, scale } => {
+                    DataType::Numeric { precision, scale }
+                }
+                SerializedDataType::Array(element) => {
+                    let element = convert::<E>(*element)?;
+                    if matches!(element, DataType::Array(_)) {
+                        return Err(E::custom("array elements cannot themselves be arrays"));
+                    }
+                    DataType::Array(Box::new(element))
+                }
+            };
+            Ok(value)
+        }
+
+        convert(SerializedDataType::deserialize(deserializer)?)
+    }
 }
 
 /// Per-table at-rest page compression setting (`docs/specs/compression.md`
@@ -588,6 +643,16 @@ mod tests {
     #[test]
     fn compression_setting_defaults_to_none() {
         assert_eq!(CompressionSetting::default(), CompressionSetting::None);
+    }
+
+    #[test]
+    fn data_type_deserialization_rejects_nested_arrays() {
+        let scalar: DataType = serde_json::from_str(r#"{"Array":"Integer"}"#).unwrap();
+        assert_eq!(scalar, DataType::Array(Box::new(DataType::Integer)));
+
+        let error =
+            serde_json::from_str::<DataType>(r#"{"Array":{"Array":"Integer"}}"#).unwrap_err();
+        assert!(error.to_string().contains("cannot themselves be arrays"));
     }
 
     #[test]
