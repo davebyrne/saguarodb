@@ -806,6 +806,10 @@ fn check_cast_int_width(value: Value, pg_type: &PgType) -> Result<Value> {
     Ok(value)
 }
 
+pub(crate) fn cast_value_to_pg_type(value: Value, pg_type: &PgType) -> Result<Value> {
+    check_cast_int_width(cast_value(value, &pg_type.data_type())?, pg_type)
+}
+
 fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
     if matches!(value, Value::Null) {
         return Ok(Value::Null);

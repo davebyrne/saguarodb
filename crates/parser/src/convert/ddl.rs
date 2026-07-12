@@ -67,7 +67,7 @@ pub(super) fn convert_alter_table(
     location: Option<sql::HiveSetLocation>,
     on_cluster: Option<sql::Ident>,
 ) -> Result<Statement> {
-    if if_exists || only || location.is_some() || on_cluster.is_some() || operations.len() != 1 {
+    if if_exists || location.is_some() || on_cluster.is_some() || operations.len() != 1 {
         return unsupported("unsupported ALTER TABLE form");
     }
     let table = object_name(&name)?;
@@ -82,6 +82,9 @@ pub(super) fn convert_alter_table(
             column_position,
             ..
         } => {
+            if only {
+                return unsupported("ALTER TABLE ONLY is only supported for ALTER COLUMN TYPE");
+            }
             if column_position.is_some() {
                 return unsupported("ALTER TABLE ADD COLUMN position is not supported");
             }
@@ -107,6 +110,9 @@ pub(super) fn convert_alter_table(
             if_exists,
             drop_behavior,
         } => {
+            if only {
+                return unsupported("ALTER TABLE ONLY is only supported for ALTER COLUMN TYPE");
+            }
             if drop_behavior.is_some() {
                 return unsupported("ALTER TABLE DROP COLUMN CASCADE/RESTRICT is not supported");
             }
@@ -119,15 +125,43 @@ pub(super) fn convert_alter_table(
         sql::AlterTableOperation::RenameColumn {
             old_column_name,
             new_column_name,
-        } => Ok(Statement::AlterTableRenameColumn {
-            table,
-            old_name: ident_name(&old_column_name)?,
-            new_name: ident_name(&new_column_name)?,
-        }),
+        } => {
+            if only {
+                return unsupported("ALTER TABLE ONLY is only supported for ALTER COLUMN TYPE");
+            }
+            Ok(Statement::AlterTableRenameColumn {
+                table,
+                old_name: ident_name(&old_column_name)?,
+                new_name: ident_name(&new_column_name)?,
+            })
+        }
         sql::AlterTableOperation::RenameTable { table_name } => {
+            if only {
+                return unsupported("ALTER TABLE ONLY is only supported for ALTER COLUMN TYPE");
+            }
             Ok(Statement::AlterTableRenameTable {
                 table,
                 new_name: simple_object_name(&table_name)?,
+            })
+        }
+        sql::AlterTableOperation::AlterColumn {
+            column_name,
+            op: sql::AlterColumnOperation::SetDataType { data_type, using },
+        } => {
+            if using.is_some() {
+                return feature_not_supported("ALTER COLUMN TYPE USING is not supported");
+            }
+            let max_length = column_char_length(&data_type)?;
+            let pg_type = match convert_pg_type(&data_type)? {
+                PgType::Varchar(_) => PgType::Varchar(max_length),
+                PgType::Bpchar(_) => PgType::Bpchar(max_length),
+                other => other,
+            };
+            Ok(Statement::AlterTableAlterColumnType {
+                table,
+                column: ident_name(&column_name)?,
+                data_type: pg_type.data_type(),
+                pg_type,
             })
         }
         _ => unsupported("unsupported ALTER TABLE operation"),

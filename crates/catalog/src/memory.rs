@@ -4,8 +4,8 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use common::{
     ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError,
     FIRST_USER_SCHEMA_ID, FileId, IndexConstraintKind, IndexId, IndexSchema, NamespaceSchema,
-    PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef, ParsedDefault, RelationKind, Result,
-    SchemaId, SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema,
+    PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef, ParsedDefault, PgType, RelationKind,
+    Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema,
     ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency,
     ViewSchema, needs_toast_relation, toast_schema,
 };
@@ -690,6 +690,70 @@ impl CatalogManager for MemoryCatalog {
         remap_columns_after_drop(&mut schema, column_id);
         remap_indexes_after_drop(&mut snapshot, id, column_id);
         bump_schema_version(&mut schema.schema_version)?;
+        replace_table_schema(&mut snapshot, schema.clone())?;
+        Ok(schema)
+    }
+
+    fn preflight_alter_table_column_type(
+        &self,
+        id: TableId,
+        column: &str,
+        pg_type: &PgType,
+    ) -> Result<TableColumnAlteration> {
+        let snapshot = self.read_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        validate_alter_column_type(&snapshot, schema, column, pg_type)
+    }
+
+    fn alter_table_column_type(
+        &self,
+        id: TableId,
+        column: &str,
+        data_type: DataType,
+        pg_type: PgType,
+        converted_default: Option<ColumnDefault>,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        if matches!(
+            validate_alter_column_type(&snapshot, &schema, column, &pg_type)?,
+            TableColumnAlteration::Noop
+        ) {
+            return Ok(schema);
+        }
+        let target = schema
+            .columns
+            .iter_mut()
+            .find(|existing| existing.name == column)
+            .ok_or_else(|| DbError::internal("type preflight accepted a missing column"))?;
+        target.data_type = data_type;
+        target.pg_type = Some(pg_type);
+        target.max_length = match target.pg_type {
+            Some(PgType::Varchar(length) | PgType::Bpchar(length)) => length,
+            _ => None,
+        };
+        target.default = converted_default;
+        bump_schema_version(&mut schema.schema_version)?;
+
+        if schema.toast_table_id.is_none() && needs_toast_relation(&schema) {
+            let toast_id = snapshot.next_table_id;
+            reject_duplicate_relation_id(&snapshot, toast_id)?;
+            snapshot.next_table_id = toast_id
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
+            let toast_storage_id = allocate_storage_id_from_snapshot(&mut snapshot)?;
+            schema.toast_table_id = Some(toast_id);
+            let mut hidden_toast = toast_schema(&schema, toast_id);
+            hidden_toast.storage_id = toast_storage_id;
+            snapshot.tables_by_id.insert(hidden_toast.id, hidden_toast);
+        }
         replace_table_schema(&mut snapshot, schema.clone())?;
         Ok(schema)
     }
@@ -2264,6 +2328,53 @@ fn validate_add_table_column(
         column,
         toast_table_id,
     })
+}
+
+fn validate_alter_column_type(
+    snapshot: &CatalogSnapshot,
+    schema: &TableSchema,
+    column: &str,
+    pg_type: &PgType,
+) -> Result<TableColumnAlteration> {
+    ensure_user_table(schema)?;
+    let target = schema
+        .columns
+        .iter()
+        .find(|existing| existing.name == column)
+        .ok_or_else(|| {
+            DbError::plan(
+                SqlState::UndefinedColumn,
+                format!("column {column} does not exist"),
+            )
+        })?;
+    if target.wire_type() == *pg_type {
+        return Ok(TableColumnAlteration::Noop);
+    }
+    if !schema.checks.is_empty() {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot alter column {column} type because table {} has CHECK constraints",
+                schema.name
+            ),
+        ));
+    }
+    reject_view_column_dependency(snapshot, schema.id, target.id, "alter type")?;
+    if matches!(target.default, Some(ColumnDefault::Expr(_))) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!("cannot alter column {column} type while it has an expression default"),
+        ));
+    }
+    if matches!(target.default, Some(ColumnDefault::Nextval(_)))
+        && pg_type.data_type() != DataType::Integer
+    {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            format!("DEFAULT nextval for column {column} requires an integer target type"),
+        ));
+    }
+    Ok(TableColumnAlteration::Rewrite)
 }
 
 enum DropColumnValidation {

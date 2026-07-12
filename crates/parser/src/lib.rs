@@ -2549,6 +2549,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_alter_column_type() {
+        for sql in [
+            "alter table app.users alter column age type bigint",
+            "alter table only app.users alter age set data type bigint",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTableAlterColumnType {
+                    table: QualifiedName {
+                        schema: Some("app".to_string()),
+                        name: "users".to_string(),
+                    },
+                    column: "age".to_string(),
+                    data_type: DataType::Integer,
+                    pg_type: PgType::Int8,
+                }
+            );
+        }
+
+        let err = parse("alter table users alter age type bigint using age + 1").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
     fn rejects_conditional_index_ddl() {
         let err = parse("create index if not exists users_name on users (name)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);

@@ -15,10 +15,10 @@ pub use system::{
 pub use truncate_overlay::TruncateCatalogOverlay;
 
 use common::{
-    ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
-    NamespaceSchema, ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions,
-    SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    ViewColumn, ViewDependency, ViewSchema,
+    ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, IndexConstraintKind,
+    IndexId, IndexSchema, NamespaceSchema, ParsedColumnDef, PgType, Result, SchemaId, SequenceId,
+    SequenceOptions, SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +207,28 @@ pub trait CatalogManager: Send + Sync {
         column: &str,
     ) -> Result<TableColumnAlteration>;
     fn drop_table_column(&self, id: TableId, column: &str) -> Result<TableSchema>;
+    fn preflight_alter_table_column_type(
+        &self,
+        _id: TableId,
+        _column: &str,
+        _pg_type: &PgType,
+    ) -> Result<TableColumnAlteration> {
+        Err(DbError::internal(
+            "catalog does not support ALTER COLUMN TYPE",
+        ))
+    }
+    fn alter_table_column_type(
+        &self,
+        _id: TableId,
+        _column: &str,
+        _data_type: DataType,
+        _pg_type: PgType,
+        _converted_default: Option<ColumnDefault>,
+    ) -> Result<TableSchema> {
+        Err(DbError::internal(
+            "catalog does not support ALTER COLUMN TYPE",
+        ))
+    }
     fn rename_table_column(
         &self,
         id: TableId,

@@ -218,6 +218,7 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::AlterTableRenameColumn { .. }
         | LogicalPlan::AlterTableRenameTable { .. }
+        | LogicalPlan::AlterTableAlterColumnType { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateSequence { .. }

@@ -64,6 +64,12 @@ pub enum Statement {
         table: QualifiedName,
         new_name: String,
     },
+    AlterTableAlterColumnType {
+        table: QualifiedName,
+        column: String,
+        data_type: DataType,
+        pg_type: PgType,
+    },
     CreateIndex {
         name: QualifiedName,
         table: QualifiedName,

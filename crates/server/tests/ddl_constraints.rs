@@ -1297,6 +1297,124 @@ async fn sequence_ddl_is_transactional() {
     conn.ok("select nextval('users_id_seq')").await;
 }
 
+#[tokio::test]
+async fn alter_column_type_rewrites_rows_and_indexes_transactionally() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table typed (id integer primary key, value integer)")
+        .await;
+    conn.ok("create index typed_value_idx on typed (value)")
+        .await;
+    conn.ok("insert into typed values (1, 42), (2, null)").await;
+    conn.ok("begin").await;
+    conn.ok("alter table typed alter column value type text")
+        .await;
+    assert_eq!(
+        conn.ok("select value from typed where value = '42'")
+            .await
+            .rows(),
+        vec![vec![Some("42".to_string())]]
+    );
+    conn.ok("rollback").await;
+    assert_eq!(
+        conn.ok("select value from typed where value = 42")
+            .await
+            .rows(),
+        vec![vec![Some("42".to_string())]]
+    );
+
+    conn.ok("alter table typed alter value set data type text")
+        .await;
+    assert_eq!(
+        conn.ok("select id from typed where value = '42'")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn alter_column_type_conversion_failure_is_atomic() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table typed_failure (id integer primary key, value text)")
+        .await;
+    conn.ok("insert into typed_failure values (1, 'not-an-integer')")
+        .await;
+    let outcome = conn
+        .ok("alter table typed_failure alter column value type integer")
+        .await;
+    assert!(outcome.result.is_err());
+    assert_eq!(
+        conn.ok("select value from typed_failure").await.rows(),
+        vec![vec![Some("not-an-integer".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn alter_column_type_validates_defaults_and_identical_type_is_noop() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table typed_default (id integer primary key, value text default 'toolong')")
+        .await;
+    let rejected = conn
+        .ok("alter table typed_default alter column value type varchar(3)")
+        .await;
+    assert!(rejected.result.is_err());
+
+    conn.prepare("typed_read", "select id from typed_default")
+        .await
+        .unwrap()
+        .unwrap();
+    conn.ok("alter table typed_default alter column id type integer")
+        .await;
+    assert!(
+        conn.execute_prepared("typed_read")
+            .await
+            .unwrap()
+            .result
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn alter_column_type_honors_search_path_dependencies_and_savepoints() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create schema app").await;
+    conn.ok("create table app.typed_scope (id integer primary key, value integer)")
+        .await;
+    conn.ok("create view app.typed_view as select value from app.typed_scope")
+        .await;
+    conn.ok("set search_path = app, public").await;
+    assert!(
+        conn.ok("alter table typed_scope alter value type text")
+            .await
+            .result
+            .is_err()
+    );
+    conn.ok("drop view app.typed_view").await;
+
+    conn.ok("begin").await;
+    conn.ok("savepoint before_type").await;
+    conn.ok("alter table typed_scope alter value type text")
+        .await;
+    conn.ok("rollback to savepoint before_type").await;
+    conn.ok("commit").await;
+    let insert = conn.ok("insert into typed_scope values (1, 9)").await;
+    if let Err(err) = insert.result {
+        panic!("insert failed: {err}");
+    }
+    assert_eq!(
+        conn.ok("select value from app.typed_scope").await.rows(),
+        vec![vec![Some("9".to_string())]]
+    );
+}
+
 /// A composite `PRIMARY KEY (a, b)` enforces uniqueness over the whole tuple, not
 /// each column, and supports point and leading-column lookups.
 #[tokio::test]

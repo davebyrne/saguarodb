@@ -100,6 +100,16 @@ fn format_node(
                 "{padding}AlterTableRenameTable {table_name} to {new_name}\n"
             ));
         }
+        PhysicalPlan::AlterTableAlterColumnType {
+            table_name,
+            column,
+            pg_type,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{padding}AlterTableAlterColumnType {table_name}.{column} to {pg_type:?}\n"
+            ));
+        }
         PhysicalPlan::CreateIndex {
             name,
             table,

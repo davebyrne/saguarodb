@@ -959,6 +959,7 @@ impl QueryService {
                 | BoundStatement::AlterTableDropColumn { .. }
                 | BoundStatement::AlterTableRenameColumn { .. }
                 | BoundStatement::AlterTableRenameTable { .. }
+                | BoundStatement::AlterTableAlterColumnType { .. }
                 | BoundStatement::CreateIndex { .. }
                 | BoundStatement::DropIndex { .. }
                 | BoundStatement::CreateSequence { .. }
@@ -2233,6 +2234,15 @@ fn preflight_bound_catalog_change(
             catalog.preflight_drop_table_column(*table, *if_exists, column)?,
             catalog::TableColumnAlteration::Noop
         )),
+        BoundStatement::AlterTableAlterColumnType {
+            table,
+            column,
+            pg_type,
+            ..
+        } => Ok(matches!(
+            catalog.preflight_alter_table_column_type(*table, column, pg_type)?,
+            catalog::TableColumnAlteration::Noop
+        )),
         _ => Ok(false),
     }
 }
@@ -2376,6 +2386,9 @@ fn collect_bound_statement_objects(
         | BoundStatement::AlterTableDropColumn { table, .. }
         | BoundStatement::AlterTableRenameColumn { table, .. }
         | BoundStatement::AlterTableRenameTable { table, .. } => {
+            record_bound_relation_version(references, *table, None)?;
+        }
+        BoundStatement::AlterTableAlterColumnType { table, .. } => {
             record_bound_relation_version(references, *table, None)?;
         }
         BoundStatement::CreateSchema { .. }
@@ -2750,6 +2763,9 @@ fn object_lock_requests(
         | BoundStatement::AlterTableRenameTable { table, .. } => {
             upgrade_target(*table, RelationLockMode::AccessExclusive);
         }
+        BoundStatement::AlterTableAlterColumnType { table, .. } => {
+            upgrade_target(*table, RelationLockMode::AccessExclusive);
+        }
         BoundStatement::DropTable { targets, .. } => {
             for target in targets {
                 let table = match target.table {
@@ -2887,6 +2903,7 @@ fn object_lock_requests(
             | BoundStatement::AlterTableDropColumn { .. }
             | BoundStatement::AlterTableRenameColumn { .. }
             | BoundStatement::AlterTableRenameTable { .. }
+            | BoundStatement::AlterTableAlterColumnType { .. }
             | BoundStatement::CreateIndex { .. }
             | BoundStatement::DropIndex { .. }
             | BoundStatement::CreateSequence { .. }
@@ -2944,6 +2961,14 @@ fn object_lock_requests(
             if let Some(table) = table {
                 schema_locks.insert(table.schema_id);
                 catalog_names.insert((table.schema_id, new_name.clone()));
+            }
+        }
+        BoundStatement::AlterTableAddColumn { table, .. }
+        | BoundStatement::AlterTableDropColumn { table, .. }
+        | BoundStatement::AlterTableRenameColumn { table, .. }
+        | BoundStatement::AlterTableAlterColumnType { table, .. } => {
+            if let Some(table) = catalog.get_table(*table)? {
+                schema_locks.insert(table.schema_id);
             }
         }
         _ => {}
@@ -3471,6 +3496,7 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::AlterTableDropColumn { .. }
         | Statement::AlterTableRenameColumn { .. }
         | Statement::AlterTableRenameTable { .. }
+        | Statement::AlterTableAlterColumnType { .. }
         | Statement::CreateView { .. }
         | Statement::DropView { .. } => Ok(StatementClass::Ddl),
         Statement::Begin { isolation } => Ok(StatementClass::TransactionControl(

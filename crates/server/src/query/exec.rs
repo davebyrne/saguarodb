@@ -1239,6 +1239,7 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
             | BoundStatement::AlterTableDropColumn { .. }
             | BoundStatement::AlterTableRenameColumn { .. }
             | BoundStatement::AlterTableRenameTable { .. }
+            | BoundStatement::AlterTableAlterColumnType { .. }
             | BoundStatement::CreateIndex { .. }
             | BoundStatement::DropIndex { .. }
             | BoundStatement::CreateSequence { .. }

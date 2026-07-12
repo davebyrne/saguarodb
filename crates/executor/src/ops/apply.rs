@@ -477,6 +477,7 @@ fn nested_apply_subplans(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
             | PhysicalPlan::AlterTableDropColumn { .. }
             | PhysicalPlan::AlterTableRenameColumn { .. }
             | PhysicalPlan::AlterTableRenameTable { .. }
+            | PhysicalPlan::AlterTableAlterColumnType { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
             | PhysicalPlan::CreateSequence { .. }

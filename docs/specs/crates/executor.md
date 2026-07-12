@@ -434,8 +434,8 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 `ALTER TABLE` schema evolution:
 
-- `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN`, and
-  `RENAME TO` execute through the DDL path under the shared writer guard, then
+- `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `ALTER [COLUMN] ...
+  [SET DATA] TYPE`, `RENAME COLUMN`, and `RENAME TO` execute through the DDL path under the shared writer guard, then
   target `AccessExclusive`, then the catalog publication gate.
 - `RENAME COLUMN` and `RENAME TO` are metadata updates: mutate catalog schema,
   then call `SchemaOperations::update_table_schema` with the updated table and
@@ -455,6 +455,10 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   when the catalog allocated a hidden TOAST relation for the new toastable
   column. `DROP COLUMN` uses catalog-remapped secondary-index schemas so WAL and
   recovery install matching table/index metadata.
+- `ALTER COLUMN TYPE` preserves column identity, explicitly casts every visible
+  value and constant default, and rebuilds fresh heap/TOAST/index generations.
+  Identical wire types are metadata no-ops. `USING`, dependent views, CHECK
+  constraints, and expression defaults are rejected in this first implementation.
 - Successful schema-evolution statements return
   `Modified { command: "ALTER TABLE", count: 0 }`; no-op `IF [NOT] EXISTS`
   forms return the same tag without catalog/storage mutation.

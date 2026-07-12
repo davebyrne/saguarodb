@@ -62,6 +62,13 @@ pub enum PhysicalPlan {
         table_name: String,
         new_name: String,
     },
+    AlterTableAlterColumnType {
+        table: TableId,
+        table_name: String,
+        column: String,
+        data_type: DataType,
+        pg_type: common::PgType,
+    },
     CreateIndex {
         schema: SchemaId,
         name: String,
@@ -335,6 +342,19 @@ fn physical_plan_inner(
             table: *table,
             table_name: table_name.clone(),
             new_name: new_name.clone(),
+        }),
+        LogicalPlan::AlterTableAlterColumnType {
+            table,
+            table_name,
+            column,
+            data_type,
+            pg_type,
+        } => Ok(PhysicalPlan::AlterTableAlterColumnType {
+            table: *table,
+            table_name: table_name.clone(),
+            column: column.clone(),
+            data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
         }),
         LogicalPlan::CreateIndex {
             schema,
@@ -753,6 +773,7 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::AlterTableDropColumn { .. }
         | PhysicalPlan::AlterTableRenameColumn { .. }
         | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }

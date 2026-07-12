@@ -106,6 +106,7 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<ParamUse>
         | BoundStatement::AlterTableDropColumn { .. }
         | BoundStatement::AlterTableRenameColumn { .. }
         | BoundStatement::AlterTableRenameTable { .. }
+        | BoundStatement::AlterTableAlterColumnType { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
@@ -359,6 +360,7 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         | BoundStatement::AlterTableDropColumn { .. }
         | BoundStatement::AlterTableRenameColumn { .. }
         | BoundStatement::AlterTableRenameTable { .. }
+        | BoundStatement::AlterTableAlterColumnType { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }

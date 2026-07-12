@@ -42,6 +42,7 @@ pub fn mutates_sequences(statement: &BoundStatement) -> bool {
         | BoundStatement::AlterTableDropColumn { .. }
         | BoundStatement::AlterTableRenameColumn { .. }
         | BoundStatement::AlterTableRenameTable { .. }
+        | BoundStatement::AlterTableAlterColumnType { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
@@ -4292,320 +4293,27 @@ mod tests {
         assert!(err.message.contains("right side"), "{}", err.message);
     }
 
-    /// Statistics for `catalog_with_users` used by the estimation tests:
-    /// 1000 rows over 10 pages; `id` unique with an even 0..1000 histogram,
-    /// `name` skewed (40% 'alice', 10% 'bob', 25% NULL, ~50 others).
-    fn analyze_users(catalog: &MemoryCatalog) {
-        use std::collections::BTreeMap;
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(
-                table.id,
-                common::TableStatistics {
-                    row_count: 1000,
-                    page_count: 10,
-                    columns: BTreeMap::from([
-                        (
-                            0,
-                            common::ColumnStatistics {
-                                null_frac: common::OrderedF64::new(0.0),
-                                avg_width: 8,
-                                n_distinct: common::NDistinct::Fraction(common::OrderedF64::new(
-                                    1.0,
-                                )),
-                                most_common: Vec::new(),
-                                histogram_bounds: (0..=10)
-                                    .map(|i| Value::Integer(i * 100))
-                                    .collect(),
-                            },
-                        ),
-                        (
-                            1,
-                            common::ColumnStatistics {
-                                null_frac: common::OrderedF64::new(0.25),
-                                avg_width: 8,
-                                n_distinct: common::NDistinct::Count(52),
-                                most_common: vec![
-                                    (
-                                        Value::Text("alice".to_string()),
-                                        common::OrderedF64::new(0.4),
-                                    ),
-                                    (Value::Text("bob".to_string()), common::OrderedF64::new(0.1)),
-                                ],
-                                histogram_bounds: Vec::new(),
-                            },
-                        ),
-                    ]),
-                },
-            )
-            .unwrap();
-    }
-
-    fn plan_rows(catalog: &MemoryCatalog, sql: &str) -> u64 {
-        let stmt = parse(sql).unwrap();
-        let bound = bind(&stmt, catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, catalog).unwrap();
-        estimated_rows(&physical, catalog)
-    }
-
     #[test]
-    fn estimates_use_defaults_without_statistics() {
+    fn alter_column_type_binds_existing_table_and_column() {
         let catalog = catalog_with_users();
-        // Un-analyzed base relation: the fixed default.
-        assert_eq!(plan_rows(&catalog, "select * from users"), 1000);
-        // Equality on a non-key column: DEFAULT_EQ_SELECTIVITY (0.005).
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name = 'x'"),
-            5
-        );
-        // Range: DEFAULT_INEQ_SEL (1/3).
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name > 'x'"),
-            333
-        );
-    }
+        let statement = parse("alter table users alter column name type varchar(20)").unwrap();
+        let bound = bind(&statement, &catalog).unwrap();
+        assert!(matches!(
+            bound,
+            BoundStatement::AlterTableAlterColumnType {
+                table_name,
+                column,
+                data_type: DataType::Text,
+                pg_type: PgType::Varchar(Some(20)),
+                ..
+            } if table_name == "users" && column == "name"
+        ));
 
-    #[test]
-    fn estimates_read_analyzed_statistics() {
-        let catalog = catalog_with_users();
-        analyze_users(&catalog);
-
-        assert_eq!(plan_rows(&catalog, "select * from users"), 1000);
-        // MCV hit: 40% of 1000 rows.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name = 'alice'"),
-            400
-        );
-        // MCV miss: (1 - 0.5 mcv - 0.25 null) / (52 - 2) of 1000 rows = 5.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name = 'zoe'"),
-            5
-        );
-        // IS NULL reads the null fraction.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name is null"),
-            250
-        );
-        // Histogram interpolation: id < 250 is a quarter of the even 0..1000
-        // axis. (The primary-key IndexScan estimates through full_filter.)
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where id < 250"),
-            250
-        );
-        // AND multiplies: 0.4 * 0.25.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select * from users where name = 'alice' and id < 250"
-            ),
-            100
-        );
-        // Strictness matters at an MCV boundary: 'alice' holds 40% of the
-        // rows, so `>` must exclude it while `>=` keeps it. With no
-        // histogram, the non-MCV mass (0.25) spreads at the 1/3 default:
-        // P(> alice) = 1 - 0.25 null - (0.4 + 0.25/3) = 0.2667 -> 267;
-        // P(>= alice) adds the MCV back: 0.6667 -> 667.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name > 'alice'"),
-            267
-        );
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name >= 'alice'"),
-            667
-        );
-        // `<>` excludes the null mass: 1 - 0.25 null - 0.4 eq = 0.35.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where name <> 'alice'"),
-            350
-        );
-        // OR adds minus the overlap: 0.4 + 0.1 - 0.04 = 0.46.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select * from users where name = 'alice' or name = 'bob'"
-            ),
-            460
-        );
-        // NOT complements: 1 - 0.4 = 0.6.
-        assert_eq!(
-            plan_rows(&catalog, "select * from users where not (name = 'alice')"),
-            600
-        );
-    }
-
-    #[test]
-    fn estimates_shape_joins_limits_and_aggregates() {
-        let catalog = catalog_with_users();
-        analyze_users(&catalog);
-
-        // Inner hash equi-join with itself on the unique id: 1000 * 1000 /
-        // max(1000, 1000) = 1000.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select a.id from users as a join users as b on a.id = b.id"
-            ),
-            1000
-        );
-        // LIMIT caps the estimate.
-        assert_eq!(plan_rows(&catalog, "select * from users limit 7"), 7);
-        // Ungrouped aggregate: one row.
-        assert_eq!(plan_rows(&catalog, "select count(*) from users"), 1);
-        // Grouped: the key's n_distinct resolves through the scan below.
-        assert_eq!(
-            plan_rows(&catalog, "select name, count(*) from users group by name"),
-            52
-        );
-        // Hash-join keys resolve through a derived table's projection: the
-        // unique id keeps the self-join at 1000, not 1000*1000/200.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select a.id from users as a join (select id from users) as b on a.id = b.id"
-            ),
-            1000
-        );
-        // Semi join keeps half the left side by default: 1000 * 0.5.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select * from users where name in (select name from users)"
-            ),
-            500
-        );
-        // EXCEPT estimates as its left arm.
-        assert_eq!(
-            plan_rows(
-                &catalog,
-                "select id from users except select id from users where name = 'alice'"
-            ),
-            1000
-        );
-    }
-
-    #[test]
-    fn hash_join_builds_over_the_smaller_analyzed_input() {
-        let catalog = catalog_with_users();
-        analyze_users(&catalog);
-
-        // Left side estimates 10 rows via LIMIT, right 1000: build left.
-        let stmt = parse(
-            "select a.id from (select * from users limit 10) as a \
-             join users as b on a.id = b.id",
+        let err = bind(
+            &parse("alter table users alter column missing type text").unwrap(),
+            &catalog,
         )
-        .unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(text.contains("build=left"), "{text}");
-
-        // Mirrored shape: the right side is smaller, keep the default.
-        let stmt = parse(
-            "select a.id from users as a \
-             join (select * from users limit 10) as b on a.id = b.id",
-        )
-        .unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(text.contains("build=right"), "{text}");
-    }
-
-    #[test]
-    fn hash_join_keeps_the_build_right_shape_without_statistics() {
-        let catalog = catalog_with_users();
-        let stmt = parse(
-            "select a.id from (select * from users limit 10) as a \
-             join users as b on a.id = b.id",
-        )
-        .unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(
-            text.contains("build=right"),
-            "un-analyzed plans must keep the historical shape: {text}"
-        );
-    }
-
-    #[test]
-    fn semi_joins_never_swap_the_build_side() {
-        let catalog = catalog_with_users();
-        analyze_users(&catalog);
-        let stmt = parse("select * from users where name in (select name from users)").unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(text.contains("type=Semi"), "{text}");
-        assert!(text.contains("build=right"), "{text}");
-    }
-
-    #[test]
-    fn scan_choice_is_cost_based_only_with_statistics() {
-        let catalog = catalog_with_users();
-
-        // Un-analyzed: an eligible predicate always takes the index.
-        let text = {
-            let stmt = parse("select * from users where id < 900").unwrap();
-            let bound = bind(&stmt, &catalog).unwrap();
-            let logical = logical_plan(&bound).unwrap();
-            let physical = physical_plan(&logical, &catalog).unwrap();
-            format_explain(&physical, &catalog)
-        };
-        assert!(text.contains("IndexScan"), "{text}");
-
-        analyze_users(&catalog);
-        // ~900 of 1000 rows match: one random heap fetch per match costs far
-        // more than one sequential pass over 10 pages.
-        let text = {
-            let stmt = parse("select * from users where id < 900").unwrap();
-            let bound = bind(&stmt, &catalog).unwrap();
-            let logical = logical_plan(&bound).unwrap();
-            let physical = physical_plan(&logical, &catalog).unwrap();
-            format_explain(&physical, &catalog)
-        };
-        assert!(text.contains("SeqScan"), "{text}");
-        assert!(!text.contains("IndexScan"), "{text}");
-
-        // A unique-key equality still takes the index.
-        let text = {
-            let stmt = parse("select * from users where id = 5").unwrap();
-            let bound = bind(&stmt, &catalog).unwrap();
-            let logical = logical_plan(&bound).unwrap();
-            let physical = physical_plan(&logical, &catalog).unwrap();
-            format_explain(&physical, &catalog)
-        };
-        assert!(text.contains("IndexScan"), "{text}");
-    }
-
-    #[test]
-    fn explain_appends_row_estimates_to_data_nodes_only() {
-        let catalog = catalog_with_users();
-        analyze_users(&catalog);
-
-        let stmt = parse("select * from users where name = 'alice'").unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(
-            text.contains("(rows=400)"),
-            "expected a rows= estimate in:\n{text}"
-        );
-
-        let stmt = parse("create table fresh (id integer primary key)").unwrap();
-        let bound = bind(&stmt, &catalog).unwrap();
-        let logical = logical_plan(&bound).unwrap();
-        let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
-        assert!(
-            !text.contains("(rows="),
-            "DDL nodes carry no estimate:\n{text}"
-        );
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
     }
 }

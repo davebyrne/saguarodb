@@ -1084,7 +1084,11 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
             .await
             .unwrap();
         server
-            .simple_query("insert into users (id, code, enabled) values (3, 30, false)")
+            .simple_query("alter table users alter column code type text")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, code, enabled) values (3, '30', false)")
             .await
             .unwrap();
     }
@@ -1116,7 +1120,7 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
         ]
     );
     let rows = server
-        .simple_query("select id, code, enabled from users where code = 20")
+        .simple_query("select id, code, enabled from users where code = '20'")
         .await
         .unwrap()
         .unwrap_rows();
@@ -1127,6 +1131,14 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
             Some("20".to_string()),
             Some("t".to_string()),
         ]]
+    );
+    assert_eq!(
+        server
+            .simple_query("select id from users where code = '20'")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string())]]
     );
 }
 

@@ -19,6 +19,7 @@ use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
+use crate::expr::cast_value_to_pg_type;
 use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanInput, IndexScanOp, LimitOp,
@@ -323,6 +324,13 @@ impl QueryEngine {
                 table_name: _,
                 new_name,
             } => execute_alter_table_rename_table(ctx, *table, new_name),
+            PhysicalPlan::AlterTableAlterColumnType {
+                table,
+                table_name: _,
+                column,
+                data_type,
+                pg_type,
+            } => execute_alter_table_alter_column_type(ctx, *table, column, data_type, pg_type),
             PhysicalPlan::CreateView {
                 schema,
                 name,
@@ -690,6 +698,7 @@ pub(crate) fn build_executor<'a>(
         | PhysicalPlan::AlterTableDropColumn { .. }
         | PhysicalPlan::AlterTableRenameColumn { .. }
         | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }
@@ -1889,6 +1898,118 @@ fn execute_alter_table_drop_column(
     )?;
 
     Ok(alter_table_result())
+}
+
+fn execute_alter_table_alter_column_type(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    column: &str,
+    data_type: &DataType,
+    pg_type: &common::PgType,
+) -> Result<ExecutionResult> {
+    let old_schema = require_table(ctx.catalog.as_ref(), table)?;
+    if matches!(
+        ctx.catalog
+            .preflight_alter_table_column_type(old_schema.id, column, pg_type)?,
+        TableColumnAlteration::Noop
+    ) {
+        return Ok(alter_table_result());
+    }
+    let position = old_schema
+        .columns
+        .iter()
+        .position(|existing| existing.name == column)
+        .ok_or_else(|| DbError::internal("type preflight accepted a missing column"))?;
+    let converted_default = match old_schema.columns[position].default.clone() {
+        Some(ColumnDefault::Const(value)) => Some(ColumnDefault::Const(
+            coerce_altered_column_value(cast_value_to_pg_type(value, pg_type)?, column, pg_type)?,
+        )),
+        default => default,
+    };
+
+    let old_relations = ctx.relations.clone();
+    let altered = ctx.catalog.alter_table_column_type(
+        old_schema.id,
+        column,
+        data_type.clone(),
+        pg_type.clone(),
+        converted_default,
+    )?;
+    let rewrite = apply_rewrite_storage_ids(ctx, altered.id)?;
+    let schema = rewrite.table;
+    if old_schema.toast_table_id != schema.toast_table_id
+        && let Some(toast_schema) = rewrite.toast_table.as_ref()
+    {
+        ctx.schema_ops.create_table(&ctx.statement, toast_schema)?;
+    } else if let Some(toast_schema) = rewrite.toast_table.as_ref() {
+        ctx.schema_ops
+            .update_table_schema(&ctx.statement, toast_schema, &[])?;
+    }
+    let indexes = rewrite.indexes;
+    ctx.schema_ops
+        .update_table_schema(&ctx.statement, &schema, &indexes)?;
+    let rewrite_relations = ctx.storage.capture_relation_snapshot()?;
+
+    ctx.storage.for_each_visible_row(
+        &ctx.statement,
+        old_relations.as_ref(),
+        old_schema.id,
+        &mut |mut stored| {
+            check_canceled(ctx)?;
+            let value = stored
+                .row
+                .values
+                .get_mut(position)
+                .ok_or_else(|| DbError::internal("stored row is missing altered column"))?;
+            *value = cast_value_to_pg_type(std::mem::replace(value, Value::Null), pg_type)?;
+            coerce_numeric_columns(&schema, &mut stored.row.values)?;
+            validate_row_constraints(&schema, &stored.row.values)?;
+            ctx.storage.insert(
+                &ctx.statement,
+                rewrite_relations.as_ref(),
+                schema.id,
+                stored.row,
+            )?;
+            Ok(())
+        },
+    )?;
+
+    Ok(alter_table_result())
+}
+
+fn coerce_altered_column_value(
+    mut value: Value,
+    column: &str,
+    pg_type: &common::PgType,
+) -> Result<Value> {
+    match (&mut value, pg_type) {
+        (
+            Value::Numeric(decimal),
+            common::PgType::Numeric {
+                precision: Some(precision),
+                scale,
+            },
+        ) => {
+            *decimal = common::numeric::apply_typmod(*decimal, Some(*precision), *scale)
+                .ok_or_else(|| {
+                    DbError::execute(
+                        SqlState::NumericValueOutOfRange,
+                        format!("numeric field overflow for column {column}"),
+                    )
+                })?;
+        }
+        (
+            Value::Text(text),
+            common::PgType::Varchar(Some(max)) | common::PgType::Bpchar(Some(max)),
+        ) if text.chars().count() > *max as usize => {
+            return Err(DbError::execute(
+                SqlState::StringDataRightTruncation,
+                format!("value too long for column {column} (maximum {max} characters)"),
+            ));
+        }
+        _ => {}
+    }
+    Ok(value)
 }
 
 fn execute_alter_table_rename_column(

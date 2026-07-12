@@ -636,6 +636,11 @@ Recovery apply methods must update catalog state consistently with storage state
 - Executor/storage should otherwise use `TableId`, `ColumnId`, `IndexId`, and
   `SequenceId` after binding.
 
+`preflight_alter_table_column_type` returns a no-op for an identical `PgType` and
+rejects dependencies that cannot safely be rebound. `alter_table_column_type`
+preserves the column ID while replacing its logical/wire type and converted
+default; the executor assigns fresh table, TOAST, and index storage generations.
+
 ## Acceptance Tests
 
 - Create table assigns table and column IDs.

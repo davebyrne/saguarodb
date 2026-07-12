@@ -300,6 +300,12 @@ impl QueryService {
                             txn.savepoints[idx].relation_generation_changed;
                         let catalog_overlay = txn.savepoints[idx].catalog_overlay.clone();
                         let storage = txn.savepoints[idx].storage.clone();
+                        let rolled: Vec<u64> = txn
+                            .live_subxids
+                            .iter()
+                            .copied()
+                            .filter(|&s| s >= level_subxid)
+                            .collect();
                         if let Err(err) = txn.catalog_overlay.rollback_to(&catalog_overlay) {
                             return (Some(txn), default_isolation, Err(err));
                         }
@@ -326,13 +332,12 @@ impl QueryService {
                         {
                             return (Some(txn), default_isolation, Err(err));
                         }
+                        for subxid in &rolled {
+                            if let Err(err) = self.components.storage.rollback_txn(*subxid) {
+                                return (Some(txn), default_isolation, Err(err));
+                            }
+                        }
                         drop(relation_publication);
-                        let rolled: Vec<u64> = txn
-                            .live_subxids
-                            .iter()
-                            .copied()
-                            .filter(|&s| s >= level_subxid)
-                            .collect();
                         self.abort_subxids(&rolled);
                         txn.live_subxids.retain(|&s| s < level_subxid);
                         txn.savepoints.truncate(idx);

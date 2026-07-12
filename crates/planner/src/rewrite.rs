@@ -31,6 +31,7 @@ pub fn rewrite_plan_exprs(
         | PhysicalPlan::AlterTableDropColumn { .. }
         | PhysicalPlan::AlterTableRenameColumn { .. }
         | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }

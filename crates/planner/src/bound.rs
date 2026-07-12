@@ -197,6 +197,13 @@ pub enum BoundStatement {
         table_name: String,
         new_name: String,
     },
+    AlterTableAlterColumnType {
+        table: TableId,
+        table_name: String,
+        column: String,
+        data_type: common::DataType,
+        pg_type: common::PgType,
+    },
     CreateIndex {
         schema: SchemaId,
         name: String,

@@ -212,6 +212,7 @@ pub(crate) fn hoist_correlated_subqueries(
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::AlterTableRenameColumn { .. }
         | LogicalPlan::AlterTableRenameTable { .. }
+        | LogicalPlan::AlterTableAlterColumnType { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateSequence { .. }

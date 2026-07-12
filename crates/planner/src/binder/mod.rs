@@ -401,6 +401,31 @@ fn bind_inner(
                 new_name: new_name.clone(),
             })
         }
+        Statement::AlterTableAlterColumnType {
+            table,
+            column,
+            data_type,
+            pg_type,
+        } => {
+            let table_schema = require_table(catalog, table, &options.search_path)?;
+            if !table_schema
+                .columns
+                .iter()
+                .any(|candidate| candidate.name == *column)
+            {
+                return Err(plan_error(
+                    SqlState::UndefinedColumn,
+                    format!("column {column} does not exist"),
+                ));
+            }
+            Ok(BoundStatement::AlterTableAlterColumnType {
+                table: table_schema.id,
+                table_name: table.name.clone(),
+                column: column.clone(),
+                data_type: data_type.clone(),
+                pg_type: pg_type.clone(),
+            })
+        }
         Statement::CreateIndex {
             name,
             table,

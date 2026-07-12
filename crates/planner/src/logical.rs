@@ -60,6 +60,13 @@ pub enum LogicalPlan {
         table_name: String,
         new_name: String,
     },
+    AlterTableAlterColumnType {
+        table: TableId,
+        table_name: String,
+        column: String,
+        data_type: common::DataType,
+        pg_type: common::PgType,
+    },
     CreateIndex {
         schema: SchemaId,
         name: String,
@@ -292,6 +299,19 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             table: *table,
             table_name: table_name.clone(),
             new_name: new_name.clone(),
+        }),
+        BoundStatement::AlterTableAlterColumnType {
+            table,
+            table_name,
+            column,
+            data_type,
+            pg_type,
+        } => Ok(LogicalPlan::AlterTableAlterColumnType {
+            table: *table,
+            table_name: table_name.clone(),
+            column: column.clone(),
+            data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
         }),
         BoundStatement::CreateIndex {
             schema,
