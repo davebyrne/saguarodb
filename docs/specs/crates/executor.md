@@ -154,6 +154,7 @@ ordinary data statements.
 | `SystemScanOp` | Materializes virtual catalog rows from the immutable statement catalog/provider snapshot captured by the server after lock convergence; applies filters and emits rows with no identity |
 | `NestedLoopJoinOp` | Stores both inputs in `work_mem`-bounded rewindable spill tapes, streams inner/cross/semi/anti/left/right/full results, records matched right ordinals in a bounded external sorter so volatile predicates run only once per pair, and applies NULL extension; clears identity except documented semi/anti and DML-spine cases |
 | `HashJoinOp` | Builds the planner-selected side (right by default; left when statistics estimate it is smaller) in a reservation-accounted, key-sorted contiguous table while it fits, then releases it and falls back to a bounded rewindable spill-tape probe. NULL keys never match; output remains logical left ++ right regardless of build side and is streamed rather than buffered |
+| `MergeJoinOp` | Internally stable-sorts both inputs under one shared operator `work_mem` budget. It streams left/right/full equi joins, evaluates residual predicates once per candidate pair, treats every NULL-bearing key as unmatched, and clears identity. Equal-key right groups use rewindable spill tapes and matched ordinals use an external sorter, bounding skewed duplicate groups; deterministic key progression is not an ordering guarantee |
 | `FilterOp` | Evaluates predicate, preserves identity |
 | `ProjectionOp` | Rewrites row values, preserves identity |
 | `SortOp` | Evaluates sort keys once, uses the query's `work_mem`-bounded stable external sorter, spills anonymous runs under the configured temporary directory when needed, streams the merged result, and preserves identity |
@@ -484,6 +485,7 @@ Statement guards are owned by server query orchestration, not by the executor cr
 - `ProjectionOp` preserves identity while changing values.
 - `NestedLoopJoinOp` clears identity.
 - `HashJoinOp` joins inner equi-join rows on one or more key columns and excludes rows with a NULL join key.
+- `MergeJoinOp` implements spillable left/right/full equi joins, including residual rejection and NULL extension, and clears identity.
 - `UPDATE WHERE` modifies only matched rows.
 - `DELETE WHERE` deletes only matched rows.
 - Failed write triggers rollback (driven by the server/harness, not the executor) and does not expose partial changes.

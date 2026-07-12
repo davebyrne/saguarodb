@@ -715,6 +715,11 @@ pub enum PhysicalPlan {
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
     },
+    MergeJoin {
+        left: Box<PhysicalPlan>, right: Box<PhysicalPlan>,
+        left_keys: Vec<usize>, right_keys: Vec<usize>,
+        residual: Option<BoundExpr>, join_type: JoinType,
+    },
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
     Projection { source: Box<PhysicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<PhysicalPlan>, order_by: Vec<BoundOrderByItem> },
@@ -746,7 +751,8 @@ pub enum PhysicalPlan {
 - The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 - Joins are left-to-right nested loop joins. The planner supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
-- An `Inner` join whose `condition` contains at least one `left_column = right_column` equality conjunct becomes a `HashJoin` on those equality pairs. The node carries `build_left: bool` (`docs/specs/statistics.md` §9.2): set only for a plain inner join outside a DML spine when both inputs are fully analyzed (`plan_fully_analyzed`) and the left side's row estimate is smaller, so the executor builds its hash table over the smaller input; semi/anti joins and any un-analyzed input keep the historical build-right shape. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). Any remaining (non-equi or expression) conjuncts are re-checked in a `Filter` above the `HashJoin`, using their global joined-row slots. An inner join with no column-equality conjunct, and every outer or cross join, stays a `NestedLoopJoin`.
+- An `Inner` join whose `condition` contains at least one `left_column = right_column` equality conjunct becomes a `HashJoin` on those equality pairs. The node carries `build_left: bool` (`docs/specs/statistics.md` §9.2): set only for a plain inner join outside a DML spine when both inputs are fully analyzed (`plan_fully_analyzed`) and the left side's row estimate is smaller, so the executor builds its hash table over the smaller input; semi/anti joins and any un-analyzed input keep the historical build-right shape. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). Any remaining (non-equi or expression) conjuncts are re-checked in a `Filter` above the `HashJoin`, using their global joined-row slots. An inner join with no column-equality conjunct stays a `NestedLoopJoin`.
+- A `Left`, `Right`, or `Full` join with no DML identity source and at least one extractable cross-side column equality becomes a `MergeJoin`; remaining conjuncts are its internal `residual`, because filtering above an outer join would change NULL-extension semantics. Outer joins with no equality key, outer DML identity spines, cross joins, and non-equality joins remain `NestedLoopJoin`. Merge join performs its own sorts and does not publish an ordering property, so an SQL `ORDER BY` still plans a `Sort`.
 - Sort and aggregate are blocking operators.
 - The planner performs no projection pushdown: `LogicalPlan::Projection` maps straight to `PhysicalPlan::Projection`, and logical planning always wraps a top-level `Projection`.
 
@@ -764,7 +770,7 @@ The executor crate is not called for `EXPLAIN`.
 
 `format_explain` appends ` (rows=N)` — the estimated output row count — to every data-producing node line (scans, joins, Apply, filters, projections, sorts, distinct, limits, aggregates, `Values`, set operations, and the `Insert`/`Update`/`Delete` heads); DDL nodes carry no estimate. Estimates come from `planner::estimate` reading ANALYZE statistics through the catalog: base scans use the stored `row_count` (default 1000 when never analyzed), scan-level predicates resolve `column op literal` shapes against MCVs, histograms, and null fractions, and every unresolvable shape uses fixed defaults (equality `0.005`, ranges `1/3`, other predicates `0.5`, join-key/grouping distinct counts `200`, semi/anti joins keep half the left side, system views `100` rows). Upper `Filter` nodes estimate from predicate shape alone — column statistics resolve only at scan level in v1. Estimates are advisory and never affect correctness.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N build=left|right`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N build=left|right`, `MergeJoin type=Left|Right|Full keys=N residual=yes|none`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 
@@ -779,5 +785,5 @@ The executor crate is not called for `EXPLAIN`.
 - Logical and physical planning preserve system views as `SystemScan`.
 - Physical planner chooses `IndexScan` for an equality or range predicate on a declared-primary-key or catalog-index leading column, preferring exact matches and primary-key identity access, preserves residual predicates in `IndexScan.filter`, and preserves the original scan predicate in `IndexScan.full_filter` for generation-snapshot fallback.
 - Physical planner falls back to `SeqScan` when no index's leading column is constrained.
-- Physical planner chooses `HashJoin` for an inner join with a column-equality `ON` predicate and falls back to `NestedLoopJoin` for outer, cross, and non-equi joins.
+- Physical planner chooses `HashJoin` for eligible inner/semi/anti equi joins, `MergeJoin` for eligible outer equi joins, and `NestedLoopJoin` for cross and non-equi joins.
 - `EXPLAIN` returns a readable physical plan tree.

@@ -13,6 +13,424 @@ use crate::query::{PlanExecutor, close_after, open_executor};
 
 type OrdinalSorter = ExternalSorter<SpillRow, Box<dyn Fn(&SpillRow, &SpillRow) -> Ordering>>;
 
+pub struct MergeJoinOp<'a> {
+    ctx: StatementContext,
+    left: Box<dyn PlanExecutor + 'a>,
+    right: Box<dyn PlanExecutor + 'a>,
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    residual: Option<BoundExpr>,
+    join_type: JoinType,
+    output_schema: Vec<ColumnInfo>,
+    spill: SpillConfig,
+    spill_ctx: Option<spill::SpillContext>,
+    left_stream: Option<SortedStream<SpillRow>>,
+    right_stream: Option<SortedStream<SpillRow>>,
+    left_next: Option<SpillRow>,
+    right_next: Option<SpillRow>,
+    group_key: Vec<Value>,
+    right_group: Option<SpillTape<ExecRow>>,
+    right_group_reader: Option<SpillTapeReader<ExecRow>>,
+    matched_sorter: Option<OrdinalSorter>,
+    matched_stream: Option<SortedStream<SpillRow>>,
+    matched_next: Option<u64>,
+    current_left: Option<ExecRow>,
+    left_matched: bool,
+    right_ordinal: u64,
+    unmatched_ordinal: u64,
+    phase: MergePhase,
+    left_width: usize,
+    right_width: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergePhase {
+    Align,
+    ScanEqualGroup,
+    EmitUnmatchedRightGroup,
+    Done,
+}
+
+impl<'a> MergeJoinOp<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ctx: StatementContext,
+        left: Box<dyn PlanExecutor + 'a>,
+        right: Box<dyn PlanExecutor + 'a>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        residual: Option<BoundExpr>,
+        join_type: JoinType,
+        spill: SpillConfig,
+    ) -> Self {
+        let left_width = left.output_schema().len();
+        let right_width = right.output_schema().len();
+        let mut output_schema = left.output_schema().to_vec();
+        output_schema.extend_from_slice(right.output_schema());
+        Self {
+            ctx,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            residual,
+            join_type,
+            output_schema,
+            spill,
+            spill_ctx: None,
+            left_stream: None,
+            right_stream: None,
+            left_next: None,
+            right_next: None,
+            group_key: Vec::new(),
+            right_group: None,
+            right_group_reader: None,
+            matched_sorter: None,
+            matched_stream: None,
+            matched_next: None,
+            current_left: None,
+            left_matched: false,
+            right_ordinal: 0,
+            unmatched_ordinal: 0,
+            phase: MergePhase::Done,
+            left_width,
+            right_width,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.left_stream = None;
+        self.spill_ctx = None;
+        self.right_stream = None;
+        self.left_next = None;
+        self.right_next = None;
+        self.group_key.clear();
+        self.right_group = None;
+        self.right_group_reader = None;
+        self.matched_sorter = None;
+        self.matched_stream = None;
+        self.matched_next = None;
+        self.current_left = None;
+        self.phase = MergePhase::Done;
+    }
+
+    fn begin_group(&mut self, spill_ctx: spill::SpillContext) -> Result<()> {
+        self.group_key = self.left_next.as_ref().expect("equal left").keys.clone();
+        let mut tape = SpillTape::new(spill_ctx.clone());
+        while self
+            .right_next
+            .as_ref()
+            .is_some_and(|row| row.keys == self.group_key)
+        {
+            self.ctx.cancel.check()?;
+            tape.push(self.right_next.take().expect("right group row").row)?;
+            self.right_next = self
+                .right_stream
+                .as_mut()
+                .expect("right stream")
+                .next_record()?;
+        }
+        tape.finish()?;
+        self.right_group = Some(tape);
+        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            self.matched_sorter = Some(ExternalSorter::new(
+                spill_ctx,
+                Box::new(|a: &SpillRow, b: &SpillRow| a.ordinal.cmp(&b.ordinal)),
+            ));
+        }
+        self.phase = MergePhase::ScanEqualGroup;
+        Ok(())
+    }
+}
+
+impl PlanExecutor for MergeJoinOp<'_> {
+    fn output_schema(&self) -> &[ColumnInfo] {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.reset();
+        if !matches!(
+            self.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full
+        ) {
+            return Err(DbError::internal(
+                "merge join requires left, right, or full join type",
+            ));
+        }
+        if self.left_keys.is_empty() || self.left_keys.len() != self.right_keys.len() {
+            return Err(DbError::internal(
+                "merge join requires non-empty paired keys",
+            ));
+        }
+        let spill_ctx = self.spill.for_operator(self.ctx.cancel.clone());
+        let compare = |a: &SpillRow, b: &SpillRow| compare_merge_keys(&a.keys, &b.keys);
+        let mut left_sorter = ExternalSorter::new(spill_ctx.clone(), Box::new(compare) as Box<_>);
+        drain_to_sorter(
+            self.left.as_mut(),
+            &self.left_keys,
+            0,
+            &mut left_sorter,
+            &self.ctx,
+        )?;
+        let mut right_sorter = ExternalSorter::new(spill_ctx.clone(), Box::new(compare) as Box<_>);
+        drain_to_sorter(
+            self.right.as_mut(),
+            &self.right_keys,
+            1,
+            &mut right_sorter,
+            &self.ctx,
+        )?;
+        let mut left_stream = left_sorter.finish()?;
+        let mut right_stream = right_sorter.finish()?;
+        self.left_next = left_stream.next_record()?;
+        self.right_next = right_stream.next_record()?;
+        self.left_stream = Some(left_stream);
+        self.right_stream = Some(right_stream);
+        self.spill_ctx = Some(spill_ctx);
+        self.phase = MergePhase::Align;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<ExecRow>> {
+        loop {
+            self.ctx.cancel.check()?;
+            match self.phase {
+                MergePhase::Align => match (&self.left_next, &self.right_next) {
+                    (None, None) => self.phase = MergePhase::Done,
+                    (Some(_), None) => {
+                        let row = self.left_next.take().expect("left tail").row;
+                        self.left_next = self
+                            .left_stream
+                            .as_mut()
+                            .expect("left stream")
+                            .next_record()?;
+                        if matches!(self.join_type, JoinType::Left | JoinType::Full) {
+                            return Ok(Some(join_with_null_right(&row, self.right_width)));
+                        }
+                    }
+                    (None, Some(_)) => {
+                        let row = self.right_next.take().expect("right tail").row;
+                        self.right_next = self
+                            .right_stream
+                            .as_mut()
+                            .expect("right stream")
+                            .next_record()?;
+                        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                            return Ok(Some(join_with_null_left(self.left_width, &row)));
+                        }
+                    }
+                    (Some(left), Some(right)) => {
+                        let left_null = key_has_null(&left.keys);
+                        let right_null = key_has_null(&right.keys);
+                        let order = compare_merge_keys(&left.keys, &right.keys);
+                        if order == Ordering::Less || (order == Ordering::Equal && left_null) {
+                            let row = self.left_next.take().expect("unmatched left").row;
+                            self.left_next = self
+                                .left_stream
+                                .as_mut()
+                                .expect("left stream")
+                                .next_record()?;
+                            if matches!(self.join_type, JoinType::Left | JoinType::Full) {
+                                return Ok(Some(join_with_null_right(&row, self.right_width)));
+                            }
+                        } else if order == Ordering::Greater || right_null {
+                            let row = self.right_next.take().expect("unmatched right").row;
+                            self.right_next = self
+                                .right_stream
+                                .as_mut()
+                                .expect("right stream")
+                                .next_record()?;
+                            if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                                return Ok(Some(join_with_null_left(self.left_width, &row)));
+                            }
+                        } else {
+                            self.begin_group(
+                                self.spill_ctx
+                                    .as_ref()
+                                    .expect("merge spill context")
+                                    .clone(),
+                            )?;
+                        }
+                    }
+                },
+                MergePhase::ScanEqualGroup => {
+                    if self.current_left.is_none() {
+                        if self
+                            .left_next
+                            .as_ref()
+                            .is_none_or(|row| row.keys != self.group_key)
+                        {
+                            if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                                self.matched_stream = Some(
+                                    self.matched_sorter
+                                        .take()
+                                        .expect("matched sorter")
+                                        .finish()?,
+                                );
+                                self.right_group_reader =
+                                    Some(self.right_group.as_mut().expect("right group").reader()?);
+                                self.unmatched_ordinal = 0;
+                                self.phase = MergePhase::EmitUnmatchedRightGroup;
+                            } else {
+                                self.right_group = None;
+                                self.phase = MergePhase::Align;
+                            }
+                            continue;
+                        }
+                        self.current_left = Some(self.left_next.take().expect("group left").row);
+                        self.left_next = self
+                            .left_stream
+                            .as_mut()
+                            .expect("left stream")
+                            .next_record()?;
+                        self.right_group_reader =
+                            Some(self.right_group.as_mut().expect("right group").reader()?);
+                        self.right_ordinal = 0;
+                        self.left_matched = false;
+                    }
+                    while let Some(right) = self
+                        .right_group_reader
+                        .as_mut()
+                        .expect("group reader")
+                        .next_record()?
+                    {
+                        self.ctx.cancel.check()?;
+                        let ordinal = self.right_ordinal;
+                        self.right_ordinal = self
+                            .right_ordinal
+                            .checked_add(1)
+                            .ok_or_else(|| DbError::internal("merge right ordinal overflow"))?;
+                        let joined =
+                            join_row_refs(self.current_left.as_ref().expect("group left"), &right);
+                        if join_condition_matches(&self.ctx, &self.residual, &joined)? {
+                            self.left_matched = true;
+                            if let Some(sorter) = &mut self.matched_sorter {
+                                sorter.push(ordinal_record(ordinal))?;
+                            }
+                            return Ok(Some(joined));
+                        }
+                    }
+                    let left = self.current_left.take().expect("finished group left");
+                    if !self.left_matched
+                        && matches!(self.join_type, JoinType::Left | JoinType::Full)
+                    {
+                        return Ok(Some(join_with_null_right(&left, self.right_width)));
+                    }
+                }
+                MergePhase::EmitUnmatchedRightGroup => {
+                    let Some(right) = self
+                        .right_group_reader
+                        .as_mut()
+                        .expect("unmatched reader")
+                        .next_record()?
+                    else {
+                        self.right_group_reader = None;
+                        self.right_group = None;
+                        self.matched_stream = None;
+                        self.matched_next = None;
+                        self.phase = MergePhase::Align;
+                        continue;
+                    };
+                    let ordinal = self.unmatched_ordinal;
+                    self.unmatched_ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| DbError::internal("merge unmatched ordinal overflow"))?;
+                    while self.matched_next.is_none() {
+                        self.matched_next = self
+                            .matched_stream
+                            .as_mut()
+                            .expect("matched stream")
+                            .next_record()?
+                            .map(record_ordinal);
+                        if self.matched_next.is_none() {
+                            break;
+                        }
+                    }
+                    if self.matched_next == Some(ordinal) {
+                        while self.matched_next == Some(ordinal) {
+                            self.matched_next = self
+                                .matched_stream
+                                .as_mut()
+                                .expect("matched stream")
+                                .next_record()?
+                                .map(record_ordinal);
+                        }
+                        continue;
+                    }
+                    return Ok(Some(join_with_null_left(self.left_width, &right)));
+                }
+                MergePhase::Done => return Ok(None),
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.reset();
+        Ok(())
+    }
+}
+
+fn compare_merge_keys(left: &[Value], right: &[Value]) -> Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let order = match (left, right) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            _ => left.cmp(right),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn key_has_null(key: &[Value]) -> bool {
+    key.iter().any(|value| matches!(value, Value::Null))
+}
+
+fn drain_to_sorter<C: Fn(&SpillRow, &SpillRow) -> Ordering>(
+    source: &mut dyn PlanExecutor,
+    key_slots: &[usize],
+    source_id: u8,
+    sorter: &mut ExternalSorter<SpillRow, C>,
+    ctx: &StatementContext,
+) -> Result<()> {
+    open_executor(source)?;
+    let result = (|| {
+        let mut ordinal = 0u64;
+        while let Some(row) = source.next()? {
+            ctx.cancel.check()?;
+            let mut keys = Vec::with_capacity(key_slots.len());
+            for &slot in key_slots {
+                keys.push(
+                    row.row
+                        .values
+                        .get(slot)
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "merge join key slot {slot} is out of bounds"
+                            ))
+                        })?
+                        .clone(),
+                );
+            }
+            sorter.push(SpillRow {
+                row,
+                keys,
+                ordinal,
+                source: source_id,
+            })?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("merge input ordinal overflow"))?;
+        }
+        Ok(())
+    })();
+    close_after(source, result)
+}
+
 pub struct NestedLoopJoinOp<'a> {
     ctx: StatementContext,
     left: Box<dyn PlanExecutor + 'a>,

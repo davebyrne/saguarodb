@@ -31,7 +31,7 @@ mod tests {
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
-    use crate::ops::{NestedLoopJoinOp, ValuesOp, join_rows, project_row};
+    use crate::ops::{MergeJoinOp, NestedLoopJoinOp, ValuesOp, join_rows, project_row};
     use crate::test_support::{ExecutorHarness, MemoryStorage};
     use crate::{ExecutionContext, ExecutionResult, PlanExecutor, QueryEngine, eval_expr};
     use storage::{SchemaOperations, StorageEngine};
@@ -219,6 +219,13 @@ mod tests {
             "SELECT l.id, r.id FROM users l LEFT JOIN users r ON l.id + 1 = r.id",
             "SELECT l.id, r.id FROM users l RIGHT JOIN users r ON l.id + 1 = r.id",
             "SELECT l.id, r.id FROM users l FULL JOIN users r ON l.id + 1 = r.id",
+            "SELECT l.id, r.id FROM users l LEFT JOIN users r ON l.name = r.name",
+            "SELECT l.id, r.id FROM users l RIGHT JOIN users r ON l.name = r.name",
+            "SELECT l.id, r.id FROM users l FULL JOIN users r ON l.name = r.name",
+            "SELECT l.id, r.id FROM users l FULL JOIN users r ON l.name = r.name AND l.id < r.id",
+            "SELECT l.id, r.id FROM users l LEFT JOIN users r ON l.id = r.id AND l.name = r.name",
+            "SELECT l.id, r.id FROM users l RIGHT JOIN users r ON l.id = r.id AND l.name = r.name",
+            "SELECT l.id, r.id FROM users l FULL JOIN users r ON l.id = r.id AND l.name = r.name",
             "SELECT l.id, r.id FROM users l JOIN users r ON l.name = r.name",
         ] {
             let expected = harness.execute(sql).unwrap();
@@ -280,6 +287,70 @@ mod tests {
     }
 
     #[test]
+    fn merge_outer_join_composite_null_and_residual_semantics_have_literal_oracles() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("INSERT INTO users VALUES (0, NULL), (1, 'a'), (2, 'a')")
+            .unwrap();
+
+        let query_rows = |sql| {
+            let ExecutionResult::Query { rows, .. } = harness.execute(sql).unwrap() else {
+                panic!("expected query result");
+            };
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>()
+        };
+        let pair = |left, right| vec![left, right];
+
+        assert_eq!(
+            query_rows(
+                "SELECT l.id, r.id FROM users l LEFT JOIN users r \
+                 ON l.id = r.id AND l.name = r.name ORDER BY l.id, r.id"
+            ),
+            vec![
+                pair(Value::Integer(0), Value::Null),
+                pair(Value::Integer(1), Value::Integer(1)),
+                pair(Value::Integer(2), Value::Integer(2)),
+            ]
+        );
+        assert_eq!(
+            query_rows(
+                "SELECT l.id, r.id FROM users l RIGHT JOIN users r \
+                 ON l.id = r.id AND l.name = r.name ORDER BY l.id, r.id"
+            ),
+            vec![
+                pair(Value::Integer(1), Value::Integer(1)),
+                pair(Value::Integer(2), Value::Integer(2)),
+                pair(Value::Null, Value::Integer(0)),
+            ]
+        );
+        assert_eq!(
+            query_rows(
+                "SELECT l.id, r.id FROM users l FULL JOIN users r \
+                 ON l.id = r.id AND l.name = r.name ORDER BY l.id, r.id"
+            ),
+            vec![
+                pair(Value::Integer(0), Value::Null),
+                pair(Value::Integer(1), Value::Integer(1)),
+                pair(Value::Integer(2), Value::Integer(2)),
+                pair(Value::Null, Value::Integer(0)),
+            ]
+        );
+        assert_eq!(
+            query_rows(
+                "SELECT l.id, r.id FROM users l FULL JOIN users r \
+                 ON l.name = r.name AND l.id < r.id ORDER BY l.id, r.id"
+            ),
+            vec![
+                pair(Value::Integer(0), Value::Null),
+                pair(Value::Integer(1), Value::Integer(2)),
+                pair(Value::Integer(2), Value::Null),
+                pair(Value::Null, Value::Integer(0)),
+                pair(Value::Null, Value::Integer(1)),
+            ]
+        );
+    }
+
+    #[test]
     fn right_join_does_not_reevaluate_volatile_predicate_for_unmatched_rows() {
         let sequences = Arc::new(TestSequenceManager::with_next_values(vec![1, 2, 3, 4, 5]));
         let mut statement = StatementContext::new(0);
@@ -334,6 +405,78 @@ mod tests {
         join.close().unwrap();
 
         assert_eq!(rows.len(), 2);
+        assert_eq!(sequences.next_values.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_join_evaluates_volatile_residual_once_per_candidate_pair() {
+        let sequences = Arc::new(TestSequenceManager::with_next_values(vec![1, 2, 3, 4, 5]));
+        let mut statement = StatementContext::new(0);
+        statement.sequence_manager = sequences.clone();
+        let literal_row = |value| {
+            vec![BoundExpr::Literal {
+                value: Value::Integer(value),
+                data_type: DataType::Integer,
+                nullable: false,
+            }]
+        };
+        let left = Box::new(ValuesOp::new(
+            statement.clone(),
+            vec![literal_row(1), literal_row(1)],
+            vec![ColumnInfo {
+                name: "l".into(),
+                data_type: DataType::Integer,
+                table_id: None,
+                column_id: None,
+                pg_type: None,
+            }],
+        ));
+        let right = Box::new(ValuesOp::new(
+            statement.clone(),
+            vec![literal_row(1), literal_row(1)],
+            vec![ColumnInfo {
+                name: "r".into(),
+                data_type: DataType::Integer,
+                table_id: None,
+                column_id: None,
+                pg_type: None,
+            }],
+        ));
+        let residual = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::Nextval {
+                sequence: 1,
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            op: BinOp::Lt,
+            right: Box::new(BoundExpr::Literal {
+                value: Value::Integer(0),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let mut join = MergeJoinOp::new(
+            statement,
+            left,
+            right,
+            vec![0],
+            vec![0],
+            Some(residual),
+            planner::JoinType::Full,
+            spill::SpillConfig::default(),
+        );
+
+        join.open().unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = join.next().unwrap() {
+            rows.push(row);
+        }
+        join.close().unwrap();
+
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row.identity.is_none()));
         assert_eq!(sequences.next_values.lock().unwrap().len(), 1);
     }
 

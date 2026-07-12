@@ -20,7 +20,7 @@ pub use distinct::DistinctOp;
 pub use filter::FilterOp;
 pub use join::NestedLoopJoinOp;
 pub use join::join_rows;
-pub use join::{HashJoinInput, HashJoinOp};
+pub use join::{HashJoinInput, HashJoinOp, MergeJoinOp};
 pub use limit::LimitOp;
 pub use projection::ProjectionOp;
 pub use projection::project_row;

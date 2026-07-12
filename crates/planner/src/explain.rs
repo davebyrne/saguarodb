@@ -221,6 +221,22 @@ fn format_node(
             format_node(left, indent + 1, catalog, output);
             format_node(right, indent + 1, catalog, output);
         }
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_keys,
+            residual,
+            join_type,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{padding}MergeJoin type={join_type:?} keys={} residual={}{rows_suffix}\n",
+                left_keys.len(),
+                if residual.is_some() { "yes" } else { "none" }
+            ));
+            format_node(left, indent + 1, catalog, output);
+            format_node(right, indent + 1, catalog, output);
+        }
         PhysicalPlan::Apply {
             input,
             subplan,

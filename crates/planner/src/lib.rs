@@ -2330,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_planner_uses_nested_loop_join_for_outer_equi_join() {
+    fn physical_planner_uses_merge_join_for_outer_equi_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt =
             parse("select users.id from users left join accounts on users.name = accounts.owner")
@@ -2340,8 +2340,31 @@ mod tests {
         let physical = physical_plan(&logical, &catalog).unwrap();
 
         let text = format_explain(&physical, &catalog);
-        assert!(text.contains("NestedLoopJoin"));
+        assert!(text.contains("MergeJoin type=Left keys=1 residual=none"));
         assert!(!text.contains("HashJoin"));
+    }
+
+    #[test]
+    fn physical_planner_routes_all_outer_equi_joins_and_keeps_residual_inside() {
+        let catalog = catalog_with_users_and_accounts();
+        for (kind, label) in [("left", "Left"), ("right", "Right"), ("full", "Full")] {
+            let sql = format!(
+                "select users.id from users {kind} join accounts \
+                 on users.id = accounts.id and users.name <> accounts.owner"
+            );
+            let bound = bind(&parse(&sql).unwrap(), &catalog).unwrap();
+            let logical = logical_plan(&bound).unwrap();
+            let physical = physical_plan(&logical, &catalog).unwrap();
+            let text = format_explain(&physical);
+            assert!(
+                text.contains(&format!("MergeJoin type={label} keys=1 residual=yes")),
+                "{text}"
+            );
+            assert!(
+                !text.contains("Filter\n"),
+                "outer residual escaped merge join: {text}"
+            );
+        }
     }
 
     #[test]
@@ -4215,7 +4238,8 @@ mod tests {
                 | PhysicalPlan::Sort { source, .. }
                 | PhysicalPlan::Limit { source, .. } => find_lateral_correlations(source),
                 PhysicalPlan::NestedLoopJoin { left, right, .. }
-                | PhysicalPlan::HashJoin { left, right, .. } => {
+                | PhysicalPlan::HashJoin { left, right, .. }
+                | PhysicalPlan::MergeJoin { left, right, .. } => {
                     find_lateral_correlations(left).or_else(|| find_lateral_correlations(right))
                 }
                 _ => None,

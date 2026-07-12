@@ -286,6 +286,7 @@ fn is_read_plan(plan: &PhysicalPlan) -> bool {
             | PhysicalPlan::IndexScan { .. }
             | PhysicalPlan::NestedLoopJoin { .. }
             | PhysicalPlan::HashJoin { .. }
+            | PhysicalPlan::MergeJoin { .. }
             | PhysicalPlan::Filter { .. }
             | PhysicalPlan::Projection { .. }
             | PhysicalPlan::Sort { .. }

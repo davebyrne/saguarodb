@@ -23,7 +23,8 @@ use crate::expr::cast_value_to_pg_type;
 use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinInput, HashJoinOp, IndexScanInput, IndexScanOp,
-    LimitOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, TableFunctionOp, ValuesOp,
+    LimitOp, MergeJoinOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp,
+    TableFunctionOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -580,6 +581,27 @@ pub(crate) fn build_executor<'a>(
                 build_left: *build_left,
                 spill: ctx.spill.clone(),
             })))
+        }
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            residual,
+            join_type,
+        } => {
+            let left = build_executor(ctx, left)?;
+            let right = build_executor(ctx, right)?;
+            Ok(Box::new(MergeJoinOp::new(
+                ctx.statement.clone(),
+                left,
+                right,
+                left_keys.clone(),
+                right_keys.clone(),
+                residual.clone(),
+                *join_type,
+                ctx.spill.clone(),
+            )))
         }
         PhysicalPlan::Apply {
             input,

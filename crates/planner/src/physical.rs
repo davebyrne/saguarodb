@@ -201,6 +201,14 @@ pub enum PhysicalPlan {
         /// build-right/stream-left behavior.
         build_left: bool,
     },
+    MergeJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        residual: Option<BoundExpr>,
+        join_type: JoinType,
+    },
     Filter {
         source: Box<PhysicalPlan>,
         predicate: BoundExpr,
@@ -579,12 +587,11 @@ fn plan_join(
     // the hash path only when the WHOLE condition is equality pairs — its
     // output has no right columns, so a residual could not be re-checked
     // above it. Anything else falls back to the nested-loop join.
-    if matches!(join_type, JoinType::Inner | JoinType::Semi | JoinType::Anti)
-        && let Some(condition) = condition
-    {
+    if let Some(condition) = condition {
         let left_width = output_width(&left_plan, catalog)?;
         let split = split_equi_keys(condition, left_width);
-        let hashable = !split.left_keys.is_empty()
+        let hashable = matches!(join_type, JoinType::Inner | JoinType::Semi | JoinType::Anti)
+            && !split.left_keys.is_empty()
             && (join_type == JoinType::Inner || split.residual.is_none());
         if hashable {
             // First cost-based decision (docs/specs/statistics.md §9.2):
@@ -615,6 +622,19 @@ fn plan_join(
                     predicate,
                 },
                 None => hash,
+            });
+        }
+        if matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full)
+            && identity_from.is_none()
+            && !split.left_keys.is_empty()
+        {
+            return Ok(PhysicalPlan::MergeJoin {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                left_keys: split.left_keys,
+                right_keys: split.right_keys,
+                residual: split.residual,
+                join_type,
             });
         }
     }
@@ -738,6 +758,12 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
             ..
         }
         | PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            ..
+        }
+        | PhysicalPlan::MergeJoin {
             left,
             right,
             join_type,

@@ -378,7 +378,8 @@ These are correlated joins on the write path.
 `ExecRow` carries `identity: Option<RowIdentity>` (physical `RowId` + key),
 which the Update/Delete executors use to target heap tuples. Join operators
 currently produce combined rows with `identity: None`. The join plan nodes
-(`NestedLoopJoin`, `HashJoin`) gain:
+The join plan nodes which may appear on a DML source spine (`NestedLoopJoin`,
+`HashJoin`) carry:
 
 ```rust
 identity_from: Option<JoinSide>,   // None = plain query joins (no identity)

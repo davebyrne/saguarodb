@@ -144,6 +144,21 @@ pub fn rewrite_plan_exprs(
             identity_from: *identity_from,
             build_left: *build_left,
         },
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            residual,
+            join_type,
+        } => PhysicalPlan::MergeJoin {
+            left: Box::new(rewrite_plan_exprs(left, f)?),
+            right: Box::new(rewrite_plan_exprs(right, f)?),
+            left_keys: left_keys.clone(),
+            right_keys: right_keys.clone(),
+            residual: rewrite_opt(residual, f)?,
+            join_type: *join_type,
+        },
         // The subplan is a separate OuterRef namespace owned by the Apply
         // operator (docs/specs/subqueries.md section 5.2): it is cloned, not
         // walked. The correlations and the In-operand are expressions over

@@ -1418,7 +1418,14 @@ pub enum PhysicalPlan {
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
     },
-    // Future: MergeSortJoin
+    MergeJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        residual: Option<BoundExpr>,
+        join_type: JoinType,
+    },
 
     // Other operators
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
@@ -1473,7 +1480,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of the table's declared primary key, emit `IndexScan` with `PRIMARY_KEY_INDEX_ID`. If it has an equality or range comparison on the leading column of a catalog index, emit `IndexScan` with that catalog index. Both forms carry a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, the original predicate in `full_filter`, and any residual predicate in `filter`.
 2. **Index choice:** When several indexed leading columns are constrained, prefer an equality over a range, primary-key identity access over catalog indexes, then the lower index id.
 3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
-4. **Join ordering:** Process joins left to right as written. An inner join whose `ON` predicate is a conjunction of `left_column = right_column` equalities becomes a `HashJoin` (its `left_keys`/`right_keys` are the paired key slots); every other join (outer, cross, non-equi) is a `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
+4. **Join ordering:** Process joins left to right as written. Eligible inner/semi/anti equi joins use `HashJoin`. A left/right/full join with at least one extractable cross-side equality and no DML identity source uses `MergeJoin`, with remaining `ON` conjuncts evaluated internally as residuals. Cross, non-equi, and DML-identity outer joins use `NestedLoopJoin`. Merge join owns spillable internal sorts but publishes no ordering property.
 5. **Projection pushdown:** Optional. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
 
 ### EXPLAIN
@@ -1562,6 +1569,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | Uses `work_mem`-bounded rewindable tapes for both inputs and streams matches/NULL extension; right/full unmatched detection uses externally sorted matched ordinals without re-evaluating predicates. |
 | `HashJoinOp` | Builds the planner-selected side (right by default; left when statistics estimate it is smaller) in a reservation-accounted, key-sorted contiguous table while it fits, then releases it and falls back to a bounded rewindable spill-tape probe; NULL keys never match and output remains logical left ++ right. |
+| `MergeJoinOp` | Stable-sorts both inputs with one shared `work_mem` account; NULL-bearing keys never match. Rewindable spill tapes and externally sorted match ordinals bound duplicate groups while residuals run once per pair; output identity is cleared. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
 | `SortOp` | Evaluates keys once and uses a stable `work_mem`-bounded external sort, spilling anonymous runs below the configured temp directory; preserves row identity. Blocking operator. |
