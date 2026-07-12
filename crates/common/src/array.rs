@@ -25,7 +25,8 @@ pub fn parse_array_text_structure(
     parser.whitespace();
     let bounds = parser.bounds()?;
     let mut tokens = Vec::new();
-    let lengths = parser.list(0, &mut tokens)?;
+    let shape = parser.list(0, &mut tokens)?;
+    let lengths = shape.lengths[..shape.dimensions].to_vec();
     parser.whitespace();
     if parser.offset != parser.bytes.len() {
         return Err(invalid_array("array text has trailing input"));
@@ -70,6 +71,12 @@ struct ArrayTextParser<'a> {
     offset: usize,
     lists: usize,
     elements: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArrayTextShape {
+    lengths: [usize; MAX_ARRAY_DIMENSIONS],
+    dimensions: usize,
 }
 
 impl ArrayTextParser<'_> {
@@ -134,7 +141,7 @@ impl ArrayTextParser<'_> {
         }
     }
 
-    fn list(&mut self, depth: usize, tokens: &mut Vec<Option<String>>) -> Result<Vec<usize>> {
+    fn list(&mut self, depth: usize, tokens: &mut Vec<Option<String>>) -> Result<ArrayTextShape> {
         self.lists += 1;
         if self.lists > MAX_ARRAY_TEXT_LISTS {
             return Err(invalid_array("array text has too many nested lists"));
@@ -150,10 +157,18 @@ impl ArrayTextParser<'_> {
         self.whitespace();
         if self.bytes.get(self.offset) == Some(&b'}') {
             self.offset += 1;
-            return Ok(vec![0]);
+            if depth != 0 {
+                return Err(invalid_array("nested empty arrays are not supported"));
+            }
+            let mut lengths = [0; MAX_ARRAY_DIMENSIONS];
+            lengths[0] = 0;
+            return Ok(ArrayTextShape {
+                lengths,
+                dimensions: 1,
+            });
         }
         let mut item_count = 0;
-        let mut nested_shape: Option<Vec<usize>> = None;
+        let mut nested_shape: Option<ArrayTextShape> = None;
         let mut scalar_items = false;
         loop {
             self.whitespace();
@@ -187,11 +202,16 @@ impl ArrayTextParser<'_> {
                 _ => return Err(invalid_array("invalid array text syntax")),
             }
         }
-        let mut shape = vec![item_count];
-        if let Some(nested) = nested_shape {
-            shape.extend(nested);
-        }
-        Ok(shape)
+        let mut lengths = [0; MAX_ARRAY_DIMENSIONS];
+        lengths[0] = item_count;
+        let dimensions = nested_shape.map_or(1, |nested| {
+            lengths[1..=nested.dimensions].copy_from_slice(&nested.lengths[..nested.dimensions]);
+            nested.dimensions + 1
+        });
+        Ok(ArrayTextShape {
+            lengths,
+            dimensions,
+        })
     }
 
     fn element(&mut self) -> Result<Option<String>> {
