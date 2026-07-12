@@ -108,6 +108,24 @@ async fn e2e_unnest_and_generate_series_table_functions() {
         .err()
         .expect("lateral table-function column dependency should block DROP COLUMN");
     assert_eq!(err.code, common::SqlState::DependentObjectsStillExist);
+    server
+        .simple_query("drop view flattened_values")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "create view nested_flattened_values as \
+             select d.value from series_inputs, \
+             lateral (select value from unnest(series_inputs.values) as u(value)) as d",
+        )
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("alter table series_inputs drop column values")
+        .await
+        .err()
+        .expect("nested lateral correlation dependency should block DROP COLUMN");
+    assert_eq!(err.code, common::SqlState::DependentObjectsStillExist);
 
     let err = server
         .simple_query("select * from series_inputs, unnest(array_agg(id)) as u(value)")

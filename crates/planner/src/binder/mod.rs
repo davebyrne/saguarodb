@@ -1107,6 +1107,7 @@ fn collect_select_dependencies(
             collect_from_dependencies(from, builder);
             let bindings = visible_relation_bindings(from);
             collect_table_function_dependencies(from, &bindings, builder);
+            collect_from_correlation_dependencies(from, &bindings, builder);
             bindings
         })
         .unwrap_or_default();
@@ -1424,6 +1425,7 @@ fn collect_bound_select_dependencies(
             collect_from_dependencies(from, builder);
             let bindings = visible_relation_bindings(from);
             collect_table_function_dependencies(from, &bindings, builder);
+            collect_from_correlation_dependencies(from, &bindings, builder);
             bindings
         })
         .unwrap_or_default();
@@ -1465,6 +1467,28 @@ fn collect_table_function_dependencies(
             BoundFrom::TableFunction { args, .. } => {
                 for arg in args {
                     collect_expr_dependencies(arg, bindings, builder);
+                }
+            }
+            BoundFrom::Join { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_from_correlation_dependencies(
+    from: &BoundFrom,
+    bindings: &[DependencyBinding],
+    builder: &mut ViewDependencyBuilder,
+) {
+    let mut stack = vec![from];
+    while let Some(item) = stack.pop() {
+        match item {
+            BoundFrom::Derived { query, .. } => {
+                for correlation in &query.correlations {
+                    collect_expr_dependencies(&correlation.outer, bindings, builder);
                 }
             }
             BoundFrom::Join { left, right, .. } => {
