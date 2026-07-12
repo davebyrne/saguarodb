@@ -3,7 +3,7 @@ use std::sync::Arc;
 use common::{ColumnInfo, DbError, IsolationLevel, QueryCancel, Result, SqlState};
 use executor::FetchStatus;
 use parser::{Query, Statement};
-use planner::{bind, logical_plan, physical_plan};
+use planner::{logical_plan, physical_plan};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -240,9 +240,14 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
     if !matches!(classify_bound(prepared.class, &bound), StatementClass::Read) {
         return send_setup_error(setup_tx, None, default_isolation, read_only_cursor_error());
     }
-    if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
-        return send_setup_error(setup_tx, None, default_isolation, err);
-    }
+    let _object_guard = match service.lock_autocommit_prepared_read(
+        &bound,
+        &prepared.schema_versions,
+        session.cancel().as_ref(),
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
     let captured = match service.capture_consistent_snapshots_cancelable(0, session.cancel()) {
         Ok(captured) => captured,
         Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
@@ -265,15 +270,18 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
         default_isolation,
         session.statement_timeout_ms(),
     );
-    let ctx = match service.execution_context(ExecutionContextInput {
-        txn_id: 0,
-        snapshot: captured.snapshot,
-        relations: captured.relations,
-        isolation: IsolationLevel::default(),
-        gc_horizon: 0,
-        live_txns: Arc::from([0]),
-        runtime,
-    }) {
+    let ctx = match service.execution_context_for_bound(
+        ExecutionContextInput {
+            txn_id: 0,
+            snapshot: captured.snapshot,
+            relations: captured.relations,
+            isolation: IsolationLevel::default(),
+            gc_horizon: 0,
+            live_txns: Arc::from([0]),
+            runtime,
+        },
+        &bound,
+    ) {
         Ok(ctx) => ctx,
         Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
     };
@@ -332,7 +340,25 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
             read_only_cursor_error(),
         );
     }
-    if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
+    let lock_result = match service.object_requests_for_bound(&bound) {
+        Ok(requests) if requests.is_empty() => {
+            service.validate_prepared_schema_versions(&prepared.schema_versions)
+        }
+        Ok(_) => match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
+            Ok(owner) => service.lock_prepared_bound(
+                &bound,
+                &prepared.schema_versions,
+                owner,
+                session.cancel().as_ref(),
+            ),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    if let Err(err) = lock_result {
+        if err.code == SqlState::DeadlockDetected {
+            service.abort_deadlock_victim(&mut txn);
+        }
         return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
     }
     let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
@@ -365,15 +391,18 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
-    let ctx = match service.execution_context(ExecutionContextInput {
-        txn_id: txn.writing_xid(),
-        snapshot,
-        relations,
-        isolation: txn.isolation,
-        gc_horizon: service.components.gc_horizon(),
-        live_txns: txn.live_txns(),
-        runtime,
-    }) {
+    let ctx = match service.execution_context_for_bound(
+        ExecutionContextInput {
+            txn_id: txn.writing_xid(),
+            snapshot,
+            relations,
+            isolation: txn.isolation,
+            gc_horizon: service.components.gc_horizon(),
+            live_txns: txn.live_txns(),
+            runtime,
+        },
+        &bound,
+    ) {
         Ok(ctx) => ctx,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
@@ -421,16 +450,27 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         );
     }
 
-    let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
-        Ok(snapshots) => snapshots,
-        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
-    };
-    txn.first_statement_ran = true;
-
     let statement = Statement::Query(query);
-    let bound = match bind(&statement, service.components.catalog.as_ref()) {
-        Ok(bound) => bound,
-        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    let locked = match service.bind_with_object_requests(&statement) {
+        Ok((bound, requests)) if requests.is_empty() => service
+            .schema_versions_for_bound(&bound)
+            .map(|versions| (bound, versions)),
+        Ok(_) => match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
+            Ok(owner) => {
+                service.bind_and_lock_unprepared(&statement, owner, session.cancel().as_ref())
+            }
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    let (bound, schema_versions) = match locked {
+        Ok(locked) => locked,
+        Err(err) => {
+            if err.code == SqlState::DeadlockDetected {
+                service.abort_deadlock_victim(&mut txn);
+            }
+            return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
+        }
     };
     if !matches!(
         classify_bound(StatementClass::Read, &bound),
@@ -444,11 +484,11 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         );
     }
 
-    let schema_versions =
-        match prepared_schema_versions(&bound, service.components.catalog.as_ref()) {
-            Ok(schema_versions) => schema_versions,
-            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
-        };
+    let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
+        Ok(snapshots) => snapshots,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    txn.first_statement_ran = true;
     if let Err(err) = service.validate_relation_snapshot_schema_versions(
         snapshots.relations.as_ref(),
         &schema_versions,
@@ -470,15 +510,18 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
-    let ctx = match service.execution_context(ExecutionContextInput {
-        txn_id: txn.writing_xid(),
-        snapshot,
-        relations,
-        isolation: txn.isolation,
-        gc_horizon: service.components.gc_horizon(),
-        live_txns: txn.live_txns(),
-        runtime,
-    }) {
+    let ctx = match service.execution_context_for_bound(
+        ExecutionContextInput {
+            txn_id: txn.writing_xid(),
+            snapshot,
+            relations,
+            isolation: txn.isolation,
+            gc_horizon: service.components.gc_horizon(),
+            live_txns: txn.live_txns(),
+            runtime,
+        },
+        &bound,
+    ) {
         Ok(ctx) => ctx,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };

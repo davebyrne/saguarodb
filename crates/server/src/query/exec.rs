@@ -1,24 +1,44 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, RwLockWriteGuard};
 
-use catalog::CatalogManager;
-use common::{CopyDirection, DbError, IsolationLevel, QueryCancel, Result, SqlState, TableId};
+use common::{CopyDirection, DbError, IsolationLevel, QueryCancel, Result, SqlState};
 use executor::{CopyJob, ExecutionResult, RowSink};
 use parser::Statement;
-use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
-use storage::StorageEngine;
+use planner::{BoundStatement, format_explain, logical_plan, physical_plan};
 
 use super::{
-    BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService,
-    QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome, Transaction,
-    TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
-    mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
-    transaction_control_is_irreversible,
+    AutocommitCopyWrite, BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput,
+    QueryService, QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome,
+    Transaction, TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in,
+    exec_or_stream, mark_failed_on_error, object_lock_requests, prepared_schema_versions, run_plan,
+    statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
-use crate::registry::SnapshotExclusionGuard;
 
 impl QueryService {
+    pub(super) fn catalog_write_after_lock_convergence<'a>(
+        &'a self,
+        bound: &BoundStatement,
+        object_guard: &mut crate::lock_manager::ObjectLockGuard,
+        object_baseline: &crate::lock_manager::OwnerGrantSnapshot,
+        cancel: &QueryCancel,
+    ) -> Result<RwLockWriteGuard<'a, ()>> {
+        loop {
+            let catalog_guard = self
+                .components
+                .catalog_publication_gate
+                .write()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            let current = object_lock_requests(bound, self.components.catalog.as_ref())?;
+            if object_guard.covers(&current)? {
+                return Ok(catalog_guard);
+            }
+            drop(catalog_guard);
+            object_guard.restore(object_baseline)?;
+            object_guard.acquire_many(&current, cancel)?;
+        }
+    }
+
     /// Route a parsed simple-query statement through the transaction lifecycle.
     /// `default_isolation` is the session default (in/out, like `slot`); only
     /// transaction-control statements read or update it, so the data and maintenance
@@ -45,11 +65,6 @@ impl QueryService {
         };
 
         if let StatementClass::TransactionControl(kind) = class {
-            if let Err(err) = session.cancel().check() {
-                return (mark_failed_on_error(slot), default_isolation, Err(err));
-            }
-            let had_txn = slot.is_some();
-            let durable = transaction_control_is_irreversible(kind, had_txn);
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,
@@ -57,27 +72,11 @@ impl QueryService {
                 session.cancel(),
                 session.gucs(),
             );
-            let result = result.map(|result| {
-                if durable {
-                    StreamOutcome::Durable(result)
-                } else {
-                    StreamOutcome::Direct(result)
-                }
-            });
-            return (slot, default_isolation, result);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         if let StatementClass::SessionConfig = class {
-            if let Err(err) = session.cancel().check() {
-                return (mark_failed_on_error(slot), default_isolation, Err(err));
-            }
             let resets_session_objects = matches!(statement, Statement::DiscardAll);
-            let mutates_session = matches!(
-                statement,
-                Statement::SetVariable { .. }
-                    | Statement::ResetVariable { .. }
-                    | Statement::DiscardAll
-            );
             let (slot, default_isolation, result) = self.handle_session_config(
                 statement,
                 slot,
@@ -88,8 +87,6 @@ impl QueryService {
             let result = result.map(|result| {
                 if resets_session_objects {
                     StreamOutcome::SessionReset(result)
-                } else if mutates_session {
-                    StreamOutcome::Durable(result)
                 } else {
                     StreamOutcome::Direct(result)
                 }
@@ -101,12 +98,9 @@ impl QueryService {
         // transaction lifecycle like transaction control; the op + name are read
         // from the parsed statement (`docs/specs/savepoints.md`).
         if let StatementClass::Savepoint = class {
-            if let Err(err) = session.cancel().check() {
-                return (mark_failed_on_error(slot), default_isolation, Err(err));
-            }
             let (slot, default_isolation, result) =
                 self.handle_savepoint(statement, slot, default_isolation);
-            return (slot, default_isolation, result.map(StreamOutcome::Durable));
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         if let StatementClass::SqlCursor = class {
@@ -146,9 +140,9 @@ impl QueryService {
 
         // COPY is bound here (resolve table/columns) but not executed: it returns a
         // `BeginCopyIn`/`BeginCopyOut` request that the connection loop drives over
-        // the COPY sub-protocol. Its snapshot is captured before binding and then
-        // carried into the streaming driver so a schema rewrite cannot publish a
-        // different relation generation between COPY bind and COPY execution.
+        // the COPY sub-protocol. Object locks are acquired and the statement is
+        // rebound/revalidated before its snapshots are captured and carried into
+        // the streaming driver.
         if let StatementClass::Copy(direction) = class {
             let (slot, default_isolation, result) = self.dispatch_copy(
                 direction,
@@ -205,65 +199,152 @@ impl QueryService {
         }
 
         let mut slot = slot;
-        let mut snapshots = match slot.as_mut() {
+        if let Err(err) = self.bind_with_object_requests(&statement) {
+            if let Some(txn) = slot.as_mut() {
+                txn.failed = true;
+            }
+            return (slot, default_isolation, Err(err));
+        }
+
+        let (bound, snapshots, schema_versions) = match slot.as_mut() {
             Some(txn) => {
-                // Capture before a first-write COPY acquires the writer guard. A
-                // transaction that already held the guard may bypass a pending
-                // schema-rewrite fence so it can finish and release that guard.
-                let snapshots = match self.snapshots_for_transaction(txn, cancel.as_ref()) {
+                let locked = match self.ensure_transaction_lock_owner(txn, cancel) {
+                    Ok(owner) => self.bind_and_lock_unprepared(&statement, owner, cancel),
+                    Err(err) => Err(err),
+                };
+                let (bound, schema_versions) = match locked {
+                    Ok(locked) => locked,
+                    Err(err) => {
+                        if err.code == SqlState::DeadlockDetected {
+                            self.abort_deadlock_victim(txn);
+                        } else {
+                            txn.failed = true;
+                        }
+                        return (slot, default_isolation, Err(err));
+                    }
+                };
+                txn.has_writes |= direction == CopyDirection::From;
+                let snapshots = match self.snapshots_for_transaction(txn, cancel) {
                     Ok(snapshots) => snapshots,
                     Err(err) => {
                         txn.failed = true;
                         return (slot, default_isolation, Err(err));
                     }
                 };
+                let catalog = match self.snapshot_catalog() {
+                    Ok(catalog) => catalog,
+                    Err(err) => {
+                        txn.failed = true;
+                        return (slot, default_isolation, Err(err));
+                    }
+                };
                 txn.first_statement_ran = true;
-                CopySnapshots::Transaction(snapshots)
+                (
+                    bound,
+                    CopySnapshots::Transaction { snapshots, catalog },
+                    schema_versions,
+                )
             }
-            None => match self.capture_consistent_snapshots_cancelable(0, cancel.as_ref()) {
-                Ok(snapshots) => CopySnapshots::Autocommit {
-                    snapshots,
-                    write_guard: None,
-                },
-                Err(err) => return (None, default_isolation, Err(err)),
-            },
+            None if direction == CopyDirection::From => {
+                let txn_id = self.register_active_txn();
+                let write_guard = match self.components.concurrency.begin_writer_cancelable(cancel)
+                {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return (None, default_isolation, Err(err));
+                    }
+                };
+                let mut object_guard = match self.components.lock_manager.transaction_owner(txn_id)
+                {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return (None, default_isolation, Err(err));
+                    }
+                };
+                let (bound, schema_versions) =
+                    match self.bind_and_lock_unprepared(&statement, &mut object_guard, cancel) {
+                        Ok(locked) => locked,
+                        Err(err) => {
+                            drop(object_guard);
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return (None, default_isolation, Err(err));
+                        }
+                    };
+                let snapshots = match self.capture_consistent_snapshots_cancelable(txn_id, cancel) {
+                    Ok(snapshots) => snapshots,
+                    Err(err) => {
+                        drop(object_guard);
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return (None, default_isolation, Err(err));
+                    }
+                };
+                let catalog = match self.snapshot_catalog() {
+                    Ok(catalog) => catalog,
+                    Err(err) => {
+                        drop(object_guard);
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return (None, default_isolation, Err(err));
+                    }
+                };
+                (
+                    bound,
+                    CopySnapshots::Autocommit {
+                        snapshots,
+                        catalog,
+                        write: Some(AutocommitCopyWrite::new(
+                            self.components.clone(),
+                            txn_id,
+                            object_guard,
+                            write_guard,
+                        )),
+                        object_guard: None,
+                    },
+                    schema_versions,
+                )
+            }
+            None => {
+                let mut object_guard = self.components.lock_manager.statement_owner();
+                let (bound, schema_versions) =
+                    match self.bind_and_lock_unprepared(&statement, &mut object_guard, cancel) {
+                        Ok(locked) => locked,
+                        Err(err) => return (None, default_isolation, Err(err)),
+                    };
+                let snapshots = match self.capture_consistent_snapshots_cancelable(0, cancel) {
+                    Ok(snapshots) => snapshots,
+                    Err(err) => return (None, default_isolation, Err(err)),
+                };
+                let catalog = match self.snapshot_catalog() {
+                    Ok(catalog) => catalog,
+                    Err(err) => return (None, default_isolation, Err(err)),
+                };
+                (
+                    bound,
+                    CopySnapshots::Autocommit {
+                        snapshots,
+                        catalog,
+                        write: None,
+                        object_guard: Some(object_guard),
+                    },
+                    schema_versions,
+                )
+            }
         };
 
-        let bound = match bind(&statement, self.components.catalog.as_ref()) {
-            Ok(bound) => bound,
-            Err(err) => {
-                if let Some(txn) = slot.as_mut() {
-                    txn.failed = true;
-                }
-                return (slot, default_isolation, Err(err));
-            }
+        let relations = match &snapshots {
+            CopySnapshots::Autocommit { snapshots, .. } => snapshots.relations.as_ref(),
+            CopySnapshots::Transaction { snapshots, .. } => snapshots.relations.as_ref(),
         };
-        let schema_versions =
-            match prepared_schema_versions(&bound, self.components.catalog.as_ref()) {
-                Ok(schema_versions) => schema_versions,
-                Err(err) => {
-                    if let Some(txn) = slot.as_mut() {
-                        txn.failed = true;
-                    }
-                    return (slot, default_isolation, Err(err));
-                }
-            };
-        {
-            let relations = match &snapshots {
-                CopySnapshots::Autocommit { snapshots, .. } => snapshots.relations.as_ref(),
-                CopySnapshots::Transaction(snapshots) => snapshots.relations.as_ref(),
-            };
-            let allow_missing_tables = matches!(direction, CopyDirection::To);
-            if let Err(err) = self.validate_relation_snapshot_schema_versions(
-                relations,
-                &schema_versions,
-                allow_missing_tables,
-            ) {
-                if let Some(txn) = slot.as_mut() {
-                    txn.failed = true;
-                }
-                return (slot, default_isolation, Err(err));
+        if let Err(err) = self.validate_relation_snapshot_schema_versions(
+            relations,
+            &schema_versions,
+            direction == CopyDirection::To,
+        ) {
+            if let Some(txn) = slot.as_mut() {
+                txn.failed = true;
             }
+            return (slot, default_isolation, Err(err));
         }
         let BoundStatement::Copy {
             table_schema,
@@ -280,58 +361,6 @@ impl QueryService {
                 Err(DbError::internal("COPY bound to a non-COPY statement")),
             );
         };
-        if matches!(direction, CopyDirection::From) {
-            if let Some(txn) = slot.as_mut() {
-                let acquired_guard = if txn.write_guard.is_none() {
-                    if let Err(err) = self.acquire_write_guard(txn, cancel.as_ref()) {
-                        txn.failed = true;
-                        return (slot, default_isolation, Err(err));
-                    }
-                    true
-                } else {
-                    false
-                };
-                let relations = match &snapshots {
-                    CopySnapshots::Autocommit { snapshots, .. } => snapshots.relations.as_ref(),
-                    CopySnapshots::Transaction(snapshots) => snapshots.relations.as_ref(),
-                };
-                if let Err(err) = self
-                    .validate_current_schema_versions(&schema_versions)
-                    .and_then(|()| self.validate_relation_snapshot_current_for_write(relations))
-                {
-                    if acquired_guard {
-                        txn.write_guard = None;
-                    }
-                    txn.failed = true;
-                    return (slot, default_isolation, Err(err));
-                }
-            } else if let CopySnapshots::Autocommit {
-                snapshots,
-                write_guard,
-            } = &mut snapshots
-            {
-                let guard = match self
-                    .components
-                    .concurrency
-                    .begin_writer_cancelable(cancel.as_ref())
-                {
-                    Ok(guard) => WriteUnitGuard::Shared(guard),
-                    Err(err) => return (slot, default_isolation, Err(err)),
-                };
-                if let Err(err) = self
-                    .validate_current_schema_versions(&schema_versions)
-                    .and_then(|()| {
-                        self.validate_relation_snapshot_current_for_write(
-                            snapshots.relations.as_ref(),
-                        )
-                    })
-                {
-                    drop(guard);
-                    return (slot, default_isolation, Err(err));
-                }
-                *write_guard = Some(guard);
-            }
-        }
         let job = CopyJob {
             schema: table_schema,
             columns,
@@ -373,7 +402,6 @@ impl QueryService {
         runtime: StatementRuntime<'_>,
         sink: Option<&mut dyn RowSink>,
     ) -> (Option<Transaction>, Result<StreamOutcome>) {
-        let cancel = runtime.cancel.clone();
         // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
         // `handle_transaction_control`, never reaching here).
         if txn.failed {
@@ -403,99 +431,72 @@ impl QueryService {
         }
 
         let initial_class = class;
-        let had_write_guard = txn.write_guard.is_some();
-        // Data statements capture before waiting for a writer guard. Schema
-        // rewrites fence new snapshot captures before waiting for the checkpoint
-        // guard, so this ordering prevents a transaction from holding a writer
-        // guard while blocked on the rewrite fence.
-        let captured_snapshot =
-            match self.snapshots_for_transaction(&mut txn, runtime.cancel.as_ref()) {
-                Ok(snapshots) => snapshots,
-                Err(err) => {
-                    txn.failed = true;
-                    return (Some(txn), Err(err));
-                }
-            };
-        txn.first_statement_ran = true;
-
-        let acquired_for_syntactic_write =
-            matches!(initial_class, StatementClass::Write) && !had_write_guard;
-        if acquired_for_syntactic_write
-            && let Err(err) = self.acquire_write_guard(&mut txn, runtime.cancel.as_ref())
-        {
-            txn.failed = true;
-            return (Some(txn), Err(err));
-        }
-
-        let prepared_schema_versions = match &source {
-            BindSource::Unbound(_) => None,
-            BindSource::Bound {
-                schema_versions, ..
-            } => Some(schema_versions.clone()),
-        };
-        if let Some(schema_versions) = prepared_schema_versions.as_deref()
-            && let Err(err) = self.validate_prepared_schema_versions(schema_versions)
-        {
-            if acquired_for_syntactic_write {
-                txn.write_guard = None;
-            }
-            txn.failed = true;
-            return (Some(txn), Err(err));
-        }
-
-        let bound = match source {
+        let locked = match source {
             BindSource::Unbound(statement) => {
-                match bind(&statement, self.components.catalog.as_ref()) {
-                    Ok(bound) => bound,
-                    Err(err) => {
-                        if acquired_for_syntactic_write {
-                            txn.write_guard = None;
-                        }
-                        txn.failed = true;
-                        return (Some(txn), Err(err));
+                let discovery = self.bind_with_object_requests(&statement);
+                match discovery {
+                    Ok((bound, requests)) if requests.is_empty() => {
+                        prepared_schema_versions(&bound, self.components.catalog.as_ref())
+                            .map(|versions| (bound, versions))
                     }
+                    Ok(_) => match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
+                        Ok(owner) => {
+                            self.bind_and_lock_unprepared(&statement, owner, runtime.cancel())
+                        }
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => Err(err),
                 }
             }
-            BindSource::Bound { bound, .. } => bound,
+            BindSource::Bound {
+                bound,
+                schema_versions,
+            } => {
+                let requests = self.object_requests_for_bound(&bound);
+                match requests {
+                    Ok(requests) if requests.is_empty() => self
+                        .validate_prepared_schema_versions(&schema_versions)
+                        .map(|()| (bound, schema_versions)),
+                    Ok(_) => match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
+                        Ok(owner) => self
+                            .lock_prepared_bound(&bound, &schema_versions, owner, runtime.cancel())
+                            .map(|()| (bound, schema_versions)),
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        let (bound, schema_versions) = match locked {
+            Ok(locked) => locked,
+            Err(err) => {
+                if err.code == SqlState::DeadlockDetected {
+                    self.abort_deadlock_victim(&mut txn);
+                } else {
+                    txn.failed = true;
+                }
+                return (Some(txn), Err(err));
+            }
         };
         let class = classify_bound(initial_class, &bound);
-        let schema_versions = match prepared_schema_versions {
-            Some(schema_versions) => schema_versions,
-            None => match super::prepared_schema_versions(&bound, self.components.catalog.as_ref())
-            {
-                Ok(schema_versions) => schema_versions,
-                Err(err) => {
-                    if acquired_for_syntactic_write {
-                        txn.write_guard = None;
-                    }
-                    txn.failed = true;
-                    return (Some(txn), Err(err));
-                }
-            },
+
+        let is_write = matches!(class, StatementClass::Write);
+        txn.has_writes |= is_write;
+        let captured_snapshot = match self.snapshots_for_transaction(&mut txn, runtime.cancel()) {
+            Ok(snapshots) => snapshots,
+            Err(err) => {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
         };
+        txn.first_statement_ran = true;
         if let Err(err) = self.validate_relation_snapshot_schema_versions(
             captured_snapshot.relations.as_ref(),
             &schema_versions,
             matches!(class, StatementClass::Read),
         ) {
-            if acquired_for_syntactic_write {
-                txn.write_guard = None;
-            }
             txn.failed = true;
             return (Some(txn), Err(err));
-        }
-
-        let is_write = matches!(class, StatementClass::Write);
-        if is_write && txn.write_guard.is_none() {
-            // A syntactic read can promote to a write after binding (for example
-            // `SELECT nextval(...)`). The snapshot was already advertised before
-            // bind, and schema rewrites wait for advertised snapshots before taking
-            // the checkpoint guard, so acquiring the writer guard here does not
-            // create a DDL deadlock.
-            if let Err(err) = self.acquire_write_guard(&mut txn, runtime.cancel.as_ref()) {
-                txn.failed = true;
-                return (Some(txn), Err(err));
-            }
         }
 
         // Capture the snapshot and hold its GC-horizon advertisement across this
@@ -527,15 +528,18 @@ impl QueryService {
         // and the live (sub)xid set is threaded for own-write/own-conflict detection
         // (`docs/specs/savepoints.md` §4).
         let result = (|| {
-            let ctx = self.execution_context(ExecutionContextInput {
-                txn_id: txn.writing_xid(),
-                snapshot,
-                relations,
-                isolation: txn.isolation,
-                gc_horizon,
-                live_txns: txn.live_txns(),
-                runtime,
-            })?;
+            let ctx = self.execution_context_for_bound(
+                ExecutionContextInput {
+                    txn_id: txn.writing_xid(),
+                    snapshot,
+                    relations,
+                    isolation: txn.isolation,
+                    gc_horizon,
+                    live_txns: txn.live_txns(),
+                    runtime,
+                },
+                &bound,
+            )?;
 
             // Only a read (a plain `SELECT`) streams; a write is materialized, so the
             // sink is withheld from `run_plan` for writes and the executor is never
@@ -555,10 +559,6 @@ impl QueryService {
         // The snapshot can no longer be used to read once `run_plan` has returned;
         // drop the per-statement advertisement now (a no-op under Repeatable Read).
         drop(advertised);
-        let result = result.and_then(|outcome| {
-            cancel.check()?;
-            Ok(outcome)
-        });
         match result {
             Ok(outcome) => {
                 // Accumulate this statement's dead-version count on the transaction
@@ -584,7 +584,11 @@ impl QueryService {
                 // CLOG (the transaction will be marked Aborted on ROLLBACK), and
                 // abort is status-based, not before-image undo (`docs/specs/mvcc.md`
                 // §4 Decision 3, Milestone D1).
-                txn.failed = true;
+                if err.code == SqlState::DeadlockDetected {
+                    self.abort_deadlock_victim(&mut txn);
+                } else {
+                    txn.failed = true;
+                }
                 (Some(txn), Err(err))
             }
         }
@@ -602,35 +606,61 @@ impl QueryService {
     ) -> Result<StreamOutcome> {
         match class {
             StatementClass::Read => {
-                let captured =
-                    self.capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())?;
-                let bound = bind(&statement, self.components.catalog.as_ref())?;
+                let (initial, requests) = self.bind_with_object_requests(&statement)?;
+                if matches!(classify_bound(class, &initial), StatementClass::Write) {
+                    return self
+                        .autocommit_write(
+                            statement,
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
+                        )
+                        .map(StreamOutcome::Direct);
+                }
+                let (bound, object_guard) = if requests.is_empty() {
+                    (initial, None)
+                } else {
+                    let mut guard = self.components.lock_manager.statement_owner();
+                    let (bound, _) = self.bind_and_lock_unprepared(
+                        &statement,
+                        &mut guard,
+                        session.cancel().as_ref(),
+                    )?;
+                    (bound, Some(guard))
+                };
                 match classify_bound(class, &bound) {
-                    StatementClass::Read => self.autocommit_read_with_snapshot(
-                        bound,
-                        session.statement_runtime(
-                            default_isolation,
-                            default_isolation,
-                            session.statement_timeout_ms(),
-                        ),
-                        sink,
-                        captured,
-                    ),
-                    // A read promoted to a write (e.g. `SELECT nextval(...)`) is
-                    // materialized, not streamed. Reuse the advertised snapshot so
-                    // schema rewrites wait for this already-bound statement.
-                    StatementClass::Write => self
-                        .autocommit_prepared_bound_write_with_snapshot(
+                    StatementClass::Read => {
+                        let captured =
+                            self.capture_consistent_snapshots_cancelable(0, session.cancel())?;
+                        self.autocommit_read_with_snapshot(
                             bound,
                             session.statement_runtime(
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
                             ),
-                            None,
+                            sink,
                             captured,
+                            object_guard,
                         )
-                        .map(StreamOutcome::Durable),
+                    }
+                    // A catalog change during discovery can only add/remove objects
+                    // by forcing the bind/lock loop to retry, but keep this branch
+                    // total: restart the unprepared statement under its xid owner.
+                    StatementClass::Write => {
+                        drop(object_guard);
+                        self.autocommit_write(
+                            statement,
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
+                        )
+                        .map(StreamOutcome::Direct)
+                    }
                     _ => unreachable!("classify_bound only promotes reads to writes"),
                 }
             }
@@ -643,7 +673,7 @@ impl QueryService {
                         session.statement_timeout_ms(),
                     ),
                 )
-                .map(StreamOutcome::Durable),
+                .map(StreamOutcome::Direct),
             // Maintenance never reaches here: `dispatch` runs it via
             // `run_maintenance` before the autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
@@ -674,16 +704,17 @@ impl QueryService {
         }
     }
 
-    /// Execute a read-only statement (SELECT/EXPLAIN) lock-free: capture a
-    /// snapshot under the registry latch and read via the buffer pool's per-frame
-    /// latches. No `ConcurrencyController` guard is taken, so reads run
-    /// concurrently with an in-flight writer (`docs/specs/mvcc.md` §7.1).
+    /// Execute a read-only statement (SELECT/EXPLAIN) with statement-owned object
+    /// locks and a snapshot captured under the registry latch. No
+    /// `ConcurrencyController` guard is taken, so autocommit reads still run
+    /// concurrently with in-flight writers (`docs/specs/mvcc.md` §7.1).
     pub(super) fn autocommit_read_with_snapshot(
         &self,
         bound: BoundStatement,
         runtime: StatementRuntime<'_>,
         sink: Option<&mut dyn RowSink>,
         captured: CapturedSnapshots,
+        _object_guard: Option<crate::lock_manager::ObjectLockGuard>,
     ) -> Result<StreamOutcome> {
         if let BoundStatement::Explain(inner) = &bound {
             return self.explain(inner.as_ref()).map(StreamOutcome::Direct);
@@ -712,15 +743,18 @@ impl QueryService {
         )?;
         // A read never runs CREATE INDEX (the only horizon consumer), so the horizon
         // is unused on this path; pass `0`.
-        let ctx = self.execution_context(ExecutionContextInput {
-            txn_id: 0,
-            snapshot,
-            relations,
-            isolation: IsolationLevel::default(),
-            gc_horizon: 0,
-            live_txns: Arc::from([0]),
-            runtime,
-        })?;
+        let ctx = self.execution_context_for_bound(
+            ExecutionContextInput {
+                txn_id: 0,
+                snapshot,
+                relations,
+                isolation: IsolationLevel::default(),
+                gc_horizon: 0,
+                live_txns: Arc::from([0]),
+                runtime,
+            },
+            &bound,
+        )?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // `_advertised` is held across the drive (including any producer block on a
@@ -732,73 +766,56 @@ impl QueryService {
     /// Execute a write/DDL statement as an autocommit unit, committing durably on
     /// success and aborting on error.
     ///
-    /// DML takes the SHARED writer guard (E2b, `docs/specs/mvcc.md` §10 E2b),
-    /// running concurrently with other writers. DDL takes the EXCLUSIVE guard (like
-    /// VACUUM): catalog rollback restores whole object maps, so no other DDL may
-    /// commit between the rollback snapshot and restore; CREATE INDEX also needs a
-    /// stable physical chain view with no concurrent writer (HOT updates) mutating a
-    /// chain mid-scan, which its HOT broken-chain safety check requires
-    /// (`docs/specs/mvcc.md` §10 Milestone H2). The GC horizon, threaded into the
-    /// backfill for that check, is captured ONCE under the exclusive guard (so a
-    /// writer cannot advance it mid-build), mirroring `run_vacuum`.
+    /// DML and DDL take the SHARED writer guard. Relation locks provide scoped
+    /// exclusion, while catalog-changing DDL additionally holds the exclusive
+    /// catalog publication gate across mutation, durable commit, and rollback.
     pub(super) fn autocommit_write(
         &self,
         statement: Statement,
         runtime: StatementRuntime<'_>,
     ) -> Result<ExecutionResult> {
-        let cancel = runtime.cancel.clone();
-        if statement_is_syntactic_dml(&statement) {
-            // Advertise the statement snapshot before waiting for the writer guard.
-            // Schema rewrites fence snapshot capture before waiting for the
-            // checkpoint guard; taking the snapshot first keeps data writers from
-            // holding a writer guard while blocked on that fence.
-            let captured = self.capture_consistent_snapshots_cancelable(0, cancel.as_ref())?;
-            let guard = WriteUnitGuard::Shared(
-                self.components
-                    .concurrency
-                    .begin_writer_cancelable(cancel.as_ref())?,
-            );
-            let bound = bind(&statement, self.components.catalog.as_ref())?;
-            return self.autocommit_bound_write_with_guard(
-                bound,
-                guard,
-                runtime,
-                None,
-                None,
-                Some(captured),
-            );
+        let (_, _, catalog_noop) = self.bind_with_object_requests_and_preflight(&statement)?;
+        if catalog_noop {
+            return Ok(ExecutionResult::Modified {
+                command: "ALTER TABLE".to_string(),
+                count: 0,
+            });
         }
-        let schema_snapshot_guard = if statement_may_rewrite_table_storage(&statement) {
-            Some(
-                self.components
-                    .active_txns
-                    .begin_snapshot_exclusion_cancelable(cancel.as_ref())?,
-            )
-        } else {
-            None
+        let txn_id = self.register_active_txn();
+        let guard = match self
+            .components
+            .concurrency
+            .begin_writer_cancelable(runtime.cancel())
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
         };
-        let needs_exclusive = statement_needs_exclusive_guard(&statement);
-        let guard = if needs_exclusive {
-            WriteUnitGuard::Exclusive(
-                self.components
-                    .concurrency
-                    .begin_checkpoint_cancelable(cancel.as_ref())?,
-            )
-        } else {
-            WriteUnitGuard::Shared(
-                self.components
-                    .concurrency
-                    .begin_writer_cancelable(cancel.as_ref())?,
-            )
+        let mut object_guard = match self.components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
         };
-        let bound = bind(&statement, self.components.catalog.as_ref())?;
+        let object_baseline = object_guard.snapshot();
+        let (bound, schema_versions) =
+            match self.bind_and_lock_unprepared(&statement, &mut object_guard, runtime.cancel()) {
+                Ok(locked) => locked,
+                Err(err) => {
+                    drop(object_guard);
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
         self.autocommit_bound_write_with_guard(
             bound,
             guard,
             runtime,
-            None,
-            schema_snapshot_guard,
-            None,
+            Some(&schema_versions),
+            (txn_id, object_guard, object_baseline),
         )
     }
 
@@ -806,76 +823,59 @@ impl QueryService {
         &self,
         bound: BoundStatement,
         runtime: StatementRuntime<'_>,
-        prepared_schema_versions: Option<&[(TableId, u64)]>,
+        prepared_schema_versions: Option<&[super::PreparedRelationVersion]>,
     ) -> Result<ExecutionResult> {
-        let cancel = runtime.cancel.clone();
-        if let Some(schema_versions) = prepared_schema_versions {
-            self.validate_prepared_schema_versions(schema_versions)?;
-        }
-        if !bound_needs_exclusive_guard(&bound) {
-            let captured = self.capture_consistent_snapshots_cancelable(0, cancel.as_ref())?;
-            return self.autocommit_prepared_bound_write_with_snapshot(
-                bound,
-                runtime,
-                prepared_schema_versions,
-                captured,
-            );
-        }
-        // Prepared statements are already bound; no catalog name resolution happens
-        // here. Acquire the write/checkpoint guard before planning/execution.
-        let schema_snapshot_guard =
-            if bound_rewrites_table_storage(&bound, self.components.catalog.as_ref())? {
-                Some(
-                    self.components
-                        .active_txns
-                        .begin_snapshot_exclusion_cancelable(cancel.as_ref())?,
-                )
-            } else {
-                None
-            };
-        let needs_exclusive = bound_needs_exclusive_guard(&bound);
-        let guard = if needs_exclusive {
-            WriteUnitGuard::Exclusive(
-                self.components
-                    .concurrency
-                    .begin_checkpoint_cancelable(cancel.as_ref())?,
-            )
-        } else {
-            WriteUnitGuard::Shared(
-                self.components
-                    .concurrency
-                    .begin_writer_cancelable(cancel.as_ref())?,
-            )
+        let schema_versions = match prepared_schema_versions {
+            Some(versions) => versions.to_vec(),
+            None => self.schema_versions_for_bound(&bound)?,
         };
-        self.autocommit_bound_write_with_guard(
-            bound,
-            guard,
-            runtime,
-            prepared_schema_versions,
-            schema_snapshot_guard,
-            None,
-        )
-    }
-
-    pub(super) fn autocommit_prepared_bound_write_with_snapshot(
-        &self,
-        bound: BoundStatement,
-        runtime: StatementRuntime<'_>,
-        prepared_schema_versions: Option<&[(TableId, u64)]>,
-        captured: CapturedSnapshots,
-    ) -> Result<ExecutionResult> {
-        let guard = WriteUnitGuard::Shared(
-            self.components
-                .concurrency
-                .begin_writer_cancelable(runtime.cancel.as_ref())?,
+        let schema_alter = matches!(
+            &bound,
+            BoundStatement::AlterTableAddColumn { .. }
+                | BoundStatement::AlterTableDropColumn { .. }
         );
+        if schema_alter && self.prepared_catalog_change_is_noop(&bound, &schema_versions)? {
+            return Ok(ExecutionResult::Modified {
+                command: "ALTER TABLE".to_string(),
+                count: 0,
+            });
+        }
+        let txn_id = self.register_active_txn();
+        let guard = match self
+            .components
+            .concurrency
+            .begin_writer_cancelable(runtime.cancel())
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut object_guard = match self.components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let object_baseline = object_guard.snapshot();
+        if let Err(err) = self.lock_prepared_bound(
+            &bound,
+            &schema_versions,
+            &mut object_guard,
+            runtime.cancel(),
+        ) {
+            drop(object_guard);
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
         self.autocommit_bound_write_with_guard(
             bound,
             guard,
             runtime,
-            prepared_schema_versions,
-            None,
-            Some(captured),
+            Some(&schema_versions),
+            (txn_id, object_guard, object_baseline),
         )
     }
 
@@ -884,21 +884,48 @@ impl QueryService {
         bound: BoundStatement,
         guard: WriteUnitGuard,
         runtime: StatementRuntime<'_>,
-        prepared_schema_versions: Option<&[(TableId, u64)]>,
-        schema_snapshot_guard: Option<SnapshotExclusionGuard>,
-        snapshot_override: Option<CapturedSnapshots>,
+        prepared_schema_versions: Option<&[super::PreparedRelationVersion]>,
+        locked_txn: (
+            u64,
+            crate::lock_manager::ObjectLockGuard,
+            crate::lock_manager::OwnerGrantSnapshot,
+        ),
     ) -> Result<ExecutionResult> {
-        let cancel = runtime.cancel.clone();
-        if let Some(schema_versions) = prepared_schema_versions {
-            self.validate_prepared_schema_versions(schema_versions)?;
-        }
-        let logical = logical_plan(&bound)?;
-        let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // The autocommit unit begins: allocate the transaction id and register it
         // active atomically (so a concurrent reader's snapshot is not torn). Its
         // CLOG status is `InProgress` implicitly until a `Commit`/`Abort` record
         // settles it.
-        let txn_id = self.register_active_txn();
+        let (txn_id, mut object_guard, object_baseline) = locked_txn;
+        let catalog_publication = if bound_mutates_catalog(&bound) {
+            match self.catalog_write_after_lock_convergence(
+                &bound,
+                &mut object_guard,
+                &object_baseline,
+                runtime.cancel(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+        let logical = match logical_plan(&bound) {
+            Ok(logical) => logical,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let physical = match physical_plan(&logical, self.components.catalog.as_ref()) {
+            Ok(physical) => physical,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
         let catalog_before = if bound_mutates_catalog(&bound) {
             match self.components.catalog.snapshot() {
                 Ok(snapshot) => Some(snapshot),
@@ -916,41 +943,25 @@ impl QueryService {
         // commit/rollback that follow (`docs/specs/mvcc.md` §9): it lives until this
         // function returns on every path (success, statement error, panic), exactly
         // bracketing when the snapshot can still be used to read.
-        let rewrite_snapshot = schema_snapshot_guard.is_some();
-        let snapshots = (|| {
-            if let Some(CapturedSnapshots {
-                snapshot,
-                relations,
-                advertised,
-            }) = snapshot_override
-            {
-                Ok((snapshot, relations, Some(advertised)))
-            } else if rewrite_snapshot {
-                Ok((
-                    self.capture_unadvertised_snapshot(txn_id),
-                    self.components.storage.capture_relation_snapshot()?,
-                    None,
-                ))
-            } else {
-                let CapturedSnapshots {
-                    snapshot,
-                    relations,
-                    advertised,
-                } = self.capture_consistent_snapshots_cancelable(txn_id, cancel.as_ref())?;
-                Ok((snapshot, relations, Some(advertised)))
-            }
-        })();
-        let (snapshot, relations, advertised) = match snapshots {
-            Ok(snapshots) => snapshots,
+        let captured = self
+            .capture_consistent_snapshots_cancelable(txn_id, runtime.cancel())
+            .map(
+                |CapturedSnapshots {
+                     snapshot,
+                     relations,
+                     advertised,
+                 }| (snapshot, relations, Some(advertised)),
+            );
+        let (snapshot, relations, advertised) = match captured {
+            Ok(captured) => captured,
             Err(err) => {
-                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                self.rollback_pre_durable_or_die(txn_id, catalog_before.clone());
                 return Err(err);
             }
         };
         let schema_versions = match prepared_schema_versions {
             Some(schema_versions) => schema_versions.to_vec(),
-            None => match super::prepared_schema_versions(&bound, self.components.catalog.as_ref())
-            {
+            None => match self.schema_versions_for_bound(&bound) {
                 Ok(schema_versions) => schema_versions,
                 Err(err) => {
                     drop(advertised);
@@ -968,15 +979,16 @@ impl QueryService {
             self.rollback_pre_durable_or_die(txn_id, catalog_before.clone());
             return Err(err);
         }
-        // Capture the GC horizon. CREATE INDEX needs it for its broken-chain check
-        // (captured AFTER the exclusive guard, so no writer can advance it, exactly as
-        // `run_vacuum` does); an UPDATE needs it for the H3 update-path prune
+        // Capture the GC horizon. CREATE INDEX holds Share on its target, so a target
+        // writer cannot create a newer dead chain during backfill; unrelated commits
+        // may advance the true horizon, but this captured lower value remains safe.
+        // An UPDATE needs it for the H3 update-path prune
         // (`docs/specs/mvcc.md` §10 H3). For an UPDATE under the SHARED writer guard a
         // concurrent writer/commit could advance the true horizon after this read, but
         // a stale/smaller horizon only prunes LESS — never unsafely — so capturing it
         // here (before execution) is sound. Other statements ignore it.
         let gc_horizon = self.components.gc_horizon();
-        let ctx = match self.execution_context(ExecutionContextInput {
+        let context_input = ExecutionContextInput {
             txn_id,
             snapshot,
             relations,
@@ -984,11 +996,17 @@ impl QueryService {
             gc_horizon,
             live_txns: Arc::from([txn_id]),
             runtime,
-        }) {
+        };
+        let context = if catalog_publication.is_some() {
+            self.execution_context_under_catalog_gate(context_input)
+        } else {
+            self.execution_context_for_bound(context_input, &bound)
+        };
+        let ctx = match context {
             Ok(ctx) => ctx,
             Err(err) => {
                 drop(advertised);
-                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                self.rollback_pre_durable_or_die(txn_id, catalog_before.clone());
                 return Err(err);
             }
         };
@@ -1008,11 +1026,6 @@ impl QueryService {
             }
         };
 
-        if let Err(err) = cancel.check() {
-            self.rollback_pre_durable_or_die(txn_id, catalog_before);
-            return Err(err);
-        }
-
         // An autocommit unit has no savepoints, so no committed subxids.
         if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
             self.rollback_pre_durable_or_die(txn_id, catalog_before);
@@ -1027,8 +1040,9 @@ impl QueryService {
         // any writer blocked on its row locks.
         self.components.active_txns.deregister(txn_id);
         self.components.lock_manager.on_txn_finished();
+        drop(catalog_publication);
+        drop(object_guard);
         drop(guard);
-        drop(schema_snapshot_guard);
 
         // Account this committed statement's dead versions toward the auto-prune
         // threshold BEFORE the checkpoint trigger, so a checkpoint fired by this same
@@ -1057,85 +1071,6 @@ impl QueryService {
     }
 }
 
-fn statement_needs_exclusive_guard(statement: &Statement) -> bool {
-    matches!(
-        statement,
-        Statement::CreateTable { .. }
-            | Statement::DropTable { .. }
-            | Statement::AlterTableAddColumn { .. }
-            | Statement::AlterTableDropColumn { .. }
-            | Statement::AlterTableRenameColumn { .. }
-            | Statement::AlterTableRenameTable { .. }
-            | Statement::CreateIndex { .. }
-            | Statement::DropIndex { .. }
-            | Statement::CreateSequence { .. }
-            | Statement::DropSequence { .. }
-            | Statement::CreateView { .. }
-            | Statement::DropView { .. }
-    )
-}
-
-fn statement_is_syntactic_dml(statement: &Statement) -> bool {
-    matches!(
-        statement,
-        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
-    )
-}
-
-fn statement_may_rewrite_table_storage(statement: &Statement) -> bool {
-    matches!(
-        statement,
-        Statement::AlterTableAddColumn { .. } | Statement::AlterTableDropColumn { .. }
-    )
-}
-
-fn bound_needs_exclusive_guard(bound: &BoundStatement) -> bool {
-    bound_mutates_catalog(bound)
-}
-
-fn bound_rewrites_table_storage(
-    bound: &BoundStatement,
-    catalog: &dyn CatalogManager,
-) -> Result<bool> {
-    match bound {
-        BoundStatement::AlterTableAddColumn {
-            table,
-            if_not_exists,
-            column,
-            ..
-        } => preflight_add_column_rewrite_by_id(catalog, *table, *if_not_exists, column),
-        BoundStatement::AlterTableDropColumn {
-            table,
-            if_exists,
-            column,
-            ..
-        } => preflight_drop_column_rewrite_by_id(catalog, *table, *if_exists, column),
-        _ => Ok(false),
-    }
-}
-
-fn preflight_add_column_rewrite_by_id(
-    catalog: &dyn CatalogManager,
-    table: TableId,
-    if_not_exists: bool,
-    column: &common::ParsedColumnDef,
-) -> Result<bool> {
-    Ok(catalog
-        .preflight_add_table_column(table, if_not_exists, column)?
-        .rewrites_storage())
-}
-
-fn preflight_drop_column_rewrite_by_id(
-    catalog: &dyn CatalogManager,
-    table: TableId,
-    if_exists: bool,
-    column: &str,
-) -> Result<bool> {
-    Ok(catalog
-        .preflight_drop_table_column(table, if_exists, column)?
-        .rewrites_storage())
-}
-
 fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
     matches!(
         bound,
@@ -1152,97 +1087,4 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
             | BoundStatement::CreateView { .. }
             | BoundStatement::DropView { .. }
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use catalog::MemoryCatalog;
-    use common::{CancelReason, DataType, ParsedColumnDef, SessionInfo, SessionSequenceState};
-
-    use crate::app::AppState;
-
-    use super::*;
-
-    fn parsed_column(name: &str) -> ParsedColumnDef {
-        ParsedColumnDef {
-            name: name.to_string(),
-            data_type: DataType::Integer,
-            nullable: true,
-            max_length: None,
-            default: None,
-            pg_type: None,
-        }
-    }
-
-    #[test]
-    fn conditional_add_drop_column_are_classified_as_potential_rewrites() {
-        let add = Statement::AlterTableAddColumn {
-            table: "t".to_string(),
-            if_not_exists: true,
-            column: parsed_column("c"),
-        };
-        assert!(statement_may_rewrite_table_storage(&add));
-
-        let drop = Statement::AlterTableDropColumn {
-            table: "t".to_string(),
-            if_exists: true,
-            column: "c".to_string(),
-        };
-        assert!(statement_may_rewrite_table_storage(&drop));
-    }
-
-    #[test]
-    fn bound_conditional_add_drop_column_detect_actual_rewrites() {
-        let catalog = MemoryCatalog::empty();
-        let schema = catalog
-            .create_table(
-                "t".to_string(),
-                vec![parsed_column("id")],
-                Vec::new(),
-                common::CompressionSetting::None,
-            )
-            .unwrap();
-        let add = BoundStatement::AlterTableAddColumn {
-            table: schema.id,
-            table_name: "t".to_string(),
-            if_not_exists: true,
-            column: parsed_column("c"),
-        };
-        assert!(bound_rewrites_table_storage(&add, &catalog).unwrap());
-
-        let drop = BoundStatement::AlterTableDropColumn {
-            table: schema.id,
-            table_name: "t".to_string(),
-            if_exists: true,
-            column: "c".to_string(),
-        };
-        assert!(!bound_rewrites_table_storage(&drop, &catalog).unwrap());
-    }
-
-    #[test]
-    fn canceled_snapshot_capture_after_registration_rolls_back_xid() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = AppState::open_for_test(dir.path()).unwrap();
-        let statement = parser::parse("create table t (id integer primary key)").unwrap();
-        let bound = bind(&statement, app.components.catalog.as_ref()).unwrap();
-        let guard =
-            WriteUnitGuard::Exclusive(app.components.concurrency.begin_checkpoint().unwrap());
-        let cancel = Arc::new(QueryCancel::new());
-        cancel.request(CancelReason::StatementTimeout);
-        let runtime = StatementRuntime::new(
-            &cancel,
-            Arc::new(SessionSequenceState::new()),
-            Arc::new(SessionInfo::default()),
-        );
-
-        let err = app
-            .query_service
-            .autocommit_bound_write_with_guard(bound, guard, runtime, None, None, None)
-            .unwrap_err();
-
-        assert_eq!(err.code, SqlState::QueryCanceled);
-        assert!(app.components.active_txns.active_ids().is_empty());
-    }
 }

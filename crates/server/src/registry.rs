@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use common::{QueryCancel, Result, TxnId};
@@ -47,16 +47,13 @@ struct RegistryState {
     /// map, distinct from a durable `pg_subtrans`, and the visibility path never
     /// consults it.
     subtrans: HashMap<TxnId, TxnId>,
-    /// True while a schema rewrite is waiting to publish, or has published, a new
-    /// physical table generation. New snapshot captures wait while this is set so
-    /// no statement can bind/execute against a generation that is being swapped.
     snapshot_exclusion: bool,
 }
 
 #[derive(Debug, Default)]
 struct RegistryShared {
     state: Mutex<RegistryState>,
-    cvar: Condvar,
+    cvar: std::sync::Condvar,
 }
 
 /// A concurrent set of in-progress transaction ids plus the advertised-`xmin`
@@ -163,11 +160,6 @@ impl ActiveTxnRegistry {
     /// [`capture`](Self::capture)), **not** the GC horizon — the horizon is the
     /// minimum *advertised* `xmin` ([`oldest_xmin`](Self::oldest_xmin)), which is
     /// always `<= oldest()`.
-    #[allow(
-        dead_code,
-        reason = "active-id minimum; retained for snapshot xmin reasoning and tests, \
-                  superseded as the horizon source by oldest_xmin"
-    )]
     pub fn oldest(&self) -> Option<TxnId> {
         self.lock().active.iter().next().copied()
     }
@@ -235,28 +227,7 @@ impl ActiveTxnRegistry {
     where
         F: FnOnce() -> TxnId,
     {
-        self.capture_with_exclusion_bypass(false, boundary)
-    }
-
-    /// Like [`capture`](Self::capture), but lets a caller that already holds a
-    /// writer guard bypass a pending schema-rewrite fence. That narrow exception
-    /// prevents deadlocks with explicit write transactions: a schema rewrite holds
-    /// the snapshot fence while waiting for the checkpoint guard, and the writer
-    /// must be able to finish statements so it can release the writer guard the
-    /// checkpoint is waiting on. Read-only transactions pass `false` and wait so
-    /// they cannot bind one schema generation and scan another.
-    pub fn capture_with_exclusion_bypass<F>(
-        &self,
-        bypass_snapshot_exclusion: bool,
-        boundary: F,
-    ) -> (Vec<TxnId>, TxnId, AdvertisedSnapshot)
-    where
-        F: FnOnce() -> TxnId,
-    {
         let mut guard = self.lock();
-        while guard.snapshot_exclusion && !bypass_snapshot_exclusion {
-            guard = self.wait(guard);
-        }
         let active: Vec<TxnId> = guard.active.iter().copied().collect();
         let xmax = boundary();
         let xmin = active.first().copied().unwrap_or(xmax);
@@ -329,6 +300,7 @@ impl ActiveTxnRegistry {
     /// for schema-rewrite DDL after [`begin_snapshot_exclusion`](Self::begin_snapshot_exclusion)
     /// has drained advertised snapshots and while the exclusive checkpoint guard
     /// prevents VACUUM from advancing the GC horizon.
+    #[allow(dead_code)]
     pub(crate) fn capture_unadvertised<F>(&self, boundary: F) -> (Vec<TxnId>, TxnId)
     where
         F: FnOnce() -> TxnId,
@@ -362,6 +334,7 @@ impl ActiveTxnRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin_snapshot_exclusion_cancelable(
         &self,
         cancel: &QueryCancel,
@@ -401,9 +374,6 @@ impl ActiveTxnRegistry {
                 false,
                 "released an advertised xmin={xmin} that was not advertised"
             );
-        }
-        if guard.xmins.is_empty() {
-            self.shared.cvar.notify_all();
         }
     }
 
@@ -446,6 +416,24 @@ impl ActiveTxnRegistry {
 /// [`ActiveTxnRegistry::capture`]). It is intentionally **not** `Clone`: each
 /// advertisement is released exactly once.
 #[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct SnapshotExclusionGuard {
+    shared: Arc<RegistryShared>,
+}
+
+impl Drop for SnapshotExclusionGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.snapshot_exclusion = false;
+        drop(guard);
+        self.shared.cvar.notify_all();
+    }
+}
+
 pub struct AdvertisedSnapshot {
     shared: Arc<RegistryShared>,
     xmin: TxnId,
@@ -471,30 +459,9 @@ impl Drop for AdvertisedSnapshot {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SnapshotExclusionGuard {
-    shared: Arc<RegistryShared>,
-}
-
-impl Drop for SnapshotExclusionGuard {
-    fn drop(&mut self) {
-        let mut guard = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.snapshot_exclusion = false;
-        drop(guard);
-        self.shared.cvar.notify_all();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::ActiveTxnRegistry;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn register_and_deregister_track_membership() {
@@ -579,183 +546,5 @@ mod tests {
         assert_eq!(registry.oldest_xmin(), Some(60), "now only 60 remains");
         drop(g60);
         assert_eq!(registry.oldest_xmin(), None);
-    }
-
-    #[test]
-    fn snapshot_exclusion_waits_for_advertised_snapshots_to_drain() {
-        let registry = ActiveTxnRegistry::new();
-        let (_active, _xmax, advertised) = registry.capture(|| 10);
-        let (tx, rx) = mpsc::channel();
-
-        let waiter = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let _guard = registry.begin_snapshot_exclusion();
-                tx.send(()).unwrap();
-            })
-        };
-
-        assert!(
-            rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "schema exclusion must wait while a snapshot is advertised"
-        );
-        drop(advertised);
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("schema exclusion should acquire after the snapshot drains");
-        waiter.join().unwrap();
-    }
-
-    #[test]
-    fn pending_snapshot_exclusion_blocks_new_snapshots_while_draining() {
-        let registry = ActiveTxnRegistry::new();
-        let (_active, _xmax, advertised) = registry.capture(|| 10);
-        let (exclude_tx, exclude_rx) = mpsc::channel();
-        let (capture_tx, capture_rx) = mpsc::channel();
-
-        let exclusion = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let guard = registry.begin_snapshot_exclusion();
-                exclude_tx.send(()).unwrap();
-                thread::sleep(Duration::from_millis(100));
-                drop(guard);
-            })
-        };
-
-        thread::sleep(Duration::from_millis(50));
-        let capture = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let (_active, xmax, _advertised) = registry.capture(|| 42);
-                capture_tx.send(xmax).unwrap();
-            })
-        };
-
-        assert!(
-            capture_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "a pending schema exclusion must fence new snapshot captures"
-        );
-        drop(advertised);
-        exclude_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("schema exclusion should acquire after old snapshots drain");
-        assert_eq!(
-            capture_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            42,
-            "new snapshot should resume after the exclusion guard drops"
-        );
-        exclusion.join().unwrap();
-        capture.join().unwrap();
-    }
-
-    #[test]
-    fn pending_snapshot_exclusion_allows_writer_guarded_transactions_to_finish() {
-        let registry = ActiveTxnRegistry::new();
-        registry.register(7);
-        let (_active, _xmax, advertised) = registry.capture_with_exclusion_bypass(true, || 10);
-        let (exclude_tx, exclude_rx) = mpsc::channel();
-
-        let exclusion = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let _guard = registry.begin_snapshot_exclusion();
-                exclude_tx.send(()).unwrap();
-            })
-        };
-
-        thread::sleep(Duration::from_millis(50));
-        let (_active, xmax, own_advertised) = registry.capture_with_exclusion_bypass(true, || 20);
-        assert_eq!(xmax, 20);
-        assert!(
-            exclude_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "the exclusion still waits for the writer-guarded transaction's snapshots"
-        );
-        drop(advertised);
-        drop(own_advertised);
-        exclude_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("schema exclusion should acquire after active txn snapshots drain");
-        exclusion.join().unwrap();
-    }
-
-    #[test]
-    fn pending_snapshot_exclusion_blocks_active_transactions_without_writer_guard() {
-        let registry = ActiveTxnRegistry::new();
-        registry.register(7);
-        let guard = registry.begin_snapshot_exclusion();
-        let (tx, rx) = mpsc::channel();
-
-        let waiter = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let (_active, xmax, _advertised) =
-                    registry.capture_with_exclusion_bypass(false, || 42);
-                tx.send(xmax).unwrap();
-            })
-        };
-
-        assert!(
-            rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "an active read-only transaction must still wait behind schema exclusion"
-        );
-        drop(guard);
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            42,
-            "active read-only transaction capture should resume after exclusion drops"
-        );
-        waiter.join().unwrap();
-    }
-
-    #[test]
-    fn try_capture_reports_snapshot_exclusion_without_blocking() {
-        let registry = ActiveTxnRegistry::new();
-        let guard = registry.begin_snapshot_exclusion();
-
-        assert!(
-            registry
-                .try_capture_with_exclusion_bypass(false, || 42)
-                .is_none(),
-            "non-bypassing try-capture should report the fence instead of waiting"
-        );
-        let (_active, xmax, advertised) = registry
-            .try_capture_with_exclusion_bypass(true, || 43)
-            .expect("writer-guarded try-capture may bypass the fence");
-        assert_eq!(xmax, 43);
-        drop(advertised);
-
-        drop(guard);
-        let (_active, xmax, advertised) = registry
-            .try_capture_with_exclusion_bypass(false, || 44)
-            .expect("try-capture should succeed after the fence clears");
-        assert_eq!(xmax, 44);
-        drop(advertised);
-    }
-
-    #[test]
-    fn capture_waits_while_snapshot_exclusion_is_active() {
-        let registry = ActiveTxnRegistry::new();
-        let guard = registry.begin_snapshot_exclusion();
-        let (tx, rx) = mpsc::channel();
-
-        let waiter = {
-            let registry = registry.clone();
-            thread::spawn(move || {
-                let (_active, xmax, _advertised) = registry.capture(|| 42);
-                tx.send(xmax).unwrap();
-            })
-        };
-
-        assert!(
-            rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "snapshot capture must wait while schema exclusion is active"
-        );
-        drop(guard);
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            42,
-            "snapshot capture should resume after exclusion drops"
-        );
-        waiter.join().unwrap();
     }
 }

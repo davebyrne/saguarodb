@@ -25,6 +25,13 @@ pub trait PageStore: PageLoader {
     /// Durably flush all previously written pages to stable storage.
     fn sync_all(&self) -> Result<()>;
 
+    /// Durably flush only `file_ids`. Implementations without per-file handles may
+    /// conservatively sync every file; callers still scope buffer flushing and
+    /// clean marking to the requested files.
+    fn sync_files(&self, _file_ids: &[FileId]) -> Result<()> {
+        self.sync_all()
+    }
+
     /// The number of pages currently stored for `file_id` (its on-disk extent),
     /// or `0` if the file does not exist. Used to seed page allocation so a freshly
     /// allocated page never reuses one that already exists on disk after recovery.

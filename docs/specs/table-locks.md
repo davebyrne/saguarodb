@@ -59,8 +59,10 @@ The same manager also provides the two-mode sequence lifetime lock needed once
 sequence DDL no longer uses the global exclusive guard:
 
 - `SequenceAccess` is shared by `nextval`/`setval` and by DML/default expressions
-  that may invoke them. `currval` also takes it for lifetime/revalidation even
-  though it does not mutate state or require a shared writer guard.
+  that may invoke them, including defaults evaluated while `ALTER TABLE ADD
+  COLUMN` rewrites existing rows. `currval` also takes it for
+  lifetime/revalidation even though it does not mutate state or require a shared
+  writer guard.
 - `SequenceExclusive` is used by DROP SEQUENCE and DROP TABLE's owned-sequence
   cascade; it conflicts with both modes. CREATE SEQUENCE is namespace-serialized
   by the catalog publication gate and publishes the new id before it can be referenced.
@@ -135,7 +137,18 @@ Normalize and compare rebound table/sequence ids and modes with the granted set.
 If not covered, release the shared catalog gate, restore every grant changed by
 this acquisition attempt to its prior mode (preserving locks retained from earlier
 explicit-transaction statements), and retry discovery/acquisition in global order.
-Prepared execution never changes its lock set and returns the reprepare error.
+Prepared execution returns the reprepare error for changed identity-bound
+objects. Execution-time name-resolved targets use the final catalog-mutation
+coverage loop below.
+
+Catalog-mutating autocommit execution performs one final coverage check after it
+takes the exclusive catalog publication gate. This closes the window in which a
+previously absent, name-resolved `IF EXISTS`/`OR REPLACE` target can be published
+after shared-gate convergence. If the current request set is not covered, the
+server releases the catalog gate, restores the attempt's baseline grants,
+acquires the complete current request set in global order, and retries the
+exclusive-gate check. It never waits for an object lock while holding the catalog
+gate.
 
 Relation-generation snapshots are statement-scoped, including under Repeatable
 Read and Serializable; only the MVCC snapshot is retained by those isolation

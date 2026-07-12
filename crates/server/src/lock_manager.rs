@@ -5,13 +5,11 @@
 //! and `docs/specs/table-locks.md`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use common::{
-    ConflictWaiter, DbError, QueryCancel, Result, SequenceId, SqlState, TableId, TxnId,
-};
+use common::{ConflictWaiter, DbError, QueryCancel, Result, SequenceId, SqlState, TableId, TxnId};
 
 use crate::registry::ActiveTxnRegistry;
 
@@ -404,6 +402,18 @@ impl ObjectLockGuard {
         self.manager.owner_snapshot(self.owner, self.guard_id)
     }
 
+    pub fn covers(&self, requests: &[ObjectLockRequest]) -> Result<bool> {
+        let grants = self
+            .manager
+            .owner_snapshot(self.owner, self.guard_id)
+            .grants;
+        Ok(normalize_requests(requests)?.iter().all(|request| {
+            grants
+                .get(&request.resource)
+                .is_some_and(|held| held.covers(request.mode))
+        }))
+    }
+
     pub fn restore(&mut self, snapshot: &OwnerGrantSnapshot) -> Result<()> {
         self.manager
             .restore_owner(self.owner, self.guard_id, snapshot)
@@ -556,6 +566,7 @@ fn on_cycle(graph: &HashMap<LockOwner, BTreeSet<LockOwner>>, start: LockOwner) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::thread;
 

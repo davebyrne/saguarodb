@@ -239,7 +239,7 @@ impl Session {
         // Keep the reported transaction-block status in sync with the slot, so the
         // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
-        if self.txn.is_none() {
+        if crate::query::transaction_resources_released(&self.txn) {
             self.close_transaction_scoped_suspended_portals();
             self.close_sql_cursors();
         }
@@ -394,6 +394,10 @@ impl Session {
         self.txn = txn;
         self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if crate::query::transaction_resources_released(&self.txn) {
+            self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
+        }
 
         let started = match started {
             Ok(started) => started,
@@ -454,6 +458,10 @@ impl Session {
                 if let Some(txn) = self.txn.as_mut() {
                     txn.mark_failed();
                     self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+                }
+                if crate::query::transaction_resources_released(&self.txn) {
+                    self.close_transaction_scoped_suspended_portals();
+                    self.close_sql_cursors();
                 }
                 self.failed = true;
                 self.end_activity();
@@ -521,6 +529,10 @@ impl Session {
                 if let Some(txn) = self.txn.as_mut() {
                     txn.mark_failed();
                     self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+                }
+                if crate::query::transaction_resources_released(&self.txn) {
+                    self.close_transaction_scoped_suspended_portals();
+                    self.close_sql_cursors();
                 }
                 self.failed = true;
                 self.end_activity();

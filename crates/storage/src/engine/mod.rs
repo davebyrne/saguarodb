@@ -76,6 +76,12 @@ pub enum StorageMode {
     Normal,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewriteTablePages {
+    pub pages_touched: usize,
+    pub file_ids: Vec<FileId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RebuildWalMode {
     Logged(u64),
@@ -238,6 +244,13 @@ impl RelationSnapshot for PageBackedRelationSnapshot {
             .get(&table)
             .filter(|table_state| !table_state.dropped)
             .map(|table_state| table_state.schema.schema_version)
+    }
+
+    fn table_storage_id(&self, table: TableId) -> Option<common::FileId> {
+        self.tables
+            .get(&table)
+            .filter(|table_state| !table_state.dropped)
+            .map(|table_state| table_state.schema.storage_id)
     }
 
     fn missing_tables_are_empty(&self) -> bool {
@@ -1509,7 +1522,7 @@ impl PageBackedStorageEngine {
     /// following flush is repaired by redo replaying the FPI
     /// (`compression.md` §8 step 7). Logical content is unchanged; only the
     /// PageLSN header field advances.
-    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize> {
+    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<RewriteTablePages> {
         let mut files = vec![
             heap_file_id(schema.storage_id),
             primary_index_file_id(schema.storage_id),
@@ -1524,8 +1537,10 @@ impl PageBackedStorageEngine {
                     .map(|i| secondary_index_file_id(i.schema.storage_id)),
             );
         }
+        files.sort_unstable();
+        files.dedup();
         let mut touched = 0usize;
-        for file_id in files {
+        for &file_id in &files {
             let page_count = self.buffer_pool.page_count(file_id)?;
             let latch = self.structural_latch(file_id);
             for page_num in 0..page_count {
@@ -1553,7 +1568,10 @@ impl PageBackedStorageEngine {
                 touched += 1;
             }
         }
-        Ok(touched)
+        Ok(RewriteTablePages {
+            pages_touched: touched,
+            file_ids: files,
+        })
     }
 
     pub fn prepare_truncate_table(

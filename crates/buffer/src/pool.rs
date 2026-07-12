@@ -139,6 +139,9 @@ pub trait BufferPool: Send + Sync {
     fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()>;
     fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool;
     fn mark_all_clean(&self) -> Result<()>;
+    /// Mark resident frames belonging to `file_ids` clean after those files alone
+    /// have been flushed and fsynced.
+    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()>;
     /// Abort cleanup is status-based (`docs/specs/mvcc.md` §4 Decision 3): no
     /// page bytes are undone and freshly allocated pages are not reclaimed. Clears
     /// only per-transaction bookkeeping.
@@ -150,6 +153,9 @@ pub trait BufferPool: Send + Sync {
     /// not fsync or mark frames clean; the caller fsyncs via the store and then
     /// calls `mark_all_clean`. Used by checkpoint (`docs/specs/mvcc.md` §8).
     fn flush_dirty_pages(&self) -> Result<()>;
+    /// Flush dirty resident frames belonging to `file_ids` without touching
+    /// unrelated writer frames. The caller has already made their WAL durable.
+    fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()>;
 
     /// Obtain a writable frame for recovery redo, creating a zeroed frame when the
     /// page is absent from the store (a new page being re-established). The frame
@@ -436,6 +442,60 @@ impl MemoryBufferPool {
     fn storage_internal_error(message: impl Into<String>) -> DbError {
         DbError::storage(SqlState::InternalError, message)
     }
+
+    fn flush_dirty_pages_in(&self, files: Option<&HashSet<FileId>>) -> Result<()> {
+        // Reserve matching dirty frames under the pool lock, then do I/O without
+        // holding it. `evicting` prevents access, eviction, and file removal while
+        // the stable page image is being written.
+        let dirty: Vec<Arc<Frame>> = loop {
+            let mut retry = false;
+            let dirty = {
+                let state = self.state.lock();
+                let mut dirty = Vec::new();
+                for frame in state.frames.values() {
+                    if !frame.is_dirty()
+                        || files.is_some_and(|files| !files.contains(&frame.file_id))
+                    {
+                        continue;
+                    }
+                    if frame.evicting.swap(true, Ordering::AcqRel) {
+                        dirty.iter().for_each(|reserved: &Arc<Frame>| {
+                            reserved.evicting.store(false, Ordering::Release);
+                        });
+                        retry = true;
+                        break;
+                    }
+                    dirty.push(frame.clone());
+                }
+                dirty
+            };
+            if !retry {
+                break dirty;
+            }
+            std::thread::yield_now();
+        };
+        let flush_result = (|| {
+            for frame in &dirty {
+                let info = PageFlushInfo {
+                    dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
+                    page_lsn: None,
+                };
+                if !self.flush_policy.can_flush(&info) {
+                    return Err(Self::storage_internal_error(
+                        "dirty page flush encountered an unflushable page",
+                    ));
+                }
+                let data = frame.data.read().clone();
+                self.store
+                    .write_page(frame.file_id, frame.page_num, &data)?;
+            }
+            Ok(())
+        })();
+        for frame in dirty {
+            frame.evicting.store(false, Ordering::Release);
+        }
+        flush_result
+    }
 }
 
 impl BufferPool for MemoryBufferPool {
@@ -598,6 +658,17 @@ impl BufferPool for MemoryBufferPool {
         Ok(())
     }
 
+    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()> {
+        let files = file_ids.iter().copied().collect::<HashSet<_>>();
+        let state = self.state.lock();
+        for frame in state.frames.values() {
+            if files.contains(&frame.file_id) {
+                frame.mark_clean();
+            }
+        }
+        Ok(())
+    }
+
     fn rollback(&self, _txn_id: u64) -> Result<()> {
         // Status-based abort (`docs/specs/mvcc.md` §4 Decision 3, §11, Milestone
         // D1): there is NO page undo and NO page reclamation. An aborting
@@ -661,69 +732,12 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn flush_dirty_pages(&self) -> Result<()> {
-        // Reserve every dirty frame under the pool lock, then do I/O without
-        // holding it. `evicting` is the pool's "in transition" bit: accessors,
-        // eviction, and file discard all treat it as unavailable, so a
-        // relation-generation cleanup cannot delete a file while checkpoint has
-        // cloned frames for that file and is about to write them.
-        //
-        // Reader pins are not a reason to fail checkpoint: a reader holds a shared
-        // data latch, and checkpoint can take another shared latch to clone a stable
-        // page image. A concurrent dirty eviction is transient; wait and retry so
-        // the caller never follows a partial flush with `mark_all_clean`.
-        let dirty: Vec<Arc<Frame>> = loop {
-            let mut retry = false;
-            let dirty = {
-                let state = self.state.lock();
-                let mut dirty = Vec::new();
-                for frame in state.frames.values() {
-                    if !frame.is_dirty() {
-                        continue;
-                    }
-                    if frame.evicting.swap(true, Ordering::AcqRel) {
-                        dirty.iter().for_each(|reserved: &Arc<Frame>| {
-                            reserved.evicting.store(false, Ordering::Release);
-                        });
-                        retry = true;
-                        break;
-                    }
-                    dirty.push(frame.clone());
-                }
-                dirty
-            };
-            if !retry {
-                break dirty;
-            }
-            std::thread::yield_now();
-        };
-        let flush_result = (|| {
-            for frame in &dirty {
-                let info = PageFlushInfo {
-                    dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
-                    page_lsn: None,
-                };
-                // Checkpoint runs under the exclusive write guard, after the WAL is
-                // flushed, so every dirty page is WAL-durable and the relaxed policy
-                // (`docs/specs/mvcc.md` §8, Milestone D1) admits it whether or not its
-                // dirtying transaction committed — committed, aborted, and in-flight
-                // pages all spill to the heap (the CLOG hides the non-committed ones).
-                // An unflushable dirty page would be silently dropped by the subsequent
-                // `mark_all_clean`, so fail loudly instead.
-                if !self.flush_policy.can_flush(&info) {
-                    return Err(Self::storage_internal_error(
-                        "checkpoint encountered an unflushable dirty page",
-                    ));
-                }
-                let data = frame.data.read().clone();
-                self.store
-                    .write_page(frame.file_id, frame.page_num, &data)?;
-            }
-            Ok(())
-        })();
-        for frame in dirty {
-            frame.evicting.store(false, Ordering::Release);
-        }
-        flush_result
+        self.flush_dirty_pages_in(None)
+    }
+
+    fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()> {
+        let files = file_ids.iter().copied().collect::<HashSet<_>>();
+        self.flush_dirty_pages_in(Some(&files))
     }
 
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard> {
@@ -1669,6 +1683,39 @@ mod tests {
         assert_eq!(writes[0].0, 1);
         assert_eq!(writes[0].1, 0);
         assert_eq!(writes[0].2.0[0], 42);
+    }
+
+    #[test]
+    fn scoped_flush_and_clean_leave_unrelated_dirty_frame_untouched() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
+        for file_id in [1, 2] {
+            let mut page = pool.new_page(file_id, 5).unwrap();
+            page.data_mut()[0] = file_id as u8;
+        }
+
+        pool.flush_dirty_pages_for_files(&[1]).unwrap();
+        pool.mark_files_clean(&[1]).unwrap();
+
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 1);
+        drop(writes);
+        let pages = pool.iter_pages().unwrap().collect::<Vec<_>>();
+        assert!(
+            !pages
+                .iter()
+                .find(|page| page.file_id == 1)
+                .unwrap()
+                .is_dirty
+        );
+        assert!(
+            pages
+                .iter()
+                .find(|page| page.file_id == 2)
+                .unwrap()
+                .is_dirty
+        );
     }
 
     #[test]

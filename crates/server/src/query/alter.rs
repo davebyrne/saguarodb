@@ -1,9 +1,9 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, RwLockWriteGuard, atomic::Ordering};
 
 use common::{
     ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema, QueryCancel,
     RelationKind, Result, SqlState, StatementContext, TableId, TableOptionPatch, TableSchema,
-    ToastCompression, ToastOptions, needs_toast_relation, toast_schema,
+    ToastCompression, ToastOptions, WriteGuard, needs_toast_relation, toast_schema,
 };
 use executor::ExecutionResult;
 use parser::Statement;
@@ -11,6 +11,7 @@ use storage::{RecoveryOperations, SchemaOperations};
 use wal::{WalRecord, WalRecordKind};
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
+use crate::lock_manager::{ObjectLockGuard, ObjectLockRequest, RelationLockMode};
 
 use super::QueryService;
 
@@ -45,9 +46,88 @@ enum PrimaryKeyAlterPostCommit {
     },
 }
 
+struct LockedMaintenanceTable<'a> {
+    txn_id: u64,
+    schema: TableSchema,
+    _catalog_publication: RwLockWriteGuard<'a, ()>,
+    _objects: ObjectLockGuard,
+    _writer: WriteGuard,
+}
+
 impl QueryService {
+    fn lock_maintenance_table<'a>(
+        &'a self,
+        table: &str,
+        cancel: &QueryCancel,
+    ) -> Result<LockedMaintenanceTable<'a>> {
+        let components = &self.components;
+        let mut discovered = {
+            let _catalog_read = components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            self.require_user_table(table)?
+        };
+        let txn_id = components
+            .active_txns
+            .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+        let writer = match components.concurrency.begin_writer_cancelable(cancel) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut objects = match components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let baseline = objects.snapshot();
+        let (catalog_publication, schema) = loop {
+            let request =
+                ObjectLockRequest::table(discovered.id, RelationLockMode::AccessExclusive);
+            if let Err(err) = objects.acquire_many(&[request], cancel) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            let catalog_publication = match components.catalog_publication_gate.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(DbError::internal("catalog publication gate poisoned"));
+                }
+            };
+            let current = match self.require_user_table(table) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            if current.id == discovered.id {
+                break (catalog_publication, current);
+            }
+            drop(catalog_publication);
+            if let Err(err) = objects.restore(&baseline) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            discovered = current;
+        };
+        Ok(LockedMaintenanceTable {
+            txn_id,
+            schema,
+            _catalog_publication: catalog_publication,
+            _objects: objects,
+            _writer: writer,
+        })
+    }
+
     /// `ALTER TABLE <t> SET (compression = ...)`: immediate-commit DDL under
-    /// the exclusive guard, then a full rewrite that logs a FullPageImage per
+    /// target `AccessExclusive`, then a full rewrite that logs a FullPageImage per
     /// page (torn-page repair, exactly like VACUUM) (`compression.md` §8).
     ///
     /// Commit boundary (mirrors `exec.rs`'s `autocommit_bound_write_with_guard`):
@@ -62,9 +142,8 @@ impl QueryService {
     /// statement error, because the DDL already committed and misreporting it as
     /// failed would be worse than crashing.
     ///
-    /// The exclusive guard is scoped to a block covering pre-commit AND
-    /// post-commit work (rewriting every page needs writers drained the whole
-    /// time), then dropped BEFORE
+    /// The shared writer, table lock, and catalog publication guards are scoped to
+    /// a block covering pre-commit AND post-commit work, then dropped BEFORE
     /// [`record_commit_and_maybe_checkpoint_after_durable_commit`] runs — that
     /// call acquires its own exclusive guard, so calling it while this ALTER
     /// still held one would deadlock. Calling it at all is this fix: unlike the
@@ -87,25 +166,9 @@ impl QueryService {
         let components = &self.components;
 
         {
-            // 1-2. Bind the table name; take the exclusive guard (drains writers,
-            // like VACUUM / CREATE INDEX backfill). Scoped to this block so it is
-            // dropped before the checkpoint trigger below runs.
-            let _guard = components
-                .concurrency
-                .begin_checkpoint_cancelable(cancel.as_ref())?;
-            let schema = components
-                .catalog
-                .get_table_by_name(&table)?
-                .ok_or_else(|| {
-                    DbError::plan(
-                        SqlState::UndefinedTable,
-                        format!("table {table} does not exist"),
-                    )
-                })?;
-
-            let txn_id = components
-                .active_txns
-                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+            let locked = self.lock_maintenance_table(&table, cancel)?;
+            let txn_id = locked.txn_id;
+            let schema = locked.schema;
 
             // 3. Train a dictionary from current heap images (zstd only, and only
             // when the corpus suffices — a tiny/empty table proceeds dict-less).
@@ -188,7 +251,7 @@ impl QueryService {
             components.active_txns.deregister(txn_id);
             components.lock_manager.on_txn_finished();
         }
-        // The exclusive guard dropped when the block above ended.
+        // The writer/object/catalog guards dropped when the block above ended.
         // `record_commit_and_maybe_checkpoint_after_durable_commit` acquires its
         // own exclusive guard internally, so it must run only now — calling it
         // while still holding this ALTER's guard would deadlock against itself.
@@ -230,20 +293,18 @@ impl QueryService {
         // produce a loud error. A crash mid-rewrite leaves self-describing
         // mixed encodings, and a torn page write is repaired by redo replaying
         // its FPI (§8).
-        components.storage.rewrite_table_pages(&schema)?;
+        let rewrite = components.storage.rewrite_table_pages(&schema)?;
         components.wal.flush()?;
-        components.buffer_pool.flush_dirty_pages()?;
-        components.store.sync_all()?;
-        // `flush_dirty_pages` does not mark frames clean (`buffer::BufferPool`'s
-        // contract: the caller fsyncs via the store and only then calls
-        // `mark_all_clean`). Without this, the rewrite's pages would still be
-        // marked dirty and get redundantly re-written at the next checkpoint.
-        components.buffer_pool.mark_all_clean()?;
+        components
+            .buffer_pool
+            .flush_dirty_pages_for_files(&rewrite.file_ids)?;
+        components.store.sync_files(&rewrite.file_ids)?;
+        components.buffer_pool.mark_files_clean(&rewrite.file_ids)?;
         Ok(())
     }
 
     /// `ALTER TABLE <t> SET (toast...)`: future-write-only TOAST policy change
-    /// under the exclusive maintenance guard. Existing parent rows and existing
+    /// under target `AccessExclusive`. Existing parent rows and existing
     /// TOAST chunks are left byte-for-byte as they are; normal reads keep using the
     /// per-value physical metadata to decode old rows.
     ///
@@ -276,28 +337,9 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components
-                .concurrency
-                .begin_checkpoint_cancelable(cancel.as_ref())?;
-            let schema = components
-                .catalog
-                .get_table_by_name(&table)?
-                .ok_or_else(|| {
-                    DbError::plan(
-                        SqlState::UndefinedTable,
-                        format!("table {table} does not exist"),
-                    )
-                })?;
-            if schema.relation_kind != RelationKind::User {
-                return Err(DbError::plan(
-                    SqlState::FeatureNotSupported,
-                    "cannot ALTER TOAST options on a hidden relation",
-                ));
-            }
-
-            let txn_id = components
-                .active_txns
-                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+            let locked = self.lock_maintenance_table(&table, cancel)?;
+            let txn_id = locked.txn_id;
+            let schema = locked.schema;
             let mut prepared_dict_id = None;
             let pre_commit = self.prepare_alter_table_toast_commit(
                 txn_id,
@@ -444,7 +486,7 @@ impl QueryService {
     }
 
     /// `ALTER TABLE <t> ADD [CONSTRAINT name] PRIMARY KEY (cols...)`: immediate
-    /// commit DDL under the exclusive guard. The normal secondary constraint index
+    /// commit DDL under target `AccessExclusive`. The normal secondary constraint index
     /// is created before commit (new index files are safe to orphan on abort);
     /// the existing table identity tree is rebuilt only after the DDL commit is
     /// durable, and recovery derives that rebuild from the logical WAL record.
@@ -466,40 +508,48 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components
-                .concurrency
-                .begin_checkpoint_cancelable(cancel.as_ref())?;
-            let schema = self.require_user_table(&table)?;
-            if !schema.primary_key.is_empty() {
-                return Err(DbError::plan(
-                    SqlState::ObjectNotInPrerequisiteState,
-                    format!("table {table} already has a primary key"),
-                ));
-            }
-            let primary_key = primary_key_column_ids(&schema, &columns)?;
-            let new_schema = schema_with_primary_key(schema.clone(), primary_key.clone())?;
-            let gc_horizon = components.gc_horizon();
-            let catalog_snapshot = components.catalog.snapshot()?;
-            let index_name = constraint_name.unwrap_or_else(|| format!("{}_pkey", schema.name));
-            if components.catalog.get_index_by_name(&index_name)?.is_some() {
-                return Err(DbError::plan(
-                    SqlState::DuplicateTable,
-                    format!("index {index_name} already exists"),
-                ));
-            }
-            let index = IndexSchema {
-                id: catalog_snapshot.next_index_id,
-                storage_id: catalog_snapshot.next_storage_id,
-                table: schema.id,
-                name: index_name,
-                columns: primary_key.clone(),
-                unique: true,
-                constraint: IndexConstraintKind::PrimaryKey,
+            let locked = self.lock_maintenance_table(&table, cancel)?;
+            let txn_id = locked.txn_id;
+            let schema = locked.schema;
+            let prepared = (|| {
+                if !schema.primary_key.is_empty() {
+                    return Err(DbError::plan(
+                        SqlState::ObjectNotInPrerequisiteState,
+                        format!("table {table} already has a primary key"),
+                    ));
+                }
+                let primary_key = primary_key_column_ids(&schema, &columns)?;
+                let new_schema = schema_with_primary_key(schema.clone(), primary_key.clone())?;
+                let gc_horizon = components.gc_horizon();
+                let catalog_snapshot = components.catalog.snapshot()?;
+                let index_name = constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", schema.name));
+                if components.catalog.get_index_by_name(&index_name)?.is_some() {
+                    return Err(DbError::plan(
+                        SqlState::DuplicateTable,
+                        format!("index {index_name} already exists"),
+                    ));
+                }
+                let index = IndexSchema {
+                    id: catalog_snapshot.next_index_id,
+                    storage_id: catalog_snapshot.next_storage_id,
+                    table: schema.id,
+                    name: index_name,
+                    columns: primary_key.clone(),
+                    unique: true,
+                    constraint: IndexConstraintKind::PrimaryKey,
+                };
+                Ok::<_, DbError>((primary_key, new_schema, gc_horizon, index, catalog_snapshot))
+            })();
+            let (primary_key, new_schema, gc_horizon, index, catalog_snapshot) = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
             };
             let catalog_before = Some(catalog_snapshot);
-            let txn_id = components
-                .active_txns
-                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
 
             let pre_commit = (|| {
                 let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
@@ -577,33 +627,42 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components
-                .concurrency
-                .begin_checkpoint_cancelable(cancel.as_ref())?;
-            let schema = self.require_user_table(&table)?;
-            if schema.primary_key.is_empty() {
-                return Err(DbError::plan(
-                    SqlState::ObjectNotInPrerequisiteState,
-                    format!("table {table} does not have a primary key"),
-                ));
-            }
-            let index = primary_key_constraint_index(components.catalog.as_ref(), &schema)?;
-            if let Some(name) = &constraint_name
-                && *name != index.name
-            {
-                return Err(DbError::plan(
-                    SqlState::UndefinedObject,
-                    format!("constraint {name} does not exist"),
-                ));
-            }
-
-            let mut new_schema = schema.clone();
-            new_schema.primary_key.clear();
-            let gc_horizon = components.gc_horizon();
-            let catalog_before = Some(components.catalog.snapshot()?);
-            let txn_id = components
-                .active_txns
-                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+            let locked = self.lock_maintenance_table(&table, cancel)?;
+            let txn_id = locked.txn_id;
+            let schema = locked.schema;
+            let prepared = (|| {
+                if schema.primary_key.is_empty() {
+                    return Err(DbError::plan(
+                        SqlState::ObjectNotInPrerequisiteState,
+                        format!("table {table} does not have a primary key"),
+                    ));
+                }
+                let index = primary_key_constraint_index(components.catalog.as_ref(), &schema)?;
+                if let Some(name) = &constraint_name
+                    && *name != index.name
+                {
+                    return Err(DbError::plan(
+                        SqlState::UndefinedObject,
+                        format!("constraint {name} does not exist"),
+                    ));
+                }
+                let mut new_schema = schema.clone();
+                new_schema.primary_key.clear();
+                Ok::<_, DbError>((
+                    index,
+                    new_schema,
+                    components.gc_horizon(),
+                    components.catalog.snapshot()?,
+                ))
+            })();
+            let (index, new_schema, gc_horizon, catalog_snapshot) = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let catalog_before = Some(catalog_snapshot);
 
             let pre_commit = (|| {
                 let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());

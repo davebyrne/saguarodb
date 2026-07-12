@@ -209,7 +209,8 @@ impl Session {
             apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
         }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
-        let transaction_cleanup = self.txn.is_none() || successful_rollback_command(&outcome);
+        let transaction_cleanup = crate::query::transaction_resources_released(&self.txn)
+            || successful_rollback_command(&outcome);
         let statement_cleanup = closes_cursors_on_success && outcome.is_ok();
         if transaction_cleanup || statement_cleanup {
             self.close_transaction_scoped_suspended_portals();
@@ -410,6 +411,10 @@ impl Session {
         self.txn = txn;
         self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if crate::query::transaction_resources_released(&self.txn) {
+            self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
+        }
         let status = self.status_byte();
         let _guard = self.retain_query_guard_for_writer(guard);
         self.end_activity();
@@ -604,6 +609,10 @@ impl Session {
         if let Some(txn) = self.txn.as_mut() {
             txn.mark_failed();
             self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        }
+        if crate::query::transaction_resources_released(&self.txn) {
+            self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
         }
     }
 }

@@ -89,8 +89,9 @@ async fn writer_blocks_then_serialization_failure_when_holder_commits() {
 }
 
 /// Two transactions that lock one row each and then cross-update form a wait-for
-/// cycle; the timeout-based detector aborts exactly one victim with `40P01`, and
-/// once the victim rolls back the survivor proceeds. (`docs/specs/deadlock.md`)
+/// cycle; the timeout-based detector physically aborts exactly one victim before
+/// returning `40P01`, so the survivor proceeds without waiting for a client-issued
+/// ROLLBACK. (`docs/specs/deadlock.md`)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deadlock_aborts_one_victim_with_40p01() {
     // A short deadlock timeout keeps the test fast (detection after ~200ms).
@@ -116,36 +117,35 @@ async fn deadlock_aborts_one_victim_with_40p01() {
     b.ok("update t set v = 21 where id = 2").await;
 
     // A now wants row 2 (held by B), B wants row 1 (held by A) ⇒ a cycle.
-    let mut a_task =
+    let a_task =
         tokio::spawn(async move { (a.query("update t set v = 12 where id = 2").await, a) });
-    let mut b_task =
+    let b_task =
         tokio::spawn(async move { (b.query("update t set v = 22 where id = 1").await, b) });
 
-    // The detector aborts exactly one. The victim's task returns first (40P01); the
-    // survivor stays blocked on the victim's still-held lock until it rolls back.
-    let (victim_outcome, mut victim_conn, survivor_task) = tokio::select! {
-        r = &mut a_task => { let (o, c) = r.unwrap(); (o, c, b_task) }
-        r = &mut b_task => { let (o, c) = r.unwrap(); (o, c, a_task) }
+    // The victim releases its locks before returning, so either response may reach
+    // the client first. Both must finish without a client-issued ROLLBACK.
+    let (a_joined, b_joined) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(a_task, b_task)
+    })
+    .await
+    .expect("deadlock participants did not finish after victim selection");
+    let (a_outcome, a_conn) = a_joined.unwrap();
+    let (b_outcome, b_conn) = b_joined.unwrap();
+    let a_error = a_outcome.unwrap().result.err();
+    let b_error = b_outcome.unwrap().result.err();
+    let (victim_err, mut victim_conn, mut survivor_conn) = match (a_error, b_error) {
+        (Some(error), None) => (error, a_conn, b_conn),
+        (None, Some(error)) => (error, b_conn, a_conn),
+        _ => panic!("exactly one deadlock participant must be aborted"),
     };
-    let victim_err = victim_outcome
-        .unwrap()
-        .result
-        .err()
-        .expect("the deadlock victim must get an error");
     assert!(
         victim_err.message.contains("C=40P01"),
         "victim must get 40P01, got: {}",
         victim_err.message
     );
 
-    // Roll back the victim to release its locks; the survivor then proceeds.
-    victim_conn.ok("rollback").await;
-    let (survivor_outcome, mut survivor_conn) = survivor_task.await.unwrap();
-    assert!(
-        survivor_outcome.unwrap().result.is_ok(),
-        "the survivor proceeds once the victim rolls back"
-    );
     survivor_conn.ok("commit").await;
+    victim_conn.ok("rollback").await;
     assert_eq!(server.active_txn_count(), 0);
 }
 

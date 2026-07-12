@@ -26,6 +26,8 @@ pub trait RowIterator: Send {
 pub trait RelationSnapshot: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn relation_epoch(&self) -> u64;
+    fn table_schema_version(&self, table: TableId) -> Option<u64>;
+    fn table_storage_id(&self, table: TableId) -> Option<FileId>;
 }
 
 pub trait StorageEngine: Send + Sync {
@@ -103,7 +105,7 @@ pub trait RecoveryOperations: Send + Sync {
 ```
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
-versions a statement should resolve plus the storage relation epoch observed
+versions/storage ids a statement should resolve plus the storage relation epoch observed
 while capturing them. The epoch increments whenever storage publishes or
 restores relation metadata. Every statement, including Repeatable Read and
 Serializable statements, captures a fresh relation snapshot only after acquiring

@@ -14,7 +14,7 @@ use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 
 pub struct ExecutorHarness {
-    catalog: MemoryCatalog,
+    catalog: Arc<MemoryCatalog>,
     storage: MemoryStorage,
     engine: QueryEngine,
 }
@@ -64,7 +64,7 @@ impl ExecutorHarness {
             .create_index(&StatementContext::new(0), &primary_key, 0)
             .unwrap();
         Self {
-            catalog,
+            catalog: Arc::new(catalog),
             storage,
             engine: QueryEngine,
         }
@@ -76,16 +76,16 @@ impl ExecutorHarness {
 
     pub fn execute_with_cancel(&self, sql: &str, cancel: &QueryCancel) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
-        let bound = bind(&statement, &self.catalog)?;
+        let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
-        let physical = physical_plan(&logical, &self.catalog)?;
+        let physical = physical_plan(&logical, self.catalog.as_ref())?;
         let is_read = is_read_plan(&physical);
         let statement = StatementContext::new(if is_read { 0 } else { 1 });
         let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
-            catalog: &self.catalog,
+            catalog: self.catalog.clone(),
             storage: &self.storage,
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -121,9 +121,9 @@ impl ExecutorHarness {
 
     pub fn explain_plan(&self, sql: &str) -> Result<String> {
         let statement = parser::parse(sql)?;
-        let bound = bind(&statement, &self.catalog)?;
+        let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
-        let physical = physical_plan(&logical, &self.catalog)?;
+        let physical = physical_plan(&logical, self.catalog.as_ref())?;
         Ok(format_explain(&physical))
     }
 
@@ -137,14 +137,14 @@ impl ExecutorHarness {
         batch_size: usize,
     ) -> Result<u64> {
         let statement = parser::parse(sql)?;
-        let bound = bind(&statement, &self.catalog)?;
+        let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
-        let physical = physical_plan(&logical, &self.catalog)?;
+        let physical = physical_plan(&logical, self.catalog.as_ref())?;
         let cancel = QueryCancel::new();
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
             relations: self.storage.capture_relation_snapshot()?,
-            catalog: &self.catalog,
+            catalog: self.catalog.clone(),
             storage: &self.storage,
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -197,7 +197,7 @@ impl ExecutorHarness {
         let ctx = ExecutionContext {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
-            catalog: &self.catalog,
+            catalog: self.catalog.clone(),
             storage: &self.storage,
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -239,7 +239,7 @@ impl ExecutorHarness {
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
             relations: self.storage.capture_relation_snapshot()?,
-            catalog: &self.catalog,
+            catalog: self.catalog.clone(),
             storage: &self.storage,
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,

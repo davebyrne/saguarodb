@@ -25,6 +25,7 @@ pub(super) struct StatementRuntime<'a> {
     session_info: Arc<SessionInfo>,
     system_state: Arc<dyn SystemStateProvider>,
     catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    catalog_introspection_is_explicit: bool,
 }
 
 pub(crate) struct CapturedSnapshots {
@@ -61,7 +62,12 @@ impl<'a> StatementRuntime<'a> {
             session_info,
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
+            catalog_introspection_is_explicit: false,
         }
+    }
+
+    pub(super) fn cancel(&self) -> &QueryCancel {
+        self.cancel.as_ref()
     }
 
     #[must_use]
@@ -74,8 +80,10 @@ impl<'a> StatementRuntime<'a> {
     pub(super) fn with_catalog_introspection(
         mut self,
         catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+        is_explicit: bool,
     ) -> Self {
         self.catalog_introspection = catalog_introspection;
+        self.catalog_introspection_is_explicit = is_explicit;
         self
     }
 }
@@ -418,9 +426,11 @@ impl QueryService {
             statement_timeout_override: None,
             first_statement_ran: false,
             failed: false,
+            physically_aborted: false,
+            object_locks: None,
             write_guard: None,
+            has_writes: false,
             rr_snapshot: None,
-            rr_relations: None,
             rr_advertised: None,
             dead_versions_pending: 0,
             savepoints: Vec::new(),
@@ -428,8 +438,9 @@ impl QueryService {
         })
     }
 
-    /// Acquire the SHARED writer guard for an explicit transaction's first write,
-    /// holding it on `txn` for the whole write-transaction. The guard is shared
+    /// Acquire the SHARED checkpoint-participant guard before an explicit
+    /// transaction's first retained object lock, holding it through top-level
+    /// completion. The guard is shared
     /// (E2b lock inversion, `docs/specs/mvcc.md` §10 E2b): acquiring it does not
     /// block on another connection's writer — only on a checkpoint holding the
     /// exclusive guard.
@@ -462,6 +473,36 @@ impl QueryService {
             .begin_writer_cancelable(cancel)?;
         txn.write_guard = Some(guard);
         Ok(())
+    }
+
+    /// Establish the universal explicit-transaction lock order: retain the shared
+    /// checkpoint-participant guard before creating the transaction's single
+    /// top-level object-lock owner. The same owner is reused by every statement and
+    /// released only with the top-level transaction.
+    pub(super) fn ensure_transaction_lock_owner<'a>(
+        &self,
+        txn: &'a mut Transaction,
+        cancel: &QueryCancel,
+    ) -> Result<&'a mut crate::lock_manager::ObjectLockGuard> {
+        let acquired_participant = txn.write_guard.is_none();
+        if acquired_participant {
+            self.acquire_write_guard(txn, cancel)?;
+        }
+        if txn.object_locks.is_none() {
+            match self.components.lock_manager.transaction_owner(txn.txn_id) {
+                Ok(owner) => txn.object_locks = Some(owner),
+                Err(err) => {
+                    if acquired_participant {
+                        txn.write_guard = None;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(txn
+            .object_locks
+            .as_mut()
+            .expect("transaction lock owner installed above"))
     }
 
     /// Commit an explicit transaction: append a `Commit` record, flush (fsync),
@@ -500,7 +541,7 @@ impl QueryService {
         // A read-only explicit transaction (no write guard, no writes by the top or
         // any subxid) has nothing durable to commit: just deregister the family and
         // return. Appending a `Commit` for it is unnecessary; skip the WAL.
-        if txn.write_guard.is_none() {
+        if !txn.has_writes {
             self.components.active_txns.deregister_all(&family);
             self.components.lock_manager.on_txn_finished();
             // A read-only serializable transaction never writes, so it can never be a
@@ -586,9 +627,12 @@ impl QueryService {
     /// failure of the engine-state rollback (storage/buffer/catalog) is fatal, since
     /// the engine can then no longer guarantee consistency.
     pub(super) fn abort_transaction(&self, txn: Transaction) {
+        if txn.physically_aborted {
+            return;
+        }
         let txn_id = txn.txn_id;
         let isolation = txn.isolation;
-        if txn.write_guard.is_none() {
+        if !txn.has_writes {
             // A read-only transaction (top + subxids) wrote nothing: no Abort record,
             // no cleanup, just deregister the whole family.
             let family: Vec<u64> = std::iter::once(txn_id)
@@ -608,6 +652,33 @@ impl QueryService {
         self.ssi_finish(txn_id, isolation, false);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
+    }
+
+    pub(super) fn abort_deadlock_victim(&self, txn: &mut Transaction) {
+        if txn.physically_aborted {
+            txn.failed = true;
+            return;
+        }
+        let family: Vec<u64> = std::iter::once(txn.txn_id)
+            .chain(txn.live_subxids.iter().copied())
+            .collect();
+        if txn.has_writes {
+            self.abort_subxids(&txn.live_subxids);
+            self.rollback_pre_durable_or_die(txn.txn_id, None);
+        } else {
+            self.components.active_txns.deregister_all(&family);
+            self.components.lock_manager.on_txn_finished();
+        }
+        self.ssi_finish(txn.txn_id, txn.isolation, false);
+        txn.object_locks = None;
+        txn.write_guard = None;
+        txn.rr_snapshot = None;
+        txn.rr_advertised = None;
+        txn.savepoints.clear();
+        txn.live_subxids.clear();
+        txn.has_writes = false;
+        txn.failed = true;
+        txn.physically_aborted = true;
     }
 
     /// Abort `subxids` (savepoint subtransactions): append an `Abort` record per
@@ -659,8 +730,8 @@ impl QueryService {
             })
     }
 
-    /// The MVCC and relation-generation snapshots a statement of `txn` reads with,
-    /// per isolation level (`docs/specs/mvcc.md` §6, §9), together with the
+    /// The MVCC snapshot selected by `txn`'s isolation level and a fresh statement
+    /// relation-generation snapshot (`docs/specs/mvcc.md` §6, §9), together with the
     /// per-statement GC-horizon advertisement the caller must hold for the
     /// statement's execution.
     ///
@@ -680,14 +751,13 @@ impl QueryService {
     ) -> Result<TransactionSnapshots> {
         match txn.isolation {
             IsolationLevel::ReadCommitted => {
-                let bypass_snapshot_exclusion = txn.write_guard.is_some();
                 let CapturedSnapshots {
                     snapshot,
                     relations,
                     advertised,
                 } = self.capture_consistent_snapshots_with_exclusion_bypass(
                     txn.txn_id,
-                    bypass_snapshot_exclusion,
+                    false,
                     Some(cancel),
                 )?;
                 Ok(TransactionSnapshots {
@@ -699,10 +769,10 @@ impl QueryService {
             // Serializable shares Repeatable Read's single per-transaction snapshot;
             // SSI layers rw-conflict tracking on top of it (`docs/specs/ssi.md`).
             IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
-                if let (Some(snapshot), Some(relations)) = (&txn.rr_snapshot, &txn.rr_relations) {
+                if let Some(snapshot) = &txn.rr_snapshot {
                     Ok(TransactionSnapshots {
                         snapshot: snapshot.clone(),
-                        relations: relations.clone(),
+                        relations: self.capture_statement_relation_snapshot()?,
                         advertised: None,
                     })
                 } else {
@@ -715,7 +785,6 @@ impl QueryService {
                         Some(cancel),
                     )?;
                     txn.rr_snapshot = Some(snapshot.clone());
-                    txn.rr_relations = Some(relations.clone());
                     // Hold the advertisement for the transaction's life (released
                     // when `txn` drops at commit/abort), so the reusable snapshot's
                     // xmin stays pinned across every statement that reuses it.
@@ -741,6 +810,15 @@ impl QueryService {
         cancel: &QueryCancel,
     ) -> Result<CapturedSnapshots> {
         self.capture_consistent_snapshots_with_options(own_txn, false, false, Some(cancel))
+    }
+
+    fn capture_statement_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>> {
+        let _publish_read = self
+            .components
+            .relation_publish_gate
+            .read()
+            .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
+        self.components.storage.capture_relation_snapshot()
     }
 
     fn capture_consistent_snapshots_allowing_missing_table_reads(
@@ -836,9 +914,59 @@ impl QueryService {
         }
     }
 
-    pub(super) fn execution_context<'a>(
+    pub(super) fn execution_context_under_catalog_gate<'a>(
+        &'a self,
+        mut input: ExecutionContextInput<'a>,
+    ) -> Result<ExecutionContext<'a>> {
+        if !input.runtime.catalog_introspection_is_explicit {
+            let introspection =
+                self.catalog_introspection_provider_under_gate(input.runtime.session_info.clone())?;
+            input.runtime = input
+                .runtime
+                .with_catalog_introspection(introspection, false);
+        }
+        self.execution_context_with_catalog(input, self.components.catalog.clone())
+    }
+
+    pub(super) fn execution_context_for_bound<'a>(
+        &'a self,
+        mut input: ExecutionContextInput<'a>,
+        bound: &planner::BoundStatement,
+    ) -> Result<ExecutionContext<'a>> {
+        let (catalog, is_snapshot) = self.statement_catalog(bound)?;
+        if is_snapshot && !input.runtime.catalog_introspection_is_explicit {
+            let introspection = Arc::new(super::QueryCatalogIntrospection {
+                source: super::QueryCatalogSource::Fixed(catalog.clone()),
+                session_info: input.runtime.session_info.clone(),
+            });
+            input.runtime = input
+                .runtime
+                .with_catalog_introspection(introspection, false);
+        }
+        self.execution_context_with_catalog(input, catalog)
+    }
+
+    pub(super) fn execution_context_with_fixed_catalog<'a>(
+        &'a self,
+        mut input: ExecutionContextInput<'a>,
+        catalog: Arc<dyn catalog::CatalogManager>,
+    ) -> Result<ExecutionContext<'a>> {
+        if !input.runtime.catalog_introspection_is_explicit {
+            let introspection = Arc::new(super::QueryCatalogIntrospection {
+                source: super::QueryCatalogSource::Fixed(catalog.clone()),
+                session_info: input.runtime.session_info.clone(),
+            });
+            input.runtime = input
+                .runtime
+                .with_catalog_introspection(introspection, false);
+        }
+        self.execution_context_with_catalog(input, catalog)
+    }
+
+    fn execution_context_with_catalog<'a>(
         &'a self,
         input: ExecutionContextInput<'a>,
+        catalog: Arc<dyn catalog::CatalogManager>,
     ) -> Result<ExecutionContext<'a>> {
         let ExecutionContextInput {
             txn_id,
@@ -882,7 +1010,7 @@ impl QueryService {
         Ok(ExecutionContext {
             statement,
             relations,
-            catalog: self.components.catalog.as_ref(),
+            catalog,
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,
@@ -890,10 +1018,27 @@ impl QueryService {
         })
     }
 
+    fn try_capture_snapshot_for_transaction(
+        &self,
+        own_txn: u64,
+        bypass_snapshot_exclusion: bool,
+    ) -> Option<(Arc<Snapshot>, AdvertisedSnapshot)> {
+        let (active, xmax, advertised) = self
+            .components
+            .active_txns
+            .try_capture_with_exclusion_bypass(bypass_snapshot_exclusion, || {
+                self.components.next_txn_id.load(Ordering::Acquire)
+            })?;
+        let xip = active.iter().copied().filter(|&id| id != own_txn).collect();
+        let xmin = active.first().copied().unwrap_or(xmax);
+        debug_assert_eq!(advertised.xmin(), xmin);
+        Some((Arc::new(Snapshot { xmin, xmax, xip }), advertised))
+    }
+
     /// Capture a visibility snapshot consistently with the active-transaction
     /// registry and the id allocator (`docs/specs/mvcc.md` §5.5, §7.1, §9), and
     /// **advertise its `xmin`** to the GC horizon for the snapshot's lifetime.
-    /// Captured under the registry's brief latch (via try-capture) so the snapshot
+    /// Captured under the registry's brief latch so the snapshot
     /// is not torn relative to `next_txn_id` AND its `xmin` is published in the
     /// same critical section that reads the active set (closing the
     /// capture-vs-horizon race).
@@ -906,24 +1051,21 @@ impl QueryService {
     ///   `own_txn = 0`; nothing is excluded.
     /// - `xmin` is the oldest active id, or `xmax` if none are active.
     ///
-    /// Returns `None` if a schema-rewrite fence is active and the caller is not
-    /// allowed to bypass it. Otherwise returns the `Arc<Snapshot>` (shared by the
-    /// executor across scan operators rather than deep-cloning `xip` per operator)
-    /// together with the [`AdvertisedSnapshot`] guard. **The caller MUST hold the
+    /// Returns the `Arc<Snapshot>` (shared by the executor across scan operators
+    /// rather than deep-cloning `xip` per operator) together with the
+    /// [`AdvertisedSnapshot`] guard. **The caller MUST hold the
     /// guard for exactly as long as the snapshot can still be used to read**:
     /// dropping it sooner lets VACUUM reclaim a version this snapshot sees live
     /// (data loss); holding it longer over-pins the horizon (a space cost only).
-    fn try_capture_snapshot_for_transaction(
+    #[allow(dead_code)]
+    fn capture_snapshot_for_transaction(
         &self,
         own_txn: u64,
-        bypass_snapshot_exclusion: bool,
-    ) -> Option<(Arc<Snapshot>, AdvertisedSnapshot)> {
+    ) -> (Arc<Snapshot>, AdvertisedSnapshot) {
         let (active, xmax, advertised) = self
             .components
             .active_txns
-            .try_capture_with_exclusion_bypass(bypass_snapshot_exclusion, || {
-                self.components.next_txn_id.load(Ordering::Acquire)
-            })?;
+            .capture(|| self.components.next_txn_id.load(Ordering::Acquire));
         let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
         let xmin = active.first().copied().unwrap_or(xmax);
         debug_assert_eq!(
@@ -931,21 +1073,7 @@ impl QueryService {
             xmin,
             "advertised xmin must match the snapshot's xmin"
         );
-        Some((Arc::new(Snapshot { xmin, xmax, xip }), advertised))
-    }
-
-    /// Capture a visibility snapshot without advertising its `xmin`. This is used
-    /// only by schema-rewrite DDL while snapshot capture is excluded and the
-    /// exclusive checkpoint guard prevents VACUUM/checkpoint maintenance from
-    /// advancing the GC horizon around the unadvertised read.
-    pub(super) fn capture_unadvertised_snapshot(&self, own_txn: u64) -> Arc<Snapshot> {
-        let (active, xmax) = self
-            .components
-            .active_txns
-            .capture_unadvertised(|| self.components.next_txn_id.load(Ordering::Acquire));
-        let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
-        let xmin = active.first().copied().unwrap_or(xmax);
-        Arc::new(Snapshot { xmin, xmax, xip })
+        (Arc::new(Snapshot { xmin, xmax, xip }), advertised)
     }
 
     pub(super) fn append_and_flush_commit(

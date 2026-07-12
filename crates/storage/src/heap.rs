@@ -308,6 +308,25 @@ impl PageStore for HeapPageStore {
         self.fsync_dir()
     }
 
+    fn sync_files(&self, file_ids: &[FileId]) -> Result<()> {
+        let handles = {
+            let files = self
+                .files
+                .lock()
+                .map_err(|_| DbError::internal("heap store lock poisoned"))?;
+            file_ids
+                .iter()
+                .filter_map(|file_id| files.get(file_id).cloned().map(|file| (*file_id, file)))
+                .collect::<Vec<_>>()
+        };
+        for (file_id, file) in handles {
+            file.sync_all().map_err(|err| {
+                DbError::io(format!("failed to fsync heap file {file_id}: {err}"))
+            })?;
+        }
+        self.fsync_dir()
+    }
+
     fn remove_file(&self, file_id: FileId) -> Result<()> {
         self.files
             .lock()

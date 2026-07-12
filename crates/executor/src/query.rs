@@ -26,7 +26,7 @@ use crate::ops::{
 pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
     pub relations: Arc<dyn RelationSnapshot>,
-    pub catalog: &'a dyn CatalogManager,
+    pub catalog: Arc<dyn CatalogManager>,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
     /// The GC horizon (minimum advertised snapshot `xmin`) captured by the server,
@@ -440,7 +440,7 @@ pub(crate) fn build_executor<'a>(
                 ctx.storage,
                 *table,
                 filter.clone(),
-                table_output_schema(ctx.catalog, *table)?,
+                table_output_schema(ctx.catalog.as_ref(), *table)?,
             )))
         }
         PhysicalPlan::SystemScan {
@@ -449,7 +449,7 @@ pub(crate) fn build_executor<'a>(
             filter,
         } => Ok(Box::new(SystemScanOp::new(
             ctx.statement.clone(),
-            crate::system::rows_for(*view, ctx.catalog, &ctx.statement)?,
+            crate::system::rows_for(*view, ctx.catalog.as_ref(), &ctx.statement)?,
             output_schema.clone(),
             filter.clone(),
         ))),
@@ -471,7 +471,10 @@ pub(crate) fn build_executor<'a>(
             let full_primary_key_exact_read = if *index == common::PRIMARY_KEY_INDEX_ID
                 && let KeyRange::Exact(key) = range
             {
-                key.0.len() == require_table(ctx.catalog, *table)?.primary_key.len()
+                key.0.len()
+                    == require_table(ctx.catalog.as_ref(), *table)?
+                        .primary_key
+                        .len()
             } else {
                 false
             };
@@ -496,7 +499,7 @@ pub(crate) fn build_executor<'a>(
                 range: range.clone(),
                 full_filter: full_filter.clone(),
                 filter: filter.clone(),
-                output_schema: table_output_schema(ctx.catalog, *table)?,
+                output_schema: table_output_schema(ctx.catalog.as_ref(), *table)?,
             })))
         }
         PhysicalPlan::NestedLoopJoin {
@@ -723,7 +726,7 @@ fn execute_insert(
     default_exprs: &[(ColumnId, BoundExpr)],
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
-    let schema = require_table(ctx.catalog, table)?;
+    let schema = require_table(ctx.catalog.as_ref(), table)?;
     let has_conflict_arbiter = if let Some(on_conflict) = on_conflict {
         validate_on_conflict_arbiter(on_conflict, &schema)?
     } else {
@@ -1226,7 +1229,7 @@ fn execute_update(
     returning: Option<&BoundReturning>,
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
-    let schema = require_table(ctx.catalog, table)?;
+    let schema = require_table(ctx.catalog.as_ref(), table)?;
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
@@ -1293,7 +1296,7 @@ fn execute_delete(
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
-        let schema = require_table(ctx.catalog, table)?;
+        let schema = require_table(ctx.catalog.as_ref(), table)?;
         let mut count = 0;
         let mut returned = Vec::new();
         // DELETE ... USING: combined source rows, deleted once per target —
@@ -1364,7 +1367,7 @@ fn execute_create_table(
         }
     }
 
-    let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
+    let serial = resolve_serial_columns(ctx.catalog.as_ref(), name, columns)?;
     let mut created_sequences = Vec::new();
     for serial_column in &serial {
         match create_owned_serial_sequence(ctx, &serial_column.sequence) {
@@ -1642,7 +1645,7 @@ fn execute_alter_table_add_column(
     if_not_exists: bool,
     column: &ParsedColumnDef,
 ) -> Result<ExecutionResult> {
-    let old_schema = require_table(ctx.catalog, table)?;
+    let old_schema = require_table(ctx.catalog.as_ref(), table)?;
     if matches!(
         ctx.catalog
             .preflight_add_table_column(old_schema.id, if_not_exists, column)?,
@@ -1708,7 +1711,7 @@ fn execute_alter_table_drop_column(
     if_exists: bool,
     column: &str,
 ) -> Result<ExecutionResult> {
-    let old_schema = require_table(ctx.catalog, table)?;
+    let old_schema = require_table(ctx.catalog.as_ref(), table)?;
     if matches!(
         ctx.catalog
             .preflight_drop_table_column(old_schema.id, if_exists, column)?,
@@ -1769,7 +1772,7 @@ fn execute_alter_table_rename_column(
     old_name: &str,
     new_name: &str,
 ) -> Result<ExecutionResult> {
-    let old_schema = require_table(ctx.catalog, table)?;
+    let old_schema = require_table(ctx.catalog.as_ref(), table)?;
     let schema = ctx
         .catalog
         .rename_table_column(old_schema.id, old_name, new_name.to_string())?;
@@ -1784,7 +1787,7 @@ fn execute_alter_table_rename_table(
     table: TableId,
     new_name: &str,
 ) -> Result<ExecutionResult> {
-    let old_schema = require_table(ctx.catalog, table)?;
+    let old_schema = require_table(ctx.catalog.as_ref(), table)?;
     let schema = ctx
         .catalog
         .rename_table(old_schema.id, new_name.to_string())?;
@@ -1911,9 +1914,10 @@ fn expression_default_for_column(
     column: &common::ColumnDef,
 ) -> Result<Vec<(ColumnId, BoundExpr)>> {
     match &column.default {
-        Some(ColumnDefault::Expr(text)) => {
-            Ok(vec![(column.id, bind_default_expr(ctx.catalog, text)?)])
-        }
+        Some(ColumnDefault::Expr(text)) => Ok(vec![(
+            column.id,
+            bind_default_expr(ctx.catalog.as_ref(), text)?,
+        )]),
         _ => Ok(Vec::new()),
     }
 }

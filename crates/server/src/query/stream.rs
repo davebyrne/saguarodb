@@ -13,6 +13,52 @@ use executor::{CopyJob, ExecutionResult, RowSink};
 use tokio::sync::mpsc;
 
 use super::{CapturedSnapshots, TransactionSnapshots, WriteUnitGuard};
+use crate::app::ServerComponents;
+use crate::lock_manager::ObjectLockGuard;
+
+pub(crate) struct AutocommitCopyWrite {
+    components: Arc<ServerComponents>,
+    txn_id: Option<u64>,
+    object_guard: Option<ObjectLockGuard>,
+    write_guard: Option<WriteUnitGuard>,
+}
+
+impl AutocommitCopyWrite {
+    pub(crate) fn new(
+        components: Arc<ServerComponents>,
+        txn_id: u64,
+        object_guard: ObjectLockGuard,
+        write_guard: WriteUnitGuard,
+    ) -> Self {
+        Self {
+            components,
+            txn_id: Some(txn_id),
+            object_guard: Some(object_guard),
+            write_guard: Some(write_guard),
+        }
+    }
+
+    pub(crate) fn txn_id(&self) -> u64 {
+        self.txn_id.expect("COPY write ownership is still armed")
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.txn_id = None;
+    }
+}
+
+impl Drop for AutocommitCopyWrite {
+    fn drop(&mut self) {
+        if let Some(txn_id) = self.txn_id.take() {
+            super::QueryService::new(self.components.clone())
+                .rollback_pre_durable_or_die(txn_id, None);
+        }
+        // Fields drop after this body: object locks first, then the shared writer
+        // guard, preserving reverse acquisition order.
+        self.object_guard.take();
+        self.write_guard.take();
+    }
+}
 
 /// Rows pulled per `PlanExecutor` batch and carried per channel message
 /// (`docs/specs/streaming.md` §7). A tuning knob only: it bounds peak buffered
@@ -35,23 +81,27 @@ pub enum StreamMessage {
     Rows(Vec<Row>),
 }
 
-/// The snapshot captured before binding a COPY statement. COPY crosses the query
-/// and protocol layers, so the captured snapshot must cross with it; otherwise a
-/// schema rewrite can publish a new relation generation between COPY bind and
-/// COPY execution.
+/// The snapshots captured after COPY binding, object-lock acquisition, and
+/// revalidation. COPY crosses the query and protocol layers, so the snapshots and
+/// lock owner must cross with it through stream completion.
 pub(crate) enum CopySnapshots {
     Autocommit {
         snapshots: CapturedSnapshots,
-        write_guard: Option<WriteUnitGuard>,
+        catalog: Arc<dyn catalog::CatalogManager>,
+        write: Option<AutocommitCopyWrite>,
+        object_guard: Option<ObjectLockGuard>,
     },
-    Transaction(TransactionSnapshots),
+    Transaction {
+        snapshots: TransactionSnapshots,
+        catalog: Arc<dyn catalog::CatalogManager>,
+    },
 }
 
 impl fmt::Debug for CopySnapshots {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CopySnapshots::Autocommit { .. } => f.write_str("CopySnapshots::Autocommit(..)"),
-            CopySnapshots::Transaction(_) => f.write_str("CopySnapshots::Transaction(..)"),
+            CopySnapshots::Transaction { .. } => f.write_str("CopySnapshots::Transaction(..)"),
         }
     }
 }

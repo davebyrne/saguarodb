@@ -1273,8 +1273,8 @@ async fn prepared_currval_errors_after_sequence_drop() {
         .err()
         .expect("prepared currval should fail after the sequence is dropped");
     assert!(
-        err.message.contains("42P01"),
-        "expected UndefinedTable: {}",
+        err.message.contains("0A000"),
+        "expected cached-plan reprepare error: {}",
         err.message
     );
 }

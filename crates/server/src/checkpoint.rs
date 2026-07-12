@@ -45,7 +45,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // **No data loss (same safety as on-demand VACUUM, F4a):** the horizon is
     // captured by `gc_horizon()` HERE, *under* the exclusive guard. Under that guard
     // no writer runs, so no committed-deleter appears mid-pass, and the horizon is
-    // the minimum `xmin` advertised by any live snapshot — INCLUDING lock-free
+    // the minimum `xmin` advertised by any live snapshot — INCLUDING concurrent
     // readers (which advertise their `xmin`). Every reclaimed version has
     // `xmax < horizon`, i.e. its delete committed before every live snapshot's `xmin`,
     // so no current snapshot can see it live. Capturing the horizon under the guard is

@@ -35,9 +35,9 @@ schedule. This matches PostgreSQL's model. Concurrent `READ COMMITTED` /
 transaction still gets full snapshot-isolation guarantees against them, but mixing
 isolation levels does not extend serializability to the lower-level transactions.
 
-`READ COMMITTED` and `REPEATABLE READ` are **unchanged** — same lock-free read path,
-no read-tracking overhead, byte-for-byte the same behavior. SSI overhead is paid
-only by `SERIALIZABLE` transactions.
+`READ COMMITTED` and `REPEATABLE READ` use the same MVCC and object-locking read
+path without SSI read-tracking overhead. SSI tracking overhead is paid only by
+`SERIALIZABLE` transactions.
 
 ### 1.2 Granularity decision (Implementation A)
 

@@ -3,6 +3,40 @@ mod support;
 use support::{Connection, TestServer, first_row_description};
 
 #[tokio::test]
+async fn system_catalog_cursor_uses_one_catalog_snapshot_for_rows_and_functions() {
+    let server = TestServer::start().await.unwrap();
+    let mut reader = Connection::connect(&server).await.unwrap();
+    let mut ddl = Connection::connect(&server).await.unwrap();
+
+    reader
+        .ok("create table catalog_snapshot_probe (id integer primary key)")
+        .await
+        .rows();
+    let oid = reader
+        .ok("select to_regclass('catalog_snapshot_probe')")
+        .await
+        .rows()[0][0]
+        .clone();
+
+    reader.ok("begin").await.rows();
+    reader
+        .ok("declare catalog_cursor cursor for \
+             select relname, to_regclass(relname) \
+             from pg_catalog.pg_class \
+             where relname = 'catalog_snapshot_probe'")
+        .await
+        .rows();
+
+    ddl.ok("drop table catalog_snapshot_probe").await.rows();
+
+    assert_eq!(
+        reader.ok("fetch all from catalog_cursor").await.rows(),
+        vec![vec![Some("catalog_snapshot_probe".to_string()), oid,]]
+    );
+    reader.ok("rollback").await.rows();
+}
+
+#[tokio::test]
 async fn system_catalogs_support_driver_query_shapes() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

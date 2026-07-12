@@ -232,6 +232,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         next_txn_id: AtomicU64::new(next_txn_id),
         dead_rows_since_vacuum: AtomicU64::new(0),
         active_txns,
+        catalog_publication_gate: Arc::new(RwLock::new(())),
         relation_publish_gate: RwLock::new(()),
         lock_manager,
         ssi_manager,

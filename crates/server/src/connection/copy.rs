@@ -164,6 +164,10 @@ impl Session {
             result = Err(err);
         }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if crate::query::transaction_resources_released(&self.txn) {
+            self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
+        }
         let status = self.status_byte();
         let transaction_holds_writer = self
             .txn
@@ -356,6 +360,10 @@ impl Session {
             result = Err(err);
         }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if crate::query::transaction_resources_released(&self.txn) {
+            self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
+        }
         let status = self.status_byte();
         let transaction_holds_writer = self
             .txn

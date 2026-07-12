@@ -18,6 +18,9 @@ pub trait RelationSnapshot: Send + Sync {
     fn table_schema_version(&self, _table: TableId) -> Option<u64> {
         None
     }
+    fn table_storage_id(&self, _table: TableId) -> Option<common::FileId> {
+        None
+    }
     /// Some transaction-level catalog lookups intentionally resolve against current
     /// metadata while their retained relation snapshot predates a new table. Read
     /// scans may treat that absent relation as empty only when this returns true;

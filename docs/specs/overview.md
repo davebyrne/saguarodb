@@ -1462,7 +1462,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 
 ### EXPLAIN
 
-`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement lock-free to `BoundStatement::Explain(inner_bound)`, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
+`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement, acquires its ordinary object-lifetime locks, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
 
 ### Planner Non-Goals
 
@@ -2121,7 +2121,7 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 **Checkpoint protocol:**
 
-1. Acquire the exclusive checkpoint guard (`begin_checkpoint`), which drains in-flight writers (readers stay lock-free).
+1. Acquire the exclusive checkpoint guard (`begin_checkpoint`), which drains in-flight writers and explicit transactions that retained the shared checkpoint-participant guard; autocommit readers remain controller-guard-free.
 2. `wal.flush()` — a page's redo must be durable before the page is written.
 3. `buffer_pool.flush_dirty_pages()` — write flushable dirty pages to the heap `PageStore` (committed, aborted, and — under Stage 2 — in-flight alike; all WAL-durable after step 2, and the CLOG hides the non-committed tuples).
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.

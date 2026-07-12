@@ -143,7 +143,7 @@ fn run_scalar_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result
 fn materialize_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<Vec<Row>> {
     let statement = BoundStatement::Query(query.clone());
     let logical = logical_plan(&statement)?;
-    let physical = physical_plan(&logical, ctx.catalog)?;
+    let physical = physical_plan(&logical, ctx.catalog.as_ref())?;
     let resolved = resolve_plan_subqueries(ctx, &physical)?;
     let mut executor = build_executor(ctx, &resolved)?;
     let rows = crate::query::collect_all_cancelable(executor.as_mut(), ctx.cancel)?;

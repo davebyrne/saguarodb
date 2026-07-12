@@ -254,15 +254,22 @@ fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
 
     let wal_len_before = fixture.wal.replay_from(0).unwrap().count();
 
-    let touched = fixture
+    let rewrite = fixture
         .engine
         .rewrite_table_pages(&users_schema_zstd())
         .unwrap();
     assert_eq!(
-        touched,
+        rewrite.pages_touched,
         before.len(),
         "one page touched per initialized page"
     );
+    let mut expected_files = before
+        .keys()
+        .map(|(file_id, _)| *file_id)
+        .collect::<Vec<_>>();
+    expected_files.sort_unstable();
+    expected_files.dedup();
+    assert_eq!(rewrite.file_ids, expected_files);
 
     // The rewrite must append exactly one FullPageImage[Compressed] per
     // touched page and nothing else.

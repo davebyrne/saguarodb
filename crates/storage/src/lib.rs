@@ -10,7 +10,7 @@ mod toast;
 mod traits;
 
 pub use codec::{DecodedRow, decode_row, encode_row};
-pub use engine::{PageBackedStorageEngine, StorageMode};
+pub use engine::{PageBackedStorageEngine, RewriteTablePages, StorageMode};
 pub use heap::HeapPageStore;
 pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;

@@ -904,7 +904,11 @@ design, because index entries accumulate per version as well as heap tuples.
   (on-demand `VACUUM` with no table, or the auto-prune over all tables) advances the
   **vacuum floor** `B = min(next_txn_id, oldest_active_xid)` captured at the start
   of the pass after its exclusion locks are held (no active xid contributes
-  `next_txn_id`).
+  `next_txn_id`). On-demand full VACUUM captures `B` while the shared catalog
+  publication gate still protects its revalidated all-table target list. Thus a
+  table published after that list is fixed either has its creator xid included
+  in `B` or can contain only tuple xids at or above `B`; the floor cannot pass an
+  aborted tuple in a relation omitted from the pass.
   A full pass leaves **no surviving on-disk reference** to any aborted txn below `B`,
   as creator OR deleter: it **reclaims** every aborted-**creator** tuple (heap + index;
   no age requirement) and **abort-cleans** every aborted-**deleter** stamp (resetting

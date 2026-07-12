@@ -49,6 +49,10 @@ pub struct ServerComponents {
     /// outcomes; this registry tracks which transactions are still running, for
     /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
     pub active_txns: ActiveTxnRegistry,
+    /// Publication boundary for catalog names and metadata. Binding and catalog
+    /// introspection take the shared side; DDL takes the exclusive side only after
+    /// acquiring its object locks (`docs/specs/table-locks.md` §4, §7).
+    pub catalog_publication_gate: Arc<RwLock<()>>,
     /// Relation-swap DDL holds the write side from before its durable commit
     /// point until catalog/storage generation publication finishes. Snapshot
     /// capture takes the read side while pairing MVCC and relation snapshots, so

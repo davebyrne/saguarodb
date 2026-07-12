@@ -107,7 +107,7 @@ Production execution uses an explicit context:
 ```rust
 pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
-    pub catalog: &'a dyn CatalogManager,
+    pub catalog: Arc<dyn CatalogManager>,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
     pub cancel: &'a QueryCancel,
@@ -119,6 +119,12 @@ impl QueryEngine {
     pub fn execute(&self, ctx: &ExecutionContext<'_>, plan: &PhysicalPlan) -> Result<ExecutionResult>;
 }
 ```
+
+The owned catalog handle is normally the live catalog. For statements that scan
+virtual system catalogs, the server instead installs an immutable statement
+snapshot captured under its shared catalog-publication gate after object-lock
+convergence. This keeps system rows coherent without cloning the catalog for
+ordinary data statements.
 
 `QueryEngine::execute` passes `ctx.statement` to storage and schema operations. It does not allocate transaction IDs, append commit records, flush WAL, or call storage/buffer commit or rollback; server query orchestration owns those statement-level concerns.
 

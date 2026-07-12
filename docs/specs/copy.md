@@ -259,6 +259,10 @@ between validation and protocol mode.
    the server sends `ErrorResponse` then `ReadyForQuery` in place of `CopyDone`/
    `CommandComplete` — a partial export is never finalized with `CopyDone`.
 
+Both directions carry an immutable catalog/introspection snapshot captured after
+lock convergence across the protocol boundary, so defaults and catalog functions
+cannot observe DDL published after `CopyInResponse`/`CopyOutResponse` begins.
+
 `COPY TO` runs under the reader path: in autocommit it uses a fresh snapshot;
 inside a transaction it uses the transaction's snapshot.
 

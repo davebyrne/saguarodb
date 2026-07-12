@@ -1213,7 +1213,7 @@ mod tests {
         let ctx = ExecutionContext {
             statement: StatementContext::new(1),
             relations: storage.capture_relation_snapshot().unwrap(),
-            catalog: &catalog,
+            catalog: Arc::new(catalog),
             storage: &storage,
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,

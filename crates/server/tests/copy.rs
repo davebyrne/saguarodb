@@ -3,7 +3,6 @@ mod support;
 use std::time::Duration;
 
 use common::SqlState;
-
 use support::{Connection, TestServer};
 
 async fn server_with_table() -> (TestServer, Connection) {
@@ -210,6 +209,34 @@ async fn copy_from_applies_expression_default() {
 }
 
 #[tokio::test]
+async fn copy_from_keeps_catalog_snapshot_captured_at_protocol_start() {
+    let server = TestServer::start().await.unwrap();
+    let mut copy = Connection::connect(&server).await.unwrap();
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    copy.ok("create table copy_catalog_snapshot (\
+         id integer primary key, \
+         observed bigint default to_regclass('late_copy_object'))")
+        .await
+        .rows();
+
+    copy.begin_copy_from("copy copy_catalog_snapshot (id) from stdin")
+        .await
+        .unwrap();
+    ddl.ok("create table late_copy_object (id integer primary key)")
+        .await
+        .rows();
+    let completion = copy.finish_copy_from(&[b"1\n"]).await.unwrap();
+    assert_eq!(completion.command_tag.as_deref(), Some("COPY 1"));
+
+    assert_eq!(
+        copy.ok("select observed from copy_catalog_snapshot where id = 1")
+            .await
+            .rows(),
+        vec![vec![None]],
+    );
+}
+
+#[tokio::test]
 async fn copy_to_stdout_text_and_csv() {
     let (_server, mut conn) = server_with_table().await;
     conn.ok("insert into t (id, name) values (1, 'ann'), (2, 'bob')")
@@ -235,11 +262,14 @@ async fn copy_to_stdout_text_and_csv() {
 }
 
 #[tokio::test]
-async fn repeatable_read_copy_to_newer_catalog_table_is_empty() {
+async fn repeatable_read_copy_to_uses_fresh_relations_and_retained_mvcc() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
         .ok("create table snapshot_anchor (id integer primary key)")
+        .await;
+    setup
+        .ok("create table copied_later (id integer primary key, name text)")
         .await;
 
     let mut reader = Connection::connect(&server).await.unwrap();
@@ -253,9 +283,6 @@ async fn repeatable_read_copy_to_newer_catalog_table_is_empty() {
     );
 
     setup
-        .ok("create table copied_later (id integer primary key, name text)")
-        .await;
-    setup
         .ok("insert into copied_later (id, name) values (1, 'ann')")
         .await;
 
@@ -266,11 +293,14 @@ async fn repeatable_read_copy_to_newer_catalog_table_is_empty() {
 }
 
 #[tokio::test]
-async fn repeatable_read_copy_from_newer_catalog_table_is_rejected_before_copy_mode() {
+async fn repeatable_read_copy_from_uses_fresh_relation_snapshot() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
         .ok("create table snapshot_anchor (id integer primary key)")
+        .await;
+    setup
+        .ok("create table copied_later (id integer primary key)")
         .await;
 
     let mut writer = Connection::connect(&server).await.unwrap();
@@ -283,18 +313,19 @@ async fn repeatable_read_copy_from_newer_catalog_table_is_rejected_before_copy_m
         vec![vec![Some("0".to_string())]]
     );
 
-    setup
-        .ok("create table copied_later (id integer primary key)")
-        .await;
-
-    let outcome = writer.query("copy copied_later from stdin").await.unwrap();
-    let err = match outcome.result {
-        Ok(_) => panic!("COPY FROM should be rejected before CopyInResponse"),
-        Err(err) => err,
-    };
-    assert_eq!(err.code, SqlState::SerializationFailure);
-    assert_eq!(outcome.status, b'E');
+    let copy = writer
+        .copy_from("copy copied_later from stdin", &[b"1\n"])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 1"));
     writer.ok("rollback").await;
+    assert!(
+        setup
+            .ok("select id from copied_later")
+            .await
+            .rows()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

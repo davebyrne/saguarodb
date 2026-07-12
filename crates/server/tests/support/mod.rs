@@ -439,6 +439,31 @@ impl Connection {
         read_until_ready(&mut self.stream).await
     }
 
+    /// Start an unnamed, parameterless extended query and stop after its portal
+    /// suspends, deliberately withholding Sync so the statement remains open.
+    pub async fn begin_suspended_execute(&mut self, sql: &str, max_rows: i32) -> Result<()> {
+        let mut seq = parse_bytes("", sql, &[]);
+        seq.extend(bind_bytes("", ""));
+        seq.extend(execute_bytes_with_max("", max_rows));
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to start suspended execute: {err}"))
+        })?;
+        read_until_tag(&mut self.stream, b's').await?;
+        Ok(())
+    }
+
+    /// Resume an unnamed portal opened by [`Self::begin_suspended_execute`], run
+    /// it to exhaustion, and Sync the extended protocol.
+    pub async fn finish_suspended_execute(&mut self) -> Result<()> {
+        let mut seq = execute_bytes("");
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to resume suspended execute: {err}"))
+        })?;
+        read_until_ready(&mut self.stream).await?;
+        Ok(())
+    }
+
     pub fn extended_parse(sql: &str) -> Vec<u8> {
         parse_bytes("", sql, &[])
     }
@@ -1228,6 +1253,14 @@ fn execute_bytes(portal: &str) -> Vec<u8> {
 }
 
 fn execute_bytes_with_max_rows(portal: &str, max_rows: i32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&max_rows.to_be_bytes());
+    tagged(b'E', &body)
+}
+
+fn execute_bytes_with_max(portal: &str, max_rows: i32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(portal.as_bytes());
     body.push(0);

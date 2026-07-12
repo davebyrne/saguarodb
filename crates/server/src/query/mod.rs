@@ -1,22 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use catalog::{
-    CatalogManager, check_constraint_oid, index_oid, primary_key_constraint_oid,
+    CatalogManager, MemoryCatalog, check_constraint_oid, index_oid, primary_key_constraint_oid,
     resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 use common::{
-    CatalogIntrospectionProvider, CheckpointGuard, ColumnDefault, ColumnInfo, CopyDirection,
-    DataType, DbError, GucSetting, IndexConstraintKind, IsolationLevel, PgType, QueryCancel,
-    RelationKind, Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot,
-    SqlState, SystemStateProvider, TableId, Value, WriteGuard,
+    CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
+    GucSetting, IndexConstraintKind, IsolationLevel, ParsedDefault, PgType, QueryCancel,
+    RelationKind, Result, SequenceId, SessionActivityRow, SessionInfo, SessionSequenceState,
+    Snapshot, SqlState, SystemStateProvider, TableId, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
 use planner::{
     BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery,
-    BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues,
+    BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues, bind_default_expr,
     bind_parameterized_with_pg_types, collect_param_pg_types, format_explain, logical_plan,
     mutates_sequences, physical_plan, substitute_params,
 };
@@ -25,6 +25,7 @@ use storage::RelationSnapshot;
 use tokio::sync::mpsc;
 
 use crate::app::ServerComponents;
+use crate::lock_manager::{ObjectLockGuard, ObjectLockRequest, RelationLockMode, SequenceLockMode};
 use crate::registry::AdvertisedSnapshot;
 use crate::session_registry::SessionRegistry;
 
@@ -41,8 +42,10 @@ mod vacuum;
 pub use copy::CopyInChunk;
 pub(crate) use cursor::{CursorFetchStatus, QueryCursorHandle, StartedCursor};
 pub use gucs::SessionGucs;
+pub(crate) use stream::{
+    AutocommitCopyWrite, CopySnapshots, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome,
+};
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
-pub(crate) use stream::{CopySnapshots, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 use txn::{CapturedSnapshots, ExecutionContextInput, StatementRuntime, TransactionSnapshots};
 pub(crate) use vacuum::full_vacuum_pass;
 
@@ -50,6 +53,8 @@ pub struct QueryService {
     components: Arc<ServerComponents>,
     engine: QueryEngine,
 }
+
+type PreparedRelationVersion = (TableId, u64, Option<common::FileId>);
 
 /// Per-connection state borrowed by query execution for one statement. The
 /// transaction slot and default isolation are still threaded separately because
@@ -63,6 +68,7 @@ pub struct QuerySessionContext {
     session_registry: Option<Arc<SessionRegistry>>,
     system_state_override: Option<Arc<dyn SystemStateProvider>>,
     catalog_introspection_override: Option<Arc<dyn CatalogIntrospectionProvider>>,
+    catalog_introspection_is_explicit: bool,
 }
 
 impl QuerySessionContext {
@@ -80,6 +86,7 @@ impl QuerySessionContext {
             session_registry: None,
             system_state_override: None,
             catalog_introspection_override: None,
+            catalog_introspection_is_explicit: false,
         }
     }
 
@@ -101,6 +108,7 @@ impl QuerySessionContext {
         catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
     ) -> Self {
         self.catalog_introspection_override = Some(catalog_introspection);
+        self.catalog_introspection_is_explicit = true;
         self
     }
 
@@ -145,6 +153,7 @@ impl QuerySessionContext {
             self.catalog_introspection_override
                 .clone()
                 .unwrap_or_else(common::no_catalog_introspection),
+            self.catalog_introspection_is_explicit,
         )
     }
 }
@@ -186,8 +195,16 @@ impl SystemStateProvider for QuerySystemState {
 }
 
 struct QueryCatalogIntrospection {
-    catalog: Arc<dyn CatalogManager>,
+    source: QueryCatalogSource,
     session_info: Arc<SessionInfo>,
+}
+
+enum QueryCatalogSource {
+    LazySnapshot {
+        components: Arc<ServerComponents>,
+        catalog: Box<OnceLock<MemoryCatalog>>,
+    },
+    Fixed(Arc<dyn CatalogManager>),
 }
 
 impl std::fmt::Debug for QueryCatalogIntrospection {
@@ -199,19 +216,42 @@ impl std::fmt::Debug for QueryCatalogIntrospection {
 }
 
 impl QueryCatalogIntrospection {
+    fn catalog(&self) -> Result<&dyn CatalogManager> {
+        match &self.source {
+            QueryCatalogSource::Fixed(catalog) => Ok(catalog.as_ref()),
+            QueryCatalogSource::LazySnapshot {
+                components,
+                catalog,
+            } => {
+                if let Some(catalog) = catalog.get() {
+                    return Ok(catalog);
+                }
+                let _catalog_read = components
+                    .catalog_publication_gate
+                    .read()
+                    .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+                let snapshot = MemoryCatalog::try_from_snapshot(components.catalog.snapshot()?)?;
+                let _ = catalog.set(snapshot);
+                Ok(catalog
+                    .get()
+                    .expect("catalog introspection snapshot installed above"))
+            }
+        }
+    }
+
     fn user_relation_oid(&self, name: &str) -> Result<Option<i64>> {
         if let Some(table) = self.user_table_by_name(name)? {
             return Ok(Some(table_oid(table.id)));
         }
-        if let Some(index) = self.catalog.get_index_by_name(name)?
+        if let Some(index) = self.catalog()?.get_index_by_name(name)?
             && self
-                .catalog
+                .catalog()?
                 .get_table(index.table)?
                 .is_some_and(|table| table.relation_kind == RelationKind::User)
         {
             return Ok(Some(index_oid(index.id)));
         }
-        for table in self.catalog.list_tables()? {
+        for table in self.catalog()?.list_tables()? {
             if table.relation_kind == RelationKind::User
                 && !table.primary_key.is_empty()
                 && primary_key_index_name(&table) == name
@@ -219,7 +259,7 @@ impl QueryCatalogIntrospection {
                 return Ok(Some(synthetic_primary_key_oid(table.id)));
             }
         }
-        if let Some(sequence) = self.catalog.get_sequence_by_name(name)? {
+        if let Some(sequence) = self.catalog()?.get_sequence_by_name(name)? {
             return Ok(Some(sequence_oid(sequence.id)));
         }
         Ok(None)
@@ -232,7 +272,7 @@ impl QueryCatalogIntrospection {
         if !matches!(schema.as_deref(), None | Some("public")) {
             return Ok(None);
         }
-        let Some(table) = self.catalog.get_table_by_name(&relation)? else {
+        let Some(table) = self.catalog()?.get_table_by_name(&relation)? else {
             return Ok(None);
         };
         if table.relation_kind == RelationKind::User {
@@ -264,7 +304,7 @@ impl QueryCatalogIntrospection {
     }
 
     fn user_relation_is_visible(&self, relation_oid: i64) -> Result<bool> {
-        for table in self.catalog.list_tables()? {
+        for table in self.catalog()?.list_tables()? {
             if table.relation_kind != RelationKind::User {
                 continue;
             }
@@ -272,7 +312,7 @@ impl QueryCatalogIntrospection {
                 return Ok(true);
             }
             let mut has_primary_key_index = false;
-            for index in self.catalog.list_indexes_for_table(table.id)? {
+            for index in self.catalog()?.list_indexes_for_table(table.id)? {
                 has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
                 if index_oid(index.id) == relation_oid {
                     return Ok(true);
@@ -285,7 +325,7 @@ impl QueryCatalogIntrospection {
                 return Ok(true);
             }
         }
-        for sequence in self.catalog.list_sequences()? {
+        for sequence in self.catalog()?.list_sequences()? {
             if sequence_oid(sequence.id) == relation_oid {
                 return Ok(true);
             }
@@ -318,7 +358,7 @@ impl QueryCatalogIntrospection {
         else {
             return Ok(None);
         };
-        let Some(sequence) = self.catalog.get_sequence(sequence_id)? else {
+        let Some(sequence) = self.catalog()?.get_sequence(sequence_id)? else {
             return Ok(None);
         };
         Ok(sequence.owned.then_some(sequence.name))
@@ -329,12 +369,12 @@ impl QueryCatalogIntrospection {
         index_oid_value: i64,
         column: Option<i64>,
     ) -> Result<Option<String>> {
-        for table in self.catalog.list_tables()? {
+        for table in self.catalog()?.list_tables()? {
             if table.relation_kind != RelationKind::User {
                 continue;
             }
             let mut has_primary_key_index = false;
-            for index in self.catalog.list_indexes_for_table(table.id)? {
+            for index in self.catalog()?.list_indexes_for_table(table.id)? {
                 has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
                 if index_oid(index.id) == index_oid_value {
                     return Ok(render_index_definition(
@@ -363,7 +403,7 @@ impl QueryCatalogIntrospection {
     }
 
     fn constraint_definition(&self, constraint_oid: i64) -> Result<Option<String>> {
-        for table in self.catalog.list_tables()? {
+        for table in self.catalog()?.list_tables()? {
             if table.relation_kind != RelationKind::User {
                 continue;
             }
@@ -494,19 +534,10 @@ fn split_relation_name(name: &str) -> Option<(Option<String>, String)> {
     ))
 }
 
-/// The concurrency guard an autocommit write/DDL unit holds for its lifetime. DML
-/// takes the SHARED writer guard (concurrent with other writers); DDL takes the
-/// EXCLUSIVE guard because catalog rollback restores whole object maps and CREATE
-/// INDEX also needs a stable physical view for its HOT broken-chain backfill
-/// (`docs/specs/mvcc.md` §10 Milestone H2). Dropping this drops the inner guard
-/// either way, so the autocommit path holds one variable across execution + commit.
-/// The inner guards are held purely for their RAII `Drop` (they own the lock), never
-/// read — like `WriteGuard`/`CheckpointGuard`'s own `_guard` fields.
-#[allow(dead_code, reason = "guards are held for RAII Drop, never read")]
-pub(crate) enum WriteUnitGuard {
-    Shared(WriteGuard),
-    Exclusive(CheckpointGuard),
-}
+/// The shared checkpoint-participant guard held by an autocommit write, DDL, or
+/// WAL-writing maintenance unit. Object locks provide relation-scoped exclusion;
+/// only an actual checkpoint takes the controller's exclusive side.
+pub(crate) type WriteUnitGuard = WriteGuard;
 
 /// The transaction-block status a session reports to the protocol layer after a
 /// statement runs. Mirrors PostgreSQL's `ReadyForQuery` status byte; the
@@ -522,23 +553,25 @@ pub enum SessionTxnStatus {
 }
 
 /// An open explicit transaction's runtime state, held on the connection `Session`
-/// across statements (`docs/specs/mvcc.md` §7.2). It owns the SHARED writer guard
-/// (acquired lazily on the first write) for the whole write-transaction. Under the
+/// across statements (`docs/specs/mvcc.md` §7.2). Before taking its first retained
+/// object lock it acquires the SHARED checkpoint-participant guard for the whole
+/// transaction. Under the
 /// E2b lock inversion (§7.1 Stage 2, §10 E2b) the writer guard is shared, so many
 /// write-transactions run concurrently; per-row conflict detection (E1) and the
 /// per-index / per-heap structural latches (E2a) provide write-write safety. Only a
-/// checkpoint (the exclusive guard) excludes writers. Readers stay lock-free.
+/// checkpoint (the exclusive guard) excludes participants. Autocommit readers
+/// remain controller-guard-free.
 pub struct Transaction {
     txn_id: u64,
     /// The transaction's isolation level (`docs/specs/mvcc.md` §6, §10 Milestone
     /// G). Set at BEGIN from an explicit `ISOLATION LEVEL` mode or the default
     /// (Read Committed), and adjustable by `SET TRANSACTION ISOLATION LEVEL`
     /// before the first query. Threaded into `StatementContext.isolation`, which
-    /// drives `snapshots_for_transaction`: Read Committed captures a fresh snapshot
-    /// per statement, Repeatable Read captures one at the first statement and
-    /// reuses it. The paired relation snapshot follows the same rule so
-    /// relation-swap DDL cannot move a stable transaction onto a newer physical
-    /// generation.
+    /// drives `snapshots_for_transaction`: Read Committed captures a fresh MVCC
+    /// snapshot per statement, while Repeatable Read captures one at the first
+    /// statement and reuses it. Relation-generation snapshots are always
+    /// statement-scoped and are captured only after the transaction's retained
+    /// object locks protect the referenced relations.
     isolation: IsolationLevel,
     /// Transactional changes to `default_transaction_isolation`. PostgreSQL makes a
     /// plain `SET` visible immediately but only persists it if the surrounding
@@ -555,21 +588,24 @@ pub struct Transaction {
     /// `true` once any statement has entered the `Failed` ('E') state. While set,
     /// every statement except COMMIT/ROLLBACK is rejected with `25P02`.
     failed: bool,
-    /// The SHARED writer guard, acquired lazily on the first write statement and
-    /// held until COMMIT/ROLLBACK. A read-only transaction never acquires it. It is
-    /// shared (concurrent with other writers); only a checkpoint, holding the
-    /// exclusive guard, waits for it to drain.
+    /// A deadlock victim is physically aborted immediately but remains as a failed
+    /// protocol shell until COMMIT/ROLLBACK consumes the transaction block.
+    physically_aborted: bool,
+    /// One top-level-xid owner token for every table/sequence lock retained by the
+    /// transaction. Subtransactions share this owner and never release its grants.
+    object_locks: Option<ObjectLockGuard>,
+    /// The SHARED checkpoint-participant guard, acquired before the first retained
+    /// object lock and held until COMMIT/ROLLBACK. It is shared with writers; only
+    /// an actual checkpoint waits for it to drain.
     write_guard: Option<WriteGuard>,
+    /// Whether the transaction performed data/sequence writes and therefore needs
+    /// WAL commit/abort settlement. Read-only transactions still retain
+    /// `write_guard` as a checkpoint participant once they acquire an object lock.
+    has_writes: bool,
     /// The Repeatable Read snapshot: captured once at the first statement and
     /// reused. `None` under Read Committed (a fresh snapshot is captured per
     /// statement).
     rr_snapshot: Option<Arc<Snapshot>>,
-    /// The relation-generation snapshot paired with `rr_snapshot`. Relation-swap
-    /// DDL such as truncate publishes new storage generations without changing
-    /// logical table ids, so Repeatable Read / Serializable must keep resolving
-    /// reads against the same relation generations for the whole transaction.
-    /// `None` under Read Committed.
-    rr_relations: Option<Arc<dyn RelationSnapshot>>,
     /// The advertisement pinning the GC horizon at the snapshot's `xmin` for the
     /// snapshot's usable lifetime (`docs/specs/mvcc.md` §9). Under Repeatable Read
     /// the one `rr_snapshot` is reusable for the whole transaction, so its
@@ -731,14 +767,183 @@ impl QueryService {
         }
     }
 
+    fn bind_with_object_requests(
+        &self,
+        statement: &Statement,
+    ) -> Result<(BoundStatement, Vec<ObjectLockRequest>)> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        let bound = planner::bind(statement, self.components.catalog.as_ref())?;
+        let requests = object_lock_requests(&bound, self.components.catalog.as_ref())?;
+        Ok((bound, requests))
+    }
+
+    fn bind_with_object_requests_and_preflight(
+        &self,
+        statement: &Statement,
+    ) -> Result<(BoundStatement, Vec<ObjectLockRequest>, bool)> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        let bound = planner::bind(statement, self.components.catalog.as_ref())?;
+        let requests = object_lock_requests(&bound, self.components.catalog.as_ref())?;
+        let noop = preflight_bound_catalog_change(&bound, self.components.catalog.as_ref())?;
+        Ok((bound, requests, noop))
+    }
+
+    fn prepared_catalog_change_is_noop(
+        &self,
+        bound: &BoundStatement,
+        schema_versions: &[PreparedRelationVersion],
+    ) -> Result<bool> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        self.validate_prepared_schema_versions_under_gate(schema_versions)?;
+        preflight_bound_catalog_change(bound, self.components.catalog.as_ref())
+    }
+
+    fn bind_and_lock_unprepared(
+        &self,
+        statement: &Statement,
+        guard: &mut ObjectLockGuard,
+        cancel: &QueryCancel,
+    ) -> Result<(BoundStatement, Vec<PreparedRelationVersion>)> {
+        let prior = guard.snapshot();
+        loop {
+            let (_, discovered) = self.bind_with_object_requests(statement)?;
+            if let Err(err) = guard.acquire_many(&discovered, cancel) {
+                guard.restore(&prior)?;
+                return Err(err);
+            }
+
+            let (bound, rebound_requests) = match self.bind_with_object_requests(statement) {
+                Ok(rebound) => rebound,
+                Err(err) => {
+                    guard.restore(&prior)?;
+                    return Err(err);
+                }
+            };
+            if rebound_requests == discovered {
+                let _catalog_read = self
+                    .components
+                    .catalog_publication_gate
+                    .read()
+                    .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+                let schema_versions =
+                    prepared_schema_versions(&bound, self.components.catalog.as_ref())?;
+                return Ok((bound, schema_versions));
+            }
+            guard.restore(&prior)?;
+        }
+    }
+
+    fn lock_prepared_bound(
+        &self,
+        bound: &BoundStatement,
+        schema_versions: &[PreparedRelationVersion],
+        guard: &mut ObjectLockGuard,
+        cancel: &QueryCancel,
+    ) -> Result<()> {
+        let requests = self.object_requests_for_bound(bound)?;
+        guard.acquire_many(&requests, cancel)?;
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        self.validate_prepared_schema_versions_under_gate(schema_versions)?;
+        let current = object_lock_requests(bound, self.components.catalog.as_ref())?;
+        if current != requests {
+            return Err(prepared_schema_changed_error());
+        }
+        Ok(())
+    }
+
+    fn object_requests_for_bound(&self, bound: &BoundStatement) -> Result<Vec<ObjectLockRequest>> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        object_lock_requests(bound, self.components.catalog.as_ref())
+    }
+
+    fn schema_versions_for_bound(
+        &self,
+        bound: &BoundStatement,
+    ) -> Result<Vec<PreparedRelationVersion>> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        prepared_schema_versions(bound, self.components.catalog.as_ref())
+    }
+
+    fn snapshot_catalog(&self) -> Result<Arc<dyn CatalogManager>> {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        Ok(Arc::new(MemoryCatalog::try_from_snapshot(
+            self.components.catalog.snapshot()?,
+        )?))
+    }
+
+    fn statement_catalog(&self, bound: &BoundStatement) -> Result<(Arc<dyn CatalogManager>, bool)> {
+        let mut references = BoundObjectReferences::default();
+        collect_bound_statement_objects(bound, &mut references)?;
+        if !references.uses_system_catalog {
+            return Ok((self.components.catalog.clone(), false));
+        }
+        Ok((self.snapshot_catalog()?, true))
+    }
+
+    fn lock_autocommit_prepared_read(
+        &self,
+        bound: &BoundStatement,
+        schema_versions: &[PreparedRelationVersion],
+        cancel: &QueryCancel,
+    ) -> Result<Option<ObjectLockGuard>> {
+        if self.object_requests_for_bound(bound)?.is_empty() {
+            self.validate_prepared_schema_versions(schema_versions)?;
+            return Ok(None);
+        }
+        let mut guard = self.components.lock_manager.statement_owner();
+        self.lock_prepared_bound(bound, schema_versions, &mut guard, cancel)?;
+        Ok(Some(guard))
+    }
+
     fn catalog_introspection_provider(
         &self,
         session_info: Arc<SessionInfo>,
     ) -> Arc<dyn CatalogIntrospectionProvider> {
         Arc::new(QueryCatalogIntrospection {
-            catalog: self.components.catalog.clone(),
+            source: QueryCatalogSource::LazySnapshot {
+                components: self.components.clone(),
+                catalog: Box::new(OnceLock::new()),
+            },
             session_info,
         })
+    }
+
+    fn catalog_introspection_provider_under_gate(
+        &self,
+        session_info: Arc<SessionInfo>,
+    ) -> Result<Arc<dyn CatalogIntrospectionProvider>> {
+        Ok(Arc::new(QueryCatalogIntrospection {
+            source: QueryCatalogSource::Fixed(self.components.catalog.clone()),
+            session_info,
+        }))
     }
 
     fn with_catalog_introspection(&self, session: QuerySessionContext) -> QuerySessionContext {
@@ -746,7 +951,10 @@ impl QueryService {
             return session;
         }
         let session_info = session.session_info.clone();
-        session.with_catalog_introspection(self.catalog_introspection_provider(session_info))
+        let mut session = session;
+        session.catalog_introspection_override =
+            Some(self.catalog_introspection_provider(session_info));
+        session
     }
 
     /// Execute a simple-protocol SQL string against the session's transaction
@@ -966,6 +1174,11 @@ impl QueryService {
             .components
             .concurrency
             .begin_shared_cancelable(cancel)?;
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
         let (bound, param_types) = bind_parameterized_with_pg_types(
             &statement,
             self.components.catalog.as_ref(),
@@ -1065,11 +1278,17 @@ impl QueryService {
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
             StatementClass::Read => {
-                let captured =
-                    self.capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())?;
                 match class {
                     StatementClass::Read => {
-                        self.validate_prepared_schema_versions(&prepared.schema_versions)?;
+                        let object_guard = self.lock_autocommit_prepared_read(
+                            &bound,
+                            &prepared.schema_versions,
+                            session.cancel().as_ref(),
+                        )?;
+                        let captured = self.capture_consistent_snapshots_cancelable(
+                            0,
+                            session.cancel().as_ref(),
+                        )?;
                         self.autocommit_read_with_snapshot(
                             bound,
                             session.statement_runtime(
@@ -1079,12 +1298,13 @@ impl QueryService {
                             ),
                             sink,
                             captured,
+                            object_guard,
                         )
                     }
                     // A read promoted to a write (e.g. `SELECT nextval(...)`) is
                     // materialized, not streamed.
                     StatementClass::Write => self
-                        .autocommit_prepared_bound_write_with_snapshot(
+                        .autocommit_prepared_bound_write(
                             bound,
                             session.statement_runtime(
                                 default_isolation,
@@ -1092,7 +1312,6 @@ impl QueryService {
                                 session.statement_timeout_ms(),
                             ),
                             Some(&prepared.schema_versions),
-                            captured,
                         )
                         .map(StreamOutcome::Durable),
                     _ => unreachable!("classify_bound only promotes reads to writes"),
@@ -1309,32 +1528,36 @@ impl QueryService {
                 let result = match prepared.class {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
-                        let captured = match self
-                            .capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())
-                        {
-                            Ok(captured) => captured,
-                            Err(err) => return (None, default_isolation, Err(err)),
-                        };
                         match class {
                             StatementClass::Read => {
-                                match self
-                                    .validate_prepared_schema_versions(&prepared.schema_versions)
-                                {
-                                    Ok(()) => self.autocommit_read_with_snapshot(
-                                        bound,
-                                        session.statement_runtime(
-                                            default_isolation,
-                                            default_isolation,
-                                            session.statement_timeout_ms(),
-                                        ),
-                                        sink,
-                                        captured,
-                                    ),
+                                match self.lock_autocommit_prepared_read(
+                                    &bound,
+                                    &prepared.schema_versions,
+                                    session.cancel().as_ref(),
+                                ) {
+                                    Ok(object_guard) => self
+                                        .capture_consistent_snapshots_cancelable(
+                                            0,
+                                            session.cancel().as_ref(),
+                                        )
+                                        .and_then(|captured| {
+                                            self.autocommit_read_with_snapshot(
+                                                bound,
+                                                session.statement_runtime(
+                                                    default_isolation,
+                                                    default_isolation,
+                                                    session.statement_timeout_ms(),
+                                                ),
+                                                sink,
+                                                captured,
+                                                object_guard,
+                                            )
+                                        }),
                                     Err(err) => Err(err),
                                 }
                             }
                             StatementClass::Write => self
-                                .autocommit_prepared_bound_write_with_snapshot(
+                                .autocommit_prepared_bound_write(
                                     bound,
                                     session.statement_runtime(
                                         default_isolation,
@@ -1342,7 +1565,6 @@ impl QueryService {
                                         session.statement_timeout_ms(),
                                     ),
                                     Some(&prepared.schema_versions),
-                                    captured,
                                 )
                                 .map(StreamOutcome::Durable),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
@@ -1457,13 +1679,24 @@ impl QueryService {
 
     pub(super) fn validate_prepared_schema_versions(
         &self,
-        schema_versions: &[(TableId, u64)],
+        schema_versions: &[PreparedRelationVersion],
     ) -> Result<()> {
-        for (relation, prepared_version) in schema_versions {
-            let current_version =
-                relation_schema_version(self.components.catalog.as_ref(), *relation)?
-                    .ok_or_else(prepared_schema_changed_error)?;
-            if current_version != *prepared_version {
+        let _catalog_read = self
+            .components
+            .catalog_publication_gate
+            .read()
+            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        self.validate_prepared_schema_versions_under_gate(schema_versions)
+    }
+
+    fn validate_prepared_schema_versions_under_gate(
+        &self,
+        schema_versions: &[PreparedRelationVersion],
+    ) -> Result<()> {
+        for (relation, prepared_version, prepared_storage) in schema_versions {
+            let current = relation_schema_identity(self.components.catalog.as_ref(), *relation)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            if current != (*prepared_version, *prepared_storage) {
                 return Err(prepared_schema_changed_error());
             }
         }
@@ -1473,49 +1706,29 @@ impl QueryService {
     pub(super) fn validate_relation_snapshot_schema_versions(
         &self,
         relations: &dyn RelationSnapshot,
-        schema_versions: &[(TableId, u64)],
+        schema_versions: &[PreparedRelationVersion],
         allow_missing_tables: bool,
     ) -> Result<()> {
-        for (table_id, bound_version) in schema_versions {
-            match relations.table_schema_version(*table_id) {
-                Some(snapshot_version) if snapshot_version == *bound_version => {}
-                None if self
-                    .components
-                    .catalog
-                    .get_view(*table_id)?
-                    .is_some_and(|view| view.schema_version == *bound_version) => {}
-                None if allow_missing_tables && relations.missing_tables_are_empty() => {}
-                _ => return Err(relation_snapshot_schema_changed_error(*table_id)),
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_current_schema_versions(
-        &self,
-        schema_versions: &[(TableId, u64)],
-    ) -> Result<()> {
-        for (table_id, bound_version) in schema_versions {
-            let current_version =
-                relation_schema_version(self.components.catalog.as_ref(), *table_id)?
-                    .ok_or_else(|| relation_snapshot_schema_changed_error(*table_id))?;
-            if current_version != *bound_version {
+        for (table_id, bound_version, bound_storage) in schema_versions {
+            if let Some(bound_storage) = bound_storage {
+                match (
+                    relations.table_schema_version(*table_id),
+                    relations.table_storage_id(*table_id),
+                ) {
+                    (Some(version), Some(storage))
+                        if version == *bound_version && storage == *bound_storage => {}
+                    (None, None)
+                        if allow_missing_tables && relations.missing_tables_are_empty() => {}
+                    _ => return Err(relation_snapshot_schema_changed_error(*table_id)),
+                }
+            } else if self
+                .components
+                .catalog
+                .get_view(*table_id)?
+                .is_none_or(|view| view.schema_version != *bound_version)
+            {
                 return Err(relation_snapshot_schema_changed_error(*table_id));
             }
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_relation_snapshot_current_for_write(
-        &self,
-        relations: &dyn RelationSnapshot,
-    ) -> Result<()> {
-        let current_epoch = self.components.storage.relation_epoch()?;
-        if relations.relation_epoch() != current_epoch {
-            return Err(DbError::execute(
-                SqlState::SerializationFailure,
-                "relation generation changed while statement snapshot was captured; retry",
-            ));
         }
         Ok(())
     }
@@ -1528,6 +1741,33 @@ fn prepared_schema_changed_error() -> DbError {
     )
 }
 
+fn preflight_bound_catalog_change(
+    bound: &BoundStatement,
+    catalog: &dyn CatalogManager,
+) -> Result<bool> {
+    match bound {
+        BoundStatement::AlterTableAddColumn {
+            table,
+            if_not_exists,
+            column,
+            ..
+        } => Ok(matches!(
+            catalog.preflight_add_table_column(*table, *if_not_exists, column)?,
+            catalog::TableColumnAlteration::Noop
+        )),
+        BoundStatement::AlterTableDropColumn {
+            table,
+            if_exists,
+            column,
+            ..
+        } => Ok(matches!(
+            catalog.preflight_drop_table_column(*table, *if_exists, column)?,
+            catalog::TableColumnAlteration::Noop
+        )),
+        _ => Ok(false),
+    }
+}
+
 fn relation_snapshot_schema_changed_error(table_id: TableId) -> DbError {
     DbError::execute(
         SqlState::SerializationFailure,
@@ -1538,44 +1778,51 @@ fn relation_snapshot_schema_changed_error(table_id: TableId) -> DbError {
 fn prepared_schema_versions(
     bound: &BoundStatement,
     catalog: &dyn catalog::CatalogManager,
-) -> Result<Vec<(TableId, u64)>> {
-    let mut relations = BTreeMap::new();
-    collect_bound_statement_tables(bound, &mut relations)?;
-    relations
+) -> Result<Vec<PreparedRelationVersion>> {
+    let mut references = BoundObjectReferences::default();
+    collect_bound_statement_objects(bound, &mut references)?;
+    augment_catalog_resolved_objects(bound, catalog, &mut references)?;
+    references
+        .relations
         .into_iter()
         .map(|(relation, bound_version)| {
-            let schema_version = match bound_version {
-                Some(schema_version) => schema_version,
-                None => relation_schema_version(catalog, relation)?
-                    .ok_or_else(prepared_schema_changed_error)?,
-            };
-            Ok((relation, schema_version))
+            if let Some(schema_version) = bound_version {
+                return Ok((relation, schema_version, None));
+            }
+            let (schema_version, storage_id) = relation_schema_identity(catalog, relation)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            Ok((relation, schema_version, storage_id))
         })
         .collect()
 }
 
-fn relation_schema_version(
+fn relation_schema_identity(
     catalog: &dyn catalog::CatalogManager,
     relation: TableId,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, Option<common::FileId>)>> {
     if let Some(table) = catalog.get_table(relation)? {
-        return Ok(Some(table.schema_version));
+        return Ok(Some((table.schema_version, Some(table.storage_id))));
     }
     if let Some(view) = catalog.get_view(relation)? {
-        return Ok(Some(view.schema_version));
+        return Ok(Some((view.schema_version, None)));
     }
     Ok(None)
 }
 
-type BoundRelationVersions = BTreeMap<TableId, Option<u64>>;
+#[derive(Default)]
+struct BoundObjectReferences {
+    relations: BTreeMap<TableId, Option<u64>>,
+    sequences: BTreeSet<SequenceId>,
+    uses_system_catalog: bool,
+}
 
 fn record_bound_relation_version(
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
     relation: TableId,
     schema_version: Option<u64>,
 ) -> Result<()> {
-    let Some(existing) = relations.get_mut(&relation) else {
-        relations.insert(relation, schema_version);
+    let Some(existing) = references.relations.get_mut(&relation) else {
+        references.relations.insert(relation, schema_version);
         return Ok(());
     };
     match (*existing, schema_version) {
@@ -1593,12 +1840,12 @@ fn record_bound_relation_version(
     }
 }
 
-fn collect_bound_statement_tables(
+fn collect_bound_statement_objects(
     bound: &BoundStatement,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     match bound {
-        BoundStatement::Query(query) => collect_query_tables(query, relations)?,
+        BoundStatement::Query(query) => collect_query_objects(query, references)?,
         BoundStatement::Insert {
             table,
             source,
@@ -1608,19 +1855,19 @@ fn collect_bound_statement_tables(
             check_exprs,
             ..
         } => {
-            record_bound_relation_version(relations, *table, None)?;
-            collect_insert_source_tables(source, relations)?;
+            record_bound_relation_version(references, *table, None)?;
+            collect_insert_source_objects(source, references)?;
             if let Some(on_conflict) = on_conflict {
-                collect_on_conflict_tables(on_conflict, relations)?;
+                collect_on_conflict_objects(on_conflict, references)?;
             }
             if let Some(returning) = returning {
-                collect_returning_tables(returning, relations)?;
+                collect_returning_objects(returning, references)?;
             }
             for (_, expr) in default_exprs {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
             for expr in check_exprs {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
         }
         BoundStatement::Update {
@@ -1631,16 +1878,16 @@ fn collect_bound_statement_tables(
             returning,
             check_exprs,
         } => {
-            record_bound_relation_version(relations, *table, None)?;
+            record_bound_relation_version(references, *table, None)?;
             for (_, expr) in assignments {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
-            collect_select_tables(source, relations)?;
+            collect_select_objects(source, references)?;
             if let Some(returning) = returning {
-                collect_returning_tables(returning, relations)?;
+                collect_returning_objects(returning, references)?;
             }
             for expr in check_exprs {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
         }
         BoundStatement::Delete {
@@ -1649,123 +1896,140 @@ fn collect_bound_statement_tables(
             joined_source: _,
             returning,
         } => {
-            record_bound_relation_version(relations, *table, None)?;
-            collect_select_tables(source, relations)?;
+            record_bound_relation_version(references, *table, None)?;
+            collect_select_objects(source, references)?;
             if let Some(returning) = returning {
-                collect_returning_tables(returning, relations)?;
+                collect_returning_objects(returning, references)?;
             }
         }
-        BoundStatement::Explain(inner) => collect_bound_statement_tables(inner, relations)?,
+        BoundStatement::Explain(inner) => collect_bound_statement_objects(inner, references)?,
         BoundStatement::AlterTableAddColumn { table, .. }
         | BoundStatement::AlterTableDropColumn { table, .. }
         | BoundStatement::AlterTableRenameColumn { table, .. }
         | BoundStatement::AlterTableRenameTable { table, .. } => {
-            record_bound_relation_version(relations, *table, None)?;
+            record_bound_relation_version(references, *table, None)?;
         }
         BoundStatement::CreateTable { .. }
-        | BoundStatement::DropTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
         | BoundStatement::DropSequence { .. }
         | BoundStatement::DropView { .. } => {}
-        BoundStatement::Copy { table, .. } => {
-            record_bound_relation_version(relations, *table, None)?;
+        BoundStatement::DropTable { targets, .. } => {
+            for target in targets {
+                if let Some(table) = target.table {
+                    record_bound_relation_version(references, table, None)?;
+                }
+            }
+        }
+        BoundStatement::Copy {
+            table,
+            default_exprs,
+            check_exprs,
+            ..
+        } => {
+            record_bound_relation_version(references, *table, None)?;
+            for (_, expr) in default_exprs {
+                collect_expr_objects(expr, references)?;
+            }
+            for expr in check_exprs {
+                collect_expr_objects(expr, references)?;
+            }
         }
         BoundStatement::CreateView {
             query,
             dependencies,
             ..
         } => {
-            collect_query_tables(query, relations)?;
+            collect_query_objects(query, references)?;
             for dependency in dependencies {
-                record_bound_relation_version(relations, dependency.relation, None)?;
+                record_bound_relation_version(references, dependency.relation, None)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_query_tables(query: &BoundQuery, relations: &mut BoundRelationVersions) -> Result<()> {
+fn collect_query_objects(query: &BoundQuery, references: &mut BoundObjectReferences) -> Result<()> {
     match &query.body {
-        BoundQueryBody::Select(select) => collect_select_tables(select, relations)?,
-        BoundQueryBody::Values(values) => collect_values_tables(values, relations)?,
+        BoundQueryBody::Select(select) => collect_select_objects(select, references)?,
+        BoundQueryBody::Values(values) => collect_values_objects(values, references)?,
         BoundQueryBody::SetOp(set_op) => {
-            collect_query_tables(&set_op.left, relations)?;
-            collect_query_tables(&set_op.right, relations)?;
+            collect_query_objects(&set_op.left, references)?;
+            collect_query_objects(&set_op.right, references)?;
         }
     }
     for order_by in &query.order_by {
-        collect_expr_tables(&order_by.expr, relations)?;
+        collect_expr_objects(&order_by.expr, references)?;
     }
     Ok(())
 }
 
-fn collect_values_tables(
+fn collect_values_objects(
     values: &BoundValues,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     for expr in values.rows.iter().flatten() {
-        collect_expr_tables(expr, relations)?;
+        collect_expr_objects(expr, references)?;
     }
     Ok(())
 }
 
-fn collect_select_tables(
+fn collect_select_objects(
     select: &BoundSelect,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     if let Some(distinct) = &select.distinct {
-        collect_distinct_tables(distinct, relations)?;
+        collect_distinct_objects(distinct, references)?;
     }
     for item in &select.columns {
-        collect_expr_tables(&item.expr, relations)?;
+        collect_expr_objects(&item.expr, references)?;
     }
     if let Some(from) = &select.from {
-        collect_from_tables(from, relations)?;
+        collect_from_objects(from, references)?;
     }
     if let Some(filter) = &select.filter {
-        collect_expr_tables(filter, relations)?;
+        collect_expr_objects(filter, references)?;
     }
     for expr in &select.group_by {
-        collect_expr_tables(expr, relations)?;
+        collect_expr_objects(expr, references)?;
     }
     if let Some(having) = &select.having {
-        collect_expr_tables(having, relations)?;
+        collect_expr_objects(having, references)?;
     }
     Ok(())
 }
 
-fn collect_distinct_tables(
+fn collect_distinct_objects(
     distinct: &BoundDistinct,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     match distinct {
         BoundDistinct::All => {}
         BoundDistinct::On(exprs) => {
             for expr in exprs {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_from_tables(from: &BoundFrom, relations: &mut BoundRelationVersions) -> Result<()> {
+fn collect_from_objects(from: &BoundFrom, references: &mut BoundObjectReferences) -> Result<()> {
     match from {
         BoundFrom::Table { table, .. } => {
-            record_bound_relation_version(relations, *table, None)?;
+            record_bound_relation_version(references, *table, None)?;
         }
-        BoundFrom::System { .. } => {}
-        BoundFrom::Derived { query, .. } => collect_query_tables(query, relations)?,
+        BoundFrom::System { .. } => references.uses_system_catalog = true,
+        BoundFrom::Derived { query, .. } => collect_query_objects(query, references)?,
         BoundFrom::View {
             view,
             schema_version,
             query,
             ..
         } => {
-            record_bound_relation_version(relations, *view, Some(*schema_version))?;
-            collect_query_tables(query, relations)?;
+            record_bound_relation_version(references, *view, Some(*schema_version))?;
+            collect_query_objects(query, references)?;
         }
         BoundFrom::Join {
             left,
@@ -1773,34 +2037,34 @@ fn collect_from_tables(from: &BoundFrom, relations: &mut BoundRelationVersions) 
             condition,
             ..
         } => {
-            collect_from_tables(left, relations)?;
-            collect_from_tables(right, relations)?;
+            collect_from_objects(left, references)?;
+            collect_from_objects(right, references)?;
             if let Some(condition) = condition {
-                collect_expr_tables(condition, relations)?;
+                collect_expr_objects(condition, references)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_insert_source_tables(
+fn collect_insert_source_objects(
     source: &BoundInsertSource,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     match source {
         BoundInsertSource::Values { rows, .. } => {
             for expr in rows.iter().flatten() {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
         }
-        BoundInsertSource::Query(query) => collect_query_tables(query, relations)?,
+        BoundInsertSource::Query(query) => collect_query_objects(query, references)?,
     }
     Ok(())
 }
 
-fn collect_on_conflict_tables(
+fn collect_on_conflict_objects(
     on_conflict: &BoundOnConflict,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     match on_conflict {
         BoundOnConflict::DoNothing { .. } => {}
@@ -1810,74 +2074,79 @@ fn collect_on_conflict_tables(
             ..
         } => {
             for (_, expr) in assignments {
-                collect_expr_tables(expr, relations)?;
+                collect_expr_objects(expr, references)?;
             }
             if let Some(filter) = filter {
-                collect_expr_tables(filter, relations)?;
+                collect_expr_objects(filter, references)?;
             }
         }
     }
     Ok(())
 }
 
-fn collect_returning_tables(
+fn collect_returning_objects(
     returning: &BoundReturning,
-    relations: &mut BoundRelationVersions,
+    references: &mut BoundObjectReferences,
 ) -> Result<()> {
     for expr in &returning.exprs {
-        collect_expr_tables(expr, relations)?;
+        collect_expr_objects(expr, references)?;
     }
     Ok(())
 }
 
-fn collect_expr_tables(expr: &BoundExpr, relations: &mut BoundRelationVersions) -> Result<()> {
+fn collect_expr_objects(expr: &BoundExpr, references: &mut BoundObjectReferences) -> Result<()> {
     match expr {
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::Nextval { .. }
-        | BoundExpr::Currval { .. }
         | BoundExpr::AggregateCall { arg: None, .. }
         | BoundExpr::LocalRef { .. }
         | BoundExpr::OuterRef { .. } => {}
+        BoundExpr::Nextval { sequence, .. } | BoundExpr::Currval { sequence, .. } => {
+            references.sequences.insert(*sequence);
+        }
         BoundExpr::BinaryOp { left, right, .. } => {
-            collect_expr_tables(left, relations)?;
-            collect_expr_tables(right, relations)?;
+            collect_expr_objects(left, references)?;
+            collect_expr_objects(right, references)?;
         }
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => collect_expr_tables(expr, relations)?,
+        | BoundExpr::Cast { expr, .. } => collect_expr_objects(expr, references)?,
         BoundExpr::Function { args, .. } => {
             for arg in args {
-                collect_expr_tables(arg, relations)?;
+                collect_expr_objects(arg, references)?;
             }
         }
         BoundExpr::Setval {
-            value, is_called, ..
+            sequence,
+            value,
+            is_called,
+            ..
         } => {
-            collect_expr_tables(value, relations)?;
+            references.sequences.insert(*sequence);
+            collect_expr_objects(value, references)?;
             if let Some(is_called) = is_called {
-                collect_expr_tables(is_called, relations)?;
+                collect_expr_objects(is_called, references)?;
             }
         }
-        BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_tables(arg, relations)?,
+        BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_objects(arg, references)?,
         BoundExpr::InList { expr, list, .. } => {
-            collect_expr_tables(expr, relations)?;
+            collect_expr_objects(expr, references)?;
             for item in list {
-                collect_expr_tables(item, relations)?;
+                collect_expr_objects(item, references)?;
             }
         }
         BoundExpr::Between {
             expr, low, high, ..
         } => {
-            collect_expr_tables(expr, relations)?;
-            collect_expr_tables(low, relations)?;
-            collect_expr_tables(high, relations)?;
+            collect_expr_objects(expr, references)?;
+            collect_expr_objects(low, references)?;
+            collect_expr_objects(high, references)?;
         }
         BoundExpr::Like { expr, pattern, .. } => {
-            collect_expr_tables(expr, relations)?;
-            collect_expr_tables(pattern, relations)?;
+            collect_expr_objects(expr, references)?;
+            collect_expr_objects(pattern, references)?;
         }
         BoundExpr::Case {
             operand,
@@ -1886,25 +2155,262 @@ fn collect_expr_tables(expr: &BoundExpr, relations: &mut BoundRelationVersions) 
             ..
         } => {
             if let Some(operand) = operand {
-                collect_expr_tables(operand, relations)?;
+                collect_expr_objects(operand, references)?;
             }
             for (when, then) in when_clauses {
-                collect_expr_tables(when, relations)?;
-                collect_expr_tables(then, relations)?;
+                collect_expr_objects(when, references)?;
+                collect_expr_objects(then, references)?;
             }
             if let Some(else_clause) = else_clause {
-                collect_expr_tables(else_clause, relations)?;
+                collect_expr_objects(else_clause, references)?;
             }
         }
         BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
-            collect_query_tables(query, relations)?;
+            collect_query_objects(query, references)?;
         }
         BoundExpr::InSubquery { expr, query, .. } => {
-            collect_expr_tables(expr, relations)?;
-            collect_query_tables(query, relations)?;
+            collect_expr_objects(expr, references)?;
+            collect_query_objects(query, references)?;
         }
     }
     Ok(())
+}
+
+fn object_lock_requests(
+    bound: &BoundStatement,
+    catalog: &dyn CatalogManager,
+) -> Result<Vec<ObjectLockRequest>> {
+    let mut references = BoundObjectReferences::default();
+    collect_bound_statement_objects(bound, &mut references)?;
+    augment_catalog_resolved_objects(bound, catalog, &mut references)?;
+
+    let mut relation_modes = references
+        .relations
+        .keys()
+        .map(|table| (*table, RelationLockMode::AccessShare))
+        .collect::<BTreeMap<_, _>>();
+    let mut upgrade_target = |table: TableId, mode: RelationLockMode| {
+        relation_modes
+            .entry(table)
+            .and_modify(|held| *held = (*held).max(mode))
+            .or_insert(mode);
+    };
+    match bound {
+        BoundStatement::Insert { table, .. }
+        | BoundStatement::Update { table, .. }
+        | BoundStatement::Delete { table, .. } => {
+            upgrade_target(*table, RelationLockMode::RowExclusive);
+        }
+        BoundStatement::Copy {
+            table, direction, ..
+        } if *direction == CopyDirection::From => {
+            upgrade_target(*table, RelationLockMode::RowExclusive);
+        }
+        BoundStatement::AlterTableAddColumn { table, .. }
+        | BoundStatement::AlterTableDropColumn { table, .. }
+        | BoundStatement::AlterTableRenameColumn { table, .. }
+        | BoundStatement::AlterTableRenameTable { table, .. } => {
+            upgrade_target(*table, RelationLockMode::AccessExclusive);
+        }
+        BoundStatement::DropTable { targets, .. } => {
+            for target in targets {
+                let table = match target.table {
+                    Some(table) => catalog.get_table(table)?,
+                    None => catalog.get_table_by_name(&target.name)?,
+                };
+                if let Some(table) = table {
+                    upgrade_target(table.id, RelationLockMode::AccessExclusive);
+                }
+            }
+        }
+        BoundStatement::CreateIndex { table, .. } => {
+            let table = catalog.get_table_by_name(table)?.ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedTable,
+                    format!("table {table} does not exist"),
+                )
+            })?;
+            upgrade_target(table.id, RelationLockMode::Share);
+        }
+        BoundStatement::DropIndex { index } => {
+            let index = catalog
+                .get_index(*index)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            upgrade_target(index.table, RelationLockMode::AccessExclusive);
+        }
+        BoundStatement::CreateView {
+            name,
+            or_replace: true,
+            ..
+        } => {
+            if let Some(view) = catalog.get_view_by_name(name)? {
+                upgrade_target(view.id, RelationLockMode::AccessExclusive);
+            }
+        }
+        BoundStatement::DropView { name, .. } => {
+            if let Some(view) = catalog.get_view_by_name(name)? {
+                upgrade_target(view.id, RelationLockMode::AccessExclusive);
+            }
+        }
+        _ => {}
+    }
+
+    if let BoundStatement::Insert { table, .. } = bound {
+        let schema = catalog
+            .get_table(*table)?
+            .ok_or_else(prepared_schema_changed_error)?;
+        for column in schema.columns {
+            if let Some(ColumnDefault::Nextval(sequence)) = column.default {
+                references.sequences.insert(sequence);
+            }
+        }
+    }
+    if let BoundStatement::Copy {
+        table_schema,
+        direction: CopyDirection::From,
+        ..
+    } = bound
+    {
+        for column in &table_schema.columns {
+            if let Some(ColumnDefault::Nextval(sequence)) = column.default {
+                references.sequences.insert(sequence);
+            }
+        }
+    }
+
+    for sequence in &references.sequences {
+        if catalog.get_sequence(*sequence)?.is_none() {
+            return Err(prepared_schema_changed_error());
+        }
+    }
+
+    let mut sequence_modes = references
+        .sequences
+        .iter()
+        .map(|sequence| (*sequence, SequenceLockMode::Access))
+        .collect::<BTreeMap<_, _>>();
+    let mut make_sequence_exclusive = |sequence: SequenceId| {
+        sequence_modes.insert(sequence, SequenceLockMode::Exclusive);
+    };
+    match bound {
+        BoundStatement::DropSequence { name, .. } => {
+            if let Some(sequence) = catalog.get_sequence_by_name(name)? {
+                make_sequence_exclusive(sequence.id);
+            }
+        }
+        BoundStatement::DropTable { targets, .. } => {
+            for target in targets {
+                let table = match target.table {
+                    Some(table) => catalog.get_table(table)?,
+                    None => catalog.get_table_by_name(&target.name)?,
+                };
+                if let Some(table) = table {
+                    for sequence in owned_sequences_for_table(catalog, &table)? {
+                        make_sequence_exclusive(sequence);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut requests = Vec::with_capacity(relation_modes.len() + sequence_modes.len());
+    requests.extend(
+        relation_modes
+            .into_iter()
+            .map(|(table, mode)| ObjectLockRequest::table(table, mode)),
+    );
+    requests.extend(
+        sequence_modes
+            .into_iter()
+            .map(|(sequence, mode)| ObjectLockRequest::sequence(sequence, mode)),
+    );
+    Ok(requests)
+}
+
+fn augment_catalog_resolved_objects(
+    bound: &BoundStatement,
+    catalog: &dyn CatalogManager,
+    references: &mut BoundObjectReferences,
+) -> Result<()> {
+    match bound {
+        BoundStatement::AlterTableAddColumn { column, .. } => match &column.default {
+            Some(ParsedDefault::Nextval(name) | ParsedDefault::OwnedNextval(name)) => {
+                let sequence = catalog.get_sequence_by_name(name)?.ok_or_else(|| {
+                    DbError::plan(
+                        SqlState::UndefinedTable,
+                        format!("sequence {name} does not exist"),
+                    )
+                })?;
+                references.sequences.insert(sequence.id);
+            }
+            Some(ParsedDefault::Expr(text)) => {
+                let expr = bind_default_expr(catalog, text)?;
+                collect_expr_objects(&expr, references)?;
+            }
+            Some(ParsedDefault::Const(_) | ParsedDefault::Serial) | None => {}
+        },
+        BoundStatement::DropTable { targets, .. } => {
+            for target in targets {
+                let table = match target.table {
+                    Some(table) => catalog.get_table(table)?,
+                    None => catalog.get_table_by_name(&target.name)?,
+                };
+                if let Some(table) = table {
+                    record_bound_relation_version(references, table.id, None)?;
+                    references
+                        .sequences
+                        .extend(owned_sequences_for_table(catalog, &table)?);
+                }
+            }
+        }
+        BoundStatement::CreateIndex { table, .. } => {
+            if let Some(table) = catalog.get_table_by_name(table)? {
+                record_bound_relation_version(references, table.id, None)?;
+            }
+        }
+        BoundStatement::DropIndex { index } => {
+            if let Some(index) = catalog.get_index(*index)? {
+                record_bound_relation_version(references, index.table, None)?;
+            }
+        }
+        BoundStatement::DropSequence { name, .. } => {
+            if let Some(sequence) = catalog.get_sequence_by_name(name)? {
+                references.sequences.insert(sequence.id);
+            }
+        }
+        BoundStatement::CreateView {
+            name,
+            or_replace: true,
+            ..
+        }
+        | BoundStatement::DropView { name, .. } => {
+            if let Some(view) = catalog.get_view_by_name(name)? {
+                record_bound_relation_version(references, view.id, Some(view.schema_version))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn owned_sequences_for_table(
+    catalog: &dyn CatalogManager,
+    table: &common::TableSchema,
+) -> Result<Vec<SequenceId>> {
+    let mut sequences = Vec::new();
+    for column in &table.columns {
+        let Some(ColumnDefault::Nextval(sequence_id)) = column.default else {
+            continue;
+        };
+        if catalog
+            .get_sequence(sequence_id)?
+            .is_some_and(|sequence| sequence.owned)
+        {
+            sequences.push(sequence_id);
+        }
+    }
+    Ok(sequences)
 }
 
 /// Abort and discard a transaction held on the session, e.g. when a client
@@ -1922,6 +2428,12 @@ pub fn slot_status(slot: &Option<Transaction>) -> SessionTxnStatus {
         Some(txn) => txn.status(),
         None => SessionTxnStatus::Idle,
     }
+}
+
+/// Whether transaction-owned runtime resources have been released even if the
+/// protocol retains a failed transaction shell after immediate deadlock abort.
+pub(crate) fn transaction_resources_released(slot: &Option<Transaction>) -> bool {
+    slot.as_ref().is_none_or(|txn| txn.physically_aborted)
 }
 
 /// Plan and execute a fully bound data statement under `ctx`.
@@ -2067,7 +2579,7 @@ enum BindSource {
     Unbound(Statement),
     Bound {
         bound: BoundStatement,
-        schema_versions: Vec<(TableId, u64)>,
+        schema_versions: Vec<PreparedRelationVersion>,
     },
 }
 
@@ -2138,7 +2650,7 @@ pub struct PreparedStatement {
     /// Table/view schema versions captured at prepare time for cached data plans.
     /// Executing the plan after any referenced relation changes shape is rejected
     /// so stale row slots and RowDescription metadata are never reused silently.
-    schema_versions: Vec<(TableId, u64)>,
+    schema_versions: Vec<PreparedRelationVersion>,
     /// The parsed maintenance statement, carried unbound for the
     /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can
     /// run it through `run_maintenance`.
@@ -2318,9 +2830,9 @@ mod tests {
         primary_key_constraint_oid, table_oid,
     };
     use common::{
-        CancelReason, CatalogIntrospectionProvider, ConcurrencyController, DbError, FlushPolicy,
-        IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, PgType,
-        QueryCancel, RelationKind, Result, RwLockConcurrencyController, SequenceId,
+        CancelReason, CatalogIntrospectionProvider, ColumnDefault, ConcurrencyController, DbError,
+        FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef,
+        PgType, QueryCancel, RelationKind, Result, RwLockConcurrencyController, SequenceId,
         SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState, TableId,
         TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
@@ -2329,12 +2841,319 @@ mod tests {
     use storage::{HeapPageStore, PageBackedStorageEngine, StorageEngine, StorageMode};
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
-    use super::{CopyInChunk, SessionTxnStatus, slot_status};
+    use super::{CopyInChunk, SessionTxnStatus, object_lock_requests, slot_status};
     use crate::app::{AppState, ServerComponents};
     use crate::checkpoint::CheckpointState;
     use crate::config::Config;
     use crate::registry::ActiveTxnRegistry;
     use crate::shutdown::ShutdownState;
+
+    #[test]
+    fn bound_dml_requests_target_sources_and_sequences_in_global_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table src (id integer primary key)",
+            "create table dst (id bigint primary key)",
+            "create sequence ids",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+        let statement = parser::parse(
+            "insert into dst (id) select nextval('ids') from src where currval('ids') > 0",
+        )
+        .unwrap();
+        let bound = planner::bind(&statement, app.components.catalog.as_ref()).unwrap();
+        let requests = object_lock_requests(&bound, app.components.catalog.as_ref()).unwrap();
+        let src = app
+            .components
+            .catalog
+            .get_table_by_name("src")
+            .unwrap()
+            .unwrap();
+        let dst = app
+            .components
+            .catalog
+            .get_table_by_name("dst")
+            .unwrap()
+            .unwrap();
+        let ids = app
+            .components
+            .catalog
+            .get_sequence_by_name("ids")
+            .unwrap()
+            .unwrap();
+        assert!(src.id < dst.id);
+
+        assert_eq!(
+            requests,
+            vec![
+                crate::lock_manager::ObjectLockRequest::table(
+                    src.id,
+                    crate::lock_manager::RelationLockMode::AccessShare,
+                ),
+                crate::lock_manager::ObjectLockRequest::table(
+                    dst.id,
+                    crate::lock_manager::RelationLockMode::RowExclusive,
+                ),
+                crate::lock_manager::ObjectLockRequest::sequence(
+                    ids.id,
+                    crate::lock_manager::SequenceLockMode::Access,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_ddl_requests_relation_and_sequence_modes() {
+        use crate::lock_manager::{ObjectLockRequest, RelationLockMode, SequenceLockMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table src (id integer primary key)",
+            "create table dst (id serial primary key, value integer)",
+            "create sequence default_ids",
+            "create index dst_value_idx on dst (value)",
+            "create view dst_view as select id from dst",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+        let catalog = app.components.catalog.as_ref();
+        let src = catalog.get_table_by_name("src").unwrap().unwrap();
+        let dst = catalog.get_table_by_name("dst").unwrap().unwrap();
+        let owned_sequence = dst
+            .columns
+            .iter()
+            .find_map(|column| match column.default {
+                Some(ColumnDefault::Nextval(sequence)) => Some(sequence),
+                _ => None,
+            })
+            .unwrap();
+        let default_ids = catalog
+            .get_sequence_by_name("default_ids")
+            .unwrap()
+            .unwrap();
+        let view = catalog.get_view_by_name("dst_view").unwrap().unwrap();
+
+        let requests = |sql: &str| {
+            let statement = parser::parse(sql).unwrap();
+            let bound = planner::bind(&statement, catalog).unwrap();
+            object_lock_requests(&bound, catalog).unwrap()
+        };
+
+        assert_eq!(
+            requests("create index another_idx on dst (value)"),
+            vec![ObjectLockRequest::table(dst.id, RelationLockMode::Share)]
+        );
+        assert_eq!(
+            requests("alter table dst rename column value to amount"),
+            vec![ObjectLockRequest::table(
+                dst.id,
+                RelationLockMode::AccessExclusive,
+            )]
+        );
+        assert_eq!(
+            requests(
+                "alter table src add column generated bigint \
+                 default nextval('default_ids') + 0",
+            ),
+            vec![
+                ObjectLockRequest::table(src.id, RelationLockMode::AccessExclusive),
+                ObjectLockRequest::sequence(default_ids.id, SequenceLockMode::Access),
+            ]
+        );
+        assert_eq!(
+            requests(
+                "alter table src add column generated_direct bigint \
+                 default nextval('default_ids')",
+            ),
+            vec![
+                ObjectLockRequest::table(src.id, RelationLockMode::AccessExclusive),
+                ObjectLockRequest::sequence(default_ids.id, SequenceLockMode::Access),
+            ]
+        );
+        assert_eq!(
+            requests("drop index dst_value_idx"),
+            vec![ObjectLockRequest::table(
+                dst.id,
+                RelationLockMode::AccessExclusive,
+            )]
+        );
+        assert_eq!(
+            requests("drop table dst"),
+            vec![
+                ObjectLockRequest::table(dst.id, RelationLockMode::AccessExclusive),
+                ObjectLockRequest::sequence(owned_sequence, SequenceLockMode::Exclusive),
+            ]
+        );
+        assert_eq!(
+            requests("drop sequence dst_id_seq"),
+            vec![ObjectLockRequest::sequence(
+                owned_sequence,
+                SequenceLockMode::Exclusive,
+            )]
+        );
+        assert_eq!(
+            requests("create or replace view dst_view as select id from src"),
+            vec![
+                ObjectLockRequest::table(src.id, RelationLockMode::AccessShare),
+                ObjectLockRequest::table(view.id, RelationLockMode::AccessExclusive),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_write_reconverges_locks_for_targets_published_after_discovery() {
+        use crate::lock_manager::{ObjectLockRequest, RelationLockMode, SequenceLockMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table source (id integer primary key)")
+            .unwrap();
+        let cancel = QueryCancel::new();
+
+        let cases = [
+            (
+                "drop table if exists late_table",
+                "create table late_table (id integer primary key)",
+            ),
+            (
+                "drop view if exists late_view",
+                "create view late_view as select id from source",
+            ),
+            (
+                "drop sequence if exists late_sequence",
+                "create sequence late_sequence",
+            ),
+        ];
+
+        for (drop_sql, create_sql) in cases {
+            let statement = parser::parse(drop_sql).unwrap();
+            let mut objects = app.components.lock_manager.statement_owner();
+            let baseline = objects.snapshot();
+            let (bound, _) = app
+                .query_service
+                .bind_and_lock_unprepared(&statement, &mut objects, &cancel)
+                .unwrap();
+            assert!(
+                object_lock_requests(&bound, app.components.catalog.as_ref())
+                    .unwrap()
+                    .is_empty()
+            );
+
+            app.query_service.execute_sql(create_sql).unwrap();
+            let gate = app
+                .query_service
+                .catalog_write_after_lock_convergence(&bound, &mut objects, &baseline, &cancel)
+                .unwrap();
+            let current = object_lock_requests(&bound, app.components.catalog.as_ref()).unwrap();
+            assert!(objects.covers(&current).unwrap());
+            drop(gate);
+
+            match drop_sql {
+                "drop table if exists late_table" => {
+                    let table = app
+                        .components
+                        .catalog
+                        .get_table_by_name("late_table")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        current,
+                        vec![ObjectLockRequest::table(
+                            table.id,
+                            RelationLockMode::AccessExclusive,
+                        )]
+                    );
+                }
+                "drop view if exists late_view" => {
+                    let view = app
+                        .components
+                        .catalog
+                        .get_view_by_name("late_view")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        current,
+                        vec![ObjectLockRequest::table(
+                            view.id,
+                            RelationLockMode::AccessExclusive,
+                        )]
+                    );
+                }
+                "drop sequence if exists late_sequence" => {
+                    let sequence = app
+                        .components
+                        .catalog
+                        .get_sequence_by_name("late_sequence")
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        current,
+                        vec![ObjectLockRequest::sequence(
+                            sequence.id,
+                            SequenceLockMode::Exclusive,
+                        )]
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn copy_from_collects_sequences_in_expression_defaults() {
+        use crate::lock_manager::{ObjectLockRequest, RelationLockMode, SequenceLockMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create sequence ids")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table copy_items (\
+                 id bigint default nextval('ids') + 0, payload text)",
+            )
+            .unwrap();
+        let catalog = app.components.catalog.as_ref();
+        let table = catalog.get_table_by_name("copy_items").unwrap().unwrap();
+        let sequence = catalog.get_sequence_by_name("ids").unwrap().unwrap();
+        let statement = parser::parse("copy copy_items (payload) from stdin").unwrap();
+        let bound = planner::bind(&statement, catalog).unwrap();
+
+        assert_eq!(
+            object_lock_requests(&bound, catalog).unwrap(),
+            vec![
+                ObjectLockRequest::table(table.id, RelationLockMode::RowExclusive),
+                ObjectLockRequest::sequence(sequence.id, SequenceLockMode::Access),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_plan_rejects_changed_storage_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("select id from t", &[])
+            .unwrap();
+
+        app.query_service.execute_sql("truncate t").unwrap();
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("reprepared"));
+    }
 
     struct TestFlushPolicy;
 
@@ -2402,6 +3221,7 @@ mod tests {
             next_txn_id: AtomicU64::new(common::ids::FIRST_NORMAL_XID),
             dead_rows_since_vacuum: AtomicU64::new(0),
             active_txns,
+            catalog_publication_gate: Arc::new(RwLock::new(())),
             relation_publish_gate: RwLock::new(()),
             lock_manager,
             ssi_manager,
@@ -3100,6 +3920,10 @@ mod tests {
             "unexpected error message: {}",
             err.message
         );
+        assert!(
+            app.components.active_txns.active_ids().is_empty(),
+            "rejected direct COPY FROM must abort its preallocated xid"
+        );
 
         let cancel = Arc::new(QueryCancel::new());
         let (slot, begin) = app
@@ -3111,6 +3935,7 @@ mod tests {
                 .execute_simple_default("copy t from stdin", slot, &cancel);
         assert_eq!(err.unwrap_err().code, SqlState::FeatureNotSupported);
         assert_eq!(slot_status(&slot), SessionTxnStatus::Failed);
+        app.query_service.abort_transaction(slot.unwrap());
     }
 
     #[test]
@@ -3192,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn autocommit_write_binds_after_acquiring_writer_guard() {
+    fn autocommit_write_discovers_before_writer_guard_then_acquires_it() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
         let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
@@ -3235,8 +4060,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            !unguarded_lookup.load(Ordering::SeqCst),
-            "catalog name resolution for a write ran before the writer guard was acquired"
+            unguarded_lookup.load(Ordering::SeqCst),
+            "initial catalog discovery should run before the writer guard"
+        );
+        assert!(
+            begin_writer_calls.load(Ordering::SeqCst) > 0,
+            "the write must acquire a shared writer guard before object locks and execution"
         );
     }
 
@@ -3309,7 +4138,7 @@ mod tests {
     }
 
     #[test]
-    fn autocommit_ddl_uses_exclusive_guard_and_dml_uses_shared_guard() {
+    fn autocommit_ddl_and_dml_use_shared_writer_guard() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
         let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
@@ -3347,13 +4176,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             begin_checkpoint_calls.load(Ordering::SeqCst),
-            1,
-            "DDL must take the exclusive guard so catalog rollback cannot race committed DDL"
+            0,
+            "only an actual checkpoint should take the exclusive guard"
         );
         assert_eq!(
             begin_writer_calls.load(Ordering::SeqCst),
-            0,
-            "DDL should not take the shared writer guard"
+            1,
+            "DDL should take the shared writer guard before object locks"
         );
 
         begin_checkpoint_calls.store(0, Ordering::SeqCst);
@@ -5635,8 +6464,10 @@ mod tests {
 
         let schema_versions =
             super::prepared_schema_versions(&bound, app.components.catalog.as_ref()).unwrap();
-        assert!(schema_versions.contains(&(original_view.id, original_view.schema_version)));
-        assert!(!schema_versions.contains(&(replaced_view.id, replaced_view.schema_version)));
+        assert!(schema_versions.contains(&(original_view.id, original_view.schema_version, None,)));
+        assert!(
+            !schema_versions.contains(&(replaced_view.id, replaced_view.schema_version, None,))
+        );
 
         let stale = app
             .query_service
@@ -5753,7 +6584,7 @@ mod tests {
             .query_service
             .execute_prepared(&prepared, &[])
             .unwrap_err();
-        assert_eq!(err.code, SqlState::UndefinedTable);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
         assert!(matches!(
             app.query_service.execute_sql("select id from users"),
             Ok(ExecutionResult::Query { .. })

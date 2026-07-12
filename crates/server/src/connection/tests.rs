@@ -675,7 +675,6 @@ async fn loopback_sql_cursor_snapshot_survives_delete_and_vacuum() {
         .write_all(&query_bytes("vacuum users"))
         .await
         .unwrap();
-    read_until_ready(&mut vacuum_client).await;
 
     cursor_client
         .write_all(&query_bytes("fetch all from c"))
@@ -692,6 +691,7 @@ async fn loopback_sql_cursor_snapshot_survives_delete_and_vacuum() {
         .await
         .unwrap();
     read_until_ready(&mut cursor_client).await;
+    read_until_ready(&mut vacuum_client).await;
     wait_for_no_advertised_snapshot(&app_for_assert).await;
 
     cursor_client.write_all(&terminate_bytes()).await.unwrap();

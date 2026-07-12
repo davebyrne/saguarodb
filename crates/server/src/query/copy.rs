@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 
 use super::stream::send_cancelable;
 use super::{
-    CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService, QuerySessionContext,
-    Transaction, TransactionSnapshots, WriteUnitGuard,
+    AutocommitCopyWrite, CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService,
+    QuerySessionContext, Transaction, TransactionSnapshots,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -57,14 +57,23 @@ impl QueryService {
                 None,
                 CopySnapshots::Autocommit {
                     snapshots,
-                    write_guard,
+                    catalog,
+                    write,
+                    object_guard,
                 },
-            ) => (
-                None,
-                self.copy_in_autocommit(job, session, snapshots, write_guard, rx),
-            ),
-            (Some(txn), CopySnapshots::Transaction(snapshots)) => {
-                self.copy_in_transaction(txn, job, session, snapshots, rx)
+            ) => {
+                let result = match (write, object_guard) {
+                    (Some(write), None) => {
+                        self.copy_in_autocommit(job, session, snapshots, catalog, write, rx)
+                    }
+                    _ => Err(DbError::internal(
+                        "autocommit COPY FROM is missing its transaction lock owner",
+                    )),
+                };
+                (None, result)
+            }
+            (Some(txn), CopySnapshots::Transaction { snapshots, catalog }) => {
+                self.copy_in_transaction(txn, job, session, snapshots, catalog, rx)
             }
             (slot, _) => (
                 slot,
@@ -83,53 +92,59 @@ impl QueryService {
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: CapturedSnapshots,
-        write_guard: Option<WriteUnitGuard>,
+        catalog: Arc<dyn catalog::CatalogManager>,
+        mut ownership: AutocommitCopyWrite,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> Result<u64> {
+        let txn_id = ownership.txn_id();
         let CapturedSnapshots {
             snapshot,
             relations,
             advertised: _advertised,
         } = snapshots;
-        let guard = match write_guard {
-            Some(guard) => guard,
-            None => WriteUnitGuard::Shared(
-                self.components
-                    .concurrency
-                    .begin_writer_cancelable(session.cancel().as_ref())?,
-            ),
-        };
-        let txn_id = self.register_active_txn();
         let gc_horizon = self.components.gc_horizon();
         // Autocommit COPY FROM: a fresh txn with no savepoints, so the live-set is
         // just `[txn_id]`.
-        let ctx = self.execution_context(ExecutionContextInput {
-            txn_id,
-            snapshot,
-            relations,
-            isolation: IsolationLevel::default(),
-            gc_horizon,
-            live_txns: Arc::from([txn_id]),
-            runtime: session.statement_runtime(
-                IsolationLevel::default(),
-                IsolationLevel::default(),
-                session.statement_timeout_ms(),
-            ),
-        })?;
+        let ctx = match self.execution_context_with_fixed_catalog(
+            ExecutionContextInput {
+                txn_id,
+                snapshot,
+                relations,
+                isolation: IsolationLevel::default(),
+                gc_horizon,
+                live_txns: Arc::from([txn_id]),
+                runtime: session.statement_runtime(
+                    IsolationLevel::default(),
+                    IsolationLevel::default(),
+                    session.statement_timeout_ms(),
+                ),
+            },
+            catalog,
+        ) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                ownership.disarm();
+                return Err(err);
+            }
+        };
 
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
         let count = match outcome {
             Ok(Ok(count)) => count,
             Ok(Err(CopyInError::Db(err))) => {
                 self.rollback_pre_durable_or_die(txn_id, None);
+                ownership.disarm();
                 return Err(err);
             }
             Ok(Err(CopyInError::Disconnected)) => {
                 self.rollback_pre_durable_or_die(txn_id, None);
+                ownership.disarm();
                 return Err(copy_disconnected_error());
             }
             Err(_) => {
                 self.rollback_pre_durable_or_die(txn_id, None);
+                ownership.disarm();
                 return Err(DbError::internal("COPY FROM execution panicked"));
             }
         };
@@ -143,6 +158,7 @@ impl QueryService {
 
         if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
             self.rollback_pre_durable_or_die(txn_id, None);
+            ownership.disarm();
             return Err(err);
         }
         if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
@@ -151,7 +167,8 @@ impl QueryService {
         self.components.active_txns.deregister(txn_id);
         // Wake any writer blocked on this committed COPY's row locks.
         self.components.lock_manager.on_txn_finished();
-        drop(guard);
+        ownership.disarm();
+        drop(ownership);
         // COPY FROM only inserts, so it produces no committed dead versions; still
         // count the commit toward the checkpoint trigger.
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
@@ -167,6 +184,7 @@ impl QueryService {
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: TransactionSnapshots,
+        catalog: Arc<dyn catalog::CatalogManager>,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
         if txn.write_guard.is_none()
@@ -185,19 +203,22 @@ impl QueryService {
         let result = (|| {
             // COPY FROM may run inside a transaction with open savepoints: stamp
             // inserts with the innermost subxid and thread the live (sub)xid set.
-            let ctx = self.execution_context(ExecutionContextInput {
-                txn_id: txn.writing_xid(),
-                snapshot,
-                relations,
-                isolation: txn.isolation,
-                gc_horizon,
-                live_txns: txn.live_txns(),
-                runtime: session.statement_runtime(
-                    txn.current_default_isolation(IsolationLevel::default()),
-                    txn.isolation,
-                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
-                ),
-            })?;
+            let ctx = self.execution_context_with_fixed_catalog(
+                ExecutionContextInput {
+                    txn_id: txn.writing_xid(),
+                    snapshot,
+                    relations,
+                    isolation: txn.isolation,
+                    gc_horizon,
+                    live_txns: txn.live_txns(),
+                    runtime: session.statement_runtime(
+                        txn.current_default_isolation(IsolationLevel::default()),
+                        txn.isolation,
+                        txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+                    ),
+                },
+                catalog,
+            )?;
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
             result
@@ -207,7 +228,11 @@ impl QueryService {
             // COPY FROM inserts produce no committed dead versions (dead_versions += 0).
             Ok(count) => (Some(txn), Ok(count)),
             Err(CopyInError::Db(err)) => {
-                txn.failed = true;
+                if err.code == SqlState::DeadlockDetected {
+                    self.abort_deadlock_victim(&mut txn);
+                } else {
+                    txn.failed = true;
+                }
                 (Some(txn), Err(err))
             }
             Err(CopyInError::Disconnected) => {
@@ -233,14 +258,16 @@ impl QueryService {
                 None,
                 CopySnapshots::Autocommit {
                     snapshots,
-                    write_guard: _write_guard,
+                    catalog,
+                    write: _write,
+                    object_guard,
                 },
             ) => (
                 None,
-                self.copy_out_autocommit(job, session, snapshots, frame_tx),
+                self.copy_out_autocommit(job, session, snapshots, catalog, object_guard, frame_tx),
             ),
-            (Some(txn), CopySnapshots::Transaction(snapshots)) => {
-                self.copy_out_transaction(txn, job, session, snapshots, frame_tx)
+            (Some(txn), CopySnapshots::Transaction { snapshots, catalog }) => {
+                self.copy_out_transaction(txn, job, session, snapshots, catalog, frame_tx)
             }
             (slot, _) => (
                 slot,
@@ -251,13 +278,16 @@ impl QueryService {
         }
     }
 
-    /// Autocommit COPY TO: a lock-free read with its own snapshot (mirrors
-    /// `autocommit_read`); the advertisement is held for the whole scan.
+    /// Autocommit COPY TO: a controller-guard-free read with statement-owned
+    /// `AccessShare` and its own snapshot; the advertisement and object lock are
+    /// held for the whole scan.
     fn copy_out_autocommit(
         &self,
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: CapturedSnapshots,
+        catalog: Arc<dyn catalog::CatalogManager>,
+        _object_guard: Option<crate::lock_manager::ObjectLockGuard>,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<u64> {
         let CapturedSnapshots {
@@ -265,19 +295,22 @@ impl QueryService {
             relations,
             advertised: _advertised,
         } = snapshots;
-        let ctx = self.execution_context(ExecutionContextInput {
-            txn_id: 0,
-            snapshot,
-            relations,
-            isolation: IsolationLevel::default(),
-            gc_horizon: 0,
-            live_txns: Arc::from([0]),
-            runtime: session.statement_runtime(
-                IsolationLevel::default(),
-                IsolationLevel::default(),
-                session.statement_timeout_ms(),
-            ),
-        })?;
+        let ctx = self.execution_context_with_fixed_catalog(
+            ExecutionContextInput {
+                txn_id: 0,
+                snapshot,
+                relations,
+                isolation: IsolationLevel::default(),
+                gc_horizon: 0,
+                live_txns: Arc::from([0]),
+                runtime: session.statement_runtime(
+                    IsolationLevel::default(),
+                    IsolationLevel::default(),
+                    session.statement_timeout_ms(),
+                ),
+            },
+            catalog,
+        )?;
         drive_copy_out(&ctx, job, frame_tx)
     }
 
@@ -289,6 +322,7 @@ impl QueryService {
         job: CopyJob,
         session: QuerySessionContext,
         snapshots: TransactionSnapshots,
+        catalog: Arc<dyn catalog::CatalogManager>,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
         let TransactionSnapshots {
@@ -300,19 +334,22 @@ impl QueryService {
         let result = (|| {
             // A read inside a savepoint transaction must see its own subxids' writes,
             // so thread the live (sub)xid set.
-            let ctx = self.execution_context(ExecutionContextInput {
-                txn_id: txn.writing_xid(),
-                snapshot,
-                relations,
-                isolation: txn.isolation,
-                gc_horizon: 0,
-                live_txns: txn.live_txns(),
-                runtime: session.statement_runtime(
-                    txn.current_default_isolation(IsolationLevel::default()),
-                    txn.isolation,
-                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
-                ),
-            })?;
+            let ctx = self.execution_context_with_fixed_catalog(
+                ExecutionContextInput {
+                    txn_id: txn.writing_xid(),
+                    snapshot,
+                    relations,
+                    isolation: txn.isolation,
+                    gc_horizon: 0,
+                    live_txns: txn.live_txns(),
+                    runtime: session.statement_runtime(
+                        txn.current_default_isolation(IsolationLevel::default()),
+                        txn.isolation,
+                        txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+                    ),
+                },
+                catalog,
+            )?;
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);
             result
@@ -321,7 +358,11 @@ impl QueryService {
         match result {
             Ok(count) => (Some(txn), Ok(count)),
             Err(err) => {
-                txn.failed = true;
+                if err.code == SqlState::DeadlockDetected {
+                    self.abort_deadlock_victim(&mut txn);
+                } else {
+                    txn.failed = true;
+                }
                 (Some(txn), Err(err))
             }
         }

@@ -215,7 +215,7 @@ async fn reader_is_not_blocked_by_in_flight_writer() {
     let mut b = Connection::connect(&server).await.unwrap();
     let read = tokio::time::timeout(Duration::from_secs(2), b.query("select id from users"))
         .await
-        .expect("a lock-free reader must not block behind the in-flight writer")
+        .expect("AccessShare must remain compatible with the in-flight writer")
         .unwrap();
     assert!(
         read.result.unwrap().unwrap_rows().is_empty(),
@@ -618,8 +618,8 @@ async fn concurrent_update_same_row_yields_one_winner_and_one_40001() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
-/// A read-only transaction stays non-blocking while a writer is open (E2b: readers
-/// are lock-free, writers share the guard): connection R opens a transaction and
+/// A read-only transaction stays non-blocking while a writer is open (E2b:
+/// `AccessShare` is compatible with `RowExclusive`): connection R opens a transaction and
 /// reads repeatedly while connection W holds an open write transaction; none of R's
 /// reads block, and R does not see W's uncommitted row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -788,11 +788,10 @@ async fn repeatable_read_holds_a_stable_snapshot_unlike_read_committed() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
-/// Relation-swap DDL publishes new storage generations under the same logical
-/// table id. Repeatable Read must therefore keep both its MVCC snapshot and its
-/// relation-generation snapshot stable for the whole transaction.
-#[tokio::test]
-async fn repeatable_read_holds_relation_generation_across_relation_swap() {
+/// Repeatable Read retains `AccessShare` on a referenced table, so relation-swap
+/// DDL cannot publish a different generation until the transaction completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeatable_read_relation_lock_blocks_relation_swap() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -805,37 +804,28 @@ async fn repeatable_read_holds_relation_generation_across_relation_swap() {
     assert_eq!(
         rr.ok("select id from users").await.rows(),
         vec![vec![Some("1".to_string())]],
-        "first RR read captures the old relation generation"
+        "first RR read acquires the retained relation lock"
     );
 
-    setup.ok("truncate table users").await;
-
-    let mut fresh = Connection::connect(&server).await.unwrap();
+    let mut truncater = Connection::connect(&server).await.unwrap();
+    let truncate_task = tokio::spawn(async move { truncater.query("truncate table users").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        fresh.ok("select id from users").await.rows().is_empty(),
-        "fresh statements use the new empty relation generation"
+        !truncate_task.is_finished(),
+        "TRUNCATE must wait for the RR transaction's retained AccessShare"
     );
     assert_eq!(
         rr.ok("select id from users").await.rows(),
         vec![vec![Some("1".to_string())]],
-        "the open RR transaction keeps reading the old relation generation"
+        "the open RR transaction continues reading while TRUNCATE waits"
     );
+    rr.ok("commit").await;
+    truncate_task.await.unwrap().unwrap().result.unwrap();
 
-    let stale_write = rr.query("insert into users (id) values (2)").await.unwrap();
-    let err = match stale_write.result {
-        Ok(_) => panic!("stale write unexpectedly succeeded"),
-        Err(err) => err,
-    };
-    assert!(
-        err.message.contains("C=40001"),
-        "unexpected stale write error: {}",
-        err.message
-    );
-    assert_eq!(stale_write.status, b'E');
-    rr.ok("rollback").await;
+    let mut fresh = Connection::connect(&server).await.unwrap();
     assert!(
         fresh.ok("select id from users").await.rows().is_empty(),
-        "the stale RR write must not mutate the new relation generation"
+        "TRUNCATE publishes the replacement after the reader releases its lock"
     );
 }
 
@@ -869,7 +859,7 @@ async fn repeatable_read_can_use_new_index_when_table_generation_is_unchanged() 
 }
 
 #[tokio::test]
-async fn repeatable_read_falls_back_when_new_index_belongs_to_newer_generation() {
+async fn repeatable_read_recaptures_a_directly_published_relation_generation() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -897,12 +887,12 @@ async fn repeatable_read_falls_back_when_new_index_belongs_to_newer_generation()
             .is_empty(),
         "fresh statements use the new empty generation"
     );
-    assert_eq!(
+    assert!(
         rr.ok("select id from users where name = 'Ada'")
             .await
-            .rows(),
-        vec![vec![Some("1".to_string())]],
-        "the RR transaction falls back to scanning its retained old generation"
+            .rows()
+            .is_empty(),
+        "RR retains its MVCC snapshot but relation generations are statement-scoped"
     );
     rr.ok("commit").await;
 }
@@ -1003,7 +993,7 @@ async fn schema_rewrite_waits_for_live_repeatable_read_snapshot() {
 }
 
 #[tokio::test]
-async fn conditional_noop_schema_alter_waits_for_live_snapshot_before_noop() {
+async fn conditional_noop_schema_alter_finishes_without_relation_lock() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -1026,23 +1016,16 @@ async fn conditional_noop_schema_alter_waits_for_live_snapshot_before_noop() {
     );
 
     let mut ddl = Connection::connect(&server).await.unwrap();
-    let add_task = tokio::spawn(async move {
-        ddl.query("alter table users add column if not exists name text")
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !add_task.is_finished(),
-        "conditional no-op ADD COLUMN still takes the schema-rewrite fence"
-    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ddl.query("alter table users add column if not exists name text"),
+    )
+    .await
+    .expect("conditional no-op ADD COLUMN must not wait for AccessExclusive")
+    .unwrap()
+    .result
+    .expect("conditional ADD COLUMN should be a no-op");
     reader.ok("rollback").await;
-    let add = tokio::time::timeout(Duration::from_secs(5), add_task)
-        .await
-        .expect("conditional ADD COLUMN should finish after the snapshot rolls back")
-        .expect("ADD COLUMN task should not panic")
-        .expect("ADD COLUMN transport should succeed");
-    add.result
-        .expect("conditional ADD COLUMN should be a no-op");
 
     reader
         .ok("start transaction isolation level repeatable read")
@@ -1056,23 +1039,16 @@ async fn conditional_noop_schema_alter_waits_for_live_snapshot_before_noop() {
     );
 
     let mut ddl = Connection::connect(&server).await.unwrap();
-    let drop_task = tokio::spawn(async move {
-        ddl.query("alter table users drop column if exists missing")
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !drop_task.is_finished(),
-        "conditional no-op DROP COLUMN still takes the schema-rewrite fence"
-    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ddl.query("alter table users drop column if exists missing"),
+    )
+    .await
+    .expect("conditional no-op DROP COLUMN must not wait for AccessExclusive")
+    .unwrap()
+    .result
+    .expect("conditional DROP COLUMN should be a no-op");
     reader.ok("rollback").await;
-    let drop = tokio::time::timeout(Duration::from_secs(5), drop_task)
-        .await
-        .expect("conditional DROP COLUMN should finish after the snapshot rolls back")
-        .expect("DROP COLUMN task should not panic")
-        .expect("DROP COLUMN transport should succeed");
-    drop.result
-        .expect("conditional DROP COLUMN should be a no-op");
 
     assert_eq!(
         setup
@@ -1202,7 +1178,7 @@ async fn schema_rewrite_fences_first_copy_from_in_transaction_before_writer_guar
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !copy_task.is_finished(),
-        "a first-write COPY must wait behind the schema-rewrite snapshot fence"
+        "a first-write COPY must wait behind the queued AccessExclusive lock"
     );
 
     blocker.ok("commit").await;
