@@ -177,6 +177,7 @@ fn select_sequences(select: &BoundSelect, scan: SequenceScan) -> bool {
 fn from_sequences(from: &BoundFrom, scan: SequenceScan) -> bool {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => false,
+        BoundFrom::TableFunction { args, .. } => args.iter().any(|expr| expr_sequences(expr, scan)),
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
             query_sequences(query, scan)
         }

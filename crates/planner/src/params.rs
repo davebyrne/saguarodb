@@ -240,6 +240,12 @@ fn collect_select(select: &BoundSelect, used: &mut Vec<Option<ParamUse>>) -> Res
 fn collect_from(from: &BoundFrom, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => Ok(()),
+        BoundFrom::TableFunction { args, .. } => {
+            for arg in args {
+                collect_expr(arg, used)?;
+            }
+            Ok(())
+        }
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
             collect_query(query, used)
         }
@@ -468,6 +474,12 @@ fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {
 fn substitute_from(from: &mut BoundFrom, params: &[Value]) -> Result<()> {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => Ok(()),
+        BoundFrom::TableFunction { args, .. } => {
+            for arg in args {
+                substitute_expr(arg, params)?;
+            }
+            Ok(())
+        }
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
             substitute_query(query, params)
         }

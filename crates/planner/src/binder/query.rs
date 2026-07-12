@@ -711,7 +711,8 @@ fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
         BoundFrom::Table { .. }
         | BoundFrom::System { .. }
         | BoundFrom::Derived { .. }
-        | BoundFrom::View { .. } => {}
+        | BoundFrom::View { .. }
+        | BoundFrom::TableFunction { .. } => {}
     }
 }
 
@@ -732,7 +733,8 @@ fn collect_from_binding_ids(from: &BoundFrom, output: &mut Vec<BindingId>) {
         BoundFrom::Table { binding, .. }
         | BoundFrom::System { binding, .. }
         | BoundFrom::Derived { binding, .. }
-        | BoundFrom::View { binding, .. } => output.push(*binding),
+        | BoundFrom::View { binding, .. }
+        | BoundFrom::TableFunction { binding, .. } => output.push(*binding),
         BoundFrom::Join { left, right, .. } => {
             collect_from_binding_ids(left, output);
             collect_from_binding_ids(right, output);
@@ -757,10 +759,21 @@ pub(super) fn bind_from_item(
             column_aliases,
             lateral,
         } => bind_derived_table(catalog, ctx, subquery, alias, column_aliases, *lateral),
-        FromItem::TableFunction { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "table functions are not yet supported by the binder",
-        )),
+        FromItem::TableFunction {
+            name,
+            args,
+            alias,
+            column_aliases,
+            with_ordinality,
+            ..
+        } => bind_table_function(
+            ctx,
+            name,
+            args,
+            alias.as_deref(),
+            column_aliases,
+            *with_ordinality,
+        ),
         FromItem::Join {
             left,
             right,
@@ -854,6 +867,102 @@ pub(super) fn bind_from_item(
             })
         }
     }
+}
+
+fn bind_table_function(
+    ctx: &mut BindContext,
+    name: &str,
+    args: &[Expr],
+    alias: Option<&str>,
+    column_aliases: &[String],
+    with_ordinality: bool,
+) -> Result<BoundFrom> {
+    if with_ordinality {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "WITH ORDINALITY is not supported",
+        ));
+    }
+    if column_aliases.len() > 1 {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "table function has only one output column",
+        ));
+    }
+    let (bound_args, data_type, nullable) = match name {
+        "unnest" => {
+            let [arg] = args else {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "UNNEST requires one array argument",
+                ));
+            };
+            let arg = super::expr::bind_expr(ctx, arg, None)?;
+            let DataType::Array(array_type) = arg.data_type() else {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    "UNNEST requires an array argument",
+                ));
+            };
+            (vec![arg], array_type.element_type().clone(), true)
+        }
+        "generate_series" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "GENERATE_SERIES requires two or three arguments",
+                ));
+            }
+            let args = args
+                .iter()
+                .map(|arg| super::expr::bind_expr(ctx, arg, Some(DataType::Integer)))
+                .collect::<Result<Vec<_>>>()?;
+            for arg in &args {
+                require_type(arg, DataType::Integer)?;
+            }
+            (args, DataType::Integer, false)
+        }
+        _ => {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                format!("table function {name} is not supported"),
+            ));
+        }
+    };
+    let visible_name = alias.unwrap_or(name).to_string();
+    let column_name = column_aliases
+        .first()
+        .cloned()
+        .unwrap_or_else(|| name.to_string());
+    let columns = vec![ColumnDef {
+        id: 0,
+        name: column_name,
+        data_type: data_type.clone(),
+        nullable,
+        max_length: None,
+        default: None,
+        pg_type: Some(PgType::from(&data_type)),
+    }];
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += 1;
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: None,
+        table_name: name.to_string(),
+        visible_name: visible_name.clone(),
+        columns: columns.clone(),
+        slot_start,
+        qualified_only: false,
+    });
+    Ok(BoundFrom::TableFunction {
+        name: name.to_string(),
+        args: bound_args,
+        binding,
+        alias: visible_name,
+        schema: columns,
+    })
 }
 
 fn bind_table_or_schema_qualified_name(

@@ -204,6 +204,7 @@ pub(crate) fn hoist_correlated_subqueries(
         plan @ (LogicalPlan::Scan { .. }
         | LogicalPlan::SystemScan { .. }
         | LogicalPlan::Values { .. }
+        | LogicalPlan::TableFunction { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTableAddColumn { .. }
@@ -859,7 +860,8 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
         | LogicalPlan::Limit { source, .. } => logical_output_width(source, catalog)?,
         LogicalPlan::Projection { output_schema, .. }
         | LogicalPlan::Aggregate { output_schema, .. }
-        | LogicalPlan::Values { output_schema, .. } => output_schema.len(),
+        | LogicalPlan::Values { output_schema, .. }
+        | LogicalPlan::TableFunction { output_schema, .. } => output_schema.len(),
         LogicalPlan::SetOp { left, .. } => logical_output_width(left, catalog)?,
         LogicalPlan::Apply { input, kind, .. } => {
             let appended = match kind {

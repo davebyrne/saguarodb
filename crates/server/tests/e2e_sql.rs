@@ -8,6 +8,65 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
+async fn e2e_unnest_and_generate_series_table_functions() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query("select value from unnest(ARRAY[1, NULL, 3]) as u(value)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".into())], vec![None], vec![Some("3".into())]]
+    );
+
+    let rows = server
+        .simple_query("select n from generate_series(3, 1, -1) as g(n)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".into())],
+            vec![Some("2".into())],
+            vec![Some("1".into())]
+        ]
+    );
+
+    let rows = server
+        .simple_query("select n from generate_series(1, 0) as g(n)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    server
+        .simple_query("create table series_inputs (id integer, values integer[])")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into series_inputs values (1, ARRAY[4, 5]), (2, ARRAY[6])")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query(
+            "select id, value from series_inputs, unnest(values) as u(value) order by id, value",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("4".into())],
+            vec![Some("1".into()), Some("5".into())],
+            vec![Some("2".into()), Some("6".into())]
+        ]
+    );
+}
+
+#[tokio::test]
 async fn e2e_array_agg_and_string_agg() {
     let server = TestServer::start().await.unwrap();
     server

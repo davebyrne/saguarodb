@@ -2231,6 +2231,11 @@ fn collect_from_objects(from: &BoundFrom, references: &mut BoundObjectReferences
         }
         BoundFrom::System { .. } => references.uses_system_catalog = true,
         BoundFrom::Derived { query, .. } => collect_query_objects(query, references)?,
+        BoundFrom::TableFunction { args, .. } => {
+            for arg in args {
+                collect_expr_objects(arg, references)?;
+            }
+        }
         BoundFrom::View {
             view,
             schema_version,

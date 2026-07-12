@@ -1375,6 +1375,12 @@ fn collect_from_dependencies(from: &BoundFrom, builder: &mut ViewDependencyBuild
     match from {
         BoundFrom::Table { table, .. } => builder.add_relation(*table),
         BoundFrom::System { .. } => {}
+        BoundFrom::TableFunction { args, .. } => {
+            let bindings = visible_relation_bindings(from);
+            for arg in args {
+                collect_expr_dependencies(arg, &bindings, builder);
+            }
+        }
         BoundFrom::Derived { query, .. } => collect_bound_query_dependencies(query, builder),
         BoundFrom::View { view, query, .. } => {
             builder.add_relation(*view);
@@ -1459,7 +1465,9 @@ fn visible_relation_bindings(from: &BoundFrom) -> Vec<DependencyBinding> {
             binding: *binding,
             relation: *view,
         }],
-        BoundFrom::System { .. } | BoundFrom::Derived { .. } => Vec::new(),
+        BoundFrom::System { .. } | BoundFrom::Derived { .. } | BoundFrom::TableFunction { .. } => {
+            Vec::new()
+        }
         BoundFrom::Join { left, right, .. } => {
             let mut bindings = visible_relation_bindings(left);
             bindings.extend(visible_relation_bindings(right));
@@ -1516,7 +1524,7 @@ fn collect_relation_bindings_with_name(
             collect_relation_bindings_with_name(left, qualifier, output);
             collect_relation_bindings_with_name(right, qualifier, output);
         }
-        BoundFrom::System { .. } | BoundFrom::Derived { .. } => {}
+        BoundFrom::System { .. } | BoundFrom::Derived { .. } | BoundFrom::TableFunction { .. } => {}
     }
 }
 

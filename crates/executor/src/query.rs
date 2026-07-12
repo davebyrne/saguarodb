@@ -20,7 +20,7 @@ use crate::eval_expr;
 use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanInput, IndexScanOp, LimitOp,
-    NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, ValuesOp,
+    NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, TableFunctionOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -630,6 +630,16 @@ pub(crate) fn build_executor<'a>(
         } => Ok(Box::new(ValuesOp::new(
             ctx.statement.clone(),
             rows.clone(),
+            output_schema.clone(),
+        ))),
+        PhysicalPlan::TableFunction {
+            name,
+            args,
+            output_schema,
+        } => Ok(Box::new(TableFunctionOp::new(
+            ctx.statement.clone(),
+            name.clone(),
+            args.clone(),
             output_schema.clone(),
         ))),
         PhysicalPlan::SetOp {

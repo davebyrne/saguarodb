@@ -141,6 +141,15 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .collect(),
             output_schema,
         },
+        LogicalPlan::TableFunction {
+            name,
+            args,
+            output_schema,
+        } => LogicalPlan::TableFunction {
+            name,
+            args: args.into_iter().map(fold_expr).collect(),
+            output_schema,
+        },
         LogicalPlan::SetOp {
             op,
             all,

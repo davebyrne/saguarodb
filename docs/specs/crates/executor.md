@@ -198,6 +198,14 @@ SSI reads and never carry `RowIdentity`, so they cannot be a DML source.
 
 ## Expression Evaluation
 
+The `TableFunctionOp` materializes one-column rows for `UNNEST` and integer
+`GENERATE_SERIES`. `UNNEST(NULL)` and a NULL series argument produce no rows;
+array NULL elements produce NULL rows. Series endpoints are inclusive, negative
+steps are supported, a direction that cannot reach the endpoint is empty, step
+zero is `InvalidParameterValue`, and output is capped by the array element guard.
+Correlated table functions are re-executed by lateral `Apply` after argument
+substitution.
+
 ```rust
 pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value>;
 ```

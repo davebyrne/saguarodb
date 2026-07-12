@@ -242,6 +242,9 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!("{padding}Values rows={}\n", rows.len()));
         }
+        PhysicalPlan::TableFunction { name, .. } => {
+            output.push_str(&format!("{padding}TableFunction name={name}\n"));
+        }
         PhysicalPlan::SetOp {
             op,
             all,

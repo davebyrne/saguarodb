@@ -204,6 +204,11 @@ pub enum PhysicalPlan {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
     },
+    TableFunction {
+        name: String,
+        args: Vec<BoundExpr>,
+        output_schema: Vec<ColumnInfo>,
+    },
     SetOp {
         op: SetOp,
         all: bool,
@@ -451,6 +456,15 @@ fn physical_plan_inner(
             rows: rows.clone(),
             output_schema: output_schema.clone(),
         }),
+        LogicalPlan::TableFunction {
+            name,
+            args,
+            output_schema,
+        } => Ok(PhysicalPlan::TableFunction {
+            name: name.clone(),
+            args: args.clone(),
+            output_schema: output_schema.clone(),
+        }),
         LogicalPlan::SetOp {
             op,
             all,
@@ -654,7 +668,8 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         }
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
-        | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),
+        | PhysicalPlan::Values { output_schema, .. }
+        | PhysicalPlan::TableFunction { output_schema, .. } => Ok(output_schema.len()),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::AlterTableAddColumn { .. }

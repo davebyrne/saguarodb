@@ -390,6 +390,13 @@ pub enum BoundFrom {
         alias: String,
         schema: Vec<ColumnDef>,
     },
+    TableFunction {
+        name: String,
+        args: Vec<BoundExpr>,
+        binding: common::BindingId,
+        alias: String,
+        schema: Vec<ColumnDef>,
+    },
     Join {
         left: Box<BoundFrom>,
         right: Box<BoundFrom>,

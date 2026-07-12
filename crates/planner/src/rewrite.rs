@@ -247,6 +247,15 @@ pub fn rewrite_plan_exprs(
                 .collect::<Result<Vec<_>>>()?,
             output_schema: output_schema.clone(),
         },
+        PhysicalPlan::TableFunction {
+            name,
+            args,
+            output_schema,
+        } => PhysicalPlan::TableFunction {
+            name: name.clone(),
+            args: rewrite_vec(args, f)?,
+            output_schema: output_schema.clone(),
+        },
         PhysicalPlan::SetOp {
             op,
             all,

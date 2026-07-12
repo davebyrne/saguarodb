@@ -566,6 +566,14 @@ recurse through every child of these nodes.
 
 ## Logical Plan
 
+`UNNEST(array)` and integer `GENERATE_SERIES(start, stop [, step])` in `FROM`
+bind as one-column table functions. Aliases and one optional column alias define
+their visible binding. `UNNEST` returns the scalar array element type and is
+nullable; `GENERATE_SERIES` returns non-null `INTEGER`. Table-function arguments
+are implicitly lateral: when placed to the right of another FROM item, logical
+planning lowers them to `Apply` correlations evaluated once per left row.
+`WITH ORDINALITY` and other table functions remain unsupported.
+
 ```rust
 pub enum LogicalPlan {
     CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },

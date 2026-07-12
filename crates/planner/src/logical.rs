@@ -175,6 +175,11 @@ pub enum LogicalPlan {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
     },
+    TableFunction {
+        name: String,
+        args: Vec<BoundExpr>,
+        output_schema: Vec<ColumnInfo>,
+    },
     /// A set operation over two sub-plans. `all` keeps duplicates; otherwise the
     /// combined result is de-duplicated. Both sides produce identically-typed rows
     /// (the binder reconciled them), so the output schema is the left side's.
@@ -625,7 +630,8 @@ fn bound_from_width(from: &BoundFrom) -> usize {
         BoundFrom::Table { schema, .. }
         | BoundFrom::System { schema, .. }
         | BoundFrom::Derived { schema, .. }
-        | BoundFrom::View { schema, .. } => schema.len(),
+        | BoundFrom::View { schema, .. }
+        | BoundFrom::TableFunction { schema, .. } => schema.len(),
         BoundFrom::Join { left, right, .. } => bound_from_width(left) + bound_from_width(right),
     }
 }
@@ -675,6 +681,31 @@ fn plan_from_at(from: &BoundFrom, offset: usize, filter: Option<BoundExpr>) -> R
             view: *view,
             filter,
         }),
+        BoundFrom::TableFunction {
+            name, args, schema, ..
+        } => {
+            let plan = LogicalPlan::TableFunction {
+                name: name.clone(),
+                args: args.clone(),
+                output_schema: schema
+                    .iter()
+                    .map(|column| ColumnInfo {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        table_id: None,
+                        column_id: None,
+                        pg_type: column.pg_type.clone(),
+                    })
+                    .collect(),
+            };
+            Ok(match filter {
+                Some(predicate) => LogicalPlan::Filter {
+                    source: Box::new(plan),
+                    predicate,
+                },
+                None => plan,
+            })
+        }
         // A derived table lowers to its inner query's plan. Its columns already
         // sit at the derived binding's slots, so an outer WHERE (the standalone
         // case) is applied as a Filter above it — it cannot be pushed into the
@@ -742,7 +773,52 @@ fn plan_from_at(from: &BoundFrom, offset: usize, filter: Option<BoundExpr>) -> R
             // (`docs/specs/subqueries.md` §7). The ON condition binds in the
             // full FROM scope, whose slots already match the combined
             // (left ++ derived) row.
-            let mut plan = if let BoundFrom::Derived {
+            let mut plan = if let BoundFrom::TableFunction {
+                name, args, schema, ..
+            } = &**right
+            {
+                let output_schema: Vec<ColumnInfo> = schema
+                    .iter()
+                    .map(|column| ColumnInfo {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        table_id: None,
+                        column_id: None,
+                        pg_type: column.pg_type.clone(),
+                    })
+                    .collect();
+                let subplan_args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, arg)| BoundExpr::OuterRef {
+                        slot,
+                        data_type: arg.data_type(),
+                        nullable: arg.nullable(),
+                    })
+                    .collect();
+                LogicalPlan::Apply {
+                    input: Box::new(plan_from_at(left, offset, None)?),
+                    subplan: Box::new(LogicalPlan::TableFunction {
+                        name: name.clone(),
+                        args: subplan_args,
+                        output_schema: output_schema.clone(),
+                    }),
+                    correlations: args
+                        .iter()
+                        .map(|arg| rebase_from_scope_expr(arg, offset))
+                        .collect::<Result<Vec<_>>>()?,
+                    kind: ApplyKind::Lateral {
+                        left_join: matches!(join_type, JoinType::Left),
+                        condition: condition
+                            .as_ref()
+                            .map(|condition| {
+                                rebase_from_scope_expr(condition, offset).map(Box::new)
+                            })
+                            .transpose()?,
+                        output_schema,
+                    },
+                }
+            } else if let BoundFrom::Derived {
                 query,
                 schema,
                 lateral: true,
