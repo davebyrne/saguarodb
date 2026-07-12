@@ -1,0 +1,680 @@
+//! ANALYZE statistics collection (`docs/specs/statistics.md` §5–§6): reservoir
+//! sampling over a snapshot-visible heap scan and the estimator math that
+//! turns a sample into [`TableStatistics`].
+//!
+//! This module is pure collection and computation. The SQL surface, target
+//! locking, and WAL/commit orchestration are Milestone D's `run_analyze`
+//! (`docs/specs/statistics.md` §5); the estimators are deterministic given a
+//! seed so tests can pin exact outputs.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use common::{
+    ColumnId, ColumnStatistics, NDistinct, OrderedF64, Result, Row, StatementContext, TableSchema,
+    TableStatistics, Value, value_is_finite,
+};
+use storage::{PageBackedStorageEngine, RelationSnapshot, StorageEngine};
+
+/// Sample size per unit of `default_statistics_target`, matching PostgreSQL's
+/// 300× rule (`docs/specs/statistics.md` §5).
+pub const SAMPLE_ROWS_PER_TARGET: u32 = 300;
+
+/// splitmix64 — a tiny deterministic PRNG, plenty for reservoir sampling and
+/// dependency-free (`docs/specs/rust-style.md` discourages dependencies for
+/// standard-library-sized helpers).
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform index in `[0, bound)` via the 128-bit multiply-shift reduction;
+    /// `bound` must be non-zero.
+    fn next_index(&mut self, bound: u64) -> u64 {
+        ((u128::from(self.next_u64()) * u128::from(bound)) >> 64) as u64
+    }
+}
+
+/// Sampled TEXT/BYTEA values wider than this are not retained: they still
+/// count toward `null_frac` (as non-null) and `avg_width`, but are excluded
+/// from the MCV list, histogram bounds, and the n_distinct estimator —
+/// PostgreSQL's `WIDTH_THRESHOLD` analog. Without it, sampling a TOASTed
+/// table of megabyte documents would hold `300 × target` fully materialized
+/// rows in memory at once.
+pub const WIDE_VALUE_THRESHOLD: u64 = 1024;
+
+/// One sampled column value, with wide payloads reduced to their width.
+#[derive(Clone, Debug, PartialEq)]
+enum SampledValue {
+    Null,
+    /// A non-null value wider than [`WIDE_VALUE_THRESHOLD`]; only its width
+    /// is retained.
+    Wide {
+        width: u64,
+    },
+    Value(Value),
+}
+
+/// One sampled row, columns in schema order.
+type SampledRow = Vec<SampledValue>;
+
+fn sampled_row(row: Row) -> SampledRow {
+    row.values
+        .into_iter()
+        .map(|value| {
+            if matches!(value, Value::Null) {
+                return SampledValue::Null;
+            }
+            let width = value_width(&value);
+            if width > WIDE_VALUE_THRESHOLD {
+                SampledValue::Wide { width }
+            } else {
+                SampledValue::Value(value)
+            }
+        })
+        .collect()
+}
+
+/// Algorithm R reservoir over scanned rows: after observing `k` rows, the
+/// sample is a uniform random subset of them (capacity permitting), and the
+/// exact count of observed rows is retained. Rows are stored width-capped
+/// (see [`WIDE_VALUE_THRESHOLD`]), bounding reservoir memory.
+pub struct RowReservoir {
+    rng: SplitMix64,
+    capacity: usize,
+    rows_seen: u64,
+    sample: Vec<SampledRow>,
+}
+
+impl RowReservoir {
+    pub fn new(capacity: usize, seed: u64) -> Self {
+        Self {
+            rng: SplitMix64::new(seed),
+            capacity,
+            rows_seen: 0,
+            sample: Vec::new(),
+        }
+    }
+
+    pub fn observe(&mut self, row: Row) {
+        self.rows_seen += 1;
+        if self.sample.len() < self.capacity {
+            self.sample.push(sampled_row(row));
+            return;
+        }
+        let slot = self.rng.next_index(self.rows_seen);
+        if (slot as usize) < self.capacity {
+            self.sample[slot as usize] = sampled_row(row);
+        }
+    }
+
+    pub fn rows_seen(&self) -> u64 {
+        self.rows_seen
+    }
+
+    fn into_sample(self) -> Vec<SampledRow> {
+        self.sample
+    }
+}
+
+/// Scan `schema`'s heap under `ctx`'s snapshot and compute its statistics:
+/// exact visible row count, heap page count, and per-column estimates from a
+/// reservoir sample of `SAMPLE_ROWS_PER_TARGET × target` rows. Deterministic
+/// given `seed`.
+///
+/// Memory stays bounded end to end: the engine's streaming
+/// `for_each_visible_row` pass materializes (and detoasts) ONE row at a time —
+/// unlike `scan`, which collects the whole table into a `Vec` before
+/// returning its iterator — and the reservoir width-caps what it retains.
+/// The engine's streaming pass checks cancellation per leaf page.
+///
+/// The output is finite by construction (`TableStatistics::is_finite`):
+/// fractions come from non-zero denominators and non-finite sampled values are
+/// excluded from MCVs and histogram bounds (§6).
+pub fn collect_table_statistics(
+    storage: &PageBackedStorageEngine,
+    relations: &dyn RelationSnapshot,
+    ctx: &StatementContext,
+    schema: &TableSchema,
+    target: u32,
+    seed: u64,
+) -> Result<TableStatistics> {
+    let capacity = (SAMPLE_ROWS_PER_TARGET.saturating_mul(target)) as usize;
+    let mut reservoir = RowReservoir::new(capacity, seed);
+    // Explicitly the trait method with the caller-supplied relation snapshot
+    // (captured under the caller's locks; the inherent helpers re-capture).
+    StorageEngine::for_each_visible_row(storage, ctx, relations, schema.id, &mut |stored| {
+        reservoir.observe(stored.row);
+        Ok(())
+    })?;
+
+    let page_count = u64::from(storage.heap_page_count(schema)?);
+    let row_count = reservoir.rows_seen();
+    let sample = reservoir.into_sample();
+    let columns = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(position, column)| {
+            (
+                column.id,
+                column_statistics(&sample, position, row_count, target),
+            )
+        })
+        .collect::<BTreeMap<ColumnId, ColumnStatistics>>();
+    Ok(TableStatistics {
+        row_count,
+        page_count,
+        columns,
+    })
+}
+
+/// Estimators for one column over the sampled rows (`docs/specs/statistics.md`
+/// §6). `total_rows` is the exact visible row count from the same scan.
+///
+/// Wide values (see [`WIDE_VALUE_THRESHOLD`]) count toward `null_frac` (as
+/// non-null) and `avg_width`, but are excluded from the MCV list, histogram,
+/// and the n_distinct estimator, which operate on the retained narrow values.
+fn column_statistics(
+    sample: &[SampledRow],
+    position: usize,
+    total_rows: u64,
+    target: u32,
+) -> ColumnStatistics {
+    let mut narrow: Vec<&Value> = Vec::new();
+    let mut non_null_count = 0u64;
+    let mut total_width = 0u64;
+    for row in sample {
+        match row.get(position) {
+            Some(SampledValue::Value(value)) => {
+                narrow.push(value);
+                non_null_count += 1;
+                total_width += value_width(value);
+            }
+            Some(SampledValue::Wide { width }) => {
+                non_null_count += 1;
+                total_width += width;
+            }
+            Some(SampledValue::Null) | None => {}
+        }
+    }
+
+    let null_frac = if sample.is_empty() {
+        0.0
+    } else {
+        (sample.len() as u64 - non_null_count) as f64 / sample.len() as f64
+    };
+
+    let avg_width = total_width.checked_div(non_null_count).unwrap_or(0) as u32;
+
+    // Sort once; every estimator below reads the (value, count) runs.
+    narrow.sort();
+    let mut runs: Vec<(&Value, usize)> = Vec::new();
+    for value in &narrow {
+        match runs.last_mut() {
+            Some((run_value, count)) if *run_value == *value => *count += 1,
+            _ => runs.push((value, 1)),
+        }
+    }
+
+    let n_distinct = estimate_n_distinct(&runs, narrow.len(), total_rows);
+
+    // MCVs: sampled values that occur more than once, most frequent first
+    // (ties broken by value order for determinism). Frequencies are overall
+    // fractions of the whole sample (nulls included), so downstream
+    // selectivity math can combine them with `null_frac` directly. Non-finite
+    // floats are excluded — the durable JSON encodings cannot round-trip them.
+    let mut candidates: Vec<(&Value, usize)> = runs
+        .iter()
+        .filter(|(value, count)| *count >= 2 && value_is_finite(value))
+        .copied()
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    candidates.truncate(target as usize);
+    let most_common: Vec<(Value, OrderedF64)> = candidates
+        .iter()
+        .map(|(value, count)| {
+            (
+                (*value).clone(),
+                OrderedF64::new(*count as f64 / sample.len() as f64),
+            )
+        })
+        .collect();
+
+    // Histogram: equi-height bounds over the finite sampled values not in the
+    // MCV list, duplicates included.
+    let mcv_values: BTreeSet<&Value> = candidates.iter().map(|(value, _)| *value).collect();
+    let mut remaining: Vec<&Value> = Vec::new();
+    for (value, count) in &runs {
+        if value_is_finite(value) && !mcv_values.contains(*value) {
+            remaining.extend(std::iter::repeat_n(*value, *count));
+        }
+    }
+    let histogram_bounds = histogram_bounds(&remaining, target);
+
+    ColumnStatistics {
+        null_frac: OrderedF64::new(null_frac),
+        avg_width,
+        n_distinct,
+        most_common,
+        histogram_bounds,
+    }
+}
+
+/// Distinct-value estimate (`docs/specs/statistics.md` §6): with sample size
+/// `n`, distinct-in-sample `d`, singletons `f1`, and total live rows `N` —
+/// no non-null values → `Count(0)`; all distinct → `Fraction(1.0)`; no
+/// singletons (the sample likely saw every value) → `Count(d)`; otherwise the
+/// Haas–Stokes estimator `D̂ = d·n / (n − f1 + f1·n/N)`, stored as a fraction
+/// of `N` when it scales with the table (> 0.1·N).
+fn estimate_n_distinct(runs: &[(&Value, usize)], n: usize, total_rows: u64) -> NDistinct {
+    let d = runs.len();
+    if n == 0 {
+        return NDistinct::Count(0);
+    }
+    if d == n {
+        return NDistinct::Fraction(OrderedF64::new(1.0));
+    }
+    let f1 = runs.iter().filter(|(_, count)| *count == 1).count();
+    if f1 == 0 {
+        return NDistinct::Count(d as u64);
+    }
+    let (n_f, d_f, f1_f) = (n as f64, d as f64, f1 as f64);
+    // total_rows >= n > 0 (both counted by the same scan), so the denominator
+    // is positive and the estimate finite.
+    let total = total_rows.max(n as u64) as f64;
+    let estimate = (d_f * n_f) / (n_f - f1_f + f1_f * n_f / total);
+    let estimate = estimate.clamp(d_f, total);
+    if estimate > 0.1 * total {
+        NDistinct::Fraction(OrderedF64::new(estimate / total))
+    } else {
+        NDistinct::Count(estimate.round() as u64)
+    }
+}
+
+/// Equi-height histogram bounds: `target + 1` evenly spaced positions over the
+/// sorted remaining values (fewer when there are fewer values), first and last
+/// included. Empty input → no histogram (the MCV list covered everything).
+fn histogram_bounds(remaining: &[&Value], target: u32) -> Vec<Value> {
+    if remaining.is_empty() {
+        return Vec::new();
+    }
+    let bound_count = (target as usize + 1).min(remaining.len());
+    if bound_count < 2 {
+        // A histogram always has at least two bounds; a single leftover value
+        // stores none (Milestone F's bucket interpolation divides by the
+        // bucket count).
+        return Vec::new();
+    }
+    let last = remaining.len() - 1;
+    (0..bound_count)
+        .map(|i| remaining[i * last / (bound_count - 1)].clone())
+        .collect()
+}
+
+/// Approximate encoded width in bytes of one non-null value. Variable-length
+/// kinds use their payload length; fixed-width kinds use their storage size.
+/// Feeds `avg_width` (informational, `pg_stats.avg_width`), not correctness.
+fn value_width(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::Boolean(_) => 1,
+        Value::Real(_) => 4,
+        Value::Integer(_)
+        | Value::Float(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Time(_)
+        | Value::TimestampTz(_) => 8,
+        Value::Numeric(_) | Value::Interval(_) | Value::Uuid(_) => 16,
+        Value::Text(text) => text.len() as u64,
+        Value::Bytes(bytes) => bytes.len() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{QueryCancel, StatementContext};
+
+    use super::*;
+    use crate::app::AppState;
+
+    fn rows_of(values: Vec<Value>) -> Vec<Row> {
+        values
+            .into_iter()
+            .map(|value| Row {
+                values: vec![value],
+            })
+            .collect()
+    }
+
+    fn integer_rows(values: impl IntoIterator<Item = i64>) -> Vec<Row> {
+        rows_of(values.into_iter().map(Value::Integer).collect())
+    }
+
+    /// Single-column sampled rows, width-capped exactly as `observe` stores
+    /// them.
+    fn sample_of(values: Vec<Value>) -> Vec<SampledRow> {
+        rows_of(values).into_iter().map(sampled_row).collect()
+    }
+
+    #[test]
+    fn reservoir_keeps_everything_under_capacity_and_counts_exactly() {
+        let mut reservoir = RowReservoir::new(10, 7);
+        for row in integer_rows(0..5) {
+            reservoir.observe(row);
+        }
+        assert_eq!(reservoir.rows_seen(), 5);
+        let sample = reservoir.into_sample();
+        let expected: Vec<SampledRow> = integer_rows(0..5).into_iter().map(sampled_row).collect();
+        assert_eq!(sample, expected);
+    }
+
+    #[test]
+    fn reservoir_is_capacity_bounded_deterministic_and_samples_the_input() {
+        let run = |seed: u64| {
+            let mut reservoir = RowReservoir::new(8, seed);
+            for row in integer_rows(0..1000) {
+                reservoir.observe(row);
+            }
+            assert_eq!(reservoir.rows_seen(), 1000);
+            reservoir.into_sample()
+        };
+        let first = run(42);
+        assert_eq!(first.len(), 8);
+        assert_eq!(first, run(42), "same seed must reproduce the same sample");
+        for row in &first {
+            let SampledValue::Value(Value::Integer(v)) = row[0] else {
+                panic!("unexpected value kind");
+            };
+            assert!((0..1000).contains(&v), "sample must come from the input");
+        }
+    }
+
+    #[test]
+    fn unique_integer_column_is_fraction_one_with_histogram_only() {
+        let sample = sample_of((0..200).map(Value::Integer).collect());
+        let stats = column_statistics(&sample, 0, 200, 10);
+        assert_eq!(stats.null_frac, OrderedF64::new(0.0));
+        assert_eq!(stats.avg_width, 8);
+        assert_eq!(stats.n_distinct, NDistinct::Fraction(OrderedF64::new(1.0)));
+        assert!(stats.most_common.is_empty(), "unique column has no MCVs");
+        assert_eq!(stats.histogram_bounds.len(), 11, "target + 1 bounds");
+        assert_eq!(stats.histogram_bounds[0], Value::Integer(0));
+        assert_eq!(stats.histogram_bounds[10], Value::Integer(199));
+    }
+
+    #[test]
+    fn skewed_text_column_yields_mcvs_and_histogram_over_the_rest() {
+        // 50× "heavy", 20× "medium", singletons "s00".."s29".
+        let mut values = vec![Value::Text("heavy".to_string()); 50];
+        values.extend(vec![Value::Text("medium".to_string()); 20]);
+        values.extend((0..30).map(|i| Value::Text(format!("s{i:02}"))));
+        let sample = sample_of(values);
+        let stats = column_statistics(&sample, 0, 100, 10);
+
+        assert_eq!(stats.most_common.len(), 2);
+        assert_eq!(stats.most_common[0].0, Value::Text("heavy".to_string()));
+        assert_eq!(stats.most_common[0].1, OrderedF64::new(0.5));
+        assert_eq!(stats.most_common[1].0, Value::Text("medium".to_string()));
+        assert_eq!(stats.most_common[1].1, OrderedF64::new(0.2));
+        assert!(
+            !stats.histogram_bounds.is_empty()
+                && !stats
+                    .histogram_bounds
+                    .contains(&Value::Text("heavy".to_string())),
+            "histogram covers the non-MCV remainder only"
+        );
+    }
+
+    #[test]
+    fn all_null_column_has_no_value_statistics() {
+        let sample = sample_of(vec![Value::Null; 40]);
+        let stats = column_statistics(&sample, 0, 40, 10);
+        assert_eq!(stats.null_frac, OrderedF64::new(1.0));
+        assert_eq!(stats.avg_width, 0);
+        assert_eq!(stats.n_distinct, NDistinct::Count(0));
+        assert!(stats.most_common.is_empty());
+        assert!(stats.histogram_bounds.is_empty());
+    }
+
+    #[test]
+    fn mostly_null_column_reports_the_null_fraction() {
+        let mut values = vec![Value::Null; 75];
+        values.extend((0..25).map(Value::Integer));
+        let stats = column_statistics(&sample_of(values), 0, 100, 10);
+        assert_eq!(stats.null_frac, OrderedF64::new(0.75));
+        assert_eq!(stats.n_distinct, NDistinct::Fraction(OrderedF64::new(1.0)));
+    }
+
+    #[test]
+    fn repeated_only_column_is_an_exact_count_with_no_histogram() {
+        // Five values, twenty occurrences each: no singletons, so the sample
+        // likely saw every distinct value.
+        let values: Vec<Value> = (0..5).flat_map(|v| vec![Value::Integer(v); 20]).collect();
+        let stats = column_statistics(&sample_of(values), 0, 100, 10);
+        assert_eq!(stats.n_distinct, NDistinct::Count(5));
+        assert_eq!(stats.most_common.len(), 5, "MCV list covers all values");
+        assert!(
+            stats.histogram_bounds.is_empty(),
+            "nothing remains outside the MCV list"
+        );
+    }
+
+    #[test]
+    fn haas_stokes_estimate_stays_between_sample_distinct_and_total() {
+        // Mixed: some repeats, some singletons, table larger than the sample.
+        let mut values: Vec<Value> = (0..20).flat_map(|v| vec![Value::Integer(v); 3]).collect();
+        values.extend((100..140).map(Value::Integer));
+        let n = values.len() as u64; // 100 sampled
+        let stats = column_statistics(&sample_of(values), 0, 10_000, 10);
+        match stats.n_distinct {
+            NDistinct::Count(count) => {
+                assert!((60..=10_000).contains(&count), "count {count} out of range");
+            }
+            NDistinct::Fraction(fraction) => {
+                let implied = fraction.get() * 10_000.0;
+                assert!(
+                    (60.0..=10_000.0).contains(&implied),
+                    "implied distinct {implied} out of range (n = {n})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_doubles_are_excluded_from_mcvs_and_histogram() {
+        let mut values = vec![Value::Float(OrderedF64::new(f64::NAN)); 30];
+        values.extend(vec![Value::Float(OrderedF64::new(f64::INFINITY)); 30]);
+        values.extend((0..40).map(|v| Value::Float(OrderedF64::new(f64::from(v)))));
+        let sample = sample_of(values);
+        let stats = column_statistics(&sample, 0, 100, 10);
+
+        assert!(
+            stats.most_common.is_empty(),
+            "the only repeated values are non-finite and must be excluded"
+        );
+        assert!(
+            stats.histogram_bounds.iter().all(value_is_finite),
+            "histogram bounds must be finite"
+        );
+        // Non-finite values still count toward n_distinct (2 of 42 distinct).
+        assert_ne!(stats.n_distinct, NDistinct::Count(40));
+        let table = TableStatistics {
+            row_count: 100,
+            page_count: 1,
+            columns: BTreeMap::from([(0, stats)]),
+        };
+        assert!(
+            table.is_finite(),
+            "collector output must always pass the durable-boundary guard"
+        );
+    }
+
+    #[test]
+    fn text_widths_average_over_non_null_values() {
+        let values = vec![
+            Value::Text("ab".to_string()),
+            Value::Text("abcd".to_string()),
+            Value::Null,
+        ];
+        let stats = column_statistics(&sample_of(values), 0, 3, 10);
+        assert_eq!(stats.avg_width, 3);
+    }
+
+    #[test]
+    fn mcv_frequency_is_a_fraction_of_the_whole_sample() {
+        // 50 NULLs + 50× 'x': the MCV frequency is the overall fraction (0.5),
+        // not the non-null fraction (1.0), so Σ mcv_freqs + null_frac ≤ 1 and
+        // the downstream equality-miss selectivity stays non-negative.
+        let mut values = vec![Value::Null; 50];
+        values.extend(vec![Value::Text("x".to_string()); 50]);
+        let stats = column_statistics(&sample_of(values), 0, 100, 10);
+        assert_eq!(stats.null_frac, OrderedF64::new(0.5));
+        assert_eq!(
+            stats.most_common,
+            vec![(Value::Text("x".to_string()), OrderedF64::new(0.5))]
+        );
+    }
+
+    #[test]
+    fn wide_values_count_for_width_and_nulls_but_not_value_statistics() {
+        let wide = "w".repeat(2048);
+        let mut values = vec![Value::Text(wide.clone()); 10];
+        values.extend((0..20).map(|i| Value::Text(format!("v{i:02}"))));
+        values.extend(vec![Value::Null; 5]);
+        let stats = column_statistics(&sample_of(values), 0, 35, 10);
+
+        assert_eq!(stats.null_frac, OrderedF64::new(5.0 / 35.0));
+        // (10 × 2048 + 20 × 3) bytes over 30 non-null values.
+        assert_eq!(stats.avg_width, ((10 * 2048 + 20 * 3) / 30) as u32);
+        assert!(
+            stats.most_common.is_empty(),
+            "the only repeated value is wide and must not be retained"
+        );
+        assert!(
+            stats.histogram_bounds.iter().all(|bound| match bound {
+                Value::Text(text) => text.len() <= WIDE_VALUE_THRESHOLD as usize,
+                _ => false,
+            }),
+            "histogram bounds come from narrow values only"
+        );
+        // n_distinct sees only the narrow values — a documented caveat shared
+        // with PostgreSQL's WIDTH_THRESHOLD.
+        assert_eq!(stats.n_distinct, NDistinct::Fraction(OrderedF64::new(1.0)));
+    }
+
+    #[test]
+    fn collects_statistics_over_a_real_table_under_mvcc_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        let mut insert = String::from("insert into users (id, name) values ");
+        for id in 0..100 {
+            if id > 0 {
+                insert.push(',');
+            }
+            // Four heavily repeated names.
+            insert.push_str(&format!("({id}, 'name{}')", id % 4));
+        }
+        app.query_service.execute_sql(&insert).unwrap();
+
+        let schema = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let relations = app.components.storage.capture_relation_snapshot().unwrap();
+        let ctx = StatementContext::new(0);
+        let stats = collect_table_statistics(
+            &app.components.storage,
+            relations.as_ref(),
+            &ctx,
+            &schema,
+            100,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(stats.row_count, 100);
+        assert!(stats.page_count >= 1);
+        let id_stats = &stats.columns[&0];
+        assert_eq!(
+            id_stats.n_distinct,
+            NDistinct::Fraction(OrderedF64::new(1.0))
+        );
+        let name_stats = &stats.columns[&1];
+        assert_eq!(name_stats.n_distinct, NDistinct::Count(4));
+        assert_eq!(name_stats.most_common.len(), 4);
+        assert!(stats.columns.values().all(|c| c.null_frac.get() == 0.0));
+
+        // Deleted rows are invisible to a later snapshot: the counts follow.
+        app.query_service
+            .execute_sql("delete from users where id >= 50")
+            .unwrap();
+        let relations = app.components.storage.capture_relation_snapshot().unwrap();
+        let stats = collect_table_statistics(
+            &app.components.storage,
+            relations.as_ref(),
+            &ctx,
+            &schema,
+            100,
+            7,
+        )
+        .unwrap();
+        assert_eq!(stats.row_count, 50);
+    }
+
+    #[test]
+    fn collection_scan_honors_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table big (id integer primary key)")
+            .unwrap();
+        let mut insert = String::from("insert into big (id) values ");
+        for id in 0..2048 {
+            if id > 0 {
+                insert.push(',');
+            }
+            insert.push_str(&format!("({id})"));
+        }
+        app.query_service.execute_sql(&insert).unwrap();
+
+        let schema = app
+            .components
+            .catalog
+            .get_table_by_name("big")
+            .unwrap()
+            .unwrap();
+        let relations = app.components.storage.capture_relation_snapshot().unwrap();
+        let mut ctx = StatementContext::new(0);
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+        cancel.request(common::CancelReason::UserRequest);
+        ctx.cancel = cancel;
+        let err = collect_table_statistics(
+            &app.components.storage,
+            relations.as_ref(),
+            &ctx,
+            &schema,
+            100,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, common::SqlState::QueryCanceled);
+    }
+}

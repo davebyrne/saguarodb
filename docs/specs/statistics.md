@@ -188,10 +188,13 @@ catalog mutations are non-transactional). Orchestration lives in
    statistics; last committed LSN wins).
 4. Capture an MVCC snapshot registered like any reader (advertising its
    `xmin`, so a concurrent VACUUM's GC horizon respects the scan).
-5. Per table: full heap scan of snapshot-visible rows, maintaining an exact
-   live row count and a **reservoir sample** (Algorithm R) of
-   `n = 300 × statistics_target` rows. Page count from the heap extent.
-   Cancellation is checked periodically; `statement_timeout` applies.
+5. Per table: full heap scan of snapshot-visible rows through the storage
+   engine's **streaming** row pass (one row materialized/detoasted at a time —
+   never the whole table), maintaining an exact live row count and a
+   **reservoir sample** (Algorithm R) of `300 × statistics_target` rows,
+   width-capped per §6's wide-value rule. Page count from the heap extent.
+   Cancellation is checked per leaf page by the streaming pass;
+   `statement_timeout` applies.
 6. Compute per-column statistics from the sample (§6).
 7. Under the catalog publication gate: append one `UpdateTableStatistics`
    record per table, update the in-memory catalog.
@@ -209,24 +212,38 @@ future optimization behind the same interface.
 
 ## 6. Estimators
 
-With sample size `n`, distinct-in-sample `d`, values appearing exactly once
-`f1`, and total live rows `N`:
+With whole-sample size `s` (all sampled rows, nulls included), retained
+non-null (narrow) sampled count `n`, distinct-in-narrow-sample `d`, narrow
+values appearing exactly once `f1`, and total live rows `N`:
 
-- `null_frac` = nulls in sample / n; `avg_width` = mean encoded width of
-  non-null sampled values.
-- `n_distinct`:
-  - every sampled value distinct (`d == n`) → `Fraction(1.0)` (unique-ish);
+- `null_frac` = nulls in sample / `s`; `avg_width` = mean approximate encoded
+  width of non-null sampled values (payload length for TEXT/BYTEA, storage
+  size for fixed-width kinds; wide values counted by width; informational
+  only).
+- **Wide values**: a non-null sampled value wider than 1 KiB (PostgreSQL's
+  `WIDTH_THRESHOLD` analog) is not retained in the sample — only its width
+  is. It counts toward `null_frac` (as non-null) and `avg_width`, but is
+  excluded from the MCV list, histogram bounds, and the n_distinct estimator.
+  This bounds ANALYZE memory on TOAST-heavy tables: without it a sample of
+  `300 × target` fully materialized megabyte documents would be held in
+  memory at once.
+- `n_distinct` (over the narrow values):
+  - no narrow sampled values (`n == 0`) → `Count(0)`;
+  - every narrow value distinct (`d == n`) → `Fraction(1.0)` (unique-ish);
   - `f1 == 0` (every value repeated — sample likely saw them all) →
     `Count(d)`;
   - otherwise the Haas–Stokes estimator
     `D̂ = d · n / (n − f1 + f1 · n / N)`; stored as `Fraction(D̂ / N)` when
     `D̂ > 0.1 × N` (scales with growth), else `Count(D̂)`.
-- **MCV list**: up to `statistics_target` sampled values that occur more than
-  once, most frequent first, each with frequency `count / n`. Skipped when the
-  column looks unique.
+- **MCV list**: up to `statistics_target` narrow sampled values that occur
+  more than once, most frequent first, each with frequency `count / s` — an
+  **overall** fraction of the whole sample (nulls included), so
+  `Σ mcv_freqs + null_frac ≤ 1` and the §9.1 equality-miss formula stays
+  non-negative. Skipped when the column looks unique.
 - **Histogram**: equi-height bounds over the sampled values not in the MCV
-  list — `statistics_target + 1` bounds from min to max. Omitted when the MCV
-  list covers every sampled distinct value.
+  list — `statistics_target + 1` bounds from min to max (fewer when fewer
+  values remain, never fewer than two — a single leftover value stores no
+  histogram). Omitted when the MCV list covers every sampled distinct value.
 - **Non-finite values**: a sampled `DOUBLE PRECISION`/`REAL` value that is NaN
   or ±Infinity is excluded from the MCV list and histogram bounds (it still
   counts toward `n_distinct` and the width/null fractions). The catalog's JSON

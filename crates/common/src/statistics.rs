@@ -77,7 +77,11 @@ impl TableStatistics {
     }
 }
 
-fn value_is_finite(value: &Value) -> bool {
+/// True unless `value` is a non-finite `DOUBLE PRECISION`/`REAL`. The ANALYZE
+/// collector uses this to exclude NaN/±Infinity sample values from MCV lists
+/// and histogram bounds (`docs/specs/statistics.md` §6) — the JSON durable
+/// encodings cannot round-trip them (see [`TableStatistics::is_finite`]).
+pub fn value_is_finite(value: &Value) -> bool {
     match value {
         Value::Float(double) => double.get().is_finite(),
         Value::Real(real) => real.get().is_finite(),

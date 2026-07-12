@@ -31,6 +31,7 @@ use crate::registry::AdvertisedSnapshot;
 use crate::session_registry::SessionRegistry;
 
 mod alter;
+pub mod analyze;
 mod copy;
 mod cursor;
 mod exec;

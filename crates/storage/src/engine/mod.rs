@@ -781,6 +781,14 @@ impl PageBackedStorageEngine {
         Ok(stream)
     }
 
+    /// Heap page count for `schema`'s current storage generation (file-size
+    /// based). ANALYZE records it as `TableStatistics.page_count`
+    /// (`docs/specs/statistics.md` §5); it feeds cost estimates, not
+    /// correctness.
+    pub fn heap_page_count(&self, schema: &TableSchema) -> Result<PageNum> {
+        self.buffer_pool.page_count(heap_file_id(schema.storage_id))
+    }
+
     fn seed_toast_next_value_id(&self, schema: &TableSchema) -> Result<u64> {
         crate::toast::ensure_toast_relation(schema)?;
         let file_id = heap_file_id(schema.storage_id);

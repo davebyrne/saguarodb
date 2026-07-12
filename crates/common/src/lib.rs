@@ -67,5 +67,5 @@ pub use schema::{
     ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name,
     toast_schema,
 };
-pub use statistics::{ColumnStatistics, NDistinct, TableStatistics};
+pub use statistics::{ColumnStatistics, NDistinct, TableStatistics, value_is_finite};
 pub use value::{Value, parse_bool_text};

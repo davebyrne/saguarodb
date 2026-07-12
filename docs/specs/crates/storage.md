@@ -1393,6 +1393,11 @@ impl PageBackedStorageEngine {
     /// PageLSN (torn-page repair, like VACUUM). Returns the number of pages
     /// touched.
     pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<RewriteTablePages>;
+    /// Heap page count for `schema`'s current storage generation (file-size
+    /// based). ANALYZE records it as `TableStatistics.page_count`
+    /// (`docs/specs/statistics.md` §5); it feeds cost estimates, not
+    /// correctness.
+    pub fn heap_page_count(&self, schema: &TableSchema) -> Result<PageNum>;
 }
 ```
 
