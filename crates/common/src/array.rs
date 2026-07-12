@@ -22,7 +22,7 @@ pub fn parse_array_text_structure(
     };
     parser.whitespace();
     let bounds = parser.bounds()?;
-    let node = parser.list()?;
+    let node = parser.list(0)?;
     parser.whitespace();
     if parser.offset != parser.bytes.len() {
         return Err(invalid_array("array text has trailing input"));
@@ -31,6 +31,18 @@ pub fn parse_array_text_structure(
     validate_text_shape(&node, 0, &mut lengths)?;
     let mut tokens = Vec::new();
     flatten_text_node(node, &mut tokens);
+    if tokens.is_empty() {
+        if lengths != [0] {
+            return Err(invalid_array(
+                "empty array text must have one empty brace level",
+            ));
+        }
+        if !bounds.is_empty()
+            && (bounds.len() != 1 || i64::from(bounds[0].1) - i64::from(bounds[0].0) + 1 != 0)
+        {
+            return Err(invalid_array("array bounds do not match empty contents"));
+        }
+    }
     if !bounds.is_empty() && bounds.len() != lengths.len() {
         return Err(invalid_array("array bounds do not match dimensionality"));
     }
@@ -69,13 +81,20 @@ impl ArrayTextParser<'_> {
     fn bounds(&mut self) -> Result<Vec<(i32, i32)>> {
         let mut bounds = Vec::new();
         while self.bytes.get(self.offset) == Some(&b'[') {
+            if bounds.len() >= MAX_ARRAY_DIMENSIONS {
+                return Err(invalid_array("array text has too many dimensions"));
+            }
             self.offset += 1;
+            self.whitespace();
             let lower = self.integer()?;
+            self.whitespace();
             if self.bytes.get(self.offset) != Some(&b':') {
                 return Err(invalid_array("invalid array bounds"));
             }
             self.offset += 1;
+            self.whitespace();
             let upper = self.integer()?;
+            self.whitespace();
             if self.bytes.get(self.offset) != Some(&b']') {
                 return Err(invalid_array("invalid array bounds"));
             }
@@ -83,10 +102,12 @@ impl ArrayTextParser<'_> {
             bounds.push((lower, upper));
         }
         if !bounds.is_empty() {
+            self.whitespace();
             if self.bytes.get(self.offset) != Some(&b'=') {
                 return Err(invalid_array("array bounds must be followed by '='"));
             }
             self.offset += 1;
+            self.whitespace();
         }
         Ok(bounds)
     }
@@ -118,22 +139,26 @@ impl ArrayTextParser<'_> {
         }
     }
 
-    fn list(&mut self) -> Result<ArrayTextNode> {
+    fn list(&mut self, depth: usize) -> Result<ArrayTextNode> {
+        if depth >= MAX_ARRAY_DIMENSIONS {
+            return Err(invalid_array("array text has too many dimensions"));
+        }
         self.whitespace();
         if self.bytes.get(self.offset) != Some(&b'{') {
             return Err(invalid_array("array text must start with '{'"));
         }
         self.offset += 1;
+        let before_whitespace = self.offset;
         self.whitespace();
         let mut items = Vec::new();
-        if self.bytes.get(self.offset) == Some(&b'}') {
+        if self.bytes.get(self.offset) == Some(&b'}') && self.offset == before_whitespace {
             self.offset += 1;
             return Ok(ArrayTextNode::List(items));
         }
         loop {
             self.whitespace();
             let item = if self.bytes.get(self.offset) == Some(&b'{') {
-                self.list()?
+                self.list(depth + 1)?
             } else {
                 self.element()?
             };
@@ -181,6 +206,11 @@ impl ArrayTextParser<'_> {
             if !quoted && matches!(byte, b',' | b'}') {
                 break;
             }
+            if !quoted && matches!(byte, b'"' | b'{') {
+                return Err(invalid_array(
+                    "array element contains an unescaped special character",
+                ));
+            }
             value.push(byte);
             self.offset += 1;
         }
@@ -191,6 +221,9 @@ impl ArrayTextParser<'_> {
         } else {
             text.trim().to_string()
         };
+        if !quoted && text.is_empty() {
+            return Err(invalid_array("array element must not be empty"));
+        }
         Ok(ArrayTextNode::Element(
             if !quoted && text.eq_ignore_ascii_case("NULL") {
                 None
@@ -516,6 +549,27 @@ mod tests {
             ]
         );
         assert!(parse_array_text_structure("{{1},{2,3}}").is_err());
+    }
+
+    #[test]
+    fn array_text_parser_rejects_excess_dimensions_and_malformed_empty_tokens() {
+        for text in [
+            "{{{{{{{1}}}}}}}",
+            "[1:1][1:1][1:1][1:1][1:1][1:1][1:1]={{{{{{{1}}}}}}}",
+            "{,}",
+            "{1,}",
+            "{ }",
+            "{a\"b}",
+            "{a{b}",
+            "{{}}",
+            "[1:2]={}",
+        ] {
+            assert!(
+                parse_array_text_structure(text).is_err(),
+                "accepted malformed array text: {text}"
+            );
+        }
+        assert!(parse_array_text_structure("[ 1 : 0 ] = {}").is_ok());
     }
 
     #[test]
