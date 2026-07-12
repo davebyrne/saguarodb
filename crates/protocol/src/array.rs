@@ -114,6 +114,7 @@ fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
         } else {
             let len = usize::try_from(len)
                 .map_err(|_| array_error("binary array element length is negative"))?;
+            validate_binary_element_width(element_type, len)?;
             elements.push(crate::codec::decode_value_with_type(
                 cursor.take(len)?,
                 element_type,
@@ -230,6 +231,11 @@ fn decode_text(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
                 "empty array text must have one empty brace level",
             ));
         }
+        if !bounds.is_empty()
+            && (bounds.len() != 1 || i64::from(bounds[0].1) - i64::from(bounds[0].0) + 1 != 0)
+        {
+            return Err(array_error("array bounds do not match empty contents"));
+        }
         return SqlArray::empty(element_type.data_type())
             .map_err(|error| array_error(error.message));
     }
@@ -254,7 +260,14 @@ fn decode_text(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
         .into_iter()
         .map(|token| match token {
             None => Ok(Value::Null),
-            Some(token) => crate::codec::decode_value_with_type(token.as_bytes(), element_type, 0),
+            Some(token) => crate::codec::decode_value_with_type(token.as_bytes(), element_type, 0)
+                .map_err(|error| {
+                    if error.code == SqlState::SyntaxError {
+                        array_error(error.message)
+                    } else {
+                        error
+                    }
+                }),
         })
         .collect::<Result<Vec<_>>>()?;
     SqlArray::new(element_type.data_type(), dimensions, elements)
@@ -514,6 +527,23 @@ fn array_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::InvalidTextRepresentation, message)
 }
 
+fn validate_binary_element_width(element_type: &PgType, len: usize) -> Result<()> {
+    let expected = match element_type {
+        PgType::Int2 => Some(2),
+        PgType::Int4 | PgType::Oid => Some(4),
+        PgType::Int8 => Some(8),
+        _ => None,
+    };
+    if expected.is_some_and(|expected| expected != len) {
+        Err(array_error(format!(
+            "binary {} array element has invalid length {len}",
+            element_type.format_type_name()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use common::{ArrayDimension, DataType, PgType, SqlArray, SqlState, Value};
@@ -583,6 +613,19 @@ mod tests {
         let mut trailing = encoded;
         trailing.push(0);
         assert!(decode(&trailing, &PgType::Int4, true).is_err());
+
+        let int8 = SqlArray::new(
+            DataType::Integer,
+            vec![ArrayDimension::new(1, 1)],
+            vec![Value::Integer(i64::from(i32::MAX) + 1)],
+        )
+        .unwrap();
+        let mut wrong_width = encode(&int8, &PgType::Int8, true).unwrap();
+        wrong_width[8..12].copy_from_slice(&23_i32.to_be_bytes());
+        assert_eq!(
+            decode(&wrong_width, &PgType::Int4, true).unwrap_err().code,
+            SqlState::InvalidBinaryRepresentation
+        );
     }
 
     #[test]
@@ -595,6 +638,14 @@ mod tests {
         );
         assert!(decode(b"{{{{{{{1}}}}}}}", &PgType::Int4, false).is_err());
         assert!(decode(b"{{}}", &PgType::Int4, false).is_err());
+        assert!(decode(b"[1:2]={}", &PgType::Int4, false).is_err());
+        assert!(decode(b"[1:0]={}", &PgType::Int4, false).is_ok());
+        assert_eq!(
+            decode(b"{not-an-int}", &PgType::Int4, false)
+                .unwrap_err()
+                .code,
+            SqlState::InvalidTextRepresentation
+        );
     }
 
     #[test]
