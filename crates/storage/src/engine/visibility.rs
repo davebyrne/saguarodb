@@ -135,6 +135,10 @@ impl PageBackedStorageEngine {
             DecodedPhysicalValue::Value(Value::Bytes(bytes)) => {
                 Ok(copy_bounded_sample(bytes, remaining))
             }
+            DecodedPhysicalValue::Value(Value::Array(array)) => {
+                let raw = crate::codec::encode_array_payload(array)?;
+                Ok(copy_bounded_sample(&raw, remaining))
+            }
             DecodedPhysicalValue::Value(_) => Ok(None),
             DecodedPhysicalValue::Compressed {
                 column: physical_column,
@@ -162,7 +166,7 @@ impl PageBackedStorageEngine {
                     payload,
                 )?;
                 debug_assert_eq!(raw.len(), sample_len);
-                validate_toast_sample_raw(data_type, &raw)?;
+                validate_toast_sample_raw(&data_type, &raw)?;
                 Ok(Some(raw))
             }
             DecodedPhysicalValue::External {
@@ -193,7 +197,7 @@ impl PageBackedStorageEngine {
                     payload,
                 )?;
                 debug_assert_eq!(raw.len(), sample_len);
-                validate_toast_sample_raw(data_type, &raw)?;
+                validate_toast_sample_raw(&data_type, &raw)?;
                 Ok(Some(raw))
             }
         }
@@ -524,12 +528,23 @@ impl PageBackedStorageEngine {
     }
 }
 
-fn validate_toast_sample_raw(data_type: DataType, raw: &[u8]) -> Result<()> {
+fn validate_toast_sample_raw(data_type: &DataType, raw: &[u8]) -> Result<()> {
     match data_type {
         DataType::Text => std::str::from_utf8(raw)
             .map(|_| ())
             .map_err(|_| crate::toast::toast_corruption("TOAST text value is not valid UTF-8")),
         DataType::Bytea => Ok(()),
-        _ => unreachable!("validate_toast_sample_column returns only TEXT or BYTEA"),
+        DataType::Array(element_type) => {
+            let array = crate::codec::decode_array_payload(raw)?;
+            if array.element_type() != element_type.element_type() {
+                return Err(crate::toast::toast_corruption(
+                    "TOAST sample array element type does not match its column",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(crate::toast::toast_corruption(
+            "TOAST sample references a non-varlena column",
+        )),
     }
 }

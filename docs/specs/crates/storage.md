@@ -1222,7 +1222,10 @@ into `write_page`'s encode step and `load_page`'s decode step.
   abandoned fresh-page hole is skipped without being faulted in. Foreground
   compression ALTER polls the statement token at each sampled page.
 - **`sample_toast_values(ctx, schema, max_samples, max_bytes)`.** Returns
-  bounded logical `TEXT`/`BYTEA` samples for TOAST value-dictionary training.
+  bounded logical `TEXT`/`BYTEA`/array-payload samples for TOAST value-dictionary
+  training. Array samples retain the versioned durable payload and are decoded
+  and element-type checked before admission, regardless of whether the stored
+  value was plain, inline-compressed, or external.
   It walks heap pages directly instead of calling the public scan iterator so
   `max_samples`/`max_bytes` bound memory on large tables. Each tuple's MVCC header
   is decoded first and filtered through the normal visibility predicate using `ctx`;

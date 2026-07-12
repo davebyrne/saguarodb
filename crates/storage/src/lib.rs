@@ -41,7 +41,7 @@ mod tests {
         codec::{
             DecodedPhysicalValue, HEAP_ONLY, HOT_UPDATED, MvccHeader, PreparedColumnValue,
             ToastPointer, V2_MVCC_HEADER_LEN, VarlenaPhysical, decode_physical_row,
-            encode_row_v3_prepared, null_bitmap_len,
+            encode_array_payload, encode_row_v3_prepared, null_bitmap_len,
         },
         decode_row, encode_row,
         engine::RowLocation,
@@ -2219,7 +2219,18 @@ mod tests {
             DecodedPhysicalValue::External { .. }
         ));
         seed_parent_tuple(&harness, &ctx, &base, &bytes, &pk(1));
+        let expected_sample = match &row.values[1] {
+            Value::Array(array) => encode_array_payload(array).unwrap(),
+            _ => unreachable!(),
+        };
         assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+        assert_eq!(
+            harness
+                .storage
+                .sample_toast_values(&ctx, &base, 1, 100_000)
+                .unwrap(),
+            vec![expected_sample]
+        );
     }
 
     #[test]
@@ -2242,7 +2253,18 @@ mod tests {
             DecodedPhysicalValue::Compressed { .. }
         ));
         seed_parent_tuple(&harness, &ctx, &base, &bytes, &pk(1));
+        let expected_sample = match &row.values[1] {
+            Value::Array(array) => encode_array_payload(array).unwrap(),
+            _ => unreachable!(),
+        };
         assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+        assert_eq!(
+            harness
+                .storage
+                .sample_toast_values(&ctx, &base, 1, 100_000)
+                .unwrap(),
+            vec![expected_sample]
+        );
     }
 
     #[test]
