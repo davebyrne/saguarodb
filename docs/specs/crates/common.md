@@ -160,8 +160,10 @@ pub enum DataType {
     Double,
     Real,
     Numeric { precision: Option<u32>, scale: u32 },
-    Array(Box<DataType>),
+    Array(ArrayType),
 }
+
+// Constructed with ArrayType::new(scalar); inspected with element_type().
 
 pub enum ToastMode {
     Off,

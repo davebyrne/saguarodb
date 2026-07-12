@@ -72,6 +72,14 @@ impl SqlArray {
                 "a non-empty array must have at least one dimension",
             ));
         }
+        for dimension in &dimensions {
+            let len = i32::try_from(dimension.len)
+                .map_err(|_| invalid_array("array dimension length exceeds signed int32"))?;
+            dimension
+                .lower_bound
+                .checked_add(len - 1)
+                .ok_or_else(|| invalid_array("array dimension upper bound exceeds signed int32"))?;
+        }
         let cardinality = dimensions.iter().try_fold(1_usize, |product, dimension| {
             let len = usize::try_from(dimension.len)
                 .map_err(|_| invalid_array("array dimension length does not fit this platform"))?;
@@ -277,6 +285,22 @@ mod tests {
                 DataType::Integer,
                 vec![ArrayDimension::new(1, 1)],
                 vec![Value::Text("wrong".to_string())],
+            )
+            .is_err()
+        );
+        assert!(
+            SqlArray::new(
+                DataType::Integer,
+                vec![ArrayDimension::new(2, i32::MAX)],
+                vec![Value::Integer(1), Value::Integer(2)],
+            )
+            .is_err()
+        );
+        assert!(
+            SqlArray::new(
+                DataType::Integer,
+                vec![ArrayDimension::new(i32::MAX as u32 + 1, 1)],
+                vec![Value::Integer(1)],
             )
             .is_err()
         );
