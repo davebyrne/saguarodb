@@ -586,6 +586,7 @@ fn hidden_toast_chunk_count(server: &TestServer, table: &str) -> usize {
 fn legacy_schema_without_toast() -> TableSchema {
     TableSchema {
         id: 50,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 50,
         name: "legacy_docs".to_string(),
         columns: vec![

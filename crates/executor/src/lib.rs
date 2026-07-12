@@ -1014,6 +1014,7 @@ mod tests {
     fn insert_row_does_not_evaluate_default_for_explicit_column() {
         let schema = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "t".to_string(),
             columns: vec![ColumnDef {
@@ -1061,6 +1062,7 @@ mod tests {
             .with_session_sequences(session_sequences.clone());
         let schema = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "t".to_string(),
             columns: vec![ColumnDef {

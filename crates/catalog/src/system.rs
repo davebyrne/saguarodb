@@ -16,6 +16,7 @@ const USER_SEQUENCE_OID_TAG: i64 = 3_i64 << VIRTUAL_OID_TAG_SHIFT;
 const SYNTHETIC_PRIMARY_KEY_OID_TAG: i64 = 4_i64 << VIRTUAL_OID_TAG_SHIFT;
 const CONSTRAINT_OID_TAG: i64 = 5_i64 << VIRTUAL_OID_TAG_SHIFT;
 const ATTRDEF_OID_TAG: i64 = 6_i64 << VIRTUAL_OID_TAG_SHIFT;
+const USER_SCHEMA_OID_TAG: i64 = 7_i64 << VIRTUAL_OID_TAG_SHIFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SystemSchema {
@@ -480,6 +481,10 @@ pub fn index_oid(index_id: u32) -> i64 {
 
 pub fn sequence_oid(sequence_id: u32) -> i64 {
     USER_SEQUENCE_OID_TAG | oid_payload(sequence_id)
+}
+
+pub fn schema_oid(schema_id: u32) -> i64 {
+    USER_SCHEMA_OID_TAG | oid_payload(schema_id)
 }
 
 pub fn synthetic_primary_key_oid(table_id: u32) -> i64 {

@@ -533,6 +533,7 @@ impl QueryService {
                 }
                 let index = IndexSchema {
                     id: catalog_snapshot.next_index_id,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: catalog_snapshot.next_storage_id,
                     table: schema.id,
                     name: index_name,

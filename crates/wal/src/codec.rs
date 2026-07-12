@@ -38,7 +38,8 @@ pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
 pub(crate) const TYPE_CREATE_VIEW: u8 = 25;
 pub(crate) const TYPE_REPLACE_VIEW: u8 = 26;
 pub(crate) const TYPE_DROP_VIEW: u8 = 27;
-pub(crate) const TYPE_UPDATE_TABLE_STATISTICS: u8 = 28;
+pub(crate) const TYPE_CREATE_SCHEMA: u8 = 28;
+pub(crate) const TYPE_DROP_SCHEMA: u8 = 29;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -166,6 +167,8 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::CreateView { .. } => TYPE_CREATE_VIEW,
         WalRecordKind::ReplaceView { .. } => TYPE_REPLACE_VIEW,
         WalRecordKind::DropView { .. } => TYPE_DROP_VIEW,
+        WalRecordKind::CreateSchema { .. } => TYPE_CREATE_SCHEMA,
+        WalRecordKind::DropSchema { .. } => TYPE_DROP_SCHEMA,
         WalRecordKind::SequenceAdvance { .. } => TYPE_SEQUENCE_ADVANCE,
         WalRecordKind::SetSequenceValue { .. } => TYPE_SET_SEQUENCE_VALUE,
         WalRecordKind::Commit => TYPE_COMMIT,
@@ -505,6 +508,7 @@ mod tests {
             WalRecordKind::CreateIndex {
                 schema: common::IndexSchema {
                     id: 3,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 30,
                     table: 1,
                     name: "users_name".to_string(),
@@ -516,6 +520,7 @@ mod tests {
             WalRecordKind::UpdateTableSchema {
                 schema: common::TableSchema {
                     id: 1,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 10,
                     name: "users".to_string(),
                     columns: vec![
@@ -549,6 +554,7 @@ mod tests {
                 },
                 indexes: vec![common::IndexSchema {
                     id: 3,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 31,
                     table: 1,
                     name: "users_code".to_string(),
@@ -561,6 +567,7 @@ mod tests {
             WalRecordKind::CreateSequence {
                 schema: common::SequenceSchema {
                     id: 4,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     name: "users_id_seq".to_string(),
                     increment: 1,
                     min_value: 1,
@@ -576,6 +583,7 @@ mod tests {
             WalRecordKind::CreateView {
                 schema: common::ViewSchema {
                     id: 5,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     name: "active_users".to_string(),
                     columns: vec![common::ColumnDef {
                         id: 0,
@@ -593,11 +601,13 @@ mod tests {
                         all_columns: false,
                     }],
                     schema_version: 1,
+                    definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
                 },
             },
             WalRecordKind::ReplaceView {
                 schema: common::ViewSchema {
                     id: 5,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     name: "active_users".to_string(),
                     columns: vec![common::ColumnDef {
                         id: 0,
@@ -615,9 +625,17 @@ mod tests {
                         all_columns: false,
                     }],
                     schema_version: 2,
+                    definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
                 },
             },
             WalRecordKind::DropView { view: 5 },
+            WalRecordKind::CreateSchema {
+                schema: common::NamespaceSchema {
+                    id: 2,
+                    name: "app".to_string(),
+                },
+            },
+            WalRecordKind::DropSchema { schema: 2 },
             WalRecordKind::SequenceAdvance {
                 sequence: 4,
                 value: 11,

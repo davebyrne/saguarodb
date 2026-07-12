@@ -42,6 +42,12 @@ pub enum SqlState {
     /// relation kind, e.g. `DROP TABLE` names a view.
     WrongObjectType,
     DuplicateTable,
+    /// `42P06`: a schema already exists with the requested name.
+    DuplicateSchema,
+    /// `42501`: the current user is not permitted to perform the operation.
+    InsufficientPrivilege,
+    /// `42P16`: an ALTER would leave a table definition invalid.
+    InvalidTableDefinition,
     /// `42P03`: a cursor declaration used a name that is already open in the
     /// current session.
     DuplicateCursor,
@@ -129,6 +135,9 @@ impl SqlState {
             SqlState::InvalidColumnReference => "42P10",
             SqlState::WrongObjectType => "42809",
             SqlState::DuplicateTable => "42P07",
+            SqlState::DuplicateSchema => "42P06",
+            SqlState::InsufficientPrivilege => "42501",
+            SqlState::InvalidTableDefinition => "42P16",
             SqlState::DuplicateCursor => "42P03",
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::DatatypeMismatch => "42804",
@@ -171,6 +180,9 @@ impl SqlState {
             "42P10" => SqlState::InvalidColumnReference,
             "42809" => SqlState::WrongObjectType,
             "42P07" => SqlState::DuplicateTable,
+            "42P06" => SqlState::DuplicateSchema,
+            "42501" => SqlState::InsufficientPrivilege,
+            "42P16" => SqlState::InvalidTableDefinition,
             "42P03" => SqlState::DuplicateCursor,
             "42P18" => SqlState::IndeterminateDatatype,
             "42804" => SqlState::DatatypeMismatch,
@@ -266,6 +278,9 @@ mod tests {
             SqlState::InvalidColumnReference,
             SqlState::WrongObjectType,
             SqlState::DuplicateTable,
+            SqlState::DuplicateSchema,
+            SqlState::InsufficientPrivilege,
+            SqlState::InvalidTableDefinition,
             SqlState::DuplicateCursor,
             SqlState::DatatypeMismatch,
             SqlState::DivisionByZero,

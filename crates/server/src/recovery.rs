@@ -313,6 +313,8 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::CreateView { .. }
             | WalRecordKind::ReplaceView { .. }
             | WalRecordKind::DropView { .. }
+            | WalRecordKind::CreateSchema { .. }
+            | WalRecordKind::DropSchema { .. }
             | WalRecordKind::CreateDictionary { .. }
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
@@ -342,6 +344,10 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         }
         WalRecordKind::CreateView { schema } => {
             catalog.reserve_table_id(schema.id)?;
+            Ok(true)
+        }
+        WalRecordKind::CreateSchema { schema } => {
+            catalog.reserve_schema_id(schema.id)?;
             Ok(true)
         }
         WalRecordKind::CreateDictionary { dict_id, .. } => {
@@ -375,6 +381,7 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         | WalRecordKind::DropSequence { .. }
         | WalRecordKind::ReplaceView { .. }
         | WalRecordKind::DropView { .. }
+        | WalRecordKind::DropSchema { .. }
         | WalRecordKind::AlterTableCompression { .. }
         | WalRecordKind::AlterTableToast { .. }
         | WalRecordKind::AlterTablePrimaryKey { .. }
@@ -478,6 +485,8 @@ fn apply_redo(
         WalRecordKind::CreateView { schema } => catalog.apply_create_view(schema.clone()),
         WalRecordKind::ReplaceView { schema } => catalog.apply_replace_view(schema.clone()),
         WalRecordKind::DropView { view } => catalog.apply_drop_view(*view),
+        WalRecordKind::CreateSchema { schema } => catalog.apply_create_schema(schema.clone()),
+        WalRecordKind::DropSchema { schema } => catalog.apply_drop_schema(*schema),
         WalRecordKind::SequenceAdvance { sequence, value } => {
             storage.apply_sequence_advance(*sequence, *value)
         }
@@ -684,6 +693,7 @@ mod tests {
     fn table_schema(id: common::TableId, name: &str) -> common::TableSchema {
         common::TableSchema {
             id,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: id,
             name: name.to_string(),
             columns: vec![common::ColumnDef {
@@ -834,6 +844,7 @@ mod tests {
 
         let legacy_index = common::IndexSchema {
             id: 7,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 0,
             table: legacy_table.id,
             name: "legacy_table_id_idx".to_string(),
@@ -1480,6 +1491,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skipped_schema = common::SequenceSchema {
             id: 41,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             name: "aborted_seq".to_string(),
             increment: 1,
             min_value: 1,

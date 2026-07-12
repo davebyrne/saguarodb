@@ -1,8 +1,35 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{ColumnId, DbError, FileId, IndexId, PgType, SequenceId, SqlState, TableId, Value};
+use crate::{
+    ColumnId, FileId, IndexId, PUBLIC_SCHEMA_ID, PgType, SchemaId, SequenceId, TableId, Value,
+};
 
 pub const INITIAL_SCHEMA_VERSION: u64 = 1;
+
+pub fn public_schema_id() -> SchemaId {
+    PUBLIC_SCHEMA_ID
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct QualifiedName {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+impl QualifiedName {
+    pub fn unqualified(name: impl Into<String>) -> Self {
+        Self {
+            schema: None,
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceSchema {
+    pub id: SchemaId,
+    pub name: String,
+}
 
 fn initial_schema_version() -> u64 {
     INITIAL_SCHEMA_VERSION
@@ -373,6 +400,8 @@ pub struct ViewColumn {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: TableId,
+    #[serde(default = "public_schema_id")]
+    pub schema_id: SchemaId,
     /// Physical storage-generation id for this table's heap and primary index.
     /// `0` means a legacy decoded schema is missing the field; catalog migration
     /// replaces it with a non-zero id before installation.
@@ -448,6 +477,8 @@ impl<'de> Deserialize<'de> for ViewDependency {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewSchema {
     pub id: TableId,
+    #[serde(default = "public_schema_id")]
+    pub schema_id: SchemaId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     /// Canonical SQL text for the view query.
@@ -456,6 +487,12 @@ pub struct ViewSchema {
     pub dependencies: Vec<ViewDependency>,
     #[serde(default = "initial_schema_version")]
     pub schema_version: u64,
+    #[serde(default = "default_view_search_path")]
+    pub definition_search_path: Vec<SchemaId>,
+}
+
+fn default_view_search_path() -> Vec<SchemaId> {
+    vec![PUBLIC_SCHEMA_ID]
 }
 
 pub fn needs_toast_relation(schema: &TableSchema) -> bool {
@@ -475,6 +512,7 @@ pub fn toast_relation_name(base_table: TableId) -> String {
 pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
     TableSchema {
         id: toast_id,
+        schema_id: base.schema_id,
         storage_id: toast_id,
         name: toast_relation_name(base.id),
         columns: vec![
@@ -543,6 +581,8 @@ impl Default for SequenceOptions {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceSchema {
     pub id: SequenceId,
+    #[serde(default = "public_schema_id")]
+    pub schema_id: SchemaId,
     pub name: String,
     pub increment: i64,
     pub min_value: i64,
@@ -569,6 +609,8 @@ pub enum IndexConstraintKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub id: IndexId,
+    #[serde(default = "public_schema_id")]
+    pub schema_id: SchemaId,
     /// Physical storage-generation id for this secondary index. `0` means a
     /// legacy decoded schema is missing the field; catalog migration replaces it
     /// with a non-zero id before installation.

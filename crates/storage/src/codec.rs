@@ -1575,6 +1575,7 @@ mod tests {
     fn schema() -> TableSchema {
         TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "t".to_string(),
             columns: vec![

@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use common::{
     ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
-    ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
-    TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
-    ViewDependency, ViewSchema,
+    NamespaceSchema, ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions,
+    SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewDependency, ViewSchema,
 };
 
 use crate::{CatalogManager, CatalogSnapshot, MemoryCatalog, TableColumnAlteration};
@@ -54,6 +54,30 @@ impl TruncateCatalogOverlay {
 }
 
 impl CatalogManager for TruncateCatalogOverlay {
+    fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
+        self.base.get_schema_by_name(name)
+    }
+
+    fn get_schema(&self, id: SchemaId) -> Result<Option<NamespaceSchema>> {
+        self.base.get_schema(id)
+    }
+
+    fn list_schemas(&self) -> Result<Vec<NamespaceSchema>> {
+        self.base.list_schemas()
+    }
+
+    fn reserve_schema_id(&self, _id: SchemaId) -> Result<()> {
+        Self::read_only()
+    }
+
+    fn apply_create_schema(&self, _schema: NamespaceSchema) -> Result<()> {
+        Self::read_only()
+    }
+
+    fn apply_drop_schema(&self, _id: SchemaId) -> Result<()> {
+        Self::read_only()
+    }
+
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>> {
         let Some(base) = self.base.get_table_by_name(name)? else {
             return Ok(None);

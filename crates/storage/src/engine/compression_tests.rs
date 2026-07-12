@@ -29,6 +29,7 @@ impl common::FlushPolicy for AlwaysFlush {
 fn users_schema_zstd() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
@@ -69,6 +70,7 @@ fn users_schema_zstd() -> TableSchema {
 fn note_index() -> IndexSchema {
     IndexSchema {
         id: NOTE_INDEX_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_note".to_string(),

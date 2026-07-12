@@ -670,6 +670,7 @@ async fn checkpoint_reconciles_a_storage_only_sequence_instead_of_failing() {
             .storage
             .install_sequences(vec![common::SequenceSchema {
                 id: 5,
+                schema_id: common::PUBLIC_SCHEMA_ID,
                 name: "ghost_seq".to_string(),
                 increment: 1,
                 min_value: 1,

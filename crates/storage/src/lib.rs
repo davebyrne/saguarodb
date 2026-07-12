@@ -569,6 +569,7 @@ mod tests {
         schema.name = "accounts".to_string();
         let index = IndexSchema {
             id: 7,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 43,
             table: schema.id,
             name: "accounts_name".to_string(),
@@ -3757,6 +3758,7 @@ mod tests {
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 101,
             table: 1,
             name: "users_name".to_string(),
@@ -4104,6 +4106,7 @@ mod tests {
     fn users_schema() -> TableSchema {
         TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "users".to_string(),
             columns: vec![
@@ -4172,6 +4175,7 @@ mod tests {
     ) -> SequenceSchema {
         SequenceSchema {
             id,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             name: name.to_string(),
             increment,
             min_value,
@@ -4229,6 +4233,7 @@ mod tests {
     fn big_text_schema() -> TableSchema {
         TableSchema {
             id: 2,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 2,
             name: "big_text".to_string(),
             columns: vec![
@@ -4291,6 +4296,7 @@ mod tests {
     fn bytea_base_and_toast_schema() -> (TableSchema, TableSchema) {
         let mut base = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "bytea_base".to_string(),
             columns: vec![
@@ -4397,6 +4403,7 @@ mod tests {
         }
         TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "wide_fixed".to_string(),
             columns,
@@ -4435,6 +4442,7 @@ mod tests {
         });
         let mut base = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "wide_bytea".to_string(),
             columns,
@@ -4484,6 +4492,7 @@ mod tests {
         });
         let mut base = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "dict_external".to_string(),
             columns,

@@ -62,6 +62,7 @@ fn ctx(txn_id: u64) -> StatementContext {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
@@ -98,6 +99,7 @@ fn users_schema() -> TableSchema {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: NAME_INDEX_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),

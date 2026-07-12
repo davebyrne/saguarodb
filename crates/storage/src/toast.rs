@@ -183,6 +183,7 @@ mod tests {
     fn base_schema() -> TableSchema {
         TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "base".to_string(),
             columns: vec![

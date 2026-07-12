@@ -285,6 +285,7 @@ fn users_schema(storage_id: FileId) -> TableSchema {
 
     TableSchema {
         id: TABLE_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id,
         name: "users".to_string(),
         columns: vec![
@@ -336,6 +337,7 @@ fn users_toast_schema(storage_id: FileId) -> TableSchema {
 fn name_index(storage_id: FileId) -> IndexSchema {
     IndexSchema {
         id: NAME_INDEX_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id,
         table: TABLE_ID,
         name: "users_name_key".to_string(),
@@ -348,6 +350,7 @@ fn name_index(storage_id: FileId) -> IndexSchema {
 fn note_index(storage_id: FileId) -> IndexSchema {
     IndexSchema {
         id: NOTE_INDEX_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id,
         table: TABLE_ID,
         name: "users_note_idx".to_string(),

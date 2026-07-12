@@ -8,15 +8,15 @@ pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
     attrdef_oid, check_constraint_oid, index_oid, is_system_schema, primary_key_constraint_oid,
-    resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
+    resolve_system_view, schema_oid, sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 pub use truncate_overlay::TruncateCatalogOverlay;
 
 use common::{
-    ColumnId, CompressionSetting, FileId, IndexConstraintKind, IndexId, IndexSchema,
-    ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
-    TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
-    ViewDependency, ViewSchema,
+    ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
+    NamespaceSchema, ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions,
+    SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewDependency, ViewSchema,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +32,37 @@ impl TableColumnAlteration {
 }
 
 pub trait CatalogManager: Send + Sync {
+    fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
+        let snapshot = self.snapshot()?;
+        Ok(snapshot
+            .schemas_by_name
+            .get(name)
+            .and_then(|id| snapshot.schemas_by_id.get(id))
+            .cloned())
+    }
+    fn get_schema(&self, id: SchemaId) -> Result<Option<NamespaceSchema>> {
+        Ok(self.snapshot()?.schemas_by_id.get(&id).cloned())
+    }
+    fn list_schemas(&self) -> Result<Vec<NamespaceSchema>> {
+        let mut schemas: Vec<_> = self.snapshot()?.schemas_by_id.into_values().collect();
+        schemas.sort_by_key(|schema| schema.id);
+        Ok(schemas)
+    }
+    fn reserve_schema_id(&self, _id: SchemaId) -> Result<()> {
+        Err(DbError::internal(
+            "catalog does not support schema mutation",
+        ))
+    }
+    fn apply_create_schema(&self, _schema: NamespaceSchema) -> Result<()> {
+        Err(DbError::internal(
+            "catalog does not support schema mutation",
+        ))
+    }
+    fn apply_drop_schema(&self, _id: SchemaId) -> Result<()> {
+        Err(DbError::internal(
+            "catalog does not support schema mutation",
+        ))
+    }
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
     fn get_table(&self, id: TableId) -> Result<Option<TableSchema>>;
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
@@ -272,6 +303,7 @@ mod tests {
     fn stored_id_table(id: u32, name: &str) -> TableSchema {
         TableSchema {
             id,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: id,
             name: name.to_string(),
             columns: vec![ColumnDef {
@@ -527,6 +559,7 @@ mod tests {
         let users = stored_id_table(1, "users");
         let duplicate_sequence = SequenceSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             name: "users".to_string(),
             increment: 1,
             min_value: 1,
@@ -551,6 +584,7 @@ mod tests {
 
         let duplicate_index = IndexSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             table: users.id,
             name: "users".to_string(),
@@ -1700,6 +1734,7 @@ mod tests {
             restored.get_sequence_by_name("s").unwrap().unwrap(),
             SequenceSchema {
                 id: first.id,
+                schema_id: common::PUBLIC_SCHEMA_ID,
                 name: "s".to_string(),
                 increment: 2,
                 min_value: 1,
@@ -1739,6 +1774,7 @@ mod tests {
     fn try_from_snapshot_rejects_next_table_id_that_reuses_existing_id() {
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -1760,6 +1796,15 @@ mod tests {
             checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
+            schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
+            schemas_by_id: HashMap::from([(
+                common::PUBLIC_SCHEMA_ID,
+                common::NamespaceSchema {
+                    id: common::PUBLIC_SCHEMA_ID,
+                    name: "public".to_string(),
+                },
+            )]),
+            next_schema_id: common::FIRST_USER_SCHEMA_ID,
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 3,
@@ -1838,6 +1883,7 @@ mod tests {
     fn try_from_snapshot_accepts_valid_sequence_default() {
         let sequence = SequenceSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             name: "users_id_seq".to_string(),
             increment: 1,
             min_value: 1,
@@ -1850,6 +1896,7 @@ mod tests {
         };
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -1871,6 +1918,15 @@ mod tests {
             checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
+            schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
+            schemas_by_id: HashMap::from([(
+                common::PUBLIC_SCHEMA_ID,
+                common::NamespaceSchema {
+                    id: common::PUBLIC_SCHEMA_ID,
+                    name: "public".to_string(),
+                },
+            )]),
+            next_schema_id: common::FIRST_USER_SCHEMA_ID,
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 4,
@@ -1899,6 +1955,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -2053,6 +2110,7 @@ mod tests {
     fn try_from_snapshot_accepts_composite_primary_key() {
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![
@@ -2093,6 +2151,7 @@ mod tests {
                 1,
                 IndexSchema {
                     id: 1,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 4,
                     table: 3,
                     name: "users_pkey".to_string(),
@@ -2120,6 +2179,7 @@ mod tests {
     fn try_from_snapshot_rejects_user_primary_key_without_constraint_index() {
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -2156,6 +2216,7 @@ mod tests {
     fn try_from_snapshot_rejects_nullable_primary_key_column() {
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -2194,6 +2255,7 @@ mod tests {
     fn try_from_snapshot_rejects_non_contiguous_column_ids() {
         let schema = TableSchema {
             id: 3,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -2305,6 +2367,7 @@ mod tests {
             .unwrap();
         let index = IndexSchema {
             id: 7,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 7,
             table: schema.id,
             name: "users_pkey".to_string(),
@@ -2341,6 +2404,7 @@ mod tests {
             .unwrap();
         let index = IndexSchema {
             id: 7,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 7,
             table: schema.id,
             name: "users_pkey".to_string(),
@@ -2519,6 +2583,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 7,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 7,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -2625,6 +2690,7 @@ mod tests {
 
         let schema = IndexSchema {
             id: 99,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 99,
             table: users.id,
             name: "users_pkey".to_string(),
@@ -2934,6 +3000,7 @@ mod tests {
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
         let schema = IndexSchema {
             id: 5,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 5,
             table: users.id,
             name: "users_name".to_string(),
@@ -2967,6 +3034,7 @@ mod tests {
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
         let schema = IndexSchema {
             id: 5,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 5,
             table: users.id,
             name: "bad_pkey".to_string(),
@@ -2996,6 +3064,7 @@ mod tests {
 
         let schema = IndexSchema {
             id: 5,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 5,
             table: users.id,
             name: "users_second_pkey".to_string(),
@@ -3059,6 +3128,7 @@ mod tests {
                 1,
                 IndexSchema {
                     id: 1,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 1,
                     table: 7,
                     name: "orphan".to_string(),
@@ -3080,6 +3150,7 @@ mod tests {
     fn validate_rejects_reserved_primary_key_index_id() {
         let table = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -3109,6 +3180,7 @@ mod tests {
                 0,
                 IndexSchema {
                     id: 0,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 2,
                     table: 1,
                     name: "bad".to_string(),
@@ -3129,6 +3201,7 @@ mod tests {
     fn validate_rejects_next_index_id_that_reuses_existing_id() {
         let table = TableSchema {
             id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
             storage_id: 1,
             name: "users".to_string(),
             columns: vec![ColumnDef {
@@ -3158,6 +3231,7 @@ mod tests {
                 1,
                 IndexSchema {
                     id: 1,
+                    schema_id: common::PUBLIC_SCHEMA_ID,
                     storage_id: 2,
                     table: 1,
                     name: "users_id".to_string(),
@@ -3544,365 +3618,189 @@ mod tests {
         assert_eq!(catalog.allocate_dictionary_id().unwrap(), 1);
     }
 
-    /// Statistics for `catalog_with_users`: column 0 is `id` (unique integer),
-    /// column 1 is `name` (skewed text with NULLs).
-    fn sample_statistics() -> TableStatistics {
-        TableStatistics {
-            row_count: 1000,
-            page_count: 10,
-            columns: BTreeMap::from([
-                (
-                    0,
-                    ColumnStatistics {
-                        null_frac: OrderedF64::new(0.0),
-                        avg_width: 8,
-                        n_distinct: NDistinct::Fraction(OrderedF64::new(1.0)),
-                        most_common: Vec::new(),
-                        histogram_bounds: vec![
-                            Value::Integer(1),
-                            Value::Integer(500),
-                            Value::Integer(1000),
-                        ],
-                    },
-                ),
-                (
-                    1,
-                    ColumnStatistics {
-                        null_frac: OrderedF64::new(0.25),
-                        avg_width: 12,
-                        n_distinct: NDistinct::Count(3),
-                        most_common: vec![
-                            (Value::Text("carol".to_string()), OrderedF64::new(0.5)),
-                            (Value::Text("bob".to_string()), OrderedF64::new(0.25)),
-                        ],
-                        histogram_bounds: Vec::new(),
-                    },
-                ),
-            ]),
+    #[test]
+    fn catalog_v2_persists_schemas_deterministically_and_migrates_legacy_objects() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .apply_create_schema(common::NamespaceSchema {
+                id: common::FIRST_USER_SCHEMA_ID,
+                name: "app".to_string(),
+            })
+            .unwrap();
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["schemas"][0]["name"], "public");
+        assert_eq!(value["schemas"][1]["name"], "app");
+        assert_eq!(
+            bytes,
+            serialize_catalog(&catalog.snapshot().unwrap()).unwrap()
+        );
+
+        let legacy = serde_json::json!({
+            "tables_by_name": {},
+            "tables_by_id": {},
+            "next_table_id": 1
+        });
+        let migrated = deserialize_catalog(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            migrated.schemas_by_name.get("public"),
+            Some(&common::PUBLIC_SCHEMA_ID)
+        );
+        assert_eq!(migrated.next_schema_id, common::FIRST_USER_SCHEMA_ID);
+    }
+
+    #[test]
+    fn schema_catalog_rejects_duplicates_and_public_drop() {
+        let catalog = MemoryCatalog::empty();
+        let app = common::NamespaceSchema {
+            id: common::FIRST_USER_SCHEMA_ID,
+            name: "app".to_string(),
+        };
+        catalog.apply_create_schema(app.clone()).unwrap();
+        assert_eq!(
+            catalog.get_schema_by_name("app").unwrap(),
+            Some(app.clone())
+        );
+        let duplicate = catalog.apply_create_schema(common::NamespaceSchema {
+            id: app.id + 1,
+            name: app.name,
+        });
+        assert_eq!(duplicate.unwrap_err().code, SqlState::DuplicateSchema);
+        assert_eq!(
+            catalog
+                .apply_drop_schema(common::PUBLIC_SCHEMA_ID)
+                .unwrap_err()
+                .code,
+            SqlState::InsufficientPrivilege
+        );
+        catalog.apply_drop_schema(app.id).unwrap();
+        assert!(catalog.get_schema(app.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn same_relation_name_is_valid_in_distinct_schemas() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .apply_create_schema(common::NamespaceSchema {
+                id: common::FIRST_USER_SCHEMA_ID,
+                name: "app".to_string(),
+            })
+            .unwrap();
+        let public_table = stored_id_table(1, "items");
+        let mut app_table = stored_id_table(2, "items");
+        app_table.schema_id = common::FIRST_USER_SCHEMA_ID;
+        catalog.apply_create_table(public_table).unwrap();
+        catalog.apply_create_table(app_table).unwrap();
+
+        let restored = MemoryCatalog::try_from_snapshot(
+            deserialize_catalog(&serialize_catalog(&catalog.snapshot().unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.list_tables().unwrap().len(), 2);
+        assert_eq!(restored.get_table_by_name("items").unwrap().unwrap().id, 1);
+    }
+
+    #[test]
+    fn catalog_v2_rejects_duplicate_object_ids() {
+        let snapshot = MemoryCatalog::empty().snapshot().unwrap();
+        let bytes = serialize_catalog(&snapshot).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["schemas"] = serde_json::json!([
+            {"id": 1, "name": "public"},
+            {"id": 1, "name": "duplicate"}
+        ]);
+        assert!(deserialize_catalog(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn schema_validation_rejects_reserved_and_oversized_ids() {
+        let catalog = MemoryCatalog::empty();
+        for id in [0, MAX_VIRTUAL_OID_PAYLOAD + 1] {
+            assert!(
+                catalog
+                    .apply_create_schema(common::NamespaceSchema {
+                        id,
+                        name: format!("schema_{id}"),
+                    })
+                    .is_err()
+            );
         }
     }
 
     #[test]
-    fn statistics_survive_snapshot_serialization_round_trip() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
+    fn apply_paths_reject_missing_object_schemas_and_view_moves() {
+        let catalog = MemoryCatalog::empty();
+        let missing_schema = 99;
 
-        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
-        let restored =
-            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
-        assert_eq!(
-            restored.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
-        );
-    }
+        let mut table = stored_id_table(1, "items");
+        table.schema_id = missing_schema;
+        assert!(catalog.apply_create_table(table).is_err());
 
-    #[test]
-    fn snapshot_without_statistics_field_deserializes_to_no_statistics() {
-        // A catalog persisted before ANALYZE existed.
-        let json = r#"{
-            "tables_by_name": {"users": 1},
-            "tables_by_id": {"1": {
-                "id": 1,
-                "name": "users",
-                "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
-                "primary_key": []
-            }},
-            "next_table_id": 2
-        }"#;
-
-        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
-        assert!(snapshot.statistics.is_empty());
-
-        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
-        assert_eq!(catalog.get_table_statistics(1).unwrap(), None);
-    }
-
-    #[test]
-    fn drop_table_removes_statistics() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        catalog.drop_table(table.id).unwrap();
-        assert!(catalog.snapshot().unwrap().statistics.is_empty());
-    }
-
-    #[test]
-    fn drop_column_clears_column_statistics_and_keeps_counts() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        catalog.drop_table_column(table.id, "name").unwrap();
-        let stats = catalog.get_table_statistics(table.id).unwrap().unwrap();
-        assert_eq!(stats.row_count, 1000);
-        assert_eq!(stats.page_count, 10);
-        assert!(
-            stats.columns.is_empty(),
-            "column ids shift on DROP COLUMN, so per-column statistics must be cleared"
-        );
-    }
-
-    #[test]
-    fn rename_column_clears_column_statistics() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
+        let sequence = SequenceSchema {
+            id: 1,
+            schema_id: missing_schema,
+            name: "items_seq".to_string(),
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start: 1,
+            cycle: false,
+            owned: false,
+            last_value: 1,
+            is_called: false,
+        };
+        assert!(catalog.apply_create_sequence(sequence).is_err());
 
         catalog
-            .rename_table_column(table.id, "name", "full_name".to_string())
-            .unwrap();
-        let stats = catalog.get_table_statistics(table.id).unwrap().unwrap();
-        assert_eq!(stats.row_count, 1000);
-        assert!(stats.columns.is_empty());
-    }
-
-    #[test]
-    fn add_column_preserves_column_statistics() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        catalog
-            .add_table_column(
-                table.id,
-                ParsedColumnDef {
-                    name: "email".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    max_length: None,
-                    default: None,
-                    pg_type: None,
-                },
+            .create_view(
+                "items_view".to_string(),
+                vec![view_column("id", DataType::Integer, true)],
+                "select 1".to_string(),
+                Vec::new(),
             )
             .unwrap();
-        assert_eq!(
-            catalog.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
-        );
+        let mut view = catalog.get_view_by_name("items_view").unwrap().unwrap();
+        view.schema_id = missing_schema;
+        let mut new_view = view.clone();
+        new_view.id += 1;
+        assert!(catalog.apply_create_view(new_view).is_err());
+        assert!(catalog.apply_replace_view(view).is_err());
     }
 
     #[test]
-    fn rename_table_preserves_statistics() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        catalog
-            .rename_table(table.id, "customers".to_string())
-            .unwrap();
-        assert_eq!(
-            catalog.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
-        );
-    }
-
-    #[test]
-    fn set_statistics_rejects_unknown_table_and_unknown_column() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-
-        let err = catalog
-            .set_table_statistics(999, sample_statistics())
-            .unwrap_err();
-        assert_eq!(err.code, SqlState::UndefinedTable);
-
-        let mut stats = sample_statistics();
-        stats.columns.insert(
-            7,
-            ColumnStatistics {
-                null_frac: OrderedF64::new(0.0),
-                avg_width: 4,
-                n_distinct: NDistinct::Count(1),
-                most_common: Vec::new(),
-                histogram_bounds: Vec::new(),
-            },
-        );
-        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
-    }
-
-    #[test]
-    fn set_statistics_rejects_non_finite_numbers() {
-        // serde_json writes NaN/Infinity as `null` and cannot read that back,
-        // so a non-finite float accepted here would leave the next startup
-        // unable to load the manifest's catalog payload.
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-
-        let mut stats = sample_statistics();
-        stats.columns.get_mut(&0).unwrap().null_frac = OrderedF64::new(f64::NAN);
-        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
-
-        let mut stats = sample_statistics();
-        stats
-            .columns
-            .get_mut(&0)
-            .unwrap()
-            .histogram_bounds
-            .push(Value::Float(OrderedF64::new(f64::INFINITY)));
-        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
-
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-    }
-
-    #[test]
-    fn try_from_snapshot_prunes_orphan_statistics() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        let mut snapshot = catalog.snapshot().unwrap();
-        snapshot.statistics.insert(999, sample_statistics());
-        snapshot
-            .statistics
-            .get_mut(&table.id)
-            .unwrap()
-            .columns
-            .insert(
-                7,
-                ColumnStatistics {
-                    null_frac: OrderedF64::new(0.0),
-                    avg_width: 4,
-                    n_distinct: NDistinct::Count(1),
-                    most_common: Vec::new(),
-                    histogram_bounds: Vec::new(),
-                },
-            );
-
-        let restored = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
-        assert_eq!(restored.get_table_statistics(999).unwrap(), None);
-        assert_eq!(
-            restored.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics()),
-            "the orphan column entry is pruned, live columns keep their statistics"
-        );
-    }
-
-    #[test]
-    fn funnel_bypassing_setters_preserve_statistics() {
-        // The primary-key, compression, and TOAST setters replace table
-        // schemas without going through the reconciliation funnel, which is
-        // sound only while they never change a column's id, name, or type
-        // (see reconcile_statistics_for_table_update). Pin that: statistics
-        // must survive all of them untouched.
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        catalog
-            .set_table_compression(table.id, CompressionSetting::Zstd, None)
-            .unwrap();
-        catalog
-            .set_table_toast_metadata(table.id, table.toast.clone(), table.toast_table_id)
-            .unwrap();
-        let pkey = IndexSchema {
-            id: 7,
-            storage_id: 7,
-            table: table.id,
-            name: "users_pkey".to_string(),
-            columns: vec![0],
-            unique: true,
-            constraint: IndexConstraintKind::PrimaryKey,
-        };
-        catalog
-            .add_table_primary_key_index(table.id, vec![0], pkey.clone())
-            .unwrap();
-        catalog.set_table_primary_key(table.id, vec![0]).unwrap();
-        catalog
-            .drop_table_primary_key_index(table.id, pkey.id)
-            .unwrap();
-
-        assert_eq!(
-            catalog.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
-        );
-    }
-
-    #[test]
-    fn apply_truncate_preserves_statistics() {
-        // docs/specs/statistics.md §3: TRUNCATE leaves statistics untouched
-        // (stale until the next ANALYZE). Pin that on the real truncate path,
-        // which swaps storage generations via direct schema inserts.
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap();
-
-        let plan = catalog.prepare_truncate_table(table.id).unwrap();
-        catalog.apply_truncate_table(&plan).unwrap();
-
-        assert_eq!(
-            catalog.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
-        );
-    }
-
-    #[test]
-    fn create_table_rejects_non_finite_constant_defaults() {
-        // A non-finite constant default would serialize as JSON `null` in the
-        // manifest and WAL and fail to load back, bricking the next startup.
+    fn batch_schema_update_cannot_reassign_an_existing_index() {
         let catalog = MemoryCatalog::empty();
-        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-            let err = catalog
-                .create_table(
-                    "t".to_string(),
-                    vec![ParsedColumnDef {
-                        name: "x".to_string(),
-                        data_type: DataType::Double,
-                        nullable: true,
-                        max_length: None,
-                        default: Some(common::ParsedDefault::Const(Value::Float(OrderedF64::new(
-                            value,
-                        )))),
-                        pg_type: None,
-                    }],
-                    Vec::new(),
-                    CompressionSetting::None,
-                )
-                .unwrap_err();
-            assert_eq!(err.code, SqlState::NumericValueOutOfRange, "for {value}");
-        }
-    }
-
-    #[test]
-    fn truncate_overlay_reads_base_statistics_and_rejects_writes() {
-        let catalog = catalog_with_users_without_primary_key();
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        catalog
-            .set_table_statistics(table.id, sample_statistics())
+        let first = catalog
+            .create_table(
+                "first".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
             .unwrap();
-
-        let overlay = TruncateCatalogOverlay::new(Arc::new(catalog), Vec::new());
-        assert_eq!(
-            overlay.get_table_statistics(table.id).unwrap(),
-            Some(sample_statistics())
+        let second = catalog
+            .create_table(
+                "second".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let mut index = catalog
+            .create_index(
+                "second_id_idx".to_string(),
+                "second",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(index.table, second.id);
+        index.table = first.id;
+        assert!(
+            catalog
+                .apply_update_table_and_index_schemas(first, &[index])
+                .is_err()
         );
-        let err = overlay
-            .set_table_statistics(table.id, sample_statistics())
-            .unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
     }
 }

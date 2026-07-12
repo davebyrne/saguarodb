@@ -296,6 +296,7 @@ fn snapshot(xmax: u64, xip: Vec<u64>) -> Snapshot {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
@@ -332,6 +333,7 @@ fn users_schema() -> TableSchema {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),
@@ -673,6 +675,7 @@ fn unique_secondary_aborted_creator_does_not_conflict() {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
@@ -830,6 +833,7 @@ fn fixture_with_unique_name_index() -> Fixture {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
@@ -1142,6 +1146,7 @@ fn committed_update_is_visible_via_seq_and_both_secondary_scans() {
     let name_idx = name_index();
     let id_idx = IndexSchema {
         id: 2,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 102,
         table: TABLE_ID,
         name: "users_id".to_string(),
@@ -1337,6 +1342,7 @@ fn update_unique_secondary_conflicts_only_with_other_live_rows() {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
@@ -2038,6 +2044,7 @@ fn non_hot_data_resolves_unchanged() {
 fn hot_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
@@ -3336,6 +3343,7 @@ fn create_index_over_a_broken_live_hot_chain_aborts_retryable() {
 
     let note_index = IndexSchema {
         id: 2,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 102,
         table: TABLE_ID,
         name: "users_note".to_string(),
@@ -3412,6 +3420,7 @@ fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder()
 
     let note_index = IndexSchema {
         id: 2,
+        schema_id: common::PUBLIC_SCHEMA_ID,
         storage_id: 102,
         table: TABLE_ID,
         name: "users_note".to_string(),

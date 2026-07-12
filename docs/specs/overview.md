@@ -1956,7 +1956,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -2003,6 +2003,8 @@ This gives the invariants:
 | `DropTable` | `TableId` |
 | `CreateIndex` | serialized `IndexSchema` (logical id, storage id, table, name, columns, unique) |
 | `DropIndex` | `IndexId` |
+| `CreateSchema` | serialized `NamespaceSchema` |
+| `DropSchema` | `SchemaId` |
 | `TruncateTable` | `TableId`, new table/TOAST/index storage ids |
 | `AlterTablePrimaryKey` | `table_id`, primary-key `ColumnId` list |
 | `UpdateTableSchema` | serialized `TableSchema` and carried `IndexSchema` list for schema-evolution DDL |

@@ -23,6 +23,9 @@ and publishes it only at top-level commit.
 
 ```rust
 pub struct Catalog {
+    schemas_by_name: HashMap<String, SchemaId>,
+    schemas_by_id: HashMap<SchemaId, NamespaceSchema>,
+    next_schema_id: SchemaId,
     tables_by_name: HashMap<String, TableId>,
     tables_by_id: HashMap<TableId, TableSchema>,
     next_table_id: TableId,
@@ -41,6 +44,9 @@ pub struct Catalog {
 }
 
 pub struct CatalogSnapshot {
+    pub schemas_by_name: HashMap<String, SchemaId>,
+    pub schemas_by_id: HashMap<SchemaId, NamespaceSchema>,
+    pub next_schema_id: SchemaId,
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
@@ -59,13 +65,24 @@ pub struct CatalogSnapshot {
 }
 ```
 
-`TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`,
+`NamespaceSchema`, `TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`,
 `ViewColumn`, `ViewDependency`, `ViewSchema`, and `SequenceSchema` live in
 `common`. `TableSchema` additionally carries `schema_version: u64`,
 `compression: CompressionSetting`, and `active_dict_id: Option<u32>` (see
 "Compression" below). `TableSchema.storage_id` and `IndexSchema.storage_id` are
 physical relation-generation ids used by storage file-id derivation; the logical
 table/index/view ids remain stable catalog identities.
+
+Every persisted relation-like object carries a `schema_id`. `ViewSchema` also
+captures the schema-id search path used to bind its stored definition. Schema id
+`1` is the built-in mutable `public` namespace; user schema allocation begins at
+`2`. Schema ids are monotonic and never reused.
+
+The catalog JSON payload has its own format version, independently of the outer
+control-record version. Version 2 stores schemas, tables, views, indexes, and
+sequences as id-sorted arrays plus allocator high-water marks; runtime name maps
+are rebuilt while decoding. An unversioned legacy payload is migrated by placing
+all objects in `public`. Unknown catalog payload versions are rejected.
 
 Table IDs, index IDs, sequence IDs, and storage IDs are independent namespaces;
 all are monotonically increasing and never reused. `next_index_id` starts at
@@ -150,6 +167,7 @@ as unsigned 32-bit values:
 - user indexes, including primary-key and unique constraint indexes: tag `2`;
 - user sequences: tag `3`;
 - fallback synthetic primary-key indexes: tag `4`;
+- user schemas: tag `7`;
 - derived constraints and column defaults use separate deterministic tagged
   spaces over `(table_id, local_object_id)`;
 - core system views use stable PostgreSQL OIDs where practical, otherwise
