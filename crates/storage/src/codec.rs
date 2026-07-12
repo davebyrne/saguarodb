@@ -232,6 +232,12 @@ fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
 }
 
 pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
+    let encoded_len = encoded_array_payload_len(array)?;
+    if encoded_len > VARLENA_LEN_MASK as usize {
+        return Err(array_size_error(
+            "array payload exceeds the supported varlena length",
+        ));
+    }
     let cardinality = u32::try_from(array.cardinality()).map_err(|_| {
         DbError::storage(
             SqlState::ProgramLimitExceeded,
@@ -244,7 +250,11 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
             "array has too many dimensions",
         )
     })?;
-    let mut bytes = vec![ARRAY_PAYLOAD_VERSION];
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| array_size_error("array payload memory reservation failed"))?;
+    bytes.push(ARRAY_PAYLOAD_VERSION);
     encode_array_element_type(&mut bytes, array.element_type())?;
     bytes.push(ndim);
     bytes.extend_from_slice(&cardinality.to_le_bytes());
@@ -262,6 +272,7 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
             encode_array_element(&mut bytes, array.element_type(), value)?;
         }
     }
+    debug_assert_eq!(bytes.len(), encoded_len);
     Ok(bytes)
 }
 
