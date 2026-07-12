@@ -64,6 +64,36 @@ async fn e2e_unnest_and_generate_series_table_functions() {
             vec![Some("2".into()), Some("6".into())]
         ]
     );
+
+    server
+        .simple_query("create table empty_input (id integer)")
+        .await
+        .unwrap();
+    for sql in [
+        "select n from empty_input right join generate_series(1, 2) as g(n) on true",
+        "select n from empty_input full join generate_series(1, 2) as g(n) on true",
+        "select n from generate_series(1, (select 2)) as g(n)",
+    ] {
+        let err = server
+            .simple_query(sql)
+            .await
+            .err()
+            .expect("unsupported table-function shape should fail during binding");
+        assert_eq!(err.code, common::SqlState::FeatureNotSupported);
+    }
+
+    server
+        .simple_query("create table join_input (id integer)")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query(
+            "select * from series_inputs, join_input join unnest(series_inputs.values) u(v) on true",
+        )
+        .await
+        .err()
+        .expect("table function must not cross an explicit join boundary");
+    assert_eq!(err.code, common::SqlState::FeatureNotSupported);
 }
 
 #[tokio::test]

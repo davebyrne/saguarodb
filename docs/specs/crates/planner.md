@@ -573,6 +573,12 @@ nullable; `GENERATE_SERIES` returns non-null `INTEGER`. Table-function arguments
 are implicitly lateral: when placed to the right of another FROM item, logical
 planning lowers them to `Apply` correlations evaluated once per left row.
 `WITH ORDINALITY` and other table functions remain unsupported.
+Subqueries in table-function arguments are rejected until those argument plans
+participate in subquery hoisting. RIGHT/FULL joins with table functions are
+rejected because dependent outer-right/full Apply semantics are not implemented.
+As with lateral derived tables, a function inside an explicit join may reference
+only that join's left subtree; crossing an earlier comma-join boundary is
+`FeatureNotSupported` rather than an internal planning error.
 
 ```rust
 pub enum LogicalPlan {

@@ -782,7 +782,10 @@ pub(super) fn bind_from_item(
         } => {
             let join_type = convert_join_type(join_type.clone());
             if matches!(join_type, JoinType::Right | JoinType::Full)
-                && matches!(**right, FromItem::Derived { lateral: true, .. })
+                && matches!(
+                    **right,
+                    FromItem::Derived { lateral: true, .. } | FromItem::TableFunction { .. }
+                )
             {
                 return Err(plan_error(
                     SqlState::FeatureNotSupported,
@@ -792,6 +795,14 @@ pub(super) fn bind_from_item(
             let slots_before = ctx.next_slot;
             let join_scope_start = ctx.bindings.len();
             let left = bind_from_item(catalog, ctx, left)?;
+            if let BoundFrom::TableFunction { args, .. } = &left
+                && args.iter().any(references_input)
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "a table function referencing siblings must be the right side of its join",
+                ));
+            }
             // A LATERAL body referencing its siblings must be the RIGHT side
             // of its join: the plan lowers it to an Apply whose input is the
             // join's left subtree, which cannot supply columns from OUTSIDE
@@ -814,6 +825,16 @@ pub(super) fn bind_from_item(
                 ));
             }
             let right = bind_from_item(catalog, ctx, right)?;
+            if let BoundFrom::TableFunction { args, .. } = &right
+                && args
+                    .iter()
+                    .any(|arg| references_input_slot_before(arg, slots_before))
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "a table function in an explicit join cannot reference FROM items outside that join",
+                ));
+            }
             // A sibling-referencing LATERAL lowers to an Apply whose input is
             // THIS join's left subtree; correlation slots are rebased to that
             // subtree during lowering, so references INTO the subtree are
@@ -929,6 +950,12 @@ fn bind_table_function(
             ));
         }
     };
+    if bound_args.iter().any(contains_subquery_expr) {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "subqueries in table-function arguments are not supported",
+        ));
+    }
     let visible_name = alias.unwrap_or(name).to_string();
     let column_name = column_aliases
         .first()
@@ -963,6 +990,33 @@ fn bind_table_function(
         alias: visible_name,
         schema: columns,
     })
+}
+
+fn contains_subquery_expr(expr: &BoundExpr) -> bool {
+    if matches!(
+        expr,
+        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::InSubquery { .. }
+    ) {
+        return true;
+    }
+    let mut found = false;
+    let _ = crate::params::for_each_child(expr, &mut |child| {
+        found |= contains_subquery_expr(child);
+        Ok(())
+    });
+    found
+}
+
+fn references_input_slot_before(expr: &BoundExpr, boundary: usize) -> bool {
+    if matches!(expr, BoundExpr::InputRef { slot, .. } if *slot < boundary) {
+        return true;
+    }
+    let mut found = false;
+    let _ = crate::params::for_each_child(expr, &mut |child| {
+        found |= references_input_slot_before(child, boundary);
+        Ok(())
+    });
+    found
 }
 
 fn bind_table_or_schema_qualified_name(
