@@ -614,14 +614,15 @@ mod tests {
         trailing.push(0);
         assert!(decode(&trailing, &PgType::Int4, true).is_err());
 
-        let int8 = SqlArray::new(
+        let one_int4 = SqlArray::new(
             DataType::Integer,
             vec![ArrayDimension::new(1, 1)],
-            vec![Value::Integer(i64::from(i32::MAX) + 1)],
+            vec![Value::Integer(1)],
         )
         .unwrap();
-        let mut wrong_width = encode(&int8, &PgType::Int8, true).unwrap();
-        wrong_width[8..12].copy_from_slice(&23_i32.to_be_bytes());
+        let mut wrong_width = encode(&one_int4, &PgType::Int4, true).unwrap();
+        wrong_width[20..24].copy_from_slice(&8_i32.to_be_bytes());
+        wrong_width.extend_from_slice(&[0; 4]);
         assert_eq!(
             decode(&wrong_width, &PgType::Int4, true).unwrap_err().code,
             SqlState::InvalidBinaryRepresentation
@@ -645,6 +646,45 @@ mod tests {
                 .unwrap_err()
                 .code,
             SqlState::InvalidTextRepresentation
+        );
+        assert_eq!(
+            decode(b"{32768}", &PgType::Int2, false).unwrap_err().code,
+            SqlState::NumericValueOutOfRange
+        );
+        assert_eq!(
+            decode(b"{2147483648}", &PgType::Int4, false)
+                .unwrap_err()
+                .code,
+            SqlState::NumericValueOutOfRange
+        );
+    }
+
+    #[test]
+    fn timestamp_epoch_arithmetic_rejects_overflow() {
+        let array = SqlArray::new(
+            DataType::Timestamp,
+            vec![ArrayDimension::new(1, 1)],
+            vec![Value::Timestamp(0)],
+        )
+        .unwrap();
+        let mut encoded = encode(&array, &PgType::Timestamp, true).unwrap();
+        encoded[24..32].copy_from_slice(&i64::MAX.to_be_bytes());
+        assert_eq!(
+            decode(&encoded, &PgType::Timestamp, true).unwrap_err().code,
+            SqlState::InvalidBinaryRepresentation
+        );
+
+        let extreme = SqlArray::new(
+            DataType::TimestampTz,
+            vec![ArrayDimension::new(1, 1)],
+            vec![Value::TimestampTz(i64::MIN)],
+        )
+        .unwrap();
+        assert_eq!(
+            encode(&extreme, &PgType::Timestamptz, true)
+                .unwrap_err()
+                .code,
+            SqlState::NumericValueOutOfRange
         );
     }
 

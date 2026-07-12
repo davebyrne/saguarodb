@@ -562,7 +562,9 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
         Value::Timestamp(micros) => match format {
             ValueFormat::Text => common::datetime::format_timestamp(*micros).into_bytes(),
             // PostgreSQL binary `timestamp` is an i64 microsecond count from 2000-01-01.
-            ValueFormat::Binary => (micros - PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+            ValueFormat::Binary => micros
+                .checked_sub(PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .ok_or_else(|| timestamp_out_of_range("timestamp"))?
                 .to_be_bytes()
                 .to_vec(),
         },
@@ -575,7 +577,9 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             ValueFormat::Text => common::datetime::format_timestamptz(*micros).into_bytes(),
             // PostgreSQL binary `timestamptz` is an i64 microsecond count from
             // 2000-01-01 UTC (same wire form as `timestamp`).
-            ValueFormat::Binary => (micros - PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+            ValueFormat::Binary => micros
+                .checked_sub(PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .ok_or_else(|| timestamp_out_of_range("timestamptz"))?
                 .to_be_bytes()
                 .to_vec(),
         },
@@ -692,6 +696,16 @@ pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Re
             }
         };
     }
+    if matches!(pg_type, PgType::Int2 | PgType::Int4) && value_format == ValueFormat::Text {
+        let value = decode_value(bytes, DataType::Integer, 0)?;
+        let Value::Integer(int) = value else {
+            unreachable!("integer decoder returned non-integer value");
+        };
+        if let Some(target) = pg_type.narrow_int_overflow(int) {
+            return Err(integer_out_of_range(int, target));
+        }
+        return Ok(value);
+    }
     decode_value(bytes, pg_type.data_type(), format)
 }
 
@@ -699,6 +713,13 @@ fn integer_out_of_range(value: i64, target: &str) -> DbError {
     DbError::protocol(
         SqlState::NumericValueOutOfRange,
         format!("{value} is out of range for the binary {target} wire format"),
+    )
+}
+
+fn timestamp_out_of_range(target: &str) -> DbError {
+    DbError::protocol(
+        SqlState::NumericValueOutOfRange,
+        format!("{target} is out of range for the binary wire format"),
     )
 }
 
@@ -794,9 +815,15 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
             let array: [u8; 8] = bytes
                 .try_into()
                 .map_err(|_| protocol_error("binary timestamptz parameter must be 8 bytes"))?;
-            Ok(Value::TimestampTz(
-                i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
-            ))
+            i64::from_be_bytes(array)
+                .checked_add(PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .map(Value::TimestampTz)
+                .ok_or_else(|| {
+                    DbError::protocol(
+                        SqlState::InvalidBinaryRepresentation,
+                        "binary timestamptz parameter is out of range",
+                    )
+                })
         }
         (DataType::Interval, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "interval parameter")?;
@@ -854,9 +881,15 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
             let array: [u8; 8] = bytes
                 .try_into()
                 .map_err(|_| protocol_error("binary timestamp parameter must be 8 bytes"))?;
-            Ok(Value::Timestamp(
-                i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
-            ))
+            i64::from_be_bytes(array)
+                .checked_add(PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .map(Value::Timestamp)
+                .ok_or_else(|| {
+                    DbError::protocol(
+                        SqlState::InvalidBinaryRepresentation,
+                        "binary timestamp parameter is out of range",
+                    )
+                })
         }
         (DataType::Bytea, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "bytea parameter")?;
