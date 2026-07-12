@@ -199,6 +199,7 @@ const KEY_TAG_TIMESTAMPTZ: u8 = 12;
 const KEY_TAG_INTERVAL: u8 = 13;
 const KEY_TAG_ARRAY: u8 = 14;
 const ARRAY_PAYLOAD_VERSION: u8 = 1;
+pub(crate) const MAX_ARRAY_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Serialize an `INTERVAL` as `[months: i32][days: i32][micros: i64]` (16 bytes LE).
 fn put_interval(bytes: &mut Vec<u8>, value: &common::Interval) {
@@ -233,9 +234,9 @@ fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
 
 pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
     let encoded_len = encoded_array_payload_len(array)?;
-    if encoded_len > VARLENA_LEN_MASK as usize {
+    if encoded_len > MAX_ARRAY_PAYLOAD_BYTES {
         return Err(array_size_error(
-            "array payload exceeds the supported varlena length",
+            "array payload exceeds the supported length",
         ));
     }
     let cardinality = u32::try_from(array.cardinality()).map_err(|_| {
@@ -314,6 +315,7 @@ fn array_size_error(message: &'static str) -> DbError {
 }
 
 pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
+    validate_decoded_array_payload_len(bytes.len())?;
     let mut offset = 0;
     let version = read_exact(bytes, &mut offset, 1)?[0];
     if version != ARRAY_PAYLOAD_VERSION {
@@ -376,6 +378,14 @@ pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     }
     SqlArray::new(element_type, dimensions, elements)
         .map_err(|error| corrupt_row(format!("invalid array payload: {}", error.message)))
+}
+
+pub(crate) fn validate_decoded_array_payload_len(len: usize) -> Result<()> {
+    if len > MAX_ARRAY_PAYLOAD_BYTES {
+        Err(corrupt_row("array payload exceeds the supported length"))
+    } else {
+        Ok(())
+    }
 }
 
 fn encode_array_element_type(bytes: &mut Vec<u8>, data_type: &DataType) -> Result<()> {
@@ -1551,13 +1561,14 @@ mod tests {
     };
 
     use super::{
-        DecodedPhysicalValue, INVALID_TID, MvccHeader, PreparedColumnValue, ROW_FORMAT_VERSION,
-        ROW_FORMAT_VERSION_V1, ROW_FORMAT_VERSION_V3, TAG_COMPRESSED, TAG_EXTERNAL, TAG_PLAIN,
-        TOAST_POINTER_LEN, ToastPointer, V2_MVCC_HEADER_LEN, VARLENA_LEN_MASK, VarlenaPhysical,
-        decode_array_payload, decode_inline_compressed, decode_key, decode_physical_row,
-        decode_row, encode_array_payload, encode_key, encode_row, encode_row_v3_prepared,
-        null_bitmap_len, pack_varlena_len, put_interval, put_numeric, set_mvcc_header_fields,
-        unpack_varlena_len,
+        DecodedPhysicalValue, INVALID_TID, MAX_ARRAY_PAYLOAD_BYTES, MvccHeader,
+        PreparedColumnValue, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, ROW_FORMAT_VERSION_V3,
+        TAG_COMPRESSED, TAG_EXTERNAL, TAG_PLAIN, TOAST_POINTER_LEN, ToastPointer,
+        V2_MVCC_HEADER_LEN, VARLENA_LEN_MASK, VarlenaPhysical, decode_array_payload,
+        decode_inline_compressed, decode_key, decode_physical_row, decode_row,
+        encode_array_payload, encode_key, encode_row, encode_row_v3_prepared, null_bitmap_len,
+        pack_varlena_len, put_interval, put_numeric, set_mvcc_header_fields, unpack_varlena_len,
+        validate_decoded_array_payload_len,
     };
 
     fn schema() -> TableSchema {
@@ -2184,6 +2195,7 @@ mod tests {
                 .to_le_bytes(),
         );
         assert!(decode_array_payload(&allocation_bomb).is_err());
+        assert!(validate_decoded_array_payload_len(MAX_ARRAY_PAYLOAD_BYTES + 1).is_err());
 
         let mut bad_numeric = vec![1, 12];
         bad_numeric.extend_from_slice(&0_u32.to_le_bytes());

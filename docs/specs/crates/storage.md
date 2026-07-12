@@ -833,7 +833,9 @@ value.
   bytes as corruption. The same complete payload, prefixed by a `u32` length,
   is B-tree key value tag `14`; existing key tags `0..13` are unchanged.
   Cardinality above `common::MAX_ARRAY_ELEMENTS` is rejected before allocating
-  element storage.
+  element storage. A complete durable array payload is capped at 64 MiB; encode,
+  decode, and TOAST materialization validate that cap before payload allocation,
+  decompression, or hidden-chunk reads.
 - External TOAST stream bytes, stored in the hidden TOAST relation's chunk rows,
   are self-describing after consulting the pointer codec:
   - `codec = 0`: `[raw_crc32:u32 LE][raw bytes]`

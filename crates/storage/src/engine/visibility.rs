@@ -96,11 +96,13 @@ impl PageBackedStorageEngine {
                     raw_crc32,
                     payload,
                 } => {
+                    validate_array_toast_raw_len(schema, column, raw_len)?;
                     let raw = self
                         .materialize_toast_payload(codec, dict_id, raw_len, raw_crc32, &payload)?;
                     values.push(toast_value_for_column(schema, column, raw)?);
                 }
                 DecodedPhysicalValue::External { column, pointer } => {
+                    validate_array_toast_raw_len(schema, column, pointer.raw_len)?;
                     let stream = self.read_toast_stream(ctx, relations, schema, &pointer)?;
                     let (dict_id, raw_crc32, payload) =
                         crate::toast::parse_external_stream(pointer.codec, &stream)?;
@@ -155,6 +157,7 @@ impl PageBackedStorageEngine {
                 }
                 let data_type = validate_toast_sample_column(schema, column)?;
                 let declared_raw_len = *raw_len;
+                validate_array_toast_raw_len(schema, column, declared_raw_len)?;
                 let Some(sample_len) = raw_len_within_remaining(declared_raw_len, remaining) else {
                     return Ok(None);
                 };
@@ -179,6 +182,7 @@ impl PageBackedStorageEngine {
                     ));
                 }
                 let data_type = validate_toast_sample_column(schema, column)?;
+                validate_array_toast_raw_len(schema, column, pointer.raw_len)?;
                 let Some(sample_len) = raw_len_within_remaining(pointer.raw_len, remaining) else {
                     return Ok(None);
                 };
@@ -547,4 +551,14 @@ fn validate_toast_sample_raw(data_type: &DataType, raw: &[u8]) -> Result<()> {
             "TOAST sample references a non-varlena column",
         )),
     }
+}
+
+fn validate_array_toast_raw_len(schema: &TableSchema, column: usize, raw_len: u32) -> Result<()> {
+    let column = schema.columns.get(column).ok_or_else(|| {
+        crate::toast::toast_corruption("TOAST physical value references a missing column")
+    })?;
+    if matches!(column.data_type, DataType::Array(_)) {
+        crate::codec::validate_decoded_array_payload_len(raw_len as usize)?;
+    }
+    Ok(())
 }
