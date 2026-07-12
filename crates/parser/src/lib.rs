@@ -2626,4 +2626,101 @@ mod tests {
         let err = parse("copy users from stdin with (escape '|')").unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
+
+    #[test]
+    fn parses_array_column_types_and_casts() {
+        let Statement::CreateTable { columns, .. } = parse("create table t (a integer[])").unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(matches!(columns[0].data_type, DataType::Array(_)));
+        assert_eq!(
+            columns[0].pg_type,
+            Some(PgType::array(PgType::Int4).unwrap())
+        );
+
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = parse("select '{}'::text[]").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Cast {
+                    data_type: DataType::Array(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_array_constructor_subscripts_and_any() {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = parse("select ARRAY[1, 2][1], 2 = ANY(ARRAY[1, 2])").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::ArraySubscript { ref subscripts, .. },
+                ..
+            } if subscripts.len() == 1
+        ));
+        assert!(matches!(
+            select.columns[1],
+            SelectItem::Expression {
+                expr: Expr::Any { op: BinOp::Eq, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_set_returning_functions_in_from() {
+        for sql in [
+            "select * from unnest(ARRAY[1, 2]) as u(value)",
+            "select * from generate_series(1, 3) as g(value)",
+        ] {
+            let Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) = parse(sql).unwrap()
+            else {
+                panic!("expected SELECT");
+            };
+            assert!(
+                matches!(
+                    select.from.as_slice(),
+                    [FromItem::TableFunction {
+                        args,
+                        alias: Some(_),
+                        column_aliases,
+                        ..
+                    }] if !args.is_empty() && column_aliases == &["value"]
+                ),
+                "{:?}",
+                select.from
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_array_slices_and_sized_type_dimensions() {
+        assert_eq!(
+            parse("select (a)[1:2] from t").unwrap_err().code,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            parse("create table t (a integer[3])").unwrap_err().code,
+            SqlState::SyntaxError
+        );
+    }
 }

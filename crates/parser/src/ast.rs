@@ -411,6 +411,16 @@ pub enum FromItem {
         column_aliases: Vec<String>,
         lateral: bool,
     },
+    /// A set-returning function in `FROM`, such as `unnest(a)` or
+    /// `generate_series(1, 10)`. Binding/execution is owned by later layers.
+    TableFunction {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+        column_aliases: Vec<String>,
+        lateral: bool,
+        with_ordinality: bool,
+    },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -475,6 +485,19 @@ pub enum Expr {
         name: String,
         args: Vec<FunctionArg>,
         distinct: bool,
+    },
+    /// `ARRAY[expr, ...]`; nested constructors represent multidimensional arrays.
+    Array(Vec<Expr>),
+    /// One or more PostgreSQL array indexes, e.g. `a[1][2]`.
+    ArraySubscript {
+        array: Box<Expr>,
+        subscripts: Vec<Expr>,
+    },
+    /// `left op ANY(array)` / `SOME(array)`.
+    Any {
+        left: Box<Expr>,
+        op: BinOp,
+        array: Box<Expr>,
     },
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),

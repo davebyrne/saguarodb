@@ -803,6 +803,21 @@ fn reject_qualified_check_column_refs(expr: &Expr) -> Result<()> {
         | Expr::Placeholder(_)
         | Expr::Subquery(_)
         | Expr::Exists { .. } => {}
+        Expr::Array(elements) => {
+            for element in elements {
+                reject_qualified_check_column_refs(element)?;
+            }
+        }
+        Expr::ArraySubscript { array, subscripts } => {
+            reject_qualified_check_column_refs(array)?;
+            for subscript in subscripts {
+                reject_qualified_check_column_refs(subscript)?;
+            }
+        }
+        Expr::Any { left, array, .. } => {
+            reject_qualified_check_column_refs(left)?;
+            reject_qualified_check_column_refs(array)?;
+        }
         Expr::InSubquery { expr, .. }
         | Expr::UnaryOp { expr, .. }
         | Expr::IsNull(expr)
@@ -1231,6 +1246,11 @@ fn collect_from_item_cte_dependencies(
 ) -> Result<()> {
     match from {
         FromItem::Table { .. } => {}
+        FromItem::TableFunction { args, .. } => {
+            for arg in args {
+                collect_expr_cte_dependencies(catalog, declared, scope, arg, builder)?;
+            }
+        }
         FromItem::Derived { subquery, .. } => {
             collect_bound_but_unretained_cte_dependencies(
                 catalog, declared, scope, subquery, builder,
@@ -1325,6 +1345,21 @@ fn collect_expr_cte_dependencies(
         }
         Expr::Cast { expr, .. } => {
             collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+        }
+        Expr::Array(elements) => {
+            for element in elements {
+                collect_expr_cte_dependencies(catalog, declared, scope, element, builder)?;
+            }
+        }
+        Expr::ArraySubscript { array, subscripts } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, array, builder)?;
+            for subscript in subscripts {
+                collect_expr_cte_dependencies(catalog, declared, scope, subscript, builder)?;
+            }
+        }
+        Expr::Any { left, array, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, left, builder)?;
+            collect_expr_cte_dependencies(catalog, declared, scope, array, builder)?;
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => {}
     }
@@ -1629,6 +1664,7 @@ fn select_item_has_sequence_function(item: &SelectItem) -> bool {
 fn from_item_has_sequence_function(item: &FromItem) -> bool {
     match item {
         FromItem::Table { .. } => false,
+        FromItem::TableFunction { args, .. } => args.iter().any(expr_has_sequence_function),
         FromItem::Derived { subquery, .. } => query_has_sequence_function(subquery),
         FromItem::Join {
             left,
@@ -1689,6 +1725,13 @@ fn expr_has_sequence_function(expr: &Expr) -> bool {
                     .is_some_and(expr_has_sequence_function)
         }
         Expr::Cast { expr, .. } => expr_has_sequence_function(expr),
+        Expr::Array(elements) => elements.iter().any(expr_has_sequence_function),
+        Expr::ArraySubscript { array, subscripts } => {
+            expr_has_sequence_function(array) || subscripts.iter().any(expr_has_sequence_function)
+        }
+        Expr::Any { left, array, .. } => {
+            expr_has_sequence_function(left) || expr_has_sequence_function(array)
+        }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => false,
     }
 }
@@ -1733,6 +1776,7 @@ fn select_item_has_placeholder(item: &SelectItem) -> bool {
 fn from_item_has_placeholder(item: &FromItem) -> bool {
     match item {
         FromItem::Table { .. } => false,
+        FromItem::TableFunction { args, .. } => args.iter().any(expr_has_placeholder),
         FromItem::Derived { subquery, .. } => query_has_placeholder(subquery),
         FromItem::Join {
             left,
@@ -1764,6 +1808,11 @@ fn expr_has_placeholder(expr: &Expr) -> bool {
         | Expr::IsNotNull(expr)
         | Expr::Cast { expr, .. } => expr_has_placeholder(expr),
         Expr::Function { args, .. } => args.iter().any(function_arg_has_placeholder),
+        Expr::Array(elements) => elements.iter().any(expr_has_placeholder),
+        Expr::ArraySubscript { array, subscripts } => {
+            expr_has_placeholder(array) || subscripts.iter().any(expr_has_placeholder)
+        }
+        Expr::Any { left, array, .. } => expr_has_placeholder(left) || expr_has_placeholder(array),
         Expr::InList { expr, list, .. } => {
             expr_has_placeholder(expr) || list.iter().any(expr_has_placeholder)
         }

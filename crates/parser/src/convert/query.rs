@@ -6,9 +6,10 @@ use crate::{
     SelectItem, SetOp,
 };
 
-use super::expr::convert_expr;
+use super::expr::{convert_expr, convert_function_arg};
 use super::{
-    fold_dml_target_name, ident_name, object_name, parse_error, relation_name, unsupported,
+    fold_dml_target_name, function_name, ident_name, object_name, parse_error, relation_name,
+    unsupported,
 };
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
@@ -313,16 +314,32 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
             sample,
             index_hints,
         } => {
-            if args.is_some()
-                || !with_hints.is_empty()
+            if !with_hints.is_empty()
                 || version.is_some()
-                || *with_ordinality
                 || !partitions.is_empty()
                 || json_path.is_some()
                 || sample.is_some()
                 || !index_hints.is_empty()
             {
                 return unsupported("unsupported table factor");
+            }
+            if let Some(args) = args {
+                if args.settings.is_some() {
+                    return unsupported("table function SETTINGS are not supported");
+                }
+                let args = convert_table_function_args(&args.args)?;
+                let (alias, column_aliases) = convert_table_function_alias(alias.as_ref())?;
+                return Ok(FromItem::TableFunction {
+                    name: function_name(name)?,
+                    args,
+                    alias,
+                    column_aliases,
+                    lateral: false,
+                    with_ordinality: *with_ordinality,
+                });
+            }
+            if *with_ordinality {
+                return unsupported("WITH ORDINALITY requires a table function");
             }
             let alias = alias.as_ref().map(table_alias_name).transpose()?;
             let (schema, name) = relation_name(name)?;
@@ -352,8 +369,70 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 lateral: *lateral,
             })
         }
+        sql::TableFactor::Function {
+            lateral,
+            name,
+            args,
+            alias,
+        } => {
+            let args = convert_table_function_args(args)?;
+            let (alias, column_aliases) = convert_table_function_alias(alias.as_ref())?;
+            Ok(FromItem::TableFunction {
+                name: function_name(name)?,
+                args,
+                alias,
+                column_aliases,
+                lateral: *lateral,
+                with_ordinality: false,
+            })
+        }
+        sql::TableFactor::UNNEST {
+            alias,
+            array_exprs,
+            with_offset,
+            with_offset_alias,
+            with_ordinality,
+        } => {
+            if *with_offset || with_offset_alias.is_some() || array_exprs.len() != 1 {
+                return unsupported("unsupported UNNEST table form");
+            }
+            let (alias, column_aliases) = convert_table_function_alias(alias.as_ref())?;
+            Ok(FromItem::TableFunction {
+                name: "unnest".to_string(),
+                args: vec![convert_expr(&array_exprs[0])?],
+                alias,
+                column_aliases,
+                lateral: false,
+                with_ordinality: *with_ordinality,
+            })
+        }
         _ => unsupported("unsupported table factor"),
     }
+}
+
+fn convert_table_function_args(args: &[sql::FunctionArg]) -> Result<Vec<Expr>> {
+    args.iter()
+        .map(|arg| match convert_function_arg(arg)? {
+            crate::FunctionArg::Expr(expr) => Ok(expr),
+            crate::FunctionArg::Wildcard => {
+                unsupported("wildcard table-function arguments are not supported")
+            }
+        })
+        .collect()
+}
+
+fn convert_table_function_alias(
+    alias: Option<&sql::TableAlias>,
+) -> Result<(Option<String>, Vec<String>)> {
+    let Some(alias) = alias else {
+        return Ok((None, Vec::new()));
+    };
+    let columns = alias
+        .columns
+        .iter()
+        .map(table_alias_column_name)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((Some(ident_name(&alias.name)?), columns))
 }
 
 /// A column alias in `AS alias(col, ...)`. Type-annotated aliases (used by some

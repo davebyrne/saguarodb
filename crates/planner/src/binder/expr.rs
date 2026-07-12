@@ -37,6 +37,10 @@ fn bind_expr_with_pg_type(
             args,
             distinct,
         } => bind_function(ctx, name, args, *distinct),
+        Expr::Array(_) | Expr::ArraySubscript { .. } | Expr::Any { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "array expressions are not yet supported by the binder",
+        )),
         Expr::IsNull(expr) => {
             let expr = Box::new(bind_expr(ctx, expr, None)?);
             Ok(BoundExpr::IsNull {

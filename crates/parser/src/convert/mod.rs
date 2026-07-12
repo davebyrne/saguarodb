@@ -650,6 +650,13 @@ fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel 
 /// the declared length in (CAST targets report the kind only).
 fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
     match data_type {
+        sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(element, None)) => {
+            PgType::array(convert_pg_type(element)?)
+        }
+        sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(_, Some(_))) => {
+            unsupported("array type dimensions must not declare a size")
+        }
+        sql::DataType::Array(_) => unsupported("unsupported array type syntax"),
         // Integer widths report distinct OIDs (int2/int4/int8) but share one
         // 64-bit storage type; a display width like `INTEGER(5)` is not supported.
         sql::DataType::SmallInt(None) | sql::DataType::Int2(None) => Ok(PgType::Int2),

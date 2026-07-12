@@ -210,6 +210,15 @@ pub enum FromItem {
     Table { schema: Option<String>, name: String, alias: Option<String> },
     // Derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required.
     Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
+    // Set-returning function in FROM. Binding and execution are downstream.
+    TableFunction {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+        column_aliases: Vec<String>,
+        lateral: bool,
+        with_ordinality: bool,
+    },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -242,6 +251,9 @@ pub enum Expr {
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
+    Array(Vec<Expr>), // ARRAY[expr, ...]
+    ArraySubscript { array: Box<Expr>, subscripts: Vec<Expr> }, // a[1][2]
+    Any { left: Box<Expr>, op: BinOp, array: Box<Expr> }, // x op ANY(array)
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
@@ -338,6 +350,16 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `a UNION [ALL] b`, `a INTERSECT [ALL] b`, `a EXCEPT [ALL] b` parse to `QueryBody::SetOp`. Each arm is converted to a full `Query` (through `convert_set_expr_to_query`), so a parenthesized arm may carry its own `ORDER BY`/`LIMIT`; an unparenthesized outer `ORDER BY`/`LIMIT` binds to the enclosing `Query` wrapper and applies to the combined result. `MINUS` and the `... BY NAME` quantifiers are rejected as unsupported.
 - Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. Each subquery converts to a `Query` (so it may carry its own `ORDER BY`/`LIMIT`); cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
 - Derived tables: `[LATERAL] (SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived` with a `lateral` flag (`docs/specs/subqueries.md` §7). The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases are rejected).
+- Array syntax: unsized `type[]` column and cast targets map to the corresponding
+  array `PgType`; sized declarations such as `integer[3]` are unsupported.
+  `ARRAY[...]`, chained one-based subscripts such as `a[1][2]`, and
+  `left op ANY(array)` / `SOME(array)` are preserved as dedicated expression
+  nodes for binder type checking. Array slices are rejected.
+- Set-returning functions in `FROM`, including `unnest(array)` and
+  `generate_series(...)`, parse to `FromItem::TableFunction`. The parser
+  preserves an optional table alias, column aliases, `LATERAL`, and
+  `WITH ORDINALITY`; function resolution, argument validation, output shape,
+  and execution are downstream responsibilities.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `INSERT`/`UPDATE`/`DELETE ... RETURNING <items>`: the optional `RETURNING` clause is parsed into `returning: Option<Vec<SelectItem>>` on the `Insert`/`Update`/`Delete` AST node (`convert_returning` reuses the `SELECT`-list converter, so items may be expressions, `*`, or `table.*`). `None` when absent. `UPDATE ... FROM <items>` and `DELETE ... USING <items>` parse into `from`/`using: Vec<FromItem>` on the `Update`/`Delete` nodes (`docs/specs/subqueries.md` §8).

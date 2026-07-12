@@ -21,12 +21,43 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             }),
             _ => unsupported("unsupported qualified identifier"),
         },
+        sql::Expr::CompoundFieldAccess { root, access_chain } => {
+            let subscripts = access_chain
+                .iter()
+                .map(|access| match access {
+                    sql::AccessExpr::Subscript(sql::Subscript::Index { index }) => {
+                        convert_expr(index)
+                    }
+                    sql::AccessExpr::Subscript(sql::Subscript::Slice { .. }) => {
+                        unsupported("array slices are not supported")
+                    }
+                    sql::AccessExpr::Dot(_) => unsupported("field access is not supported"),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if subscripts.is_empty() {
+                return unsupported("empty field access chain");
+            }
+            Ok(Expr::ArraySubscript {
+                array: Box::new(convert_expr(root)?),
+                subscripts,
+            })
+        }
         sql::Expr::Value(value) => convert_value(&value.value),
         sql::Expr::Nested(expr) => convert_expr(expr),
         sql::Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(convert_expr(left)?),
             op: convert_bin_op(op)?,
             right: Box::new(convert_expr(right)?),
+        }),
+        sql::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => Ok(Expr::Any {
+            left: Box::new(convert_expr(left)?),
+            op: convert_bin_op(compare_op)?,
+            array: Box::new(convert_expr(right)?),
         }),
         sql::Expr::UnaryOp { op, expr } => match op {
             sql::UnaryOperator::Minus => Ok(Expr::UnaryOp {
@@ -161,6 +192,18 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }),
         sql::Expr::Interval(interval) => convert_interval(interval),
         sql::Expr::Function(function) => convert_function(function),
+        sql::Expr::Array(array) => {
+            if !array.named {
+                return unsupported("array constructors require ARRAY[...] syntax");
+            }
+            Ok(Expr::Array(
+                array
+                    .elem
+                    .iter()
+                    .map(convert_expr)
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
         sql::Expr::Substring {
             expr,
             substring_from,
@@ -451,7 +494,7 @@ fn convert_function(function: &sql::Function) -> Result<Expr> {
     })
 }
 
-fn convert_function_arg(arg: &sql::FunctionArg) -> Result<FunctionArg> {
+pub(super) fn convert_function_arg(arg: &sql::FunctionArg) -> Result<FunctionArg> {
     let sql::FunctionArg::Unnamed(arg) = arg else {
         return unsupported("named function arguments are not supported");
     };

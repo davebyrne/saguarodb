@@ -757,6 +757,10 @@ pub(super) fn bind_from_item(
             column_aliases,
             lateral,
         } => bind_derived_table(catalog, ctx, subquery, alias, column_aliases, *lateral),
+        FromItem::TableFunction { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "table functions are not yet supported by the binder",
+        )),
         FromItem::Join {
             left,
             right,
