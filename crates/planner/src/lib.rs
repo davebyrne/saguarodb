@@ -30,8 +30,8 @@ pub use binder::{
 };
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
-    BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
-    CorrelatedColumn, DropTableTarget, OutputColumn,
+    BoundReturning, BoundRowLock, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement,
+    BoundValues, CorrelatedColumn, DropTableTarget, OutputColumn,
 };
 pub use estimate::estimated_rows;
 pub use explain::{
@@ -3556,6 +3556,58 @@ mod tests {
             matches!(source.as_ref(), LogicalPlan::Sort { .. }),
             "expected sort under projection, got {source:?}"
         );
+    }
+
+    #[test]
+    fn locking_select_locks_after_sort_and_before_limit() {
+        let catalog = catalog_with_users();
+        let stmt = parse(
+            "select id from users where id > 0 order by id limit 2 \
+             for no key update skip locked",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        let LogicalPlan::Limit { source, .. } = &logical else {
+            panic!("expected limit, got {logical:?}");
+        };
+        let LogicalPlan::LockRows {
+            source,
+            mode,
+            wait_policy,
+            recheck: Some(_),
+            expressions,
+            ..
+        } = source.as_ref()
+        else {
+            panic!("expected LockRows under limit, got {source:?}");
+        };
+        assert_eq!(*mode, common::TupleLockMode::NoKeyUpdate);
+        assert_eq!(*wait_policy, common::TupleLockWaitPolicy::SkipLocked);
+        assert_eq!(expressions.len(), 1);
+        assert!(
+            matches!(source.as_ref(), LogicalPlan::Sort { .. }),
+            "expected sort below LockRows, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn locking_select_requires_one_simple_base_table() {
+        let catalog = catalog_with_users_and_accounts();
+        for sql in [
+            "select * from users, accounts for update",
+            "select distinct id from users for update",
+            "select count(*) from users for update",
+            "select (select id from accounts limit 1) from users for update",
+        ] {
+            let stmt = parse(sql).unwrap();
+            assert_eq!(
+                bind(&stmt, &catalog).unwrap_err().code,
+                common::SqlState::FeatureNotSupported,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@ use common::Result;
 use sqlparser::ast as sql;
 
 use crate::{
-    Assignment, Cte, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody, Select,
-    SelectItem, SetOp,
+    Assignment, Cte, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody,
+    RowLockClause, Select, SelectItem, SetOp,
 };
 
 use super::expr::{convert_expr, convert_function_arg};
@@ -14,9 +14,16 @@ use super::{
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
 /// `WITH` CTEs and query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's
 /// fields; the body dispatches on the `SetExpr`.
+pub(super) fn convert_top_level_query(query: sql::Query) -> Result<Query> {
+    convert_query_inner(query, true)
+}
+
 pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
+    convert_query_inner(query, false)
+}
+
+fn convert_query_inner(query: sql::Query, allow_row_lock: bool) -> Result<Query> {
     if query.fetch.is_some()
-        || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
         || query.format_clause.is_some()
@@ -24,6 +31,10 @@ pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
         return unsupported("unsupported SELECT query form");
     }
 
+    if !allow_row_lock && !query.locks.is_empty() {
+        return unsupported("row locking is supported only on a top-level SELECT");
+    }
+    let row_lock = convert_row_lock(query.locks)?;
     let with = convert_with(query.with)?;
     let (limit, offset) = convert_limit_clause(query.limit_clause)?;
     let order_by = query
@@ -39,7 +50,33 @@ pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
         order_by,
         limit,
         offset,
+        row_lock,
     })
+}
+
+fn convert_row_lock(locks: Vec<sql::LockClause>) -> Result<Option<RowLockClause>> {
+    let mut locks = locks.into_iter();
+    let Some(lock) = locks.next() else {
+        return Ok(None);
+    };
+    if locks.next().is_some() {
+        return unsupported("multiple row-locking clauses are not supported");
+    }
+    let mode = match lock.lock_type {
+        sql::LockType::Update => common::TupleLockMode::Update,
+        sql::LockType::Share => common::TupleLockMode::Share,
+    };
+    let wait_policy = match lock.nonblock {
+        None => common::TupleLockWaitPolicy::Block,
+        Some(sql::NonBlock::Nowait) => common::TupleLockWaitPolicy::NoWait,
+        Some(sql::NonBlock::SkipLocked) => common::TupleLockWaitPolicy::SkipLocked,
+    };
+    let relation = lock.of.map(|name| relation_name(&name)).transpose()?;
+    Ok(Some(RowLockClause {
+        mode,
+        wait_policy,
+        relation,
+    }))
 }
 
 /// Convert an optional `WITH` clause into a list of CTEs. `WITH RECURSIVE` is not
@@ -151,6 +188,7 @@ pub(super) fn convert_set_expr_to_query(set_expr: sql::SetExpr) -> Result<Query>
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            row_lock: None,
         }),
     }
 }

@@ -686,6 +686,7 @@ fn nested_apply_subplans(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
             | PhysicalPlan::Delete { source, .. }
             | PhysicalPlan::Filter { source, .. }
             | PhysicalPlan::Projection { source, .. }
+            | PhysicalPlan::LockRows { source, .. }
             | PhysicalPlan::Sort { source, .. }
             | PhysicalPlan::Distinct { source, .. }
             | PhysicalPlan::Limit { source, .. }

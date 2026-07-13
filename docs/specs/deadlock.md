@@ -28,10 +28,12 @@ serialization failure now arises only for a *committed*-superseded conflict — 
 - Covers transaction- and statement-owned table-lock waits. Table-lock modes,
   compatibility, acquisition order, and lifetime are specified in
   `docs/specs/table-locks.md`.
-- **No EvalPlanQual / row re-evaluation.** After a wait, a writer either proceeds
+- **DML EvalPlanQual remains deferred.** After a wait, an UPDATE/DELETE writer either proceeds
   (holder aborted) or fails with `40001` (holder committed) — it does not re-read
   and re-qualify the updated row version. (PostgreSQL's Read Committed
-  re-evaluation is intentionally out of scope.)
+  DML re-evaluation is intentionally out of scope.) Locking SELECT is different:
+  after acquiring its tuple lock it resolves the latest committed version,
+  rechecks its predicate, and projects that latest row.
 
 ## 2. Where the wait happens
 

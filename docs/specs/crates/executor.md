@@ -347,6 +347,19 @@ in `docs/specs/subqueries.md`.
 - Call `StorageEngine::delete`.
 - Return count.
 
+`LockRowsOp` implements top-level locking SELECT. For each identity-preserving
+candidate from its child it calls `StorageEngine::lock_row` with the bound tuple
+mode and wait policy. Deleted and `SKIP LOCKED` candidates are skipped. A granted
+candidate is rebuilt from the latest locked version. If locking advanced to a
+successor, the original WHERE predicate is re-evaluated; an unchanged candidate
+is not evaluated twice, which preserves volatile-expression semantics. The SELECT
+projection is evaluated over the locked row. Advancing to a successor is allowed
+only under Read Committed; Repeatable Read and Serializable return `40001` rather
+than exposing a version newer than their retained snapshot.
+Because LIMIT/OFFSET wrap `LockRows`, the operator locks only rows consumed by the
+limit; sort keys are computed from the pre-lock snapshot row and are not resorted
+if a concurrent update changes them.
+
 `RETURNING` (INSERT/UPDATE/DELETE): when the plan carries a `BoundReturning`, the executor evaluates the projection expressions over each affected full row — the inserted/updated NEW row for INSERT/UPDATE, the deleted OLD row for DELETE — and collects the result rows. For UPDATE/DELETE a row is collected only when storage actually mutated it (`update`/`delete` returned `true`); for an INSERT every inserted row is returned. The statement then returns `ModifiedReturning { command, count, columns, rows }` (with the `BoundReturning.output_schema` as `columns`) instead of `Modified`, so the affected-row count still drives the DML command tag.
 
 If a write errors after mutating pages or storage-owned metadata, the executor propagates the error without rolling back itself (consistent with `QueryEngine::execute` not calling storage/buffer commit or rollback). The server query orchestration — or the test harness — owns recovery and calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` before returning the error.
@@ -497,7 +510,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. SELECT and non-sequence-mutating EXPLAIN take no autocommit `ConcurrencyController` guard but do take `AccessShare` on referenced tables. Analyzed EXPLAIN containing `nextval` or `setval` uses the existing write classification, sequence locks, WAL lifecycle, and autocommit commit; plain EXPLAIN never evaluates sequence expressions. DML, COPY FROM, DDL, and WAL-writing maintenance acquire `ConcurrencyController::begin_writer`; DDL additionally takes the catalog publication gate. Table modes are `RowExclusive` for DML targets, `Share` for CREATE INDEX/VACUUM, and `AccessExclusive` for DROP/ALTER/TRUNCATE. Actual checkpoint alone takes `begin_checkpoint`. Shared writer and table-lock guards live for the full statement. Transaction-owned grants normally live through top-level completion; `ROLLBACK TO SAVEPOINT` restores the earlier captured grant set. See `docs/specs/crates/server.md` and `docs/specs/table-locks.md`.
+Statement guards are owned by server query orchestration, not by the executor crate. Plain SELECT and non-sequence-mutating EXPLAIN take no autocommit `ConcurrencyController` guard but do take `AccessShare` on referenced tables. Locking SELECT takes the shared participant guard and target `RowShare` through the transaction-owned path. Analyzed EXPLAIN containing `nextval` or `setval` uses the existing write classification, sequence locks, WAL lifecycle, and autocommit commit; plain EXPLAIN never evaluates sequence expressions. DML, COPY FROM, DDL, and WAL-writing maintenance acquire `ConcurrencyController::begin_writer`; DDL additionally takes the catalog publication gate. Table modes are `RowExclusive` for DML targets, `Share` for CREATE INDEX/VACUUM, and `AccessExclusive` for DROP/ALTER/TRUNCATE. Actual checkpoint alone takes `begin_checkpoint`. Shared writer and table-lock guards live for the full statement. Transaction-owned grants normally live through top-level completion; `ROLLBACK TO SAVEPOINT` restores the earlier captured grant set. See `docs/specs/crates/server.md` and `docs/specs/table-locks.md`.
 
 ## Acceptance Tests
 

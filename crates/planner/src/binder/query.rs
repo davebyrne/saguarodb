@@ -11,8 +11,8 @@ use parser::{
 };
 
 use crate::{
-    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
-    BoundSelectItem, BoundSetOp, BoundValues, JoinType, OutputColumn,
+    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody,
+    BoundRowLock, BoundSelect, BoundSelectItem, BoundSetOp, BoundValues, JoinType, OutputColumn,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
@@ -53,15 +53,29 @@ pub(super) fn bind_query<'a>(
                 outer,
                 pending,
             )?;
+            let row_lock = bind_row_lock(
+                query.row_lock.as_ref(),
+                &bound_select,
+                &order_by,
+                catalog,
+                search_path,
+            )?;
             Ok(BoundQuery {
                 body: BoundQueryBody::Select(Box::new(bound_select)),
                 order_by,
                 limit: query.limit,
                 offset: query.offset,
+                row_lock,
                 correlations: Vec::new(),
             })
         }
         QueryBody::Values(rows) => {
+            if query.row_lock.is_some() {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "row locking requires a SELECT over one base table",
+                ));
+            }
             // `LIMIT`/`OFFSET` need no binding. `ORDER BY` resolves against the
             // VALUES output columns by position or name (like a set operation). The
             // CTE scope is threaded in because a subquery inside a VALUES row can
@@ -80,6 +94,7 @@ pub(super) fn bind_query<'a>(
                 order_by: Vec::new(),
                 limit: query.limit,
                 offset: query.offset,
+                row_lock: None,
                 correlations: Vec::new(),
             };
             bound.order_by = bind_output_order_by(&query.order_by, &bound.output_columns())?;
@@ -91,6 +106,12 @@ pub(super) fn bind_query<'a>(
             left,
             right,
         } => {
+            if query.row_lock.is_some() {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "row locking is not supported for set operations",
+                ));
+            }
             let (left, right) = bind_set_op_arms(
                 catalog,
                 left,
@@ -116,10 +137,74 @@ pub(super) fn bind_query<'a>(
                 order_by,
                 limit: query.limit,
                 offset: query.offset,
+                row_lock: None,
                 correlations: Vec::new(),
             })
         }
     }
+}
+
+fn bind_row_lock(
+    lock: Option<&parser::RowLockClause>,
+    select: &BoundSelect,
+    order_by: &[BoundOrderByItem],
+    catalog: &dyn CatalogManager,
+    search_path: &[common::SchemaId],
+) -> Result<Option<BoundRowLock>> {
+    let Some(lock) = lock else {
+        return Ok(None);
+    };
+    if select.distinct.is_some()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select
+            .columns
+            .iter()
+            .any(|item| contains_aggregate(&item.expr))
+        || order_by.iter().any(|item| contains_aggregate(&item.expr))
+        || select.filter.as_ref().is_some_and(contains_subquery_expr)
+        || select
+            .columns
+            .iter()
+            .any(|item| contains_subquery_expr(&item.expr))
+        || order_by
+            .iter()
+            .any(|item| contains_subquery_expr(&item.expr))
+    {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "row locking is not supported with DISTINCT, aggregation, or subqueries",
+        ));
+    }
+    let Some(BoundFrom::Table {
+        table, name, alias, ..
+    }) = &select.from
+    else {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "row locking currently requires exactly one base table",
+        ));
+    };
+    if let Some(relation) = &lock.relation {
+        let matches = if let Some(alias) = alias {
+            relation.schema.is_none() && relation.name == *alias
+        } else if relation.schema.is_none() && relation.name == *name {
+            true
+        } else {
+            super::require_table(catalog, relation, search_path)?.id == *table
+        };
+        if !matches {
+            return Err(plan_error(
+                SqlState::UndefinedTable,
+                format!("relation {relation} in row-locking clause is not in FROM"),
+            ));
+        }
+    }
+    Ok(Some(BoundRowLock {
+        table: *table,
+        mode: lock.mode,
+        wait_policy: lock.wait_policy,
+    }))
 }
 
 /// Bind a child query whose body may reference `ctx`'s scope and the scopes

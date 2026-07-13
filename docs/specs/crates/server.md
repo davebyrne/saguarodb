@@ -233,7 +233,8 @@ targets (`docs/specs/statistics.md` §7). These forms return the ordinary
 restrictions.
 
 Table access and relation-changing operations additionally use transaction-owned
-locks defined by `docs/specs/table-locks.md`. Reads use `AccessShare`, DML uses
+locks defined by `docs/specs/table-locks.md`. Plain reads use `AccessShare`, a
+locking SELECT uses `RowShare` on its target, DML uses
 `RowExclusive` on targets, CREATE INDEX/VACUUM use the initial safe `Share` mode,
 and TRUNCATE/DROP/ALTER use `AccessExclusive`. Explicit transactions retain locks
 through top-level completion except that `ROLLBACK TO SAVEPOINT` restores the
@@ -292,7 +293,7 @@ storage latches. The gate is never held while waiting for an object lock.
 
 As of Milestone E2b the global writer lock is **inverted** into a shared-writer / exclusive-checkpoint guard (`common.md`, `mvcc.md` §10 E2b), so write-transactions now run concurrently.
 
-- **Readers use table locks.** An autocommit read takes no controller guard. Before an explicit transaction's first object lock, even for a read, it acquires and retains the shared checkpoint-participant guard. Both then take `AccessShare` before snapshot capture.
+- **Readers use table locks.** An autocommit plain read takes no controller guard. Before an explicit transaction's first object lock, even for a read, it acquires and retains the shared checkpoint-participant guard. Plain reads take `AccessShare`; a locking SELECT is promoted through the transaction-owned path, takes `RowShare`, and retains tuple locks until statement commit or explicit top-level completion.
 - **Writers run concurrently.** Autocommit writes acquire the shared writer guard before object locks. An explicit transaction already holds that same shared side before any retained object lock and reuses it if a later statement writes. It releases the guard at top-level completion. Write-write safety comes from table/row conflicts and storage structural latches.
 - **DDL is catalog-serialized and relation-scoped.** DDL is transactional and
   uses a transaction-local catalog overlay and the shared writer guard,
@@ -326,12 +327,22 @@ slot has been restored. Parse/Bind/Describe are not activity-tracked;
 
 `EXPLAIN` converges in `run_plan` after normal snapshot, relation-snapshot, object-lock, SSI, cancellation, and timeout setup. For `BoundStatement::Explain { analyze, statement }`, `QueryService` plans the inner SELECT. Plain mode calls the fallible planner `format_explain`; analyzed mode drains it exactly once through `QueryEngine::analyze_query` and calls the fallible `format_explain_analyze`. Plan/layout invariant failures propagate as structured errors. Successful formatting returns `StreamOutcome::Direct(ExecutionResult::Explanation)` and ignores a connection-provided SELECT row sink, so no inner rows escape and extended `max_rows` cannot suspend the result. Errors use the same panic firewall and explicit-transaction poisoning as SELECT.
 
+When the inner query has a row-locking clause, plain EXPLAIN remains non-executing
+and takes only its ordinary read locks. EXPLAIN ANALYZE is promoted to the locking
+transaction lifecycle, upgrades the target to `RowShare`, and retains tuple locks
+exactly as executing the locking SELECT would.
+
 Statement guard policy:
 
-- No `ConcurrencyController` guard: autocommit SELECT, plain EXPLAIN, and analyzed
+- No `ConcurrencyController` guard: autocommit plain SELECT, plain EXPLAIN, and analyzed
   EXPLAIN that does not mutate sequences. Explicit transactions take the shared side before their first
   object lock. Both take `AccessShare` and may wait for relation-changing work.
-- Shared writer/participant guard (`begin_writer`, many concurrent): all writes, DDL, and WAL-writing maintenance, including analyzed EXPLAIN whose SELECT calls `nextval` or `setval`; plus an explicit transaction before its first object lock even when that statement is read-only. DDL takes the catalog publication gate only after object locks. Plain EXPLAIN never advances sequences.
+- Shared writer/participant guard (`begin_writer`, many concurrent): all writes,
+  locking SELECT, DDL, and WAL-writing maintenance, including analyzed EXPLAIN
+  whose SELECT calls `nextval` or `setval`; plus an explicit transaction before
+  its first object lock even when that statement is read-only. DDL takes the
+  catalog publication gate only after object locks. Plain EXPLAIN never advances
+  sequences.
 - Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): actual checkpoint and its internal auto-prune only. Existing readers take no controller guard; relation locks separately exclude conflicting table access.
 
 Simple-query bind discovers relation ids before snapshot capture; execution then
@@ -377,6 +388,10 @@ Checkpoint may run after successful writes according to configured thresholds. I
 `ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>`. Startup uses it for `install_schemas`, `install_index_schemas`, `install_sequences`, and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine`, to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`, and to `StatementContext.sequence_manager` as `Arc<dyn SequenceManager>`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
 ## Query Results
+
+Here `SELECT` means a plain non-locking SELECT. A locking SELECT is materialized
+on the transaction-owned path so its implicit transaction retains tuple locks
+until the result is complete.
 
 A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`). The connection creates an `mpsc` channel and calls `execute_simple_streamed`, whose `spawn_blocking` producer owns the `PlanExecutor` and pushes a `StreamMessage::Start { columns }` then `StreamMessage::Rows` batches into it (via a `ChannelRowSink` implementing `executor::RowSink`); the async task drains the channel — emitting `RowDescription` from `Start` and `DataRow`s from each batch — concurrently while the producer runs, then finishes with `CommandComplete("SELECT n")` (n is the producer's authoritative row count, carried on `StreamOutcome::Streamed { count }`) and `ReadyForQuery`. The producer returns a `StreamOutcome`: `Streamed` for a SELECT, `Direct(ExecutionResult)` for an ordinary cancelable non-streamed result, `Durable(ExecutionResult)` after an autocommit or completed irreversible session/transaction-state boundary (including savepoint commands), or `SessionReset(ExecutionResult)` for completed `DISCARD ALL` so the connection clears prepared statements and portals through a typed signal. The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream and returns the transaction slot only when it finishes, so MVCC and transaction semantics are unchanged. A retrying `try_send` loop provides backpressure while polling the statement cancellation token; a dropped receiver (client gone) turns the next push into a graceful stop. The extended-protocol `Execute` streams identically through `execute_prepared_cancelable_streamed` / `execute_prepared_in_session_streamed`, differing only in that its `RowDescription` comes from `Describe` (so `Start` is consumed without emitting one) and its `ReadyForQuery` comes from `Sync` (see Connection Handling). Streaming alters neither protocol message encoding nor physical operator semantics; the materializing path (`execute_simple_with_session_sequences` and the `execute_sql` / `execute_prepared` convenience helpers, used by tests) shares the same executor drive.
 

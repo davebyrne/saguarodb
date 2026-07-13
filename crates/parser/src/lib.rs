@@ -16,8 +16,8 @@ mod convert;
 
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FetchCount, FromItem,
-    FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select,
-    SelectItem, SetOp, SetScope, Statement, UnaryOp,
+    FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, RowLockClause,
+    Select, SelectItem, SetOp, SetScope, Statement, UnaryOp,
 };
 
 use common::Result;
@@ -2915,5 +2915,51 @@ mod tests {
             parse("create table t (a integer[3])").unwrap_err().code,
             SqlState::SyntaxError
         );
+    }
+
+    #[test]
+    fn parses_all_row_lock_modes_and_wait_policies() {
+        let cases = [
+            (
+                "select * from users for update",
+                common::TupleLockMode::Update,
+                common::TupleLockWaitPolicy::Block,
+            ),
+            (
+                "select * from users for no key update nowait",
+                common::TupleLockMode::NoKeyUpdate,
+                common::TupleLockWaitPolicy::NoWait,
+            ),
+            (
+                "select * from users for share skip locked",
+                common::TupleLockMode::Share,
+                common::TupleLockWaitPolicy::SkipLocked,
+            ),
+            (
+                "select * from users for key share of users",
+                common::TupleLockMode::KeyShare,
+                common::TupleLockWaitPolicy::Block,
+            ),
+        ];
+
+        for (sql, mode, wait_policy) in cases {
+            let Statement::Query(query) = parse(sql).unwrap() else {
+                panic!("expected SELECT for {sql}");
+            };
+            let lock = query.row_lock.expect("expected row-locking clause");
+            assert_eq!(lock.mode, mode, "{sql}");
+            assert_eq!(lock.wait_policy, wait_policy, "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_nested_and_multiple_row_locking_clauses() {
+        for sql in [
+            "select * from (select * from users for update) u",
+            "select (select id from users for share) from users",
+            "select * from users for update for share",
+        ] {
+            assert_eq!(parse(sql).unwrap_err().code, SqlState::SyntaxError, "{sql}");
+        }
     }
 }

@@ -345,6 +345,17 @@ pub struct Query {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Optional PostgreSQL row-locking clause on this query result.
+    pub row_lock: Option<RowLockClause>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowLockClause {
+    pub mode: common::TupleLockMode,
+    pub wait_policy: common::TupleLockWaitPolicy,
+    /// Optional relation named by `OF`; binding validates it against the sole
+    /// lockable base-table source currently supported.
+    pub relation: Option<common::QualifiedName>,
 }
 
 /// A common table expression: `name [(col, ...)] AS (query)`. `column_aliases`

@@ -141,6 +141,15 @@ pub enum PhysicalPlan {
         joined_source: bool,
         returning: Option<BoundReturning>,
     },
+    LockRows {
+        source: Box<PhysicalPlan>,
+        table: TableId,
+        mode: common::TupleLockMode,
+        wait_policy: common::TupleLockWaitPolicy,
+        recheck: Option<BoundExpr>,
+        expressions: Vec<BoundExpr>,
+        output_schema: Vec<ColumnInfo>,
+    },
     SeqScan {
         table: TableId,
         table_name: String,
@@ -471,6 +480,23 @@ fn physical_plan_inner(
             joined_source: *joined_source,
             returning: returning.clone(),
         }),
+        LogicalPlan::LockRows {
+            source,
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        } => Ok(PhysicalPlan::LockRows {
+            source: Box::new(physical_plan_inner(source, catalog)?),
+            table: *table,
+            mode: *mode,
+            wait_policy: *wait_policy,
+            recheck: recheck.clone(),
+            expressions: expressions.clone(),
+            output_schema: output_schema.clone(),
+        }),
         LogicalPlan::Scan { table, filter } => plan_scan(*table, filter.clone(), catalog),
         LogicalPlan::SystemScan { view, filter } => Ok(PhysicalPlan::SystemScan {
             view: *view,
@@ -789,6 +815,7 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
             Ok(output_width(input, catalog)? + appended)
         }
         PhysicalPlan::Projection { output_schema, .. }
+        | PhysicalPlan::LockRows { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
         | PhysicalPlan::Values { output_schema, .. }
         | PhysicalPlan::TableFunction { output_schema, .. } => Ok(output_schema.len()),

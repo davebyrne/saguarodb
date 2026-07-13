@@ -26,6 +26,14 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - The `EXPLAIN` entry above is SELECT-only and includes plain `EXPLAIN`,
   `EXPLAIN ANALYZE`, and `EXPLAIN (ANALYZE [TRUE|FALSE])`; other options and
   non-SELECT inner statements are unsupported.
+- A top-level SELECT over exactly one base table may end with `FOR UPDATE`,
+  `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`, optionally naming that
+  table or alias with `OF` and selecting `NOWAIT` or `SKIP LOCKED`. DISTINCT,
+  grouping/aggregation, joins, views, derived/system relations, set operations,
+  VALUES, subqueries, and nested locking clauses are excluded. The executor
+  locks and resolves the latest version, rechecks WHERE, and projects that row
+  under Read Committed. Repeatable Read and Serializable reject a post-snapshot
+  successor with `40001`.
 - Schema-evolution DDL also supports `ALTER TABLE [ONLY] <table> ALTER [COLUMN]
   <column> TYPE <type>` and `... SET DATA TYPE <type>`. It performs an explicit-cast
   full heap/index rewrite transactionally; `USING` expressions are unsupported.
@@ -553,6 +561,9 @@ pub trait ConnectionState: Send {
 ```
 
 ### Query Result Architecture
+
+Here `SELECT` means a plain non-locking SELECT. A locking SELECT is materialized
+so its implicit transaction retains tuple locks until the result is complete.
 
 A `SELECT` **streams** its rows: the `spawn_blocking` producer owns the `PlanExecutor` and pushes row batches through a bounded channel to the async connection task, which writes them to the socket as they arrive (`docs/specs/streaming.md`). This bounds server memory (the whole result is never materialized) and applies TCP backpressure — a slow client blocks the producer on a full channel rather than letting it run ahead. DML, DML `RETURNING`, DDL, and `EXPLAIN` are still computed inside `spawn_blocking` and returned as complete results. `COPY` requests are bound in the query pipeline but return `BeginCopyIn`/`BeginCopyOut` outcomes; the connection task then drives the COPY sub-protocol, with COPY-out streamed through its own bounded channel.
 
@@ -1594,6 +1605,10 @@ binder or logical planner.
 
 `Statement::Explain { analyze, statement }` is orchestrated by server `QueryService`. Supported SELECT-only spellings are plain `EXPLAIN`, keyword `EXPLAIN ANALYZE`, and `EXPLAIN (ANALYZE [TRUE|FALSE])`; false behaves like plain EXPLAIN and all other options remain unsupported. The server binds the inner query, establishes the same statement snapshot, relation snapshot, `AccessShare` locks, SSI tracking, cancellation token, and timeout as SELECT, then plans it. Plain EXPLAIN formats the `PhysicalPlan` without executing it. Analyzed EXPLAIN drains the query exactly once through the opt-in instrumented executor and returns only `ExecutionResult::Explanation`, never the inner rows. `logical_plan` and `physical_plan` do not accept the outer `BoundStatement::Explain` directly.
 
+For an inner locking SELECT, plain EXPLAIN remains non-executing and uses ordinary
+read locking. EXPLAIN ANALYZE follows the locking transaction lifecycle, takes
+target `RowShare`, and retains tuple locks as the executed query would.
+
 Each plan line begins with an execution-local `[node=N]` identifier assigned in deterministic pre-order (root, unary child, binary left then right, Apply input then subplan), followed by the operator type, table/index involved, predicates, and row estimate. IDs are identical between plain and analyzed output for an unchanged main physical tree, but are neither durable nor catalog identifiers. Analyzed lines add per-loop average inclusive startup/total milliseconds, rows, and loop count; a zero-loop node says `(never executed)`. Init plans follow the main tree in deterministic ordinal order and use IDs after the main range. `Execution Time` uses a monotonic clock and covers init-subquery resolution/execution, executor construction, open, drain, and close. Parent times include child work and must not be summed.
 
 Plain EXPLAIN is side-effect free. Analyzed EXPLAIN has the same sequence and transaction semantics as executing its SELECT: `nextval`/`setval` promote autocommit analysis through writer classification, sequence locks, WAL, and commit, while failures and cancellation poison an explicit transaction like failed SELECT. Non-mutating autocommit analysis remains a read.
@@ -2130,7 +2145,7 @@ This gives the invariants:
 - Normal operation and recovery both spill dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory). The steal path forces the WAL durable before writing a stolen page (write-ahead), so a possibly-uncommitted stolen page is always recoverable.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
-**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. The buffer-pool boundary remains unchanged; the storage trait also exposes tuple lock/resolve and exact-version mutation plumbing intended for the forthcoming EvalPlanQual executor path.
+**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. Locking SELECT uses tuple lock/resolve for latest-version recheck and projection; exact-version mutation plumbing remains available for the forthcoming DML EvalPlanQual path.
 
 ### WAL Record Format
 
@@ -2735,7 +2750,12 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
-- **Read-only statements** (`SELECT`, plain EXPLAIN, and analyzed EXPLAIN without sequence mutation): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward. Analyzed EXPLAIN with `nextval`/`setval` follows the write lifecycle instead; plain EXPLAIN never evaluates them.
+- **Read-only statements** (plain `SELECT`, plain EXPLAIN, and analyzed EXPLAIN without sequence mutation): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward. Analyzed EXPLAIN with `nextval`/`setval` follows the write lifecycle instead; plain EXPLAIN never evaluates them.
+- **Locking SELECT** is promoted through the transaction-owned lifecycle so it has
+  an active xid and retains tuple grants. It takes the shared participant guard
+  and `RowShare`, captures its snapshot, materializes the result while resolving
+  and rechecking latest row versions, then releases locks at autocommit or retains
+  them to explicit top-level completion.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): bind to discover relations, allocate/register the autocommit xid (or use the explicit transaction's top xid), acquire the shared writer guard, then acquire xid-owned table locks and revalidate before snapshot capture. Targets use `RowExclusive`; read sources use `AccessShare`. Row and table waits share the same graph node and deadlock manager.
 - **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): transaction-scoped. Explicit transactions retain their catalog overlay and schema/name/table/sequence locks through commit or rollback; `ROLLBACK TO` instead restores both the overlay and the lock-grant snapshot captured at that savepoint. Autocommit uses the same lifecycle for one statement. Catalog changes become globally visible only after the transaction's commit record is durable. The publication gate makes the combined catalog snapshot visible atomically; object modes scope data/lifetime access.
 - **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE and ALTER take `AccessExclusive`. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback, while `ROLLBACK TO` restores both to the savepoint snapshot.

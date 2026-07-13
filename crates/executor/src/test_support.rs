@@ -368,7 +368,7 @@ impl TupleLockManager for PermissiveMemoryTupleLocks {
     }
 }
 
-fn memory_statement_context(txn_id: u64) -> StatementContext {
+pub(crate) fn memory_statement_context(txn_id: u64) -> StatementContext {
     StatementContext::new(txn_id).with_tuple_lock_manager(Arc::new(PermissiveMemoryTupleLocks))
 }
 
@@ -401,6 +401,7 @@ struct MemoryStoredRow {
     row_id: RowId,
     xmin: u64,
     row: Row,
+    predecessors: Vec<(RowId, u64)>,
 }
 
 impl MemoryStorage {
@@ -505,14 +506,18 @@ impl MemoryStorage {
         if replacement_key != target.identity().key && rows.contains_key(&replacement_key) {
             return Err(duplicate_storage_identity_error(&schema));
         }
-        rows.remove(&target.identity().key)
+        let previous = rows
+            .remove(&target.identity().key)
             .expect("validated locked row");
+        let mut predecessors = previous.predecessors;
+        predecessors.push((previous.row_id, previous.xmin));
         rows.insert(
             replacement_key,
             MemoryStoredRow {
                 row_id: replacement_row_id,
                 xmin: ctx.txn_id,
                 row,
+                predecessors,
             },
         );
         Ok(true)
@@ -570,6 +575,7 @@ impl StorageEngine for MemoryStorage {
                 row_id,
                 xmin: ctx.txn_id,
                 row,
+                predecessors: Vec::new(),
             },
         );
         Ok(row_id)
@@ -623,20 +629,31 @@ impl StorageEngine for MemoryStorage {
                 state
                     .rows
                     .get(&table)
+                    // Memory storage keeps only the current version. Resolve by the
+                    // stable logical key so executor tests exercise the same
+                    // scan-old/lock-latest contract as page-backed storage.
                     .and_then(|rows| rows.get(&identity.key))
                     .filter(|stored| {
-                        stored.row_id == identity.row_id && stored.xmin == identity.xmin
+                        (stored.row_id == identity.row_id && stored.xmin == identity.xmin)
+                            || stored
+                                .predecessors
+                                .contains(&(identity.row_id, identity.xmin))
                     })
-                    .map(|stored| stored.row.clone())
+                    .map(|stored| {
+                        (
+                            RowIdentity {
+                                row_id: stored.row_id,
+                                xmin: stored.xmin,
+                                key: identity.key.clone(),
+                            },
+                            stored.row.clone(),
+                        )
+                    })
             });
         match lookup {
-            Ok(Some(row)) => Ok(LockRowResult::Locked(LockedRow::from_lock_grant(
-                table,
-                ctx.txn_id,
-                identity.clone(),
-                row,
-                mode,
-            ))),
+            Ok(Some((current_identity, row))) => Ok(LockRowResult::Locked(
+                LockedRow::from_lock_grant(table, ctx.txn_id, current_identity, row, mode),
+            )),
             Ok(None) => {
                 ctx.tuple_locks
                     .restore_tuple_grants(ctx.txn_id, vec![change])?;
@@ -705,7 +722,10 @@ impl StorageEngine for MemoryStorage {
             TupleLockMode::Update,
             TupleLockWaitPolicy::Block,
         )? {
-            LockRowResult::Locked(target) => self.delete_locked(ctx, relations, table, &target),
+            LockRowResult::Locked(target) if target.identity() == &identity => {
+                self.delete_locked(ctx, relations, table, &target)
+            }
+            LockRowResult::Locked(_) => Err(memory_concurrent_update_error()),
             LockRowResult::Deleted => Err(memory_concurrent_update_error()),
             LockRowResult::Skipped => {
                 unreachable!("blocking tuple-lock acquisition cannot skip a row")
@@ -753,9 +773,10 @@ impl StorageEngine for MemoryStorage {
             mode,
             TupleLockWaitPolicy::Block,
         )? {
-            LockRowResult::Locked(target) => {
+            LockRowResult::Locked(target) if target.identity() == &identity => {
                 self.update_locked(ctx, relations, table, &target, row)
             }
+            LockRowResult::Locked(_) => Err(memory_concurrent_update_error()),
             LockRowResult::Deleted => Err(memory_concurrent_update_error()),
             LockRowResult::Skipped => {
                 unreachable!("blocking tuple-lock acquisition cannot skip a row")

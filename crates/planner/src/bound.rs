@@ -19,11 +19,19 @@ pub struct BoundQuery {
     pub order_by: Vec<BoundOrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub row_lock: Option<BoundRowLock>,
     /// The outer columns this query's body references, in `OuterRef` slot
     /// order. Empty for an uncorrelated query (including every top-level
     /// statement query); set only at a subquery boundary by the binder.
     /// `docs/specs/subqueries.md` §4.2.
     pub correlations: Vec<CorrelatedColumn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundRowLock {
+    pub table: TableId,
+    pub mode: common::TupleLockMode,
+    pub wait_policy: common::TupleLockWaitPolicy,
 }
 
 /// One entry of a correlated query's correlation list: the outer column an

@@ -173,10 +173,10 @@ ordinary `update`/`delete` entry points remain available for existing callers, b
 they also take a blocking `NoKeyUpdate`/`Update` tuple lock before mutation so they
 cannot bypass an explicit row lock. Those legacy entry points retain
 first-updater-wins behavior: if resolution advances beyond their snapshot-selected
-identity or finds it deleted, they return `40001`. The explicit
-lock/resolve/mutate methods are plumbing for the locking SELECT and EvalPlanQual
-executor orchestration; until that wiring ships, production DML continues through
-the ordinary first-updater-wins entry points.
+identity or finds it deleted, they return `40001`. `lock_row` is used by the
+locking-SELECT `LockRows` operator for latest-version predicate recheck and
+projection. The exact-version mutation methods are reserved for DML EvalPlanQual;
+production DML still uses the ordinary first-updater-wins entry points.
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions/storage ids a statement should resolve plus the storage relation epoch observed

@@ -144,7 +144,18 @@ pub struct Query {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub row_lock: Option<RowLockClause>,
 }
+
+// FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE [OF relation]
+// plus Block / NoWait / SkipLocked policy.
+pub struct RowLockClause { /* ... */ }
+
+// sqlparser 0.56 lacks the two extended lock strengths, so token-aware
+// normalization maps only those top-level phrases to a supported base form and
+// restores the intended mode after conversion. Locking clauses are rejected inside
+// derived tables, CTEs, scalar subqueries, INSERT sources, views, and cursors;
+// an outer EXPLAIN retains the top-level query clause. Multiple clauses are rejected.
 
 // A common table expression: `name [(col, ...)] AS (query)`. `column_aliases`
 // optionally renames the CTE's output columns left to right.

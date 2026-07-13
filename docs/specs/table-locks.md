@@ -51,12 +51,11 @@ The symmetric compatibility matrix is:
 
 Mappings:
 
-- `AccessShare`: `SELECT`, `COPY TO`, and every user table read through a view,
+- `AccessShare`: plain `SELECT`, `COPY TO`, and every user table read through a view,
   subquery, CTE, join, cursor, or suspended portal. A view reference also locks
   the view's logical relation id so replace/drop cannot change its definition.
-- `RowShare`: reserved for a transaction that will lock selected tuples. The SQL
-  locking clauses are not exposed yet, but the distinct mode prevents that
-  future behavior from being conflated with a plain snapshot read.
+- `RowShare`: a top-level locking `SELECT` on its single base-table target
+  (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`).
 - `RowExclusive`: `INSERT`, `UPDATE`, `DELETE`, and `COPY FROM`; a modifying
   statement takes this mode on its target and `AccessShare` on read-only source
   tables.

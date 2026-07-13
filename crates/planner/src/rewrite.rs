@@ -217,6 +217,23 @@ fn rewrite_plan_exprs_impl(
             expressions: rewrite_vec(expressions, f)?,
             output_schema: output_schema.clone(),
         },
+        PhysicalPlan::LockRows {
+            source,
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        } => PhysicalPlan::LockRows {
+            source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
+            table: *table,
+            mode: *mode,
+            wait_policy: *wait_policy,
+            recheck: rewrite_opt(recheck, f)?,
+            expressions: rewrite_vec(expressions, f)?,
+            output_schema: output_schema.clone(),
+        },
         PhysicalPlan::Sort { source, order_by } => PhysicalPlan::Sort {
             source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
             order_by: order_by

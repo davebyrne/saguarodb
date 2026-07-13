@@ -2815,6 +2815,9 @@ fn object_lock_requests(
             .and_modify(|held| *held = (*held).max(mode))
             .or_insert(mode);
     };
+    if let Some(table) = executing_row_lock_table(bound) {
+        upgrade_target(table, RelationLockMode::RowShare);
+    }
     match bound {
         BoundStatement::Insert { table, .. }
         | BoundStatement::Update { table, .. }
@@ -3611,10 +3614,25 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
 }
 
 fn classify_bound(class: StatementClass, bound: &BoundStatement) -> StatementClass {
-    if matches!(class, StatementClass::Read) && mutates_sequences(bound) {
+    let locks_rows = executing_row_lock_table(bound).is_some();
+    if matches!(class, StatementClass::Read) && (mutates_sequences(bound) || locks_rows) {
         StatementClass::Write
     } else {
         class
+    }
+}
+
+fn executing_row_lock_table(bound: &BoundStatement) -> Option<TableId> {
+    match bound {
+        BoundStatement::Query(query) => query.row_lock.as_ref().map(|lock| lock.table),
+        BoundStatement::Explain {
+            analyze: true,
+            statement,
+        } => match statement.as_ref() {
+            BoundStatement::Query(query) => query.row_lock.as_ref().map(|lock| lock.table),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -3723,6 +3741,31 @@ mod tests {
                     crate::lock_manager::SequenceLockMode::Access,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn locking_select_requests_row_share_on_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        let table = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let statement = parser::parse("select * from users for key share").unwrap();
+        let bound = planner::bind(&statement, app.components.catalog.as_ref()).unwrap();
+
+        assert_eq!(
+            object_lock_requests(&bound, app.components.catalog.as_ref()).unwrap(),
+            vec![crate::lock_manager::ObjectLockRequest::table(
+                table.id,
+                crate::lock_manager::RelationLockMode::RowShare,
+            )]
         );
     }
 

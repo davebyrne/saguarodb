@@ -25,8 +25,8 @@ use crate::instrumentation::{DynamicProfile, InstrumentedExecutor, MetricCollect
 use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinInput, HashJoinOp, IndexScanInput, IndexScanOp,
-    LimitOp, MergeJoinOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp,
-    TableFunctionOp, ValuesOp,
+    LimitOp, LockRowsInput, LockRowsOp, MergeJoinOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp,
+    SetOpOp, SortOp, TableFunctionOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -819,6 +819,26 @@ fn build_executor_impl<'a>(
             expressions.clone(),
             output_schema.clone(),
         ))),
+        PhysicalPlan::LockRows {
+            source,
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        } => Ok(Box::new(LockRowsOp::new(LockRowsInput {
+            ctx: ctx.statement.clone(),
+            relations: ctx.relations.clone(),
+            storage: ctx.storage,
+            source: child(source, 0)?,
+            table: *table,
+            mode: *mode,
+            wait_policy: *wait_policy,
+            recheck: recheck.clone(),
+            expressions: expressions.clone(),
+            output_schema: output_schema.clone(),
+        }))),
         PhysicalPlan::Distinct { source, on_keys } => Ok(Box::new(DistinctOp::new(
             ctx.statement.clone(),
             child(source, 0)?,
@@ -929,6 +949,7 @@ fn executor_child_count(plan: &PhysicalPlan) -> usize {
         | PhysicalPlan::Delete { .. }
         | PhysicalPlan::Filter { .. }
         | PhysicalPlan::Projection { .. }
+        | PhysicalPlan::LockRows { .. }
         | PhysicalPlan::Sort { .. }
         | PhysicalPlan::Distinct { .. }
         | PhysicalPlan::Limit { .. }
@@ -978,6 +999,7 @@ fn validate_plan_layout(plan: &PhysicalPlan, layout: &PlanNodeLayout) -> Result<
         | PhysicalPlan::Delete { source, .. }
         | PhysicalPlan::Filter { source, .. }
         | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::LockRows { source, .. }
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. }

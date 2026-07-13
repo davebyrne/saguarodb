@@ -83,6 +83,7 @@ fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Delete { source, .. }
         | PhysicalPlan::Filter { source, .. }
         | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::LockRows { source, .. }
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. }
@@ -554,6 +555,24 @@ fn format_node(
                 metrics,
                 output,
             )?;
+        }
+        PhysicalPlan::LockRows {
+            source,
+            mode,
+            wait_policy,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{prefix}LockRows mode={mode:?} wait={wait_policy:?}{rows_suffix}{actual_suffix}\n"
+            ));
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                metrics,
+                output,
+            );
         }
         PhysicalPlan::Sort { source, order_by } => {
             output.push_str(&format!(

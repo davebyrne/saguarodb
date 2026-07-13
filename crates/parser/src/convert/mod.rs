@@ -24,7 +24,7 @@ use dml::{convert_copy, convert_delete, convert_insert};
 use expr::convert_expr;
 use query::{
     convert_assignment, convert_query, convert_returning, convert_table_with_joins,
-    table_name_from_table_with_joins,
+    convert_top_level_query, table_name_from_table_with_joins,
 };
 
 pub fn parse_statement(sql: &str) -> Result<Statement> {
@@ -61,8 +61,10 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     // statement terminator. We stream copy-in over the wire and never carry
     // inline data, so ensure the statement is terminated. A trailing `;` is a
     // no-op for every other statement and never introduces a second one.
-    let copy_compat = normalize_pgbench_copy_freeze(sql)?;
-    let trimmed = copy_compat.as_deref().unwrap_or(sql).trim_end();
+    let (row_lock_compat, extended_lock_mode) = normalize_extended_row_lock_mode(sql)?;
+    let row_lock_sql = row_lock_compat.as_deref().unwrap_or(sql);
+    let copy_compat = normalize_pgbench_copy_freeze(row_lock_sql)?;
+    let trimmed = copy_compat.as_deref().unwrap_or(row_lock_sql).trim_end();
     let normalized = if trimmed.ends_with(';') {
         trimmed.to_string()
     } else {
@@ -77,7 +79,99 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
         return Err(parse_error("expected exactly one SQL statement"));
     }
 
-    convert_statement(statements.remove(0))
+    let top_level_has_lock = matches!(
+        statements.first(),
+        Some(sql::Statement::Query(query)) if !query.locks.is_empty()
+    );
+    let mut statement = convert_statement(statements.remove(0))?;
+    if let Some(mode) = extended_lock_mode {
+        if !top_level_has_lock {
+            return Err(parse_error(
+                "extended row-lock mode is only supported on a top-level SELECT",
+            ));
+        }
+        let Statement::Query(query) = &mut statement else {
+            return Err(parse_error("row-locking clause requires SELECT"));
+        };
+        let Some(row_lock) = &mut query.row_lock else {
+            return Err(parse_error("row-locking clause was not preserved"));
+        };
+        row_lock.mode = mode;
+    }
+    Ok(statement)
+}
+
+fn normalize_extended_row_lock_mode(
+    sql_text: &str,
+) -> Result<(Option<String>, Option<common::TupleLockMode>)> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql_text)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to tokenize SELECT: {err}")))?;
+    let next_word = |start: usize| {
+        tokens
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, token)| !matches!(token, Token::Whitespace(_)))
+            .and_then(|(index, token)| match token {
+                Token::Word(word) => Some((index, word.value.as_str())),
+                _ => None,
+            })
+    };
+    let mut output = String::new();
+    let mut mode = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let is_for =
+            matches!(&tokens[index], Token::Word(word) if word.value.eq_ignore_ascii_case("for"));
+        if is_for && let Some((first_index, first)) = next_word(index + 1) {
+            let extended = if first.eq_ignore_ascii_case("no") {
+                let Some((key_index, key)) = next_word(first_index + 1) else {
+                    output.push_str(&tokens[index].to_string());
+                    index += 1;
+                    continue;
+                };
+                let Some((mode_index, update)) = next_word(key_index + 1) else {
+                    output.push_str(&tokens[index].to_string());
+                    index += 1;
+                    continue;
+                };
+                (key.eq_ignore_ascii_case("key") && update.eq_ignore_ascii_case("update"))
+                    .then_some((mode_index, common::TupleLockMode::NoKeyUpdate, "FOR UPDATE"))
+            } else if first.eq_ignore_ascii_case("key") {
+                let Some((mode_index, share)) = next_word(first_index + 1) else {
+                    output.push_str(&tokens[index].to_string());
+                    index += 1;
+                    continue;
+                };
+                share.eq_ignore_ascii_case("share").then_some((
+                    mode_index,
+                    common::TupleLockMode::KeyShare,
+                    "FOR SHARE",
+                ))
+            } else {
+                None
+            };
+            if let Some((last_index, found_mode, replacement)) = extended {
+                if mode.replace(found_mode).is_some() {
+                    return Err(parse_error(
+                        "multiple extended row-locking clauses are not supported",
+                    ));
+                }
+                output.push_str(replacement);
+                index = last_index + 1;
+                continue;
+            }
+        }
+        output.push_str(&tokens[index].to_string());
+        index += 1;
+    }
+    if mode.is_some() {
+        Ok((Some(output), mode))
+    } else {
+        Ok((None, None))
+    }
 }
 
 /// pgbench 18 uses `COPY ... FROM STDIN WITH (FREEZE ON)` during client-side
@@ -265,7 +359,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             }
         }
         sql::Statement::Insert(insert) => convert_insert(insert),
-        sql::Statement::Query(query) => Ok(Statement::Query(convert_query(*query)?)),
+        sql::Statement::Query(query) => Ok(Statement::Query(convert_top_level_query(*query)?)),
         sql::Statement::Update {
             table,
             assignments,

@@ -61,6 +61,23 @@ pub(crate) fn hoist_correlated_subqueries(
                 output_schema,
             }
         }
+        LogicalPlan::LockRows {
+            source,
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        } => LogicalPlan::LockRows {
+            source: Box::new(hoist_correlated_subqueries(*source, catalog)?),
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        },
         // Structural recursion for every other node; expressions they carry
         // keep their correlated subqueries (unsupported positions) for the
         // executor's staging guard.
@@ -869,6 +886,7 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
         | LogicalPlan::Distinct { source, .. }
         | LogicalPlan::Limit { source, .. } => logical_output_width(source, catalog)?,
         LogicalPlan::Projection { output_schema, .. }
+        | LogicalPlan::LockRows { output_schema, .. }
         | LogicalPlan::Aggregate { output_schema, .. }
         | LogicalPlan::Values { output_schema, .. }
         | LogicalPlan::TableFunction { output_schema, .. } => output_schema.len(),

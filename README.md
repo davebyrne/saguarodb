@@ -49,8 +49,9 @@ trait seams.
 - Multi-statement transactions, autocommit, transaction-scoped and
   session-scoped isolation settings, savepoints, forward-only read-only SQL
   cursors, `statement_timeout`, `work_mem`, and `DISCARD ALL`.
-- MVCC tuple visibility without row locks, concurrent writers, Read Committed,
-  Repeatable Read, and Serializable Snapshot Isolation.
+- MVCC tuple visibility, concurrent writers, locking SELECT with four PostgreSQL
+  tuple-lock strengths plus NOWAIT/SKIP LOCKED, Read Committed, Repeatable Read,
+  and Serializable Snapshot Isolation.
 - Garbage collection via `VACUUM [table]`, coordinated TOAST cleanup, and
   checkpoint auto-pruning (`--auto-vacuum-dead-rows`).
 - Optimizer statistics via `ANALYZE [table]` / `VACUUM ANALYZE` (sampled row
@@ -78,7 +79,7 @@ SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, or time-travel
 queries. Important follow-on areas include a fuller cost-based optimizer (join
 reordering, multi-column index ranges), recursive queries, window functions,
-row-locking SELECTs, advanced index options
+advanced index options
 (partial/expression/concurrent/include indexes), and more complete sequence and
 constraint DDL.
 
@@ -191,8 +192,11 @@ map, and reclaimed later by VACUUM.
   locks acquired since the savepoint, restores upgraded locks to their earlier
   modes, and preserves the outer transaction. Releasing a savepoint keeps its
   changes and locks merged into the parent.
-- **Concurrency.** MVCC tuple reads take no row locks and do not conflict with
-  ordinary DML writers. SQL statements also take transaction- or statement-owned
+- **Concurrency.** Plain MVCC tuple reads take no row locks and do not conflict
+  with ordinary DML writers. A top-level SELECT over one base table can use
+  `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`, optionally
+  with `NOWAIT` or `SKIP LOCKED`; it locks and rechecks the latest row version.
+  SQL statements also take transaction- or statement-owned
   table locks, so a reader can wait behind an `AccessExclusive` operation such as
   `TRUNCATE` or table-rewrite DDL. Writers run concurrently, coordinated by table
   and row locks plus per-index and per-heap structural latches; a writer blocked
@@ -288,8 +292,9 @@ crates/
 
 ## Query Path
 
-Most SQL flows through the same parse, bind, plan, and execute pipeline. Read
+Most SQL flows through the same parse, bind, plan, and execute pipeline. Plain read
 statements take an MVCC snapshot and `AccessShare` table locks but no row locks;
+locking SELECT takes `RowShare`, a transaction ID, and selected tuple locks;
 data-changing statements run under a shared writer guard and receive a
 transaction ID plus a snapshot for visibility, WAL, table/row locks, and
 conflict detection. DDL and maintenance also use the shared writer guard plus
@@ -309,8 +314,8 @@ QueryService
     |
     +--> classify statement
     |       |
-    |       +-- SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks;
-    |       |                      writer guard only for sequence-mutating analysis
+    |       +-- plain SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks
+    |       +-- locking SELECT: txn_id + RowShare + tuple locks + latest-row recheck
     |       +-- DML / COPY FROM:  shared writer guard + txn_id + table locks + snapshot
     |       +-- DDL / maintenance:
     |                            shared writer guard + object locks/catalog gate

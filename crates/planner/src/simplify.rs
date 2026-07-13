@@ -87,6 +87,23 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             expressions: expressions.into_iter().map(fold_expr).collect(),
             output_schema,
         },
+        LogicalPlan::LockRows {
+            source,
+            table,
+            mode,
+            wait_policy,
+            recheck,
+            expressions,
+            output_schema,
+        } => LogicalPlan::LockRows {
+            source: Box::new(simplify_logical(*source)),
+            table,
+            mode,
+            wait_policy,
+            recheck: recheck.map(fold_expr).filter(|expr| !is_true(expr)),
+            expressions: expressions.into_iter().map(fold_expr).collect(),
+            output_schema,
+        },
         LogicalPlan::Sort { source, order_by } => LogicalPlan::Sort {
             source: Box::new(simplify_logical(*source)),
             order_by: order_by

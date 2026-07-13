@@ -136,6 +136,15 @@ pub enum LogicalPlan {
         joined_source: bool,
         returning: Option<BoundReturning>,
     },
+    LockRows {
+        source: Box<LogicalPlan>,
+        table: TableId,
+        mode: common::TupleLockMode,
+        wait_policy: common::TupleLockWaitPolicy,
+        recheck: Option<BoundExpr>,
+        expressions: Vec<BoundExpr>,
+        output_schema: Vec<ColumnInfo>,
+    },
     Scan {
         table: TableId,
         filter: Option<BoundExpr>,
@@ -463,9 +472,13 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
 /// its arms' plans before those modifiers.
 pub(crate) fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
     match &query.body {
-        BoundQueryBody::Select(select) => {
-            plan_select_body(select, &query.order_by, query.limit, query.offset)
-        }
+        BoundQueryBody::Select(select) => plan_select_body(
+            select,
+            &query.order_by,
+            query.limit,
+            query.offset,
+            query.row_lock.as_ref(),
+        ),
         // A VALUES body is a literal row set. It lowers directly to the existing
         // `Values` node; the query-level `ORDER BY` (bound to output positions) and
         // `LIMIT`/`OFFSET` stack above.
@@ -549,6 +562,7 @@ fn plan_select_body(
     order_by: &[BoundOrderByItem],
     limit: Option<u64>,
     offset: Option<u64>,
+    row_lock: Option<&crate::BoundRowLock>,
 ) -> Result<LogicalPlan> {
     let mut plan = plan_select_source(select)?;
 
@@ -643,7 +657,20 @@ fn plan_select_body(
             Some(BoundDistinct::All) => Some(expressions.clone()),
             Some(BoundDistinct::On(on)) => Some(on.clone()),
         };
-        plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
+        plan = if let Some(lock) = row_lock {
+            debug_assert!(distinct_keys.is_none());
+            LogicalPlan::LockRows {
+                source: Box::new(plan),
+                table: lock.table,
+                mode: lock.mode,
+                wait_policy: lock.wait_policy,
+                recheck: select.filter.clone(),
+                expressions,
+                output_schema: select.output_schema.clone(),
+            }
+        } else {
+            apply_distinct_and_projection(plan, select, distinct_keys, expressions)
+        };
     }
 
     Ok(apply_limit(plan, limit, offset))
