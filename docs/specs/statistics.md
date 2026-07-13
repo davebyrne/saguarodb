@@ -37,8 +37,10 @@ defines:
 
 - Join reordering (follow-on project; this spec only produces the estimates it
   will need).
-- Widening index-scan predicate eligibility (literal `Integer`/`Text`/`Boolean`
-  comparands only, single leading column — unchanged here; separate project).
+- Widening index-scan access derivation (single-leading-column ranges only —
+  a composite index uses just its first column; multi-column prefix ranges
+  are a separate project). Note: any scalar literal comparand is already
+  index-eligible, and parameters substitute to literals before planning.
 - Extended statistics (multi-column correlations, expression statistics),
   physical-order correlation, per-index statistics.
 - `ANALYZE <table> (columns...)` column lists; `EXPLAIN ANALYZE` (still

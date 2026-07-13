@@ -741,7 +741,7 @@ pub enum PhysicalPlan {
 - A `LogicalPlan::SystemScan` maps directly to `PhysicalPlan::SystemScan`; it is
   not considered for storage index selection and carries the system view's full
   output schema for later execution and EXPLAIN/debug output.
-- Only a literal comparand of type `Integer`, `Text`, or `Boolean` qualifies for an `IndexScan`; a parameter, expression, or other-typed comparand falls back to `SeqScan`.
+- Any scalar literal comparand qualifies for an `IndexScan` (`literal_key` accepts every scalar `Value` kind); a `NULL` or array comparand and a non-constant expression fall back to `SeqScan`. Extended-protocol parameters are substituted into the bound statement before per-execution planning, so the planner never sees a parameter comparand. Constant expressions are folded by the simplification pass before physical planning.
 - With statistics on the scanned table, `plan_scan` compares `seq_scan_cost(pages, rows)` against `index_scan_cost(matches, rows)` (`planner::estimate`, constants per `docs/specs/statistics.md` §9.2) and keeps the eligible `IndexScan` only when it is not costlier; without statistics the always-index rule is unchanged.
 - The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.

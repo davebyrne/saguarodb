@@ -48,12 +48,18 @@ trait seams.
   Read, and Serializable Snapshot Isolation.
 - Garbage collection via `VACUUM [table]`, coordinated TOAST cleanup, and
   checkpoint auto-pruning (`--auto-vacuum-dead-rows`).
+- Optimizer statistics via `ANALYZE [table]` / `VACUUM ANALYZE` (sampled row
+  counts, null fractions, n_distinct, most-common values, histograms), exposed
+  through `pg_class.reltuples`/`relpages` and `pg_stats`, refreshed
+  automatically at checkpoints (`--auto-analyze-changed-rows`).
 - HOT (heap-only tuples): eligible same-page updates that do not change indexed
   columns skip secondary-index maintenance, and dead HOT chains are pruned in
   place.
 - Rule-based planning with table scans, primary-key and secondary-index scans,
   hash joins for inner equi-joins, streaming SELECT execution, and materialized
-  blocking operators where needed.
+  blocking operators where needed. ANALYZE statistics feed cardinality
+  estimates (shown as `rows=` in `EXPLAIN`) and the first cost-based
+  decisions: hash-join build-side choice and seq-vs-index scan selection.
 - Page-backed MVCC storage with heap files, durable non-clustered
   storage-identity B-trees, secondary B-tree indexes, TOAST relations for large
   values, at-rest page compression, dictionary-backed zstd payload compression,
@@ -63,11 +69,11 @@ trait seams.
 
 SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, transactional DDL,
-or time-travel queries. Important follow-on areas include SQL cursors
-(`DECLARE`/`FETCH`/`CLOSE`), statement timeouts, a cost-based optimizer and
-statistics, recursive queries, window functions, row-locking SELECTs, advanced
-index options (partial/expression/concurrent/include indexes), and more
-complete sequence and constraint DDL.
+or time-travel queries. Important follow-on areas include a fuller
+cost-based optimizer (join reordering, multi-column index ranges), recursive
+queries, window functions, row-locking SELECTs, advanced index options
+(partial/expression/concurrent/include indexes), and more complete sequence
+and constraint DDL.
 
 ## Quick Start
 
@@ -137,6 +143,7 @@ The server accepts:
 --checkpoint-every-n-commits <N>   default 100
 --checkpoint-wal-bytes <BYTES>     default 67108864
 --auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)
+--auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)
 --shutdown-timeout-ms <MS>         default 30000
 --deadlock-timeout-ms <MS>         default 1000
 --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)
