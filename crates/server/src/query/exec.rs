@@ -396,7 +396,10 @@ impl QueryService {
                 )
             }
             None => {
-                let mut object_guard = self.components.lock_manager.statement_owner();
+                let mut object_guard = match self.components.lock_manager.statement_owner() {
+                    Ok(guard) => guard,
+                    Err(err) => return (None, default_isolation, Err(err)),
+                };
                 let (bound, schema_versions) = match self.bind_and_lock_unprepared_for_path(
                     &statement,
                     &session.gucs.search_path_names(&session.session_info.user),
@@ -775,7 +778,7 @@ impl QueryService {
                 let (bound, object_guard) = if requests.is_empty() {
                     (initial, None)
                 } else {
-                    let mut guard = self.components.lock_manager.statement_owner();
+                    let mut guard = self.components.lock_manager.statement_owner()?;
                     let (bound, _) = self.bind_and_lock_unprepared_for_path(
                         &statement,
                         &session.gucs.search_path_names(&session.session_info.user),
@@ -817,7 +820,9 @@ impl QueryService {
                         )
                         .map(StreamOutcome::Direct)
                     }
-                    _ => unreachable!("classify_bound only promotes reads to writes"),
+                    _ => Err(DbError::internal(
+                        "autocommit read was reclassified as an unsupported statement class",
+                    )),
                 }
             }
             StatementClass::Write | StatementClass::Ddl => self

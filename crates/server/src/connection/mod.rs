@@ -684,7 +684,7 @@ impl Session {
                     .app
                     .components
                     .cancel_registry
-                    .register(self.cancel.clone(), self.cancel_wake.clone());
+                    .register(self.cancel.clone(), self.cancel_wake.clone())?;
                 self.backend_key = Some(key);
                 self.session_info = Arc::new(SessionInfo {
                     user: session_user,

@@ -35,11 +35,23 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 ## Unsafe, Panics, and Assertions
 
 - Do not use `unsafe`. If a future change needs `unsafe`, isolate it in a small module, document the safety invariants, and add targeted tests.
-- Library crates must not panic for expected runtime errors. Return `common::Result<T>`.
-- Avoid `unwrap()` and `expect()` in production code. Use structured error conversion instead.
-- `panic!`, `unwrap()`, and `expect()` are acceptable in tests.
-- `debug_assert!` is acceptable for internal invariants that should be impossible if earlier validation worked.
-- Use `unreachable!()` only for genuinely impossible states, not as a substitute for error handling.
+- Production code must not intentionally panic. Return `common::Result<T>` for
+  expected runtime failures and unexpected invariant violations alike.
+- Do not use `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
+  `unimplemented!`, `assert!`, `assert_eq!`, `assert_ne!`, or `debug_assert*`
+  in production code. Replace invariant assertions with a structured error at
+  the nearest fallible boundary.
+- Fixed-width decoders validate length before conversion and propagate failed
+  `try_into`; they never use `try_into().unwrap()` or `try_into().expect()`.
+- Infallible trait methods and `Drop` implementations must be total. Recover
+  explicitly where safe or defer/report failure at a later fallible boundary.
+- Mutex poisoning is handled deliberately by returning a structured error or by
+  explicitly recovering the guard where continuation is the documented policy.
+- Runtime-controlled indexing and slicing requires checked access or a prior
+  bounds/length validation; invariant failure still becomes an error rather than
+  an assertion.
+- Panic helpers and assertions are acceptable only in `#[cfg(test)]` code and
+  integration-test targets that cannot enter a production execution path.
 
 ## Errors
 

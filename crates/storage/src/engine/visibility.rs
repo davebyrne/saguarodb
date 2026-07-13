@@ -168,7 +168,11 @@ impl PageBackedStorageEngine {
                     *raw_crc32,
                     payload,
                 )?;
-                debug_assert_eq!(raw.len(), sample_len);
+                if raw.len() != sample_len {
+                    return Err(crate::toast::toast_corruption(
+                        "materialized TOAST sample length does not match metadata",
+                    ));
+                }
                 validate_toast_sample_raw(&data_type, &raw)?;
                 Ok(Some(raw))
             }
@@ -200,7 +204,11 @@ impl PageBackedStorageEngine {
                     raw_crc32,
                     payload,
                 )?;
-                debug_assert_eq!(raw.len(), sample_len);
+                if raw.len() != sample_len {
+                    return Err(crate::toast::toast_corruption(
+                        "materialized TOAST sample length does not match metadata",
+                    ));
+                }
                 validate_toast_sample_raw(&data_type, &raw)?;
                 Ok(Some(raw))
             }

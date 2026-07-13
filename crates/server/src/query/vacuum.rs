@@ -76,7 +76,7 @@ impl QueryService {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
             DbError::internal("maintenance prepared statement has no carried payload")
         })?;
-        let mut identity_guard = self.components.lock_manager.statement_owner();
+        let mut identity_guard = self.components.lock_manager.statement_owner()?;
         let mut identity_requests = Vec::new();
         for name in maintenance_target_names(statement) {
             let Some(schema_name) = name.schema.as_deref() else {

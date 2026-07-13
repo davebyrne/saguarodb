@@ -606,7 +606,7 @@ impl PageBackedStorageEngine {
             let raw = cached_payload
                 .as_deref()
                 .or(borrowed_payload)
-                .expect("one TOAST payload representation is present");
+                .ok_or_else(|| DbError::internal("TOAST payload representation is missing"))?;
             let mut plan = ToastVarlenaPlan::Plain {
                 cached_payload: cached_payload.clone(),
             };

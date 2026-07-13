@@ -112,6 +112,10 @@ impl ArrayType {
         Ok(Self(Box::new(element_type)))
     }
 
+    pub(crate) fn from_validated_scalar(element_type: DataType) -> Self {
+        Self(Box::new(element_type))
+    }
+
     #[must_use]
     pub fn element_type(&self) -> &DataType {
         &self.0

@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::ApplyKind;
 use crate::JoinType;
 use crate::PhysicalPlan;
-use common::{Key, KeyRange};
+use common::{DbError, Key, KeyRange, Result};
 
 /// An execution-local identifier assigned to one node in a physical plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,18 +115,21 @@ fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
     }
 }
 
-pub fn format_explain(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> String {
+pub fn format_explain(
+    plan: &PhysicalPlan,
+    catalog: &dyn catalog::CatalogManager,
+) -> Result<String> {
     let mut output = String::new();
     let layout = PlanNodeLayout::new(plan);
-    format_node(plan, &layout, 0, catalog, None, &mut output);
-    output
+    format_node(plan, &layout, 0, catalog, None, &mut output)?;
+    Ok(output)
 }
 
 pub fn format_explain_analyze(
     plan: &PhysicalPlan,
     catalog: &dyn catalog::CatalogManager,
     analysis: &ExplainAnalysis,
-) -> String {
+) -> Result<String> {
     let mut output = String::new();
     let layout = PlanNodeLayout::new(plan);
     format_node(
@@ -136,7 +139,7 @@ pub fn format_explain_analyze(
         catalog,
         Some(&analysis.nodes),
         &mut output,
-    );
+    )?;
     if !analysis.init_plans.is_empty() {
         output.push_str("Init Plans:\n");
         let mut init_plans = analysis.init_plans.iter().collect::<Vec<_>>();
@@ -154,14 +157,14 @@ pub fn format_explain_analyze(
                 catalog,
                 Some(&analysis.nodes),
                 &mut output,
-            );
+            )?;
         }
     }
     output.push_str(&format!(
         "Execution Time: {:.3} ms\n",
         analysis.execution_time.as_secs_f64() * 1_000.0
     ));
-    output
+    Ok(output)
 }
 
 /// Whether a node produces (or, for DML, consumes) rows and therefore carries
@@ -191,7 +194,7 @@ fn format_node(
     catalog: &dyn catalog::CatalogManager,
     metrics: Option<&BTreeMap<PlanNodeId, NodeExecutionMetrics>>,
     output: &mut String,
-) {
+) -> Result<()> {
     let prefix = format!("{}[node={}] ", "  ".repeat(indent), layout.id().0);
     // Estimated output rows (docs/specs/statistics.md §9.1), appended to
     // every data-producing node line.
@@ -323,12 +326,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Update { table, source, .. } => {
             output.push_str(&format!(
@@ -336,12 +339,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Delete { table, source, .. } => {
             output.push_str(&format!(
@@ -349,12 +352,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::SeqScan {
             table,
@@ -403,20 +406,20 @@ fn format_node(
             ));
             format_node(
                 left,
-                layout.child(0).expect("left layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
             format_node(
                 right,
-                layout.child(1).expect("right layout"),
+                layout_child(layout, 1)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::HashJoin {
             left,
@@ -438,20 +441,20 @@ fn format_node(
             ));
             format_node(
                 left,
-                layout.child(0).expect("left layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
             format_node(
                 right,
-                layout.child(1).expect("right layout"),
+                layout_child(layout, 1)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::MergeJoin {
             left,
@@ -468,20 +471,20 @@ fn format_node(
             ));
             format_node(
                 left,
-                layout.child(0).expect("left layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
             format_node(
                 right,
-                layout.child(1).expect("right layout"),
+                layout_child(layout, 1)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Apply {
             input,
@@ -508,31 +511,31 @@ fn format_node(
             ));
             format_node(
                 input,
-                layout.child(0).expect("input layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
             format_node(
                 subplan,
-                layout.child(1).expect("subplan layout"),
+                layout_child(layout, 1)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Filter { source, .. } => {
             output.push_str(&format!("{prefix}Filter{rows_suffix}{actual_suffix}\n"));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Projection {
             source,
@@ -545,12 +548,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Sort { source, order_by } => {
             output.push_str(&format!(
@@ -559,12 +562,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Distinct { source, on_keys } => {
             output.push_str(&format!(
@@ -573,12 +576,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Limit {
             source,
@@ -593,12 +596,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Aggregate {
             source,
@@ -613,12 +616,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!(
@@ -642,22 +645,32 @@ fn format_node(
             ));
             format_node(
                 left,
-                layout.child(0).expect("left layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
             format_node(
                 right,
-                layout.child(1).expect("right layout"),
+                layout_child(layout, 1)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
     }
+    Ok(())
+}
+
+fn layout_child(layout: &PlanNodeLayout, index: usize) -> Result<&PlanNodeLayout> {
+    layout.child(index).ok_or_else(|| {
+        DbError::internal(format!(
+            "EXPLAIN layout node {} is missing child {index}",
+            layout.id().0
+        ))
+    })
 }
 
 fn table_label(table: u32, table_name: &str) -> String {

@@ -34,11 +34,9 @@ pub(crate) fn primary_index_file_id(storage_id: FileId) -> FileId {
 /// The file id for a secondary index, tagged so it shares the page store with
 /// heaps and primary-key indexes without collision.
 pub(crate) fn secondary_index_file_id(storage_id: FileId) -> FileId {
-    debug_assert_eq!(
-        storage_id & SECONDARY_INDEX_BITS,
-        0,
-        "secondary index storage id {storage_id} does not fit in 30 bits"
-    );
+    // Catalog construction/deserialization rejects storage ids carrying any
+    // file-kind bits. Keep this pure mapping total; callers only receive
+    // catalog-validated ids.
     storage_id | SECONDARY_INDEX_BITS
 }
 
@@ -246,7 +244,7 @@ impl PageStore for HeapPageStore {
     fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()> {
         let file = self
             .handle(file_id, true)?
-            .expect("handle with create=true is always Some");
+            .ok_or_else(|| DbError::internal("heap file creation returned no handle"))?;
         let offset = page_offset(page_num);
         if let Some(envelope) = self.compression.compress_page_at_rest(file_id, &data.0)? {
             // Smallest whole number of fs blocks holding the envelope; only

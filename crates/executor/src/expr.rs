@@ -353,7 +353,7 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
                 "division by zero",
             )),
             BinOp::Mod => checked_integer(left.checked_rem(right)),
-            _ => unreachable!(),
+            _ => datatype_mismatch("operator is not defined for integers"),
         },
         (Value::Float(left), Value::Float(right)) => {
             let (left, right) = (left.0, right.0);
@@ -415,7 +415,7 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
                     ));
                 }
                 BinOp::Mod => left.checked_rem(right),
-                _ => unreachable!(),
+                _ => return datatype_mismatch("operator is not defined for numeric values"),
             };
             result.map(Value::Numeric).ok_or_else(numeric_overflow)
         }
@@ -556,7 +556,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         BinOp::LtEq => ordering.is_le(),
         BinOp::Gt => ordering.is_gt(),
         BinOp::GtEq => ordering.is_ge(),
-        _ => unreachable!(),
+        _ => return datatype_mismatch("operator is not a comparison operator"),
     };
     Ok(Value::Boolean(result))
 }

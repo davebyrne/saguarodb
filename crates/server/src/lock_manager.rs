@@ -197,10 +197,9 @@ pub struct LockManager {
 }
 
 impl LockManager {
-    pub fn new(registry: ActiveTxnRegistry, deadlock_timeout: Duration) -> Self {
-        let id = NEXT_MANAGER_ID.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, u64::MAX, "lock manager id exhausted");
-        Self {
+    pub fn new(registry: ActiveTxnRegistry, deadlock_timeout: Duration) -> Result<Self> {
+        let id = next_id(&NEXT_MANAGER_ID, "lock manager")?;
+        Ok(Self {
             id,
             state: Mutex::new(LockState::default()),
             cond: Condvar::new(),
@@ -209,15 +208,13 @@ impl LockManager {
             next_guard_id: AtomicU64::new(1),
             next_statement_owner: AtomicU64::new(1),
             next_request_id: AtomicU64::new(1),
-        }
+        })
     }
 
-    pub fn statement_owner(self: &Arc<Self>) -> ObjectLockGuard {
-        let id = self.next_statement_owner.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, u64::MAX, "statement lock-owner id exhausted");
+    pub fn statement_owner(self: &Arc<Self>) -> Result<ObjectLockGuard> {
+        let id = next_id(&self.next_statement_owner, "statement lock owner")?;
         let owner = LockOwner::Statement(id);
         self.create_guard(owner)
-            .expect("fresh statement lock owner must be unique")
     }
 
     pub fn transaction_owner(self: &Arc<Self>, xid: TxnId) -> Result<ObjectLockGuard> {
@@ -227,8 +224,7 @@ impl LockManager {
 
     fn create_guard(self: &Arc<Self>, owner: LockOwner) -> Result<ObjectLockGuard> {
         self.register_owner(owner)?;
-        let guard_id = self.next_guard_id.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(guard_id, u64::MAX, "object lock guard id exhausted");
+        let guard_id = next_id(&self.next_guard_id, "object lock guard")?;
         Ok(ObjectLockGuard::new(Arc::clone(self), owner, guard_id))
     }
 
@@ -238,7 +234,10 @@ impl LockManager {
     }
 
     fn lock(&self) -> MutexGuard<'_, LockState> {
-        self.state.lock().expect("lock manager mutex poisoned")
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     fn register_owner(&self, owner: LockOwner) -> Result<()> {
@@ -280,8 +279,7 @@ impl LockManager {
             return Ok(());
         }
 
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(request_id, u64::MAX, "object lock request id exhausted");
+        let request_id = next_id(&self.next_request_id, "object lock request")?;
         state
             .queues
             .entry(request.resource.clone())
@@ -337,10 +335,10 @@ impl LockManager {
             }
             state.waits_for.insert(owner, blockers);
 
-            let (next_state, _woken) = self
-                .cond
-                .wait_timeout(state, POLL_INTERVAL)
-                .expect("lock manager mutex poisoned");
+            let (next_state, _woken) = match self.cond.wait_timeout(state, POLL_INTERVAL) {
+                Ok(waited) => waited,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             state = next_state;
             if last_detection.elapsed() >= self.deadlock_timeout {
                 last_detection = Instant::now();
@@ -523,10 +521,10 @@ impl ConflictWaiter for LockManager {
             if let Err(err) = cancel.check() {
                 break Err(err);
             }
-            let (next_state, _woken) = self
-                .cond
-                .wait_timeout(state, POLL_INTERVAL)
-                .expect("lock manager mutex poisoned");
+            let (next_state, _woken) = match self.cond.wait_timeout(state, POLL_INTERVAL) {
+                Ok(waited) => waited,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             state = next_state;
             if last_detection.elapsed() >= self.deadlock_timeout {
                 last_detection = Instant::now();
@@ -542,6 +540,12 @@ impl ConflictWaiter for LockManager {
         state.waits_for.remove(&waiter);
         result
     }
+}
+
+fn next_id(counter: &AtomicU64, kind: &str) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| DbError::internal(format!("{kind} id space exhausted")))
 }
 
 fn validate_request(request: &ObjectLockRequest) -> Result<()> {
@@ -652,10 +656,9 @@ mod tests {
     fn manager(timeout_ms: u64) -> (Arc<LockManager>, ActiveTxnRegistry) {
         let registry = ActiveTxnRegistry::new();
         (
-            Arc::new(LockManager::new(
-                registry.clone(),
-                Duration::from_millis(timeout_ms),
-            )),
+            Arc::new(
+                LockManager::new(registry.clone(), Duration::from_millis(timeout_ms)).unwrap(),
+            ),
             registry,
         )
     }
@@ -753,7 +756,7 @@ mod tests {
     fn snapshot_restore_preserves_preexisting_grants() {
         let (manager, _) = manager(20);
         let cancel = QueryCancel::new();
-        let mut guard = manager.statement_owner();
+        let mut guard = manager.statement_owner().unwrap();
         guard
             .acquire_many(
                 &[ObjectLockRequest::table(1, RelationLockMode::AccessShare)],
@@ -791,7 +794,7 @@ mod tests {
     fn snapshot_cannot_be_restored_by_another_owner() {
         let (manager, _) = manager(20);
         let cancel = QueryCancel::new();
-        let mut first = manager.statement_owner();
+        let mut first = manager.statement_owner().unwrap();
         first
             .acquire_many(
                 &[ObjectLockRequest::table(
@@ -802,7 +805,7 @@ mod tests {
             )
             .unwrap();
         let snapshot = first.snapshot();
-        let mut second = manager.statement_owner();
+        let mut second = manager.statement_owner().unwrap();
 
         assert!(second.restore(&snapshot).is_err());
         assert!(second.snapshot().grants.is_empty());
@@ -812,7 +815,7 @@ mod tests {
     fn stale_snapshot_cannot_recreate_a_released_grant() {
         let (manager, _) = manager(20);
         let cancel = QueryCancel::new();
-        let mut guard = manager.statement_owner();
+        let mut guard = manager.statement_owner().unwrap();
         let empty = guard.snapshot();
         guard
             .acquire_many(
@@ -826,7 +829,7 @@ mod tests {
         let locked = guard.snapshot();
         guard.restore(&empty).unwrap();
 
-        let mut reader = manager.statement_owner();
+        let mut reader = manager.statement_owner().unwrap();
         reader
             .acquire_many(
                 &[ObjectLockRequest::table(1, RelationLockMode::AccessShare)],
@@ -842,7 +845,7 @@ mod tests {
     fn queued_exclusive_prevents_reader_bypass() {
         let (manager, _) = manager(20);
         let cancel = Arc::new(QueryCancel::new());
-        let mut reader = manager.statement_owner();
+        let mut reader = manager.statement_owner().unwrap();
         reader
             .acquire_many(
                 &[ObjectLockRequest::table(1, RelationLockMode::AccessShare)],
@@ -851,7 +854,7 @@ mod tests {
             .unwrap();
 
         let (events_tx, events_rx) = mpsc::channel();
-        let mut exclusive = manager.statement_owner();
+        let mut exclusive = manager.statement_owner().unwrap();
         let exclusive_owner = exclusive.owner();
         let exclusive_cancel = Arc::clone(&cancel);
         let exclusive_tx = events_tx.clone();
@@ -869,7 +872,7 @@ mod tests {
         });
         wait_until_queued(&manager, exclusive_owner, LockResource::Table(1));
 
-        let mut late_reader = manager.statement_owner();
+        let mut late_reader = manager.statement_owner().unwrap();
         let late_reader_owner = late_reader.owner();
         let late_cancel = Arc::clone(&cancel);
         let late_tx = events_tx;
@@ -901,14 +904,14 @@ mod tests {
     fn sequence_access_is_shared_and_exclusive_waits_for_every_holder() {
         let (manager, _) = manager(20);
         let cancel = Arc::new(QueryCancel::new());
-        let mut first = manager.statement_owner();
+        let mut first = manager.statement_owner().unwrap();
         first
             .acquire_many(
                 &[ObjectLockRequest::sequence(1, SequenceLockMode::Access)],
                 &cancel,
             )
             .unwrap();
-        let mut second = manager.statement_owner();
+        let mut second = manager.statement_owner().unwrap();
         second
             .acquire_many(
                 &[ObjectLockRequest::sequence(1, SequenceLockMode::Access)],
@@ -916,7 +919,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut exclusive = manager.statement_owner();
+        let mut exclusive = manager.statement_owner().unwrap();
         let exclusive_owner = exclusive.owner();
         let exclusive_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -1114,7 +1117,7 @@ mod tests {
     fn cancellation_removes_queued_request() {
         let (manager, _) = manager(500);
         let holder_cancel = QueryCancel::new();
-        let mut holder = manager.statement_owner();
+        let mut holder = manager.statement_owner().unwrap();
         holder
             .acquire_many(
                 &[ObjectLockRequest::table(
@@ -1125,7 +1128,7 @@ mod tests {
             )
             .unwrap();
         let cancel = Arc::new(QueryCancel::new());
-        let mut waiter = manager.statement_owner();
+        let mut waiter = manager.statement_owner().unwrap();
         let waiter_cancel = Arc::clone(&cancel);
         let thread = thread::spawn(move || {
             waiter.acquire_many(

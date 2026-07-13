@@ -211,6 +211,11 @@ impl PgType {
     }
 
     /// The PostgreSQL type OID reported on the wire.
+    #[allow(
+        clippy::manual_unwrap_or,
+        clippy::manual_unwrap_or_default,
+        reason = "spell out the total fallback without an unwrap-family method"
+    )]
     pub fn oid(&self) -> i32 {
         match self {
             PgType::Int2 => 21,
@@ -235,8 +240,10 @@ impl PgType {
             PgType::Int2Vector => 22,
             PgType::CatalogOidArrayText => 1028,
             PgType::CatalogInt2ArrayText => 1005,
-            PgType::Array(element) => array_oid(&element.0)
-                .expect("PgArrayType construction guarantees a supported scalar element"),
+            PgType::Array(element) => match array_oid(&element.0) {
+                Some(oid) => oid,
+                None => 0,
+            },
         }
     }
 
@@ -319,10 +326,9 @@ impl PgType {
             | PgType::Int2Vector
             | PgType::CatalogOidArrayText
             | PgType::CatalogInt2ArrayText => DataType::Text,
-            PgType::Array(element) => DataType::Array(
-                crate::ArrayType::new(element.0.data_type())
-                    .expect("PgArrayType always contains a scalar element"),
-            ),
+            PgType::Array(element) => DataType::Array(crate::ArrayType::from_validated_scalar(
+                element.0.data_type(),
+            )),
             PgType::Bytea => DataType::Bytea,
             PgType::Uuid => DataType::Uuid,
             PgType::Date => DataType::Date,
@@ -464,8 +470,9 @@ impl From<&DataType> for PgType {
                 precision: *precision,
                 scale: *scale,
             },
-            DataType::Array(element) => PgType::array(PgType::from(element.element_type()))
-                .expect("DataType arrays always have supported scalar elements"),
+            DataType::Array(element) => {
+                PgType::Array(PgArrayType(Box::new(PgType::from(element.element_type()))))
+            }
         }
     }
 }

@@ -115,7 +115,12 @@ impl<'a> MergeJoinOp<'a> {
     }
 
     fn begin_group(&mut self, spill_ctx: spill::SpillContext) -> Result<()> {
-        self.group_key = self.left_next.as_ref().expect("equal left").keys.clone();
+        self.group_key = self
+            .left_next
+            .as_ref()
+            .ok_or_else(|| DbError::internal("merge join equal group has no left row"))?
+            .keys
+            .clone();
         let mut tape = SpillTape::new(spill_ctx.clone());
         while self
             .right_next
@@ -123,11 +128,15 @@ impl<'a> MergeJoinOp<'a> {
             .is_some_and(|row| row.keys == self.group_key)
         {
             self.ctx.cancel.check()?;
-            tape.push(self.right_next.take().expect("right group row").row)?;
+            let right = self
+                .right_next
+                .take()
+                .ok_or_else(|| DbError::internal("merge join right group row is missing"))?;
+            tape.push(right.row)?;
             self.right_next = self
                 .right_stream
                 .as_mut()
-                .expect("right stream")
+                .ok_or_else(|| DbError::internal("merge join right stream is not open"))?
                 .next_record()?;
         }
         tape.finish()?;
@@ -199,22 +208,32 @@ impl PlanExecutor for MergeJoinOp<'_> {
                 MergePhase::Align => match (&self.left_next, &self.right_next) {
                     (None, None) => self.phase = MergePhase::Done,
                     (Some(_), None) => {
-                        let row = self.left_next.take().expect("left tail").row;
+                        let row = self
+                            .left_next
+                            .take()
+                            .ok_or_else(|| DbError::internal("merge join left tail is missing"))?
+                            .row;
                         self.left_next = self
                             .left_stream
                             .as_mut()
-                            .expect("left stream")
+                            .ok_or_else(|| DbError::internal("merge join left stream is not open"))?
                             .next_record()?;
                         if matches!(self.join_type, JoinType::Left | JoinType::Full) {
                             return Ok(Some(join_with_null_right(&row, self.right_width)));
                         }
                     }
                     (None, Some(_)) => {
-                        let row = self.right_next.take().expect("right tail").row;
+                        let row = self
+                            .right_next
+                            .take()
+                            .ok_or_else(|| DbError::internal("merge join right tail is missing"))?
+                            .row;
                         self.right_next = self
                             .right_stream
                             .as_mut()
-                            .expect("right stream")
+                            .ok_or_else(|| {
+                                DbError::internal("merge join right stream is not open")
+                            })?
                             .next_record()?;
                         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
                             return Ok(Some(join_with_null_left(self.left_width, &row)));
@@ -225,21 +244,37 @@ impl PlanExecutor for MergeJoinOp<'_> {
                         let right_null = key_has_null(&right.keys);
                         let order = compare_merge_keys(&left.keys, &right.keys);
                         if order == Ordering::Less || (order == Ordering::Equal && left_null) {
-                            let row = self.left_next.take().expect("unmatched left").row;
+                            let row = self
+                                .left_next
+                                .take()
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join unmatched left row is missing")
+                                })?
+                                .row;
                             self.left_next = self
                                 .left_stream
                                 .as_mut()
-                                .expect("left stream")
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join left stream is not open")
+                                })?
                                 .next_record()?;
                             if matches!(self.join_type, JoinType::Left | JoinType::Full) {
                                 return Ok(Some(join_with_null_right(&row, self.right_width)));
                             }
                         } else if order == Ordering::Greater || right_null {
-                            let row = self.right_next.take().expect("unmatched right").row;
+                            let row = self
+                                .right_next
+                                .take()
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join unmatched right row is missing")
+                                })?
+                                .row;
                             self.right_next = self
                                 .right_stream
                                 .as_mut()
-                                .expect("right stream")
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join right stream is not open")
+                                })?
                                 .next_record()?;
                             if matches!(self.join_type, JoinType::Right | JoinType::Full) {
                                 return Ok(Some(join_with_null_left(self.left_width, &row)));
@@ -248,7 +283,9 @@ impl PlanExecutor for MergeJoinOp<'_> {
                             self.begin_group(
                                 self.spill_ctx
                                     .as_ref()
-                                    .expect("merge spill context")
+                                    .ok_or_else(|| {
+                                        DbError::internal("merge join spill context is not open")
+                                    })?
                                     .clone(),
                             )?;
                         }
@@ -265,11 +302,21 @@ impl PlanExecutor for MergeJoinOp<'_> {
                                 self.matched_stream = Some(
                                     self.matched_sorter
                                         .take()
-                                        .expect("matched sorter")
+                                        .ok_or_else(|| {
+                                            DbError::internal(
+                                                "merge join matched sorter is missing",
+                                            )
+                                        })?
                                         .finish()?,
                                 );
-                                self.right_group_reader =
-                                    Some(self.right_group.as_mut().expect("right group").reader()?);
+                                self.right_group_reader = Some(
+                                    self.right_group
+                                        .as_mut()
+                                        .ok_or_else(|| {
+                                            DbError::internal("merge join right group is missing")
+                                        })?
+                                        .reader()?,
+                                );
                                 self.unmatched_ordinal = 0;
                                 self.phase = MergePhase::EmitUnmatchedRightGroup;
                             } else {
@@ -278,21 +325,34 @@ impl PlanExecutor for MergeJoinOp<'_> {
                             }
                             continue;
                         }
-                        self.current_left = Some(self.left_next.take().expect("group left").row);
+                        self.current_left = Some(
+                            self.left_next
+                                .take()
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join group left row is missing")
+                                })?
+                                .row,
+                        );
                         self.left_next = self
                             .left_stream
                             .as_mut()
-                            .expect("left stream")
+                            .ok_or_else(|| DbError::internal("merge join left stream is not open"))?
                             .next_record()?;
-                        self.right_group_reader =
-                            Some(self.right_group.as_mut().expect("right group").reader()?);
+                        self.right_group_reader = Some(
+                            self.right_group
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join right group is missing")
+                                })?
+                                .reader()?,
+                        );
                         self.right_ordinal = 0;
                         self.left_matched = false;
                     }
                     while let Some(right) = self
                         .right_group_reader
                         .as_mut()
-                        .expect("group reader")
+                        .ok_or_else(|| DbError::internal("merge join group reader is missing"))?
                         .next_record()?
                     {
                         self.ctx.cancel.check()?;
@@ -301,8 +361,12 @@ impl PlanExecutor for MergeJoinOp<'_> {
                             .right_ordinal
                             .checked_add(1)
                             .ok_or_else(|| DbError::internal("merge right ordinal overflow"))?;
-                        let joined =
-                            join_row_refs(self.current_left.as_ref().expect("group left"), &right);
+                        let joined = join_row_refs(
+                            self.current_left.as_ref().ok_or_else(|| {
+                                DbError::internal("merge join current left row is missing")
+                            })?,
+                            &right,
+                        );
                         if join_condition_matches(&self.ctx, &self.residual, &joined)? {
                             self.left_matched = true;
                             if let Some(sorter) = &mut self.matched_sorter {
@@ -311,7 +375,9 @@ impl PlanExecutor for MergeJoinOp<'_> {
                             return Ok(Some(joined));
                         }
                     }
-                    let left = self.current_left.take().expect("finished group left");
+                    let left = self.current_left.take().ok_or_else(|| {
+                        DbError::internal("merge join finished group has no left row")
+                    })?;
                     if !self.left_matched
                         && matches!(self.join_type, JoinType::Left | JoinType::Full)
                     {
@@ -322,7 +388,7 @@ impl PlanExecutor for MergeJoinOp<'_> {
                     let Some(right) = self
                         .right_group_reader
                         .as_mut()
-                        .expect("unmatched reader")
+                        .ok_or_else(|| DbError::internal("merge join unmatched reader is missing"))?
                         .next_record()?
                     else {
                         self.right_group_reader = None;
@@ -340,7 +406,9 @@ impl PlanExecutor for MergeJoinOp<'_> {
                         self.matched_next = self
                             .matched_stream
                             .as_mut()
-                            .expect("matched stream")
+                            .ok_or_else(|| {
+                                DbError::internal("merge join matched stream is missing")
+                            })?
                             .next_record()?
                             .map(record_ordinal);
                         if self.matched_next.is_none() {
@@ -352,7 +420,9 @@ impl PlanExecutor for MergeJoinOp<'_> {
                             self.matched_next = self
                                 .matched_stream
                                 .as_mut()
-                                .expect("matched stream")
+                                .ok_or_else(|| {
+                                    DbError::internal("merge join matched stream is missing")
+                                })?
                                 .next_record()?
                                 .map(record_ordinal);
                         }
@@ -545,7 +615,9 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                         self.current_left = self
                             .left_reader
                             .as_mut()
-                            .expect("open nested-loop left reader")
+                            .ok_or_else(|| {
+                                DbError::internal("nested-loop left reader is not open")
+                            })?
                             .next_record()?;
                         let Some(_) = self.current_left else {
                             if matches!(self.join_type, JoinType::Right | JoinType::Full) {
@@ -554,14 +626,20 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                                 self.matched_stream = Some(
                                     self.matched_sorter
                                         .take()
-                                        .expect("right/full matched sorter")
+                                        .ok_or_else(|| {
+                                            DbError::internal(
+                                                "nested-loop matched sorter is missing",
+                                            )
+                                        })?
                                         .finish()?,
                                 );
                                 self.matched_next = None;
                                 self.right_reader = Some(
                                     self.right_tape
                                         .as_mut()
-                                        .expect("open nested-loop right tape")
+                                        .ok_or_else(|| {
+                                            DbError::internal("nested-loop right tape is not open")
+                                        })?
                                         .reader()?,
                                 );
                                 continue;
@@ -574,15 +652,19 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                         self.right_reader = Some(
                             self.right_tape
                                 .as_mut()
-                                .expect("open nested-loop right tape")
+                                .ok_or_else(|| {
+                                    DbError::internal("nested-loop right tape is not open")
+                                })?
                                 .reader()?,
                         );
                     }
-                    let left = self.current_left.as_ref().expect("current left row");
+                    let left = self.current_left.as_ref().ok_or_else(|| {
+                        DbError::internal("nested-loop current left row is missing")
+                    })?;
                     while let Some(right) = self
                         .right_reader
                         .as_mut()
-                        .expect("open nested-loop right reader")
+                        .ok_or_else(|| DbError::internal("nested-loop right reader is not open"))?
                         .next_record()?
                     {
                         self.ctx.cancel.check()?;
@@ -615,7 +697,9 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                     if self.current_left.is_none() {
                         continue;
                     }
-                    let left = self.current_left.take().expect("finished left row");
+                    let left = self.current_left.take().ok_or_else(|| {
+                        DbError::internal("nested-loop finished left row is missing")
+                    })?;
                     if self.join_type == JoinType::Anti && !self.matched {
                         return Ok(Some(left));
                     }
@@ -627,7 +711,7 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                     let right = self
                         .right_reader
                         .as_mut()
-                        .expect("open nested-loop right reader")
+                        .ok_or_else(|| DbError::internal("nested-loop right reader is not open"))?
                         .next_record()?;
                     let Some(right) = right else {
                         self.phase = NestedPhase::Done;
@@ -643,7 +727,9 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
                             self.matched_next = self
                                 .matched_stream
                                 .as_mut()
-                                .expect("right/full matched stream")
+                                .ok_or_else(|| {
+                                    DbError::internal("nested-loop matched stream is missing")
+                                })?
                                 .next_record()?
                                 .map(record_ordinal);
                         }
@@ -812,7 +898,7 @@ pub struct HashJoinInput<'a> {
 }
 
 impl<'a> HashJoinOp<'a> {
-    pub fn new(input: HashJoinInput<'a>) -> Self {
+    pub fn new(input: HashJoinInput<'a>) -> Result<Self> {
         let HashJoinInput {
             ctx,
             mut left,
@@ -824,10 +910,11 @@ impl<'a> HashJoinOp<'a> {
             build_left,
             spill,
         } = input;
-        debug_assert!(
-            !build_left || join_type == JoinType::Inner,
-            "build_left is only valid for inner hash joins"
-        );
+        if build_left && join_type != JoinType::Inner {
+            return Err(DbError::internal(
+                "left-side hash build is only valid for inner hash joins",
+            ));
+        }
         let mut output_schema = left.output_schema().to_vec();
         if !join_type.is_semi_or_anti() {
             output_schema.extend_from_slice(right.output_schema());
@@ -836,7 +923,7 @@ impl<'a> HashJoinOp<'a> {
             std::mem::swap(&mut left, &mut right);
             std::mem::swap(&mut left_keys, &mut right_keys);
         }
-        Self {
+        Ok(Self {
             ctx,
             left,
             right,
@@ -855,7 +942,7 @@ impl<'a> HashJoinOp<'a> {
             match_key: None,
             match_index: 0,
             left_open: false,
-        }
+        })
     }
 }
 
@@ -877,7 +964,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                 self.ctx.cancel.check()?;
                 if build.is_none() {
                     if join_key_heap_size(&right.row.values, &self.right_keys)?.is_some() {
-                        tape.as_mut().expect("hash fallback tape").push(right)?;
+                        tape.as_mut()
+                            .ok_or_else(|| DbError::internal("hash join fallback tape is missing"))?
+                            .push(right)?;
                     }
                     continue;
                 }
@@ -886,7 +975,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                 else {
                     continue;
                 };
-                let rows = build.as_mut().expect("hash build rows");
+                let rows = build
+                    .as_mut()
+                    .ok_or_else(|| DbError::internal("hash join build rows are missing"))?;
                 let old_capacity = rows.capacity();
                 let growing = rows.len() == old_capacity;
                 let requested_capacity = if growing {
@@ -929,7 +1020,7 @@ impl PlanExecutor for HashJoinOp<'_> {
                 }
                 let key = if fits {
                     join_key(&right.row.values, &self.right_keys)?
-                        .expect("nonnull preflight hash key")
+                        .ok_or_else(|| DbError::internal("hash join preflight key is missing"))?
                 } else {
                     Vec::new()
                 };
@@ -948,7 +1039,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                         *rows = replacement;
                         self.reservation
                             .as_mut()
-                            .expect("hash build reservation")
+                            .ok_or_else(|| {
+                                DbError::internal("hash join build reservation is missing")
+                            })?
                             .shrink(
                                 old_capacity.saturating_mul(std::mem::size_of::<HashBuildRow>())
                                     as u64,
@@ -964,7 +1057,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                         .ok_or_else(|| DbError::internal("hash build input ordinal overflow"))?;
                 } else {
                     drop(candidate);
-                    let prior = build.take().expect("hash build before fallback");
+                    let prior = build.take().ok_or_else(|| {
+                        DbError::internal("hash join build rows disappeared before fallback")
+                    })?;
                     let mut fallback = SpillTape::disk_only(spill_ctx.clone())?;
                     for row in prior {
                         fallback.push(row.row)?;
@@ -984,7 +1079,9 @@ impl PlanExecutor for HashJoinOp<'_> {
             sort_hash_build_cancelable(&self.ctx, rows)?;
         }
         if build.is_none() {
-            let tape = tape.as_mut().expect("finished hash fallback tape");
+            let tape = tape
+                .as_mut()
+                .ok_or_else(|| DbError::internal("hash join fallback tape is missing"))?;
             self.right_reader = Some(tape.reader()?);
         }
         self.right_tape = tape;
@@ -1007,7 +1104,7 @@ impl PlanExecutor for HashJoinOp<'_> {
                     &self
                         .current_left
                         .as_ref()
-                        .expect("current hash left")
+                        .ok_or_else(|| DbError::internal("hash join current left row is missing"))?
                         .row
                         .values,
                     &self.left_keys,
@@ -1017,7 +1114,7 @@ impl PlanExecutor for HashJoinOp<'_> {
                     self.right_reader = Some(
                         self.right_tape
                             .as_mut()
-                            .expect("open hash right tape")
+                            .ok_or_else(|| DbError::internal("hash join right tape is not open"))?
                             .reader()?,
                     );
                 }
@@ -1031,7 +1128,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                 });
                 if self.join_type.is_semi_or_anti() {
                     let matched = range.as_ref().is_some_and(|range| !range.is_empty());
-                    let left = self.current_left.take().expect("hash semi/anti left");
+                    let left = self.current_left.take().ok_or_else(|| {
+                        DbError::internal("hash semi/anti join left row is missing")
+                    })?;
                     if matched == (self.join_type == JoinType::Semi) {
                         return Ok(Some(left));
                     }
@@ -1042,7 +1141,9 @@ impl PlanExecutor for HashJoinOp<'_> {
                     .filter(|row| self.match_key.as_ref() == Some(&row.key))
                 {
                     self.match_index += 1;
-                    let probe = self.current_left.as_ref().expect("hash matched probe");
+                    let probe = self.current_left.as_ref().ok_or_else(|| {
+                        DbError::internal("hash join matched probe row is missing")
+                    })?;
                     let (left, logical_right) = if self.build_left {
                         (&right.row, probe)
                     } else {
@@ -1059,12 +1160,15 @@ impl PlanExecutor for HashJoinOp<'_> {
                 continue;
             }
 
-            let probe = self.current_left.as_ref().expect("fallback hash probe");
+            let probe = self
+                .current_left
+                .as_ref()
+                .ok_or_else(|| DbError::internal("fallback hash join probe row is missing"))?;
             let mut matched = false;
             while let Some(right) = self
                 .right_reader
                 .as_mut()
-                .expect("fallback hash reader")
+                .ok_or_else(|| DbError::internal("fallback hash join reader is missing"))?
                 .next_record()?
             {
                 let right_key = join_key(&right.row.values, &self.right_keys)?;
@@ -1093,7 +1197,9 @@ impl PlanExecutor for HashJoinOp<'_> {
             if self.current_left.is_none() {
                 continue;
             }
-            let left = self.current_left.take().expect("finished fallback left");
+            let left = self.current_left.take().ok_or_else(|| {
+                DbError::internal("fallback hash join finished left row is missing")
+            })?;
             if self.join_type == JoinType::Anti && !matched {
                 return Ok(Some(left));
             }

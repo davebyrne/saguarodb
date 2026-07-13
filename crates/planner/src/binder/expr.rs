@@ -1,4 +1,4 @@
-use common::{ColumnDef, DataType, PgType, Result, SqlState, Value};
+use common::{ColumnDef, DataType, DbError, PgType, Result, SqlState, Value};
 use parser::{Expr, FunctionArg, Query};
 
 use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, CorrelatedColumn, UnaryOp};
@@ -269,10 +269,7 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Bytes(_) => (DataType::Bytea, false),
         Value::Uuid(_) => (DataType::Uuid, false),
         Value::Array(array) => (
-            DataType::Array(
-                common::ArrayType::new(array.element_type().clone())
-                    .expect("SqlArray always has a scalar element type"),
-            ),
+            DataType::Array(common::ArrayType::new(array.element_type().clone())?),
             false,
         ),
     };
@@ -371,7 +368,10 @@ fn array_dimensions(elements: &[Expr]) -> Result<Vec<u32>> {
         ));
     }
     let mut nested = nested;
-    let first = array_dimensions(nested.next().expect("non-empty nested array"))?;
+    let first_elements = nested
+        .next()
+        .ok_or_else(|| DbError::internal("nested array disappeared after shape validation"))?;
+    let first = array_dimensions(first_elements)?;
     if first.is_empty() || first.contains(&0) {
         return Err(plan_error(
             SqlState::DatatypeMismatch,
@@ -541,8 +541,8 @@ fn bind_binary_op(
                 _ => None,
             };
             if let Some(data_type) = interval_result {
-                let left = left_res.expect("left bound above");
-                let right = right_res.expect("right bound above");
+                let left = left_res?;
+                let right = right_res?;
                 let nullable = left.nullable() || right.nullable();
                 return Ok(BoundExpr::BinaryOp {
                     left: Box::new(left),
@@ -951,7 +951,9 @@ fn bind_coalesce(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExp
 
     // COALESCE is non-null exactly when some argument can never be NULL.
     let nullable = bound.iter().all(BoundExpr::nullable);
-    let last = bound.pop().expect("coalesce has at least one argument");
+    let last = bound
+        .pop()
+        .ok_or_else(|| DbError::internal("COALESCE arguments disappeared after binding"))?;
     let when_clauses = bound
         .into_iter()
         .map(|arg| {

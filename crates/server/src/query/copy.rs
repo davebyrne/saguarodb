@@ -108,7 +108,7 @@ impl QueryService {
         mut ownership: AutocommitCopyWrite,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> Result<u64> {
-        let txn_id = ownership.txn_id();
+        let txn_id = ownership.txn_id()?;
         let CapturedSnapshots {
             snapshot,
             relations,

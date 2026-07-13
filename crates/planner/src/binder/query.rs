@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use catalog::{CatalogManager, SystemView, is_system_schema, resolve_system_view};
 use common::{
-    BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId,
-    TableSchema, Value, ViewSchema,
+    BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, DbError, PgType, Result, SqlState,
+    TableId, TableSchema, Value, ViewSchema,
 };
 use parser::{
     Cte, Distinct, Expr, FromItem, FunctionArg, OrderByItem, Query, QueryBody, Select, SelectItem,
@@ -631,7 +631,7 @@ fn bind_select<'a>(
         None
     } else {
         let from = bind_from_items(catalog, &mut ctx, &select.from)?;
-        apply_outer_join_nullability(&mut ctx, &from);
+        apply_outer_join_nullability(&mut ctx, &from)?;
         Some(from)
     };
     let filter = select
@@ -727,7 +727,7 @@ fn bind_from_items(
     Ok(bound)
 }
 
-fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
+fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) -> Result<()> {
     match from {
         BoundFrom::Join {
             left,
@@ -735,8 +735,8 @@ fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
             join_type,
             ..
         } => {
-            apply_outer_join_nullability(ctx, left);
-            apply_outer_join_nullability(ctx, right);
+            apply_outer_join_nullability(ctx, left)?;
+            apply_outer_join_nullability(ctx, right)?;
             match join_type {
                 JoinType::Left => mark_from_bindings_nullable(ctx, right),
                 JoinType::Right => mark_from_bindings_nullable(ctx, left),
@@ -748,7 +748,9 @@ fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
                 // Semi/anti joins are planner-made (decorrelation); the
                 // binder never produces them in a FROM clause.
                 JoinType::Semi | JoinType::Anti => {
-                    unreachable!("semi/anti joins do not appear in bound FROM clauses")
+                    return Err(DbError::internal(
+                        "semi/anti join appeared in a bound FROM clause",
+                    ));
                 }
             }
         }
@@ -758,6 +760,7 @@ fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
         | BoundFrom::View { .. }
         | BoundFrom::TableFunction { .. } => {}
     }
+    Ok(())
 }
 
 fn mark_from_bindings_nullable(ctx: &mut BindContext, from: &BoundFrom) {

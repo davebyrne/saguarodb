@@ -140,9 +140,7 @@ impl SpillContext {
             .reserved
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        *reserved = reserved
-            .checked_sub(bytes)
-            .expect("spill reservation released more bytes than it owns");
+        *reserved = reserved.saturating_sub(bytes);
     }
 
     pub fn reserve(&self, bytes: u64) -> Option<Reservation> {
@@ -364,7 +362,11 @@ fn read_record<T: SpillRecord>(file: &mut File, ctx: &SpillContext) -> Result<Op
     match file.read(&mut len[..1]).map_err(io_error)? {
         0 => return Ok(None),
         1 => file.read_exact(&mut len[1..]).map_err(io_error)?,
-        _ => unreachable!("one-byte read returned more than one byte"),
+        _ => {
+            return Err(io_error(
+                "one-byte spill read returned an invalid byte count",
+            ));
+        }
     }
     let payload_len = u64::from_le_bytes(len);
     let mut take = file.take(payload_len);
@@ -540,7 +542,9 @@ impl<T: SpillRecord> SpillTape<T> {
             TapeStorage::Memory { records, .. } => {
                 reserve_vec_item(&self.ctx, records, record.retained_size(), size_of::<T>())?
             }
-            TapeStorage::SharedMemory(_) => unreachable!("finished spill tape is immutable"),
+            TapeStorage::SharedMemory(_) => {
+                return Err(DbError::internal("finished spill tape is immutable"));
+            }
             TapeStorage::Disk(_) => Some((0, 0)),
         };
         if let TapeStorage::Memory { records, charged } = &mut self.storage
@@ -553,7 +557,9 @@ impl<T: SpillRecord> SpillTape<T> {
         }
         self.migrate_to_disk()?;
         let TapeStorage::Disk(file) = &mut self.storage else {
-            unreachable!()
+            return Err(DbError::internal(
+                "spill tape migration did not produce disk storage",
+            ));
         };
         let mut file = file.lock().unwrap_or_else(|p| p.into_inner());
         let result = write_record(&mut file, &record, &self.ctx);
@@ -571,7 +577,11 @@ impl<T: SpillRecord> SpillTape<T> {
         let records: &[T] = match &self.storage {
             TapeStorage::Memory { records, .. } => records,
             TapeStorage::SharedMemory(records) => &records.records,
-            TapeStorage::Disk(_) => unreachable!(),
+            TapeStorage::Disk(_) => {
+                return Err(DbError::internal(
+                    "disk spill tape unexpectedly required migration",
+                ));
+            }
         };
         // Do not take ownership of the in-memory state until every write has
         // succeeded. On error the tape remains intact and its reservation stays
@@ -589,7 +599,11 @@ impl<T: SpillRecord> SpillTape<T> {
                 drop(records);
                 0
             }
-            TapeStorage::Disk(_) => unreachable!(),
+            TapeStorage::Disk(_) => {
+                return Err(DbError::internal(
+                    "spill tape migration replaced disk storage",
+                ));
+            }
         };
         self.ctx.release(charged);
         Ok(())
@@ -619,14 +633,21 @@ impl<T: SpillRecord> SpillTape<T> {
             ));
         }
         if let TapeStorage::Memory { .. } = self.storage {
-            let TapeStorage::Memory { records, charged } = std::mem::replace(
+            let replaced = std::mem::replace(
                 &mut self.storage,
                 TapeStorage::Memory {
                     records: Vec::new(),
                     charged: 0,
                 },
-            ) else {
-                unreachable!()
+            );
+            let (records, charged) = match replaced {
+                TapeStorage::Memory { records, charged } => (records, charged),
+                other => {
+                    self.storage = other;
+                    return Err(DbError::internal(
+                        "spill tape storage changed while creating a reader",
+                    ));
+                }
             };
             self.storage = TapeStorage::SharedMemory(Arc::new(SharedRecords {
                 records,
@@ -655,7 +676,9 @@ impl<T: SpillRecord> SpillTape<T> {
                     ctx: self.ctx.clone(),
                 })
             }
-            TapeStorage::Memory { .. } => unreachable!(),
+            TapeStorage::Memory { .. } => Err(DbError::internal(
+                "finished spill tape remained in mutable memory storage",
+            )),
         }
     }
 }
@@ -964,7 +987,9 @@ where
                 Some(current) => self.merge_runs(current, run)?,
             });
         }
-        let mut file = final_run.expect("flushed sorter has a run").file;
+        let mut file = final_run
+            .ok_or_else(|| DbError::internal("flushed external sorter has no merge run"))?
+            .file;
         rewind_data(&mut file)?;
         Ok(SortedStream {
             storage: SortedStorage::Disk {

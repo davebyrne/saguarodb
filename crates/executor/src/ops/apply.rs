@@ -39,12 +39,12 @@ struct ApplyMemo {
 }
 
 impl ApplyMemo {
-    fn new(ctx: &SpillContext) -> Self {
-        Self {
+    fn new(ctx: &SpillContext) -> Option<Self> {
+        Some(Self {
             entries: HashMap::new(),
-            reservation: ctx.reserve(0).expect("zero reservation"),
+            reservation: ctx.reserve(0)?,
             access: 0,
-        }
+        })
     }
 
     fn tick(&mut self) -> u64 {
@@ -178,14 +178,16 @@ impl<'a> ApplyOp<'a> {
         correlations: Vec<BoundExpr>,
         kind: ApplyKind,
         profile: Option<DynamicProfile>,
-    ) -> Self {
+    ) -> Result<Self> {
         let appended = ColumnInfo {
             name: "?column?".to_string(),
             data_type: match &kind {
                 ApplyKind::Scalar { data_type } => data_type.clone(),
                 ApplyKind::Exists { .. } | ApplyKind::In { .. } => DataType::Boolean,
                 ApplyKind::Lateral { .. } => {
-                    unreachable!("Lateral applies are built as LateralApplyOp")
+                    return Err(DbError::internal(
+                        "lateral apply was routed to the scalar apply executor",
+                    ));
                 }
             },
             table_id: None,
@@ -198,9 +200,9 @@ impl<'a> ApplyOp<'a> {
         let memo = if plan_has_volatile_exprs(&subplan) {
             None
         } else {
-            Some(ApplyMemo::new(&spill_ctx))
+            ApplyMemo::new(&spill_ctx)
         };
-        Self {
+        Ok(Self {
             ctx,
             input,
             subplan,
@@ -210,7 +212,7 @@ impl<'a> ApplyOp<'a> {
             memo,
             spill_ctx,
             profile,
-        }
+        })
     }
 
     /// Substitute this outer row's correlation values into the template and
@@ -289,7 +291,9 @@ impl<'a> ApplyOp<'a> {
                     MemoPayload::Column(Arc::new(Mutex::new(column)))
                 }
                 ApplyKind::Lateral { .. } => {
-                    unreachable!("Lateral applies are built as LateralApplyOp")
+                    return Err(DbError::internal(
+                        "lateral apply was routed to the scalar apply executor",
+                    ));
                 }
             })
         })();
@@ -426,7 +430,7 @@ impl<'a> LateralApplyOp<'a> {
         let memo = if plan_has_volatile_exprs(&subplan) {
             None
         } else {
-            Some(ApplyMemo::new(&spill_ctx))
+            ApplyMemo::new(&spill_ctx)
         };
         Self {
             ctx,
@@ -529,7 +533,9 @@ impl PlanExecutor for LateralApplyOp<'_> {
             if let Some(reader) = &mut self.current_reader {
                 while let Some(inner) = reader.next_record()? {
                     check_canceled(self.ctx)?;
-                    let outer = self.current_outer.as_ref().expect("reader has outer row");
+                    let outer = self.current_outer.as_ref().ok_or_else(|| {
+                        DbError::internal("lateral Apply reader has no outer row")
+                    })?;
                     let mut values = outer.row.values.clone();
                     values.extend(inner.values);
                     let combined = ExecRow {
@@ -547,7 +553,10 @@ impl PlanExecutor for LateralApplyOp<'_> {
                 }
                 self.current_reader = None;
                 self.current_owned_tape = None;
-                let outer = self.current_outer.take().expect("reader has outer row");
+                let outer = self
+                    .current_outer
+                    .take()
+                    .ok_or_else(|| DbError::internal("lateral Apply reader lost its outer row"))?;
                 if self.left_join && !self.current_matched {
                     let mut values = outer.row.values;
                     values.extend(std::iter::repeat_n(Value::Null, self.inner_width));
@@ -624,7 +633,9 @@ fn single_value(row: Row) -> Result<Value> {
             "subquery used as a value produced a row with the wrong number of columns",
         ));
     }
-    Ok(values.pop().expect("length checked"))
+    values
+        .pop()
+        .ok_or_else(|| DbError::internal("single-value subquery row is empty"))
 }
 
 /// Whether any expression in the template (including nested Apply templates,

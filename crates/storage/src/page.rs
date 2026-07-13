@@ -232,14 +232,14 @@ pub fn try_insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<Option<u
     // UNUSED, never DEAD). Reuse does not grow the slot array, so `free_bytes`
     // above (which is computed from `num_slots`) stays a valid lower bound. When no
     // UNUSED slot exists the append path runs, identical to the pre-F3b behavior.
-    let slot_num = match first_unused_slot(data, header.num_slots) {
+    let slot_num = match first_unused_slot(data, header.num_slots)? {
         Some(reused) => {
-            write_slot(data, reused, new_slot);
+            write_slot(data, reused, new_slot)?;
             reused
         }
         None => {
             let appended = header.num_slots;
-            write_slot(data, appended, new_slot);
+            write_slot(data, appended, new_slot)?;
             write_u16(data, NUM_SLOTS_OFFSET, appended + 1);
             appended
         }
@@ -254,8 +254,13 @@ pub fn try_insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<Option<u
 /// deliberately skipped: it may still have a dangling index entry (see
 /// `insert_row`'s safety invariant). O(num_slots) — the deferred free-slot map
 /// would make this O(1).
-fn first_unused_slot(data: &[u8; PAGE_SIZE], num_slots: u16) -> Option<u16> {
-    (0..num_slots).find(|&slot_num| read_slot(data, slot_num).flags == line_pointer::UNUSED)
+fn first_unused_slot(data: &[u8; PAGE_SIZE], num_slots: u16) -> Result<Option<u16>> {
+    for slot_num in 0..num_slots {
+        if read_slot(data, slot_num)?.flags == line_pointer::UNUSED {
+            return Ok(Some(slot_num));
+        }
+    }
+    Ok(None)
 }
 
 /// Classify the line pointer at `slot_num` (`mvcc.md` §5.2) without reading the
@@ -268,7 +273,7 @@ pub fn slot_state(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<LinePointer> 
     if slot_num >= header.num_slots {
         return Err(corrupt_page("slot number is out of bounds"));
     }
-    let slot = read_slot(data, slot_num);
+    let slot = read_slot(data, slot_num)?;
     Ok(match slot.flags {
         line_pointer::NORMAL => LinePointer::Normal,
         line_pointer::DEAD => LinePointer::Dead,
@@ -286,7 +291,7 @@ pub fn read_row(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<Option<Vec<u8>>
     if slot_num >= header.num_slots {
         return Err(corrupt_page("slot number is out of bounds"));
     }
-    let slot = read_slot(data, slot_num);
+    let slot = read_slot(data, slot_num)?;
     if !slot.is_live() {
         return Ok(None);
     }
@@ -300,12 +305,12 @@ pub fn delete_row(data: &mut [u8; PAGE_SIZE], slot_num: u16) -> Result<bool> {
     if slot_num >= header.num_slots {
         return Err(corrupt_page("slot number is out of bounds"));
     }
-    let mut slot = read_slot(data, slot_num);
+    let mut slot = read_slot(data, slot_num)?;
     if !slot.is_live() {
         return Ok(false);
     }
     slot.flags = line_pointer::DEAD;
-    write_slot(data, slot_num, slot);
+    write_slot(data, slot_num, slot)?;
     write_checksum(data);
     Ok(true)
 }
@@ -341,7 +346,7 @@ pub fn set_tuple_header(
     if slot_num >= header.num_slots {
         return Err(corrupt_page("slot number is out of bounds"));
     }
-    let slot = read_slot(data, slot_num);
+    let slot = read_slot(data, slot_num)?;
     if !slot.is_live() {
         return Err(DbError::storage(
             SqlState::InternalError,
@@ -390,7 +395,7 @@ pub fn prune_and_compact(data: &mut [u8; PAGE_SIZE], dead_slots: &[u16], lsn: Ls
         if slot_num >= header.num_slots {
             return Err(corrupt_page("slot number is out of bounds"));
         }
-        let mut slot = read_slot(data, slot_num);
+        let mut slot = read_slot(data, slot_num)?;
         if !slot.is_live() {
             return Err(DbError::storage(
                 SqlState::InternalError,
@@ -398,7 +403,7 @@ pub fn prune_and_compact(data: &mut [u8; PAGE_SIZE], dead_slots: &[u16], lsn: Ls
             ));
         }
         slot.flags = line_pointer::DEAD;
-        write_slot(data, slot_num, slot);
+        write_slot(data, slot_num, slot)?;
     }
 
     compact_survivors_and_stamp(data, header, lsn)
@@ -441,7 +446,7 @@ fn compact_survivors_and_stamp(
     // copy-back never reads a region a prior survivor has already overwritten.
     let mut survivors: Vec<(u16, Vec<u8>)> = Vec::new();
     for slot_num in 0..header.num_slots {
-        let slot = read_slot(data, slot_num);
+        let slot = read_slot(data, slot_num)?;
         if slot.is_live() {
             let start = slot.offset as usize;
             let end = start + slot.len as usize;
@@ -455,10 +460,10 @@ fn compact_survivors_and_stamp(
         let new_offset = cursor;
         let new_end = new_offset + bytes.len();
         data[new_offset..new_end].copy_from_slice(bytes);
-        let mut slot = read_slot(data, *slot_num);
+        let mut slot = read_slot(data, *slot_num)?;
         slot.offset =
             u16::try_from(new_offset).map_err(|_| corrupt_page("compacted offset overflows"))?;
-        write_slot(data, *slot_num, slot);
+        write_slot(data, *slot_num, slot)?;
         cursor = new_end;
     }
 
@@ -493,7 +498,7 @@ pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn
         if slot_num >= header.num_slots {
             return Err(corrupt_page("slot number is out of bounds"));
         }
-        let mut slot = read_slot(data, slot_num);
+        let mut slot = read_slot(data, slot_num)?;
         if slot.flags != line_pointer::DEAD {
             return Err(DbError::storage(
                 SqlState::InternalError,
@@ -501,7 +506,7 @@ pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn
             ));
         }
         slot.flags = line_pointer::UNUSED;
-        write_slot(data, slot_num, slot);
+        write_slot(data, slot_num, slot)?;
     }
     set_page_lsn(data, lsn);
     Ok(())
@@ -534,7 +539,7 @@ pub fn set_redirect(data: &mut [u8; PAGE_SIZE], slot_num: u16, target_slot: u16)
             len: 0,
             flags: line_pointer::REDIRECT,
         },
-    );
+    )?;
     write_checksum(data);
     Ok(())
 }
@@ -558,7 +563,7 @@ pub fn free_slots_to_unused(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result
         if slot_num >= header.num_slots {
             return Err(corrupt_page("slot number is out of bounds"));
         }
-        let mut slot = read_slot(data, slot_num);
+        let mut slot = read_slot(data, slot_num)?;
         if slot.flags != line_pointer::NORMAL {
             return Err(DbError::storage(
                 SqlState::InternalError,
@@ -566,7 +571,7 @@ pub fn free_slots_to_unused(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result
             ));
         }
         slot.flags = line_pointer::UNUSED;
-        write_slot(data, slot_num, slot);
+        write_slot(data, slot_num, slot)?;
     }
     write_checksum(data);
     Ok(())
@@ -592,7 +597,7 @@ pub fn mark_slots_dead(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result<()> 
         if slot_num >= header.num_slots {
             return Err(corrupt_page("slot number is out of bounds"));
         }
-        let mut slot = read_slot(data, slot_num);
+        let mut slot = read_slot(data, slot_num)?;
         if slot.flags != line_pointer::NORMAL && slot.flags != line_pointer::REDIRECT {
             return Err(DbError::storage(
                 SqlState::InternalError,
@@ -600,7 +605,7 @@ pub fn mark_slots_dead(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result<()> 
             ));
         }
         slot.flags = line_pointer::DEAD;
-        write_slot(data, slot_num, slot);
+        write_slot(data, slot_num, slot)?;
     }
     write_checksum(data);
     Ok(())
@@ -624,7 +629,7 @@ fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
     }
 
     for slot_num in 0..header.num_slots {
-        let slot = read_slot(data, slot_num);
+        let slot = read_slot(data, slot_num)?;
         // NORMAL/DEAD are produced by inserts/deletes; UNUSED is produced by
         // line-pointer reclaim (VACUUM, Milestone F); REDIRECT by HOT pruning
         // (Milestone H). Any other flag value is corrupt.
@@ -669,20 +674,21 @@ fn slot_offset(slot_num: u16) -> Option<usize> {
     PAGE_SIZE.checked_sub((slot_num as usize + 1) * SLOT_LEN)
 }
 
-fn read_slot(data: &[u8; PAGE_SIZE], slot_num: u16) -> Slot {
-    let offset = slot_offset(slot_num).expect("slot offset already validated");
-    Slot {
+fn read_slot(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<Slot> {
+    let offset = slot_offset(slot_num).ok_or_else(|| corrupt_page("slot offset overflows page"))?;
+    Ok(Slot {
         offset: read_u16(data, offset),
         len: read_u16(data, offset + 2),
         flags: read_u16(data, offset + 4),
-    }
+    })
 }
 
-fn write_slot(data: &mut [u8; PAGE_SIZE], slot_num: u16, slot: Slot) {
-    let offset = slot_offset(slot_num).expect("slot offset already validated");
+fn write_slot(data: &mut [u8; PAGE_SIZE], slot_num: u16, slot: Slot) -> Result<()> {
+    let offset = slot_offset(slot_num).ok_or_else(|| corrupt_page("slot offset overflows page"))?;
     write_u16(data, offset, slot.offset);
     write_u16(data, offset + 2, slot.len);
     write_u16(data, offset + 4, slot.flags);
+    Ok(())
 }
 
 fn checksum(data: &[u8; PAGE_SIZE]) -> u32 {
@@ -853,12 +859,12 @@ mod tests {
         init_page(&mut data.0, 1);
         let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
 
-        let before = read_slot(&data.0, slot);
+        let before = read_slot(&data.0, slot).unwrap();
 
         set_tuple_header(&mut data.0, slot, 99, (4, 5), XMAX_COMMITTED, 0x42).unwrap();
 
         // The tuple kept its exact offset and length: no relocation, no compaction.
-        let after = read_slot(&data.0, slot);
+        let after = read_slot(&data.0, slot).unwrap();
         assert_eq!(after.offset, before.offset);
         assert_eq!(after.len, before.len);
         assert!(after.is_live());
@@ -895,11 +901,14 @@ mod tests {
         let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
 
         // A freshly inserted slot is a NORMAL line pointer.
-        assert_eq!(read_slot(&data.0, slot).flags, line_pointer::NORMAL);
+        assert_eq!(
+            read_slot(&data.0, slot).unwrap().flags,
+            line_pointer::NORMAL
+        );
 
         // Deleting through the existing path moves it to the DEAD state.
         assert!(delete_row(&mut data.0, slot).unwrap());
-        assert_eq!(read_slot(&data.0, slot).flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, slot).unwrap().flags, line_pointer::DEAD);
     }
 
     #[test]
@@ -949,7 +958,10 @@ mod tests {
             let got = read_row(&data.0, slots[i]).unwrap();
             if dead.contains(&slots[i]) {
                 assert_eq!(got, None, "dead slot {i} must read None");
-                assert_eq!(read_slot(&data.0, slots[i]).flags, line_pointer::DEAD);
+                assert_eq!(
+                    read_slot(&data.0, slots[i]).unwrap().flags,
+                    line_pointer::DEAD
+                );
             } else {
                 assert_eq!(
                     got,
@@ -975,7 +987,7 @@ mod tests {
             if dead.contains(&slots[i]) {
                 continue;
             }
-            let s = read_slot(&data.0, slots[i]);
+            let s = read_slot(&data.0, slots[i]).unwrap();
             assert_eq!(
                 s.offset as usize, cursor,
                 "survivor {i} packed contiguously"
@@ -1030,7 +1042,7 @@ mod tests {
 
         // The lone survivor slid down to HEADER_LEN; its bytes are intact.
         assert_eq!(read_row(&data.0, b).unwrap(), Some(blob(0x66, 16)));
-        assert_eq!(read_slot(&data.0, b).offset as usize, HEADER_LEN);
+        assert_eq!(read_slot(&data.0, b).unwrap().offset as usize, HEADER_LEN);
         assert_eq!(
             read_u16(&data.0, FREE_SPACE_OFFSET) as usize,
             HEADER_LEN + 16
@@ -1057,11 +1069,11 @@ mod tests {
         init_page(&mut data.0, 1);
         let a = insert_blob(&mut data, 0x88, 10);
         assert!(delete_row(&mut data.0, a).unwrap());
-        assert_eq!(read_slot(&data.0, a).flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, a).unwrap().flags, line_pointer::DEAD);
 
         reclaim_line_pointers(&mut data.0, &[a], 0xABCD).unwrap();
 
-        assert_eq!(read_slot(&data.0, a).flags, line_pointer::UNUSED);
+        assert_eq!(read_slot(&data.0, a).unwrap().flags, line_pointer::UNUSED);
         assert_eq!(read_row(&data.0, a).unwrap(), None);
         validate(&data.0).unwrap();
         assert_eq!(super::page_lsn(&data.0), 0xABCD);
@@ -1093,7 +1105,7 @@ mod tests {
         // reclaim -> UNUSED), the only path that produces a reusable slot.
         prune_and_compact(&mut data.0, &[b], 1).unwrap();
         reclaim_line_pointers(&mut data.0, &[b], 2).unwrap();
-        assert_eq!(read_slot(&data.0, b).flags, line_pointer::UNUSED);
+        assert_eq!(read_slot(&data.0, b).unwrap().flags, line_pointer::UNUSED);
 
         // A new insert recycles the UNUSED slot id `b` rather than appending a new
         // one: the slot count is unchanged and the new row reads back at slot `b`.
@@ -1105,7 +1117,10 @@ mod tests {
             "reusing a slot must not grow the slot array"
         );
         assert_eq!(read_row(&data.0, reused).unwrap(), Some(blob(0x40, 15)));
-        assert_eq!(read_slot(&data.0, reused).flags, line_pointer::NORMAL);
+        assert_eq!(
+            read_slot(&data.0, reused).unwrap().flags,
+            line_pointer::NORMAL
+        );
         // The untouched neighbours still read their own bytes.
         assert_eq!(read_row(&data.0, a).unwrap(), Some(blob(0x10, 10)));
         assert_eq!(read_row(&data.0, c).unwrap(), Some(blob(0x30, 8)));
@@ -1142,7 +1157,7 @@ mod tests {
         let a = insert_blob(&mut data, 0xA1, 10); // survivor
         let dead = insert_blob(&mut data, 0xD1, 12); // pruned to DEAD, NOT reclaimed
         prune_and_compact(&mut data.0, &[dead], 1).unwrap();
-        assert_eq!(read_slot(&data.0, dead).flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, dead).unwrap().flags, line_pointer::DEAD);
         let slots_before = read_u16(&data.0, NUM_SLOTS_OFFSET);
 
         let produced = insert_row(&mut data.0, &blob(0xE1, 9)).unwrap();
@@ -1153,7 +1168,7 @@ mod tests {
             "with no UNUSED slot, insert appends a fresh slot id"
         );
         // The DEAD slot is still DEAD (untouched) and reads as absent.
-        assert_eq!(read_slot(&data.0, dead).flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, dead).unwrap().flags, line_pointer::DEAD);
         assert_eq!(read_row(&data.0, dead).unwrap(), None);
         // The new row landed at the freshly appended slot, and the survivor is intact.
         assert_eq!(read_row(&data.0, produced).unwrap(), Some(blob(0xE1, 9)));
@@ -1190,9 +1205,9 @@ mod tests {
 
         // A page carrying NORMAL + DEAD + UNUSED slots is valid.
         validate(&data.0).unwrap();
-        assert_eq!(read_slot(&data.0, a).flags, line_pointer::NORMAL);
-        assert_eq!(read_slot(&data.0, b).flags, line_pointer::DEAD);
-        assert_eq!(read_slot(&data.0, c).flags, line_pointer::UNUSED);
+        assert_eq!(read_slot(&data.0, a).unwrap().flags, line_pointer::NORMAL);
+        assert_eq!(read_slot(&data.0, b).unwrap().flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, c).unwrap().flags, line_pointer::UNUSED);
     }
 
     #[test]
@@ -1203,18 +1218,18 @@ mod tests {
 
         // Push the NORMAL slot's end past free_start (out of the live region).
         let free_start = read_u16(&data.0, FREE_SPACE_OFFSET);
-        let mut slot = read_slot(&data.0, a);
+        let mut slot = read_slot(&data.0, a).unwrap();
         slot.offset = free_start - 4; // end = free_start - 4 + 10 > free_start
-        write_slot(&mut data.0, a, slot);
+        write_slot(&mut data.0, a, slot).unwrap();
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
 
         // Reset, then corrupt with an out-of-bounds offset below the header.
         init_page(&mut data.0, 1);
         let a = insert_blob(&mut data, 0xAB, 10);
-        let mut slot = read_slot(&data.0, a);
+        let mut slot = read_slot(&data.0, a).unwrap();
         slot.offset = (HEADER_LEN - 1) as u16;
-        write_slot(&mut data.0, a, slot);
+        write_slot(&mut data.0, a, slot).unwrap();
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
     }
@@ -1238,11 +1253,11 @@ mod tests {
         // The DEAD slot's offset still names its pre-compaction location, which is
         // now beyond the shrunken live region — unconstrained for DEAD, but as
         // NORMAL it must point into the live region.
-        let mut dead = read_slot(&data.0, a);
+        let mut dead = read_slot(&data.0, a).unwrap();
         let live_end = read_u16(&data.0, FREE_SPACE_OFFSET);
         assert!(dead.offset as usize + dead.len as usize > live_end as usize);
         dead.flags = line_pointer::NORMAL;
-        write_slot(&mut data.0, a, dead);
+        write_slot(&mut data.0, a, dead).unwrap();
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
         let _ = b;
@@ -1320,7 +1335,8 @@ mod tests {
                 len: 0,
                 flags: line_pointer::REDIRECT,
             },
-        );
+        )
+        .unwrap();
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
     }

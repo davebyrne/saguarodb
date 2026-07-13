@@ -71,11 +71,11 @@ pub(super) fn convert_alter_table(
         return unsupported("unsupported ALTER TABLE form");
     }
     let table = object_name(&name)?;
-    match operations
+    let operation = operations
         .into_iter()
         .next()
-        .expect("checked exactly one operation")
-    {
+        .ok_or_else(|| DbError::internal("ALTER TABLE operation disappeared after validation"))?;
+    match operation {
         sql::AlterTableOperation::AddColumn {
             if_not_exists,
             column_def,

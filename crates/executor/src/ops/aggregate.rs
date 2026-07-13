@@ -240,7 +240,7 @@ impl PlanExecutor for AggregateOp<'_> {
         let spill_ctx = self
             .spill_ctx
             .as_ref()
-            .expect("open aggregate spill context")
+            .ok_or_else(|| DbError::internal("aggregate spill context is not open"))?
             .clone();
         let mut states = self
             .aggregates
@@ -269,7 +269,7 @@ impl PlanExecutor for AggregateOp<'_> {
             let record = self
                 .stream
                 .as_mut()
-                .expect("open aggregate stream")
+                .ok_or_else(|| DbError::internal("aggregate stream is not open"))?
                 .next_record()?;
             match record {
                 Some(record) if record.keys == group_key => {
@@ -543,11 +543,8 @@ impl AggregateState {
     }
 
     fn finish(self) -> Result<Value> {
-        let state = match self {
+        Ok(match self {
             Self::Collect { tape, kind } => return finish_collection(tape, kind),
-            state => state,
-        };
-        Ok(match state {
             Self::Count(count) => Value::Integer(count),
             Self::Integer { count: 0, .. } => Value::Null,
             Self::Integer { sum, count, avg } => {
@@ -594,7 +591,6 @@ impl AggregateState {
             }
             Self::Bool { seen: false, .. } => Value::Null,
             Self::Bool { value, .. } => Value::Boolean(value),
-            Self::Collect { .. } => unreachable!("collect aggregate handled above"),
         })
     }
 }

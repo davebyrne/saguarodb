@@ -6,7 +6,7 @@ use catalog::{
     synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
-    ColumnDef, ColumnDefault, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32,
+    ColumnDef, ColumnDefault, DbError, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32,
     PgProcCatalogEntry, PgType, RelationKind, Result, Row, SequenceSchema, SessionActivityRow,
     StatementContext, TableId, TableSchema, Value, ViewSchema, bytea, datetime, float, interval,
     numeric, pg_proc_catalog_entries, uuid,
@@ -28,7 +28,7 @@ pub(crate) fn rows_for(
         SystemView::PgNamespace => pg_namespace_rows(catalog),
         SystemView::PgClass => pg_class_rows(catalog),
         SystemView::PgAttribute => pg_attribute_rows(catalog),
-        SystemView::PgType => Ok(pg_type_rows()),
+        SystemView::PgType => pg_type_rows(),
         SystemView::PgIndex => pg_index_rows(catalog),
         SystemView::PgProc => pg_proc_rows(),
         SystemView::PgConstraint => pg_constraint_rows(catalog),
@@ -45,9 +45,9 @@ pub(crate) fn rows_for(
     }
 }
 
-fn namespace_oid(schema_id: common::SchemaId) -> i64 {
+fn namespace_oid(schema_id: common::SchemaId) -> Result<i64> {
     if schema_id == common::PUBLIC_SCHEMA_ID {
-        PUBLIC_SCHEMA_OID
+        Ok(PUBLIC_SCHEMA_OID)
     } else {
         schema_oid(schema_id)
     }
@@ -70,7 +70,7 @@ fn pg_namespace_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     for schema in catalog.list_schemas()? {
         if schema.id != common::PUBLIC_SCHEMA_ID {
             rows.push(row(vec![
-                int(namespace_oid(schema.id)),
+                int(namespace_oid(schema.id)?),
                 text(&schema.name),
                 int(OWNER_OID),
             ]));
@@ -96,31 +96,31 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             table,
             catalog.get_table_statistics(table.id)?.as_ref(),
             !indexes.is_empty() || (!table.primary_key.is_empty() && !has_primary_key_index),
-        ));
+        )?);
         for index in indexes {
             rows.push(pg_class_index_row(
-                index_oid(index.id),
+                index_oid(index.id)?,
                 &index.name,
                 index.columns.len(),
                 index.schema_id,
-            ));
+            )?);
         }
         if !has_primary_key_index && !table.primary_key.is_empty() {
             rows.push(pg_class_index_row(
-                synthetic_primary_key_oid(table.id),
+                synthetic_primary_key_oid(table.id)?,
                 &primary_key_index_name(table),
                 table.primary_key.len(),
                 table.schema_id,
-            ));
+            )?);
         }
     }
 
     for sequence in catalog.list_sequences()? {
-        rows.push(pg_class_sequence_row(&sequence));
+        rows.push(pg_class_sequence_row(&sequence)?);
     }
 
     for view in catalog.list_views()? {
-        rows.push(pg_class_user_view_row(&view));
+        rows.push(pg_class_user_view_row(&view)?);
     }
 
     for view in SystemView::ALL {
@@ -138,14 +138,14 @@ fn pg_class_table_row(
     table: &TableSchema,
     statistics: Option<&common::TableStatistics>,
     relhasindex: bool,
-) -> Row {
-    let oid = table_oid(table.id);
+) -> Result<Row> {
+    let oid = table_oid(table.id)?;
     let relpages = statistics.map_or(0, |stats| stats.page_count as i64);
     let reltuples = statistics.map_or(-1.0, |stats| stats.row_count as f32);
-    row(vec![
+    Ok(row(vec![
         int(oid),
         text(relation_name(table)),
-        int(namespace_oid(table.schema_id)),
+        int(namespace_oid(table.schema_id)?),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -172,14 +172,19 @@ fn pg_class_table_row(
         bool_value(true),
         text("d"),
         bool_value(false),
-    ])
+    ]))
 }
 
-fn pg_class_index_row(oid: i64, name: &str, natts: usize, schema_id: common::SchemaId) -> Row {
-    row(vec![
+fn pg_class_index_row(
+    oid: i64,
+    name: &str,
+    natts: usize,
+    schema_id: common::SchemaId,
+) -> Result<Row> {
+    Ok(row(vec![
         int(oid),
         text(name),
-        int(namespace_oid(schema_id)),
+        int(namespace_oid(schema_id)?),
         int(0),
         int(OWNER_OID),
         int(BTREE_AM_OID),
@@ -203,15 +208,15 @@ fn pg_class_index_row(oid: i64, name: &str, natts: usize, schema_id: common::Sch
         bool_value(true),
         text("d"),
         bool_value(false),
-    ])
+    ]))
 }
 
-fn pg_class_sequence_row(sequence: &SequenceSchema) -> Row {
-    let oid = sequence_oid(sequence.id);
-    row(vec![
+fn pg_class_sequence_row(sequence: &SequenceSchema) -> Result<Row> {
+    let oid = sequence_oid(sequence.id)?;
+    Ok(row(vec![
         int(oid),
         text(&sequence.name),
-        int(namespace_oid(sequence.schema_id)),
+        int(namespace_oid(sequence.schema_id)?),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -235,15 +240,15 @@ fn pg_class_sequence_row(sequence: &SequenceSchema) -> Row {
         bool_value(true),
         text("d"),
         bool_value(false),
-    ])
+    ]))
 }
 
-fn pg_class_user_view_row(view: &ViewSchema) -> Row {
-    let oid = table_oid(view.id);
-    row(vec![
+fn pg_class_user_view_row(view: &ViewSchema) -> Result<Row> {
+    let oid = table_oid(view.id)?;
+    Ok(row(vec![
         int(oid),
         text(&view.name),
-        int(namespace_oid(view.schema_id)),
+        int(namespace_oid(view.schema_id)?),
         int(0),
         int(OWNER_OID),
         int(0),
@@ -267,7 +272,7 @@ fn pg_class_user_view_row(view: &ViewSchema) -> Row {
         bool_value(true),
         text("d"),
         bool_value(false),
-    ])
+    ]))
 }
 
 fn pg_class_view_row(view: SystemView) -> Row {
@@ -309,12 +314,12 @@ fn pg_attribute_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             continue;
         }
         for column in &table.columns {
-            rows.push(pg_attribute_row(table_oid(table.id), column));
+            rows.push(pg_attribute_row(table_oid(table.id)?, column));
         }
     }
     for view in catalog.list_views()? {
         for column in &view.columns {
-            rows.push(pg_attribute_row(table_oid(view.id), column));
+            rows.push(pg_attribute_row(table_oid(view.id)?, column));
         }
     }
     for view in SystemView::ALL {
@@ -360,8 +365,8 @@ fn pg_attribute_row(rel_oid: i64, column: &ColumnDef) -> Row {
     ])
 }
 
-fn pg_type_rows() -> Vec<Row> {
-    type_entries()
+fn pg_type_rows() -> Result<Vec<Row>> {
+    Ok(type_entries()?
         .into_iter()
         .map(|entry| {
             row(vec![
@@ -382,7 +387,7 @@ fn pg_type_rows() -> Vec<Row> {
                 int(0),
             ])
         })
-        .collect()
+        .collect())
 }
 
 fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
@@ -403,8 +408,8 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             .any(|index| index.constraint == IndexConstraintKind::PrimaryKey);
         if !has_primary_key_index && !table.primary_key.is_empty() {
             rows.push(pg_index_row(
-                synthetic_primary_key_oid(table.id),
-                table_oid(table.id),
+                synthetic_primary_key_oid(table.id)?,
+                table_oid(table.id)?,
                 &table.primary_key,
                 true,
                 true,
@@ -412,19 +417,24 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         }
         for index in indexes {
             if let Some(table) = table_by_id.get(&index.table) {
-                rows.push(pg_index_row(
-                    index_oid(index.id),
-                    table_oid(index.table),
-                    &index.columns,
-                    index.unique,
-                    index.constraint == IndexConstraintKind::PrimaryKey,
-                ));
-                debug_assert!(index.columns.iter().all(|column| {
+                if !index.columns.iter().all(|column| {
                     table
                         .columns
                         .iter()
                         .any(|candidate| candidate.id == *column)
-                }));
+                }) {
+                    return Err(DbError::internal(format!(
+                        "index {} references a missing table column",
+                        index.name
+                    )));
+                }
+                rows.push(pg_index_row(
+                    index_oid(index.id)?,
+                    table_oid(index.table)?,
+                    &index.columns,
+                    index.unique,
+                    index.constraint == IndexConstraintKind::PrimaryKey,
+                ));
             }
         }
     }
@@ -522,21 +532,19 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 .list_indexes_for_table(table.id)?
                 .into_iter()
                 .find(|index| index.constraint == IndexConstraintKind::PrimaryKey);
-            let (name, index_oid_value, key_columns) = primary_key_index.map_or_else(
-                || {
-                    (
-                        primary_key_index_name(&table),
-                        synthetic_primary_key_oid(table.id),
-                        table.primary_key.clone(),
-                    )
-                },
-                |index| (index.name, index_oid(index.id), index.columns),
-            );
+            let (name, index_oid_value, key_columns) = match primary_key_index {
+                Some(index) => (index.name, index_oid(index.id)?, index.columns),
+                None => (
+                    primary_key_index_name(&table),
+                    synthetic_primary_key_oid(table.id)?,
+                    table.primary_key.clone(),
+                ),
+            };
             rows.push(pg_constraint_row(ConstraintRow {
-                oid: primary_key_constraint_oid(table.id),
+                oid: primary_key_constraint_oid(table.id)?,
                 name,
                 kind: "p",
-                table_oid: table_oid(table.id),
+                table_oid: table_oid(table.id)?,
                 index_oid: index_oid_value,
                 key_columns: Some(attnums_array_text(&key_columns)),
                 expression: None,
@@ -547,7 +555,7 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 oid: try_check_constraint_oid(table.id, index)?,
                 name: check_constraint_name(&table, index),
                 kind: "c",
-                table_oid: table_oid(table.id),
+                table_oid: table_oid(table.id)?,
                 index_oid: 0,
                 key_columns: None,
                 expression: Some(check.clone()),
@@ -602,8 +610,8 @@ fn pg_attrdef_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 continue;
             };
             rows.push(row(vec![
-                int(attrdef_oid(table.id, column.id)),
-                int(table_oid(table.id)),
+                int(attrdef_oid(table.id, column.id)?),
+                int(table_oid(table.id)?),
                 int(i64::from(column.id) + 1),
                 text(rendered),
             ]));
@@ -622,10 +630,10 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         if !table.primary_key.is_empty() {
             rows.push(pg_depend_row(
                 SystemView::PgConstraint.relation_oid(),
-                primary_key_constraint_oid(table.id),
+                primary_key_constraint_oid(table.id)?,
                 0,
                 SystemView::PgClass.relation_oid(),
-                table_oid(table.id),
+                table_oid(table.id)?,
                 0,
                 "a",
             ));
@@ -636,7 +644,7 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 try_check_constraint_oid(table.id, index)?,
                 0,
                 SystemView::PgClass.relation_oid(),
-                table_oid(table.id),
+                table_oid(table.id)?,
                 0,
                 "a",
             ));
@@ -645,14 +653,14 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             let Some(default) = column.default.as_ref() else {
                 continue;
             };
-            let attrdef = attrdef_oid(table.id, column.id);
+            let attrdef = attrdef_oid(table.id, column.id)?;
             let attnum = i64::from(column.id) + 1;
             rows.push(pg_depend_row(
                 SystemView::PgAttrdef.relation_oid(),
                 attrdef,
                 0,
                 SystemView::PgClass.relation_oid(),
-                table_oid(table.id),
+                table_oid(table.id)?,
                 attnum,
                 "a",
             ));
@@ -666,16 +674,16 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                     attrdef,
                     0,
                     SystemView::PgClass.relation_oid(),
-                    sequence_oid(*sequence_id),
+                    sequence_oid(*sequence_id)?,
                     0,
                     "n",
                 ));
                 rows.push(pg_depend_row(
                     SystemView::PgClass.relation_oid(),
-                    sequence_oid(*sequence_id),
+                    sequence_oid(*sequence_id)?,
                     0,
                     SystemView::PgClass.relation_oid(),
-                    table_oid(table.id),
+                    table_oid(table.id)?,
                     attnum,
                     if sequence_owned { "a" } else { "n" },
                 ));
@@ -1291,8 +1299,8 @@ struct TypeEntry {
     array_oid: i64,
 }
 
-fn type_entries() -> Vec<TypeEntry> {
-    vec![
+fn type_entries() -> Result<Vec<TypeEntry>> {
+    let mut entries = vec![
         type_entry(PgType::Bool, "bool", "B", true, 0, 1000),
         type_entry(PgType::Bytea, "bytea", "U", false, 0, 1001),
         type_entry(PgType::Int8, "int8", "N", true, 0, 1016),
@@ -1325,41 +1333,47 @@ fn type_entries() -> Vec<TypeEntry> {
             1231,
         ),
         type_entry(PgType::Uuid, "uuid", "U", false, 0, 2951),
-        array_type_entry(PgType::Bool, "_bool"),
-        array_type_entry(PgType::Bytea, "_bytea"),
-        array_type_entry(PgType::Int8, "_int8"),
-        array_type_entry(PgType::Int4, "_int4"),
-        array_type_entry(PgType::Text, "_text"),
-        array_type_entry(PgType::Float4, "_float4"),
-        array_type_entry(PgType::Float8, "_float8"),
-        array_type_entry(PgType::Bpchar(None), "_bpchar"),
-        array_type_entry(PgType::Varchar(None), "_varchar"),
-        array_type_entry(PgType::Date, "_date"),
-        array_type_entry(PgType::Time, "_time"),
-        array_type_entry(PgType::Timestamp, "_timestamp"),
-        array_type_entry(PgType::Timestamptz, "_timestamptz"),
-        array_type_entry(PgType::Interval, "_interval"),
-        array_type_entry(
+    ];
+    let array_types = [
+        (PgType::Bool, "_bool"),
+        (PgType::Bytea, "_bytea"),
+        (PgType::Int8, "_int8"),
+        (PgType::Int4, "_int4"),
+        (PgType::Text, "_text"),
+        (PgType::Float4, "_float4"),
+        (PgType::Float8, "_float8"),
+        (PgType::Bpchar(None), "_bpchar"),
+        (PgType::Varchar(None), "_varchar"),
+        (PgType::Date, "_date"),
+        (PgType::Time, "_time"),
+        (PgType::Timestamp, "_timestamp"),
+        (PgType::Timestamptz, "_timestamptz"),
+        (PgType::Interval, "_interval"),
+        (
             PgType::Numeric {
                 precision: None,
                 scale: 0,
             },
             "_numeric",
         ),
-        array_type_entry(PgType::Uuid, "_uuid"),
-    ]
+        (PgType::Uuid, "_uuid"),
+    ];
+    for (element, name) in array_types {
+        entries.push(array_type_entry(element, name)?);
+    }
+    Ok(entries)
 }
 
-fn array_type_entry(element: PgType, name: &'static str) -> TypeEntry {
+fn array_type_entry(element: PgType, name: &'static str) -> Result<TypeEntry> {
     let element_oid = i64::from(element.oid());
-    type_entry(
-        PgType::array(element).expect("catalog array element type is scalar"),
+    Ok(type_entry(
+        PgType::array(element)?,
         name,
         "A",
         false,
         element_oid,
         0,
-    )
+    ))
 }
 
 fn type_entry(
@@ -1432,10 +1446,8 @@ fn type_collation_oid(pg_type: &PgType) -> i64 {
 }
 
 fn sql_data_type(pg_type: &PgType) -> String {
-    if matches!(pg_type, PgType::Array(_)) {
-        return pg_type.format_type_name();
-    }
     match pg_type {
+        PgType::Array(_) => return pg_type.format_type_name(),
         PgType::Int2 => "smallint",
         PgType::Int4 => "integer",
         PgType::Int8 => "bigint",
@@ -1458,16 +1470,13 @@ fn sql_data_type(pg_type: &PgType) -> String {
         PgType::Int2Vector => "int2vector",
         PgType::CatalogOidArrayText => "oid[]",
         PgType::CatalogInt2ArrayText => "smallint[]",
-        PgType::Array(_) => unreachable!("handled above"),
     }
     .to_string()
 }
 
 fn pg_type_name(pg_type: &PgType) -> String {
-    if let PgType::Array(element) = pg_type {
-        return format!("_{}", pg_type_name(element.element_type()));
-    }
     match pg_type {
+        PgType::Array(element) => return format!("_{}", pg_type_name(element.element_type())),
         PgType::Int2 => "int2",
         PgType::Int4 => "int4",
         PgType::Int8 => "int8",
@@ -1490,7 +1499,6 @@ fn pg_type_name(pg_type: &PgType) -> String {
         PgType::Int2Vector => "int2vector",
         PgType::CatalogOidArrayText => "_oid",
         PgType::CatalogInt2ArrayText => "_int2",
-        PgType::Array(_) => unreachable!("handled above"),
     }
     .to_string()
 }

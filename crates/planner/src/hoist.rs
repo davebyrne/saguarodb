@@ -56,7 +56,7 @@ pub(crate) fn hoist_correlated_subqueries(
                 .map(|expr| hoister.hoist_expr(expr))
                 .collect::<Result<Vec<_>>>()?;
             LogicalPlan::Projection {
-                source: hoister.into_source(),
+                source: hoister.into_source()?,
                 expressions,
                 output_schema,
             }
@@ -351,7 +351,7 @@ fn hoist_predicate(
         for conjunct in leftovers {
             residual.push(hoister.hoist_expr(&conjunct)?);
         }
-        source = *hoister.into_source();
+        source = *hoister.into_source()?;
     }
 
     Ok(match and_reduce(residual) {
@@ -748,8 +748,9 @@ struct Hoister<'c> {
 }
 
 impl Hoister<'_> {
-    fn into_source(self) -> Box<LogicalPlan> {
-        self.source.expect("hoister source is always restored")
+    fn into_source(self) -> Result<Box<LogicalPlan>> {
+        self.source
+            .ok_or_else(|| DbError::internal("correlated-subquery hoister lost its source plan"))
     }
 
     fn hoist_expr(&mut self, expr: &BoundExpr) -> Result<BoundExpr> {
@@ -808,13 +809,19 @@ impl Hoister<'_> {
             _ => return Ok(None),
         };
 
-        let slot =
-            logical_output_width(self.source.as_ref().expect("source present"), self.catalog)?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| DbError::internal("correlated-subquery hoister source is missing"))?;
+        let slot = logical_output_width(source, self.catalog)?;
         let subplan = hoist_correlated_subqueries(
             crate::simplify::simplify_logical(crate::logical::plan_query(query)?),
             self.catalog,
         )?;
-        let input = self.source.take().expect("source present");
+        let input = self
+            .source
+            .take()
+            .ok_or_else(|| DbError::internal("correlated-subquery hoister source is missing"))?;
         self.source = Some(Box::new(LogicalPlan::Apply {
             input,
             subplan: Box::new(subplan),

@@ -471,32 +471,35 @@ pub fn is_system_schema(name: &str) -> bool {
     SystemSchema::from_name(name).is_some()
 }
 
-pub fn table_oid(table_id: u32) -> i64 {
-    USER_TABLE_OID_TAG | oid_payload(table_id)
+pub fn table_oid(table_id: u32) -> Result<i64> {
+    Ok(USER_TABLE_OID_TAG | oid_payload(table_id)?)
 }
 
-pub fn index_oid(index_id: u32) -> i64 {
-    USER_INDEX_OID_TAG | oid_payload(index_id)
+pub fn index_oid(index_id: u32) -> Result<i64> {
+    Ok(USER_INDEX_OID_TAG | oid_payload(index_id)?)
 }
 
-pub fn sequence_oid(sequence_id: u32) -> i64 {
-    USER_SEQUENCE_OID_TAG | oid_payload(sequence_id)
+pub fn sequence_oid(sequence_id: u32) -> Result<i64> {
+    Ok(USER_SEQUENCE_OID_TAG | oid_payload(sequence_id)?)
 }
 
-pub fn schema_oid(schema_id: u32) -> i64 {
-    USER_SCHEMA_OID_TAG | oid_payload(schema_id)
+pub fn schema_oid(schema_id: u32) -> Result<i64> {
+    Ok(USER_SCHEMA_OID_TAG | oid_payload(schema_id)?)
 }
 
-pub fn synthetic_primary_key_oid(table_id: u32) -> i64 {
-    SYNTHETIC_PRIMARY_KEY_OID_TAG | oid_payload(table_id)
+pub fn synthetic_primary_key_oid(table_id: u32) -> Result<i64> {
+    Ok(SYNTHETIC_PRIMARY_KEY_OID_TAG | oid_payload(table_id)?)
 }
 
-pub fn primary_key_constraint_oid(table_id: u32) -> i64 {
-    CONSTRAINT_OID_TAG | compound_oid_payload(table_id, 0)
+pub fn primary_key_constraint_oid(table_id: u32) -> Result<i64> {
+    Ok(CONSTRAINT_OID_TAG | compound_oid_payload(table_id, 0)?)
 }
 
-pub fn check_constraint_oid(table_id: u32, check_index: u16) -> i64 {
-    CONSTRAINT_OID_TAG | compound_oid_payload(table_id, check_index.saturating_add(1))
+pub fn check_constraint_oid(table_id: u32, check_index: u16) -> Result<i64> {
+    let sub_id = check_index
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog CHECK constraint index overflow"))?;
+    Ok(CONSTRAINT_OID_TAG | compound_oid_payload(table_id, sub_id)?)
 }
 
 /// Construct a CHECK-constraint OID from an enumerated catalog position.
@@ -521,31 +524,36 @@ pub fn try_check_constraint_oid(table_id: u32, check_index: usize) -> Result<i64
             MAX_COMPOUND_OID_SUB_ID - 1
         )));
     }
-    Ok(check_constraint_oid(table_id, check_index))
+    check_constraint_oid(table_id, check_index)
 }
 
-pub fn attrdef_oid(table_id: u32, column_id: u16) -> i64 {
-    ATTRDEF_OID_TAG | compound_oid_payload(table_id, column_id)
+pub fn attrdef_oid(table_id: u32, column_id: u16) -> Result<i64> {
+    Ok(ATTRDEF_OID_TAG | compound_oid_payload(table_id, column_id)?)
 }
 
-fn compound_oid_payload(id: u32, sub_id: u16) -> i64 {
-    assert!(
-        id <= MAX_COMPOUND_OID_TABLE_ID,
-        "catalog table id {id} exceeds compound virtual OID table-id limit"
-    );
-    assert!(
-        sub_id <= MAX_COMPOUND_OID_SUB_ID,
-        "catalog object sub-id {sub_id} exceeds compound virtual OID sub-id limit"
-    );
-    i64::from((id << COMPOUND_OID_SUB_ID_BITS) | u32::from(sub_id))
+fn compound_oid_payload(id: u32, sub_id: u16) -> Result<i64> {
+    if id > MAX_COMPOUND_OID_TABLE_ID {
+        return Err(DbError::internal(format!(
+            "catalog table id {id} exceeds compound virtual OID table-id limit"
+        )));
+    }
+    if sub_id > MAX_COMPOUND_OID_SUB_ID {
+        return Err(DbError::internal(format!(
+            "catalog object sub-id {sub_id} exceeds compound virtual OID sub-id limit"
+        )));
+    }
+    Ok(i64::from(
+        (id << COMPOUND_OID_SUB_ID_BITS) | u32::from(sub_id),
+    ))
 }
 
-fn oid_payload(id: u32) -> i64 {
-    assert!(
-        id <= MAX_VIRTUAL_OID_PAYLOAD,
-        "catalog id {id} exceeds virtual OID payload limit"
-    );
-    i64::from(id)
+fn oid_payload(id: u32) -> Result<i64> {
+    if id > MAX_VIRTUAL_OID_PAYLOAD {
+        return Err(DbError::internal(format!(
+            "catalog id {id} exceeds virtual OID payload limit"
+        )));
+    }
+    Ok(i64::from(id))
 }
 
 fn col(id: u16, name: &str, data_type: DataType, pg_type: PgType, nullable: bool) -> ColumnDef {
@@ -689,12 +697,12 @@ mod tests {
     fn oid_spaces_are_disjoint_for_same_raw_id() {
         for id in [0, 7, MAX_COMPOUND_OID_TABLE_ID] {
             let oids = [
-                table_oid(id),
-                index_oid(id),
-                sequence_oid(id),
-                synthetic_primary_key_oid(id),
-                primary_key_constraint_oid(id),
-                attrdef_oid(id, 7),
+                table_oid(id).unwrap(),
+                index_oid(id).unwrap(),
+                sequence_oid(id).unwrap(),
+                synthetic_primary_key_oid(id).unwrap(),
+                primary_key_constraint_oid(id).unwrap(),
+                attrdef_oid(id, 7).unwrap(),
             ];
             assert_eq!(
                 oids.iter().copied().collect::<HashSet<_>>().len(),
@@ -711,12 +719,9 @@ mod tests {
 
     #[test]
     fn virtual_oid_helpers_reject_ids_outside_supported_payloads() {
-        assert!(std::panic::catch_unwind(|| table_oid(MAX_VIRTUAL_OID_PAYLOAD + 1)).is_err());
-        assert!(
-            std::panic::catch_unwind(|| primary_key_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1))
-                .is_err()
-        );
-        assert!(std::panic::catch_unwind(|| attrdef_oid(1, MAX_COMPOUND_OID_SUB_ID + 1)).is_err());
+        assert!(table_oid(MAX_VIRTUAL_OID_PAYLOAD + 1).is_err());
+        assert!(primary_key_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1).is_err());
+        assert!(attrdef_oid(1, MAX_COMPOUND_OID_SUB_ID + 1).is_err());
     }
 
     #[test]
@@ -724,7 +729,7 @@ mod tests {
         let greatest_index = usize::from(MAX_COMPOUND_OID_SUB_ID - 1);
         assert_eq!(
             try_check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID, greatest_index).unwrap(),
-            check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID, MAX_COMPOUND_OID_SUB_ID - 1)
+            check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID, MAX_COMPOUND_OID_SUB_ID - 1).unwrap()
         );
 
         let reserved_sub_id = try_check_constraint_oid(

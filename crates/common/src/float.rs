@@ -43,9 +43,10 @@ impl Ord for OrderedF64 {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater, // NaN sorts after every number
             (false, true) => Ordering::Less,
-            // Neither is NaN, so `partial_cmp` is always `Some`; `-0.0`/`+0.0`
-            // compare `Equal` here, matching the equality below.
-            (false, false) => self.0.partial_cmp(&other.0).expect("non-NaN comparison"),
+            (false, false) if self.0 < other.0 => Ordering::Less,
+            (false, false) if self.0 > other.0 => Ordering::Greater,
+            // Includes equal finite values and signed zero.
+            (false, false) => Ordering::Equal,
         }
     }
 }
@@ -94,12 +95,12 @@ pub fn format_double(value: f64) -> String {
     // Rust's `{:e}` gives the shortest significant digits with an exact base-10
     // exponent; the fixed form `{}` is the shortest fixed-point that round-trips.
     let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("`{:e}` output always contains an exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("`{:e}` exponent is a base-10 integer");
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return scientific;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return scientific;
+    };
     if (-4..=15).contains(&exponent) {
         format!("{value}")
     } else {
@@ -146,7 +147,9 @@ impl Ord for OrderedF32 {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
-            (false, false) => self.0.partial_cmp(&other.0).expect("non-NaN comparison"),
+            (false, false) if self.0 < other.0 => Ordering::Less,
+            (false, false) if self.0 > other.0 => Ordering::Greater,
+            (false, false) => Ordering::Equal,
         }
     }
 }
@@ -189,12 +192,12 @@ pub fn format_real(value: f32) -> String {
         return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
     }
     let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("`{:e}` output always contains an exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("`{:e}` exponent is a base-10 integer");
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return scientific;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return scientific;
+    };
     if (-4..=15).contains(&exponent) {
         format!("{value}")
     } else {

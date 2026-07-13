@@ -110,7 +110,10 @@ impl SerializableConflictManager {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SsiState> {
-        self.state.lock().expect("ssi manager mutex poisoned")
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Begin tracking the serializable transaction `txn_id` under `snapshot` (called
@@ -160,8 +163,9 @@ impl SerializableConflictManager {
             .map(|(&id, _)| id)
             .collect();
         for top in releasable {
-            let txn = st.txns.remove(&top).expect("just collected");
-            purge(&mut st, top, txn);
+            if let Some(txn) = st.txns.remove(&top) {
+                purge(&mut st, top, txn);
+            }
         }
     }
 
@@ -205,8 +209,14 @@ impl SerializableConflictManager {
         }
         // Passed: stamp the commit sequence so later checks can order this commit.
         let seq = st.next_commit_seq;
-        st.next_commit_seq += 1;
-        st.txns.get_mut(&top).expect("present above").commit_seq = Some(seq);
+        st.next_commit_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("SSI commit sequence exhausted"))?;
+        let txn = st
+            .txns
+            .get_mut(&top)
+            .ok_or_else(|| DbError::internal("SSI transaction disappeared during commit check"))?;
+        txn.commit_seq = Some(seq);
         Ok(())
     }
 
@@ -371,16 +381,12 @@ fn form_rw_edge(st: &mut SsiState, reader: TxnId, writer: TxnId) {
     if !concurrent {
         return;
     }
-    st.txns
-        .get_mut(&reader)
-        .expect("checked")
-        .out_edges
-        .insert(writer);
-    st.txns
-        .get_mut(&writer)
-        .expect("checked")
-        .in_edges
-        .insert(reader);
+    if let Some(reader_txn) = st.txns.get_mut(&reader) {
+        reader_txn.out_edges.insert(writer);
+    }
+    if let Some(writer_txn) = st.txns.get_mut(&writer) {
+        writer_txn.in_edges.insert(reader);
+    }
 }
 
 /// The `40001` raised when an SSI check aborts a transaction (matches PostgreSQL's
@@ -417,7 +423,9 @@ impl SsiTracker for SerializableConflictManager {
         // Record the tuple SIREAD lock (with the per-table cap collapse). Each tuple
         // read already formed its own conflict-out above, so a later collapse to a
         // relation lock loses no conflict-out edge (it only coarsens future conflict-in).
-        let txn = st.txns.get_mut(&top).expect("checked above");
+        let Some(txn) = st.txns.get_mut(&top) else {
+            return;
+        };
         let table_keys = txn.tuple_locks.entry(table).or_default();
         if !table_keys.insert(key.clone()) {
             return; // already held
@@ -477,7 +485,9 @@ impl SsiTracker for SerializableConflictManager {
         }
         // Record this write in the writer tables (both grains) + reverse index, so a
         // concurrent reader that reads the item LATER forms the conflict-out edge (§6).
-        let txn = st.txns.get_mut(&writer_top).expect("tracked above");
+        let txn = st.txns.get_mut(&writer_top).ok_or_else(|| {
+            DbError::internal("SSI writer disappeared while recording tuple write")
+        })?;
         txn.relation_writes.insert(table);
         txn.tuple_writes
             .entry(table)
@@ -522,7 +532,9 @@ impl SsiTracker for SerializableConflictManager {
         for reader in readers {
             form_rw_edge(&mut st, reader, writer_top);
         }
-        let txn = st.txns.get_mut(&writer_top).expect("tracked above");
+        let txn = st.txns.get_mut(&writer_top).ok_or_else(|| {
+            DbError::internal("SSI writer disappeared while recording relation write")
+        })?;
         txn.relation_writes.insert(table);
         txn.whole_relation_writes.insert(table);
         st.relation_writers

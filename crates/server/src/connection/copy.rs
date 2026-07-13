@@ -85,7 +85,7 @@ impl Session {
         let sender = copy
             .sender
             .as_ref()
-            .expect("running COPY has an input sender")
+            .ok_or_else(|| DbError::internal("running COPY has no input sender"))?
             .clone();
         let insert_failed = copy.insert_failed;
         let send =
@@ -94,7 +94,8 @@ impl Session {
             drop(sender);
             return self.cancel_copy_in(stream, codec).await;
         }
-        if !insert_failed && send.expect("cancellation handled above").is_err() {
+        let send = send?;
+        if !insert_failed && send.is_err() {
             // The receiver was dropped because the insert task exited on a row error.
             if let Some(copy) = self.copy_in.as_mut() {
                 copy.insert_failed = true;
@@ -119,7 +120,7 @@ impl Session {
         let mut copy = self
             .copy_in
             .take()
-            .expect("finish_copy_in called with no active COPY");
+            .ok_or_else(|| DbError::internal("finish_copy_in called with no active COPY"))?;
         if copy.draining_after_cancel {
             self.stop_statement_timer().await;
             return write_messages(
@@ -133,7 +134,7 @@ impl Session {
         let sender = copy
             .sender
             .take()
-            .expect("running COPY has an input sender");
+            .ok_or_else(|| DbError::internal("running COPY has no input sender"))?;
         if !insert_failed {
             // Signal a clean end (`Done` → commit) or a client abort (`Fail`).
             let signal = if fail_message.is_some() {
@@ -144,7 +145,10 @@ impl Session {
             let _ = sender.send(signal).await;
         }
         drop(sender);
-        let task = copy.task.take().expect("running COPY has a worker task");
+        let task = copy
+            .task
+            .take()
+            .ok_or_else(|| DbError::internal("running COPY has no worker task"))?;
         let (txn, mut result) = match task.await {
             Ok(pair) => pair,
             Err(join_err) => (
@@ -233,7 +237,7 @@ impl Session {
             let copy = self
                 .copy_in
                 .as_mut()
-                .expect("cancel_copy_in called with no active COPY");
+                .ok_or_else(|| DbError::internal("cancel_copy_in called with no active COPY"))?;
             if copy.draining_after_cancel {
                 return Ok(());
             }
@@ -244,17 +248,17 @@ impl Session {
             let _ = sender.try_send(CopyInChunk::Fail);
             drop(sender);
         }
-        let (txn, _) = match task.expect("running COPY has a worker task").await {
+        let task = task.ok_or_else(|| DbError::internal("running COPY has no worker task"))?;
+        let (txn, _) = match task.await {
             Ok(pair) => pair,
             Err(_) => (None, Err(DbError::internal("timed-out COPY task failed"))),
         };
         self.txn = txn;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         self.end_activity();
-        let copy = self
-            .copy_in
-            .as_mut()
-            .expect("COPY draining state remains installed");
+        let copy = self.copy_in.as_mut().ok_or_else(|| {
+            DbError::internal("COPY draining state disappeared after worker shutdown")
+        })?;
         copy.draining_after_cancel = true;
         // The worker and its transaction are gone. Keep only protocol drain state;
         // canceled clients must not hold graceful shutdown open unless the restored

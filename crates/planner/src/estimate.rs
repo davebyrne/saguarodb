@@ -474,7 +474,10 @@ fn histogram_fraction_below(bounds: &[Value], literal: &Value) -> f64 {
     if literal <= &bounds[0] {
         return 0.0;
     }
-    if literal >= bounds.last().expect("len checked") {
+    let Some(last) = bounds.last() else {
+        return DEFAULT_RANGE_SELECTIVITY;
+    };
+    if literal >= last {
         return 1.0;
     }
     let buckets = (bounds.len() - 1) as f64;

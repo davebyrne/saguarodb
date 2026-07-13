@@ -3,17 +3,17 @@
 //! (case-insensitive, optional surrounding braces, hyphens optional) matching
 //! PostgreSQL's permissive `uuid_in`.
 
-use std::fmt::Write;
-
 /// Format a 16-byte UUID as the canonical lowercase hyphenated string,
 /// e.g. `0a0b0c0d-0e0f-1011-1213-141516171819`.
 pub fn format_uuid(bytes: &[u8; 16]) -> String {
     let mut out = String::with_capacity(36);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for (i, byte) in bytes.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {
             out.push('-');
         }
-        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
 }

@@ -1817,7 +1817,7 @@ fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> 
         let table = snapshot
             .tables_by_id
             .get_mut(&table_id)
-            .expect("table id came from map keys");
+            .ok_or_else(|| DbError::internal("catalog table disappeared during normalization"))?;
         if table.storage_id == 0 {
             table.storage_id =
                 legacy_or_fresh_storage_id(table.id, &mut next_storage_id, &mut table_assigned)?;
@@ -1834,7 +1834,7 @@ fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> 
         let index = snapshot
             .indexes_by_id
             .get_mut(&index_id)
-            .expect("index id came from map keys");
+            .ok_or_else(|| DbError::internal("catalog index disappeared during normalization"))?;
         if index.storage_id == 0 {
             index.storage_id =
                 legacy_or_fresh_storage_id(index.id, &mut next_storage_id, &mut index_assigned)?;

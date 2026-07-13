@@ -1124,12 +1124,10 @@ fn literal_key(expr: &BoundExpr) -> Option<Value> {
                 | Value::Bytes(_)
                 | Value::Uuid(_),
             ..
-        } => {
-            let BoundExpr::Literal { value, .. } = expr else {
-                unreachable!();
-            };
-            Some(value.clone())
-        }
+        } => match expr {
+            BoundExpr::Literal { value, .. } => Some(value.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }

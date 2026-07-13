@@ -211,7 +211,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
     let lock_manager = Arc::new(crate::lock_manager::LockManager::new(
         active_txns.clone(),
         std::time::Duration::from_millis(config.deadlock_timeout_ms),
-    ));
+    )?);
     // SSI conflict tracking for SERIALIZABLE transactions (`docs/specs/ssi.md`).
     // Shares the registry handle to canonicalize subxids to top-level ids.
     let ssi_manager = Arc::new(crate::ssi_manager::SerializableConflictManager::new(

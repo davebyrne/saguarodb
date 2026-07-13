@@ -194,9 +194,10 @@ as unsigned 32-bit values:
 - core system views use stable PostgreSQL OIDs where practical, otherwise
   project-reserved constants.
 
-The tag scheme reserves 28 payload bits. Table, index, sequence, and synthetic
-primary-key-index virtual OIDs reject installed object IDs above that payload
-range instead of truncating them. Derived constraint/default OIDs split the
+The tag scheme reserves 28 payload bits. The table, index, sequence, schema,
+synthetic-primary-key-index, constraint, and attribute-default OID helpers are
+fallible and return `InternalError` for object IDs above their payload ranges
+instead of truncating or panicking. Derived constraint/default OIDs split the
 payload into a table-id portion and a local-object-id portion; catalog validation
 rejects objects outside that deterministic injective range rather than hashing
 or masking IDs into colliding OIDs. System-catalog row construction uses the

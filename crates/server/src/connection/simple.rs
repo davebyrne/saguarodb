@@ -442,7 +442,9 @@ impl Session {
             Statement::CloseCursor { name } => {
                 self.close_sql_cursor(stream, codec, name, guard).await
             }
-            _ => unreachable!("caller passes only SQL cursor statements"),
+            _ => Err(DbError::internal(
+                "non-cursor statement was routed to SQL cursor execution",
+            )),
         }
     }
 
@@ -478,10 +480,9 @@ impl Session {
         let cancel = self.cancel_token();
         let session = self.query_session_context(cancel);
         self.begin_activity(sql);
-        let txn = self
-            .txn
-            .take()
-            .expect("DECLARE cursor requires an open transaction");
+        let txn = self.txn.take().ok_or_else(|| {
+            DbError::internal("DECLARE cursor reached execution without an open transaction")
+        })?;
         let default_isolation = self.default_isolation;
         let (txn, default_isolation, started) =
             QueryService::start_sql_cursor(service, query, txn, default_isolation, session).await;
@@ -794,10 +795,11 @@ where
         return Ok(0);
     }
 
-    let handle = cursor
-        .handle
-        .take()
-        .expect("checked cursor handle is present");
+    let handle = cursor.handle.take().ok_or_else(|| {
+        SqlCursorFetchError::Worker(DbError::internal(
+            "SQL cursor handle disappeared before fetch",
+        ))
+    })?;
     let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
     let reply_rx = handle
         .start_fetch(max_rows, row_tx)

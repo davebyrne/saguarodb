@@ -542,11 +542,6 @@ impl QueryService {
         cancel: &QueryCancel,
     ) -> Result<()> {
         if txn.write_guard.is_some() {
-            debug_assert!(
-                false,
-                "duplicate write-guard acquisition: this transaction already holds \
-                 a writer guard"
-            );
             return Err(DbError::internal(
                 "duplicate write-guard acquisition (transaction already holds a writer guard)",
             ));
@@ -583,10 +578,9 @@ impl QueryService {
                 }
             }
         }
-        Ok(txn
-            .object_locks
-            .as_mut()
-            .expect("transaction lock owner installed above"))
+        txn.object_locks.as_mut().ok_or_else(|| {
+            DbError::internal("transaction lock owner was not installed after acquisition")
+        })
     }
 
     /// Commit an explicit transaction: append a `Commit` record, flush (fsync),

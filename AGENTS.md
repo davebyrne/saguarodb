@@ -71,6 +71,33 @@ precedence.
 - Normal storage operations append WAL records. Recovery operations must not
   append WAL records.
 
+## Production Panic Policy
+
+- Production code must not intentionally panic. Do not use `unwrap()`,
+  `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`,
+  `assert_eq!`, `assert_ne!`, or their `debug_assert*` variants outside tests.
+- Convert fallible operations and invariant checks to `common::Result<T>` and a
+  structured `common::DbError`. Use the error kind and SQLSTATE appropriate to
+  the boundary; use `DbError::internal` only for an unexpected internal state.
+- Infallible trait methods and `Drop` implementations cannot propagate errors.
+  Make those implementations total, recover explicitly where safe, or record
+  failure for a later fallible boundary; never hide a panic in them.
+- Handle poisoned mutexes deliberately: either return a structured error from a
+  fallible boundary or recover the poisoned guard when continuing is the stated
+  policy. Never call `unwrap()` or `expect()` on a lock result.
+- Fixed-width decoding must validate the input length and propagate the failed
+  conversion. Never use `try_into().unwrap()` or `try_into().expect()`.
+- Indexing and slicing of runtime-controlled data must be preceded by checked
+  bounds/length validation or use checked accessors. A prior validation may
+  establish an internal invariant, but violating it must still produce an error
+  at the nearest fallible boundary rather than an assertion or panic.
+- Panic helpers and assertion macros remain acceptable in `#[cfg(test)]` unit
+  tests and integration-test targets. Test-only usage must not be compiled into
+  a production execution path.
+- Before handing off Rust changes, scan non-test code for every prohibited macro
+  and method above in addition to running Clippy and tests. Treat a new match as
+  a defect unless it is unambiguously test-only.
+
 ## SQL And Durability Rules
 
 - Preserve the supported SQL subset unless the specs are intentionally updated:

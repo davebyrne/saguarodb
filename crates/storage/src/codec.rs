@@ -268,7 +268,11 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
             encode_array_element(&mut bytes, array.element_type(), value)?;
         }
     }
-    debug_assert_eq!(bytes.len(), encoded_len);
+    if bytes.len() != encoded_len {
+        return Err(DbError::internal(
+            "encoded array length did not match its preflight size",
+        ));
+    }
     Ok(bytes)
 }
 
@@ -616,7 +620,11 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
                 }
                 bytes.push(KEY_TAG_ARRAY);
                 let payload = encode_array_payload(array)?;
-                debug_assert_eq!(payload.len(), payload_len);
+                if payload.len() != payload_len {
+                    return Err(DbError::internal(
+                        "encoded array key length did not match its preflight size",
+                    ));
+                }
                 let len = u32::try_from(payload_len).map_err(|_| {
                     DbError::storage(SqlState::ProgramLimitExceeded, "array key is too large")
                 })?;
@@ -728,7 +736,7 @@ pub(crate) fn encode_row_with_infomask(
     let bitmap_len = null_bitmap_len(schema.columns.len());
     let mut bytes = vec![0; 1 + V2_MVCC_HEADER_LEN + bitmap_len];
     bytes[0] = ROW_FORMAT_VERSION;
-    write_v2_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], txn_id);
+    write_v2_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], txn_id)?;
     // Stamp the requested infomask over the fresh-insert default (0). HOT uses this
     // to set HEAP_ONLY on the new heap-only tuple; the default path passes 0.
     bytes[1..3].copy_from_slice(&infomask.to_le_bytes());
@@ -838,7 +846,7 @@ pub(crate) fn encode_row_v3_prepared(
     let bitmap_len = null_bitmap_len(schema.columns.len());
     let mut bytes = vec![0; 1 + V2_MVCC_HEADER_LEN + bitmap_len];
     bytes[0] = ROW_FORMAT_VERSION_V3;
-    write_mvcc_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], header);
+    write_mvcc_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], header)?;
 
     let bitmap_start = 1 + V2_MVCC_HEADER_LEN;
     let bitmap_end = bitmap_start + bitmap_len;
@@ -1405,18 +1413,21 @@ pub(crate) fn decode_mvcc_header(tuple: &[u8]) -> Result<(TxnId, TxnId, (PageNum
 
 /// Write the v2 MVCC header into `header` (exactly `V2_MVCC_HEADER_LEN` bytes):
 /// `[infomask:2][xmin:8][xmax:8][t_ctid:6]` for a freshly inserted tuple.
-fn write_v2_header(header: &mut [u8], txn_id: TxnId) {
-    write_mvcc_header(header, &MvccHeader::fresh(txn_id, 0));
+fn write_v2_header(header: &mut [u8], txn_id: TxnId) -> Result<()> {
+    write_mvcc_header(header, &MvccHeader::fresh(txn_id, 0))
 }
 
-fn write_mvcc_header(header: &mut [u8], mvcc: &MvccHeader) {
-    debug_assert_eq!(header.len(), V2_MVCC_HEADER_LEN);
+fn write_mvcc_header(header: &mut [u8], mvcc: &MvccHeader) -> Result<()> {
+    if header.len() != V2_MVCC_HEADER_LEN {
+        return Err(corrupt_row("MVCC header has an invalid length"));
+    }
     header[0..2].copy_from_slice(&mvcc.infomask.to_le_bytes());
     header[2..10].copy_from_slice(&mvcc.xmin.to_le_bytes());
     header[10..18].copy_from_slice(&mvcc.xmax.to_le_bytes());
     let (page, slot) = mvcc.t_ctid;
     header[18..22].copy_from_slice(&page.to_le_bytes());
     header[22..24].copy_from_slice(&slot.to_le_bytes());
+    Ok(())
 }
 
 fn read_mvcc_header(header: &[u8]) -> Result<MvccHeader> {

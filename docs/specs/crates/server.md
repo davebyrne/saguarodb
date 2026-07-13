@@ -322,7 +322,7 @@ transaction`, or `idle in transaction (aborted)` after the session's transaction
 slot has been restored. Parse/Bind/Describe are not activity-tracked;
 `client_addr`, `client_port`, and wait-event columns are reported as `NULL`.
 
-`EXPLAIN` converges in `run_plan` after normal snapshot, relation-snapshot, object-lock, SSI, cancellation, and timeout setup. For `BoundStatement::Explain { analyze, statement }`, `QueryService` plans the inner SELECT. Plain mode calls planner `format_explain`; analyzed mode drains it exactly once through `QueryEngine::analyze_query` and calls `format_explain_analyze`. Both return `StreamOutcome::Direct(ExecutionResult::Explanation)` and ignore a connection-provided SELECT row sink, so no inner rows escape and extended `max_rows` cannot suspend the result. Errors use the same panic firewall and explicit-transaction poisoning as SELECT.
+`EXPLAIN` converges in `run_plan` after normal snapshot, relation-snapshot, object-lock, SSI, cancellation, and timeout setup. For `BoundStatement::Explain { analyze, statement }`, `QueryService` plans the inner SELECT. Plain mode calls the fallible planner `format_explain`; analyzed mode drains it exactly once through `QueryEngine::analyze_query` and calls the fallible `format_explain_analyze`. Plan/layout invariant failures propagate as structured errors. Successful formatting returns `StreamOutcome::Direct(ExecutionResult::Explanation)` and ignores a connection-provided SELECT row sink, so no inner rows escape and extended `max_rows` cannot suspend the result. Errors use the same panic firewall and explicit-transaction poisoning as SELECT.
 
 Statement guard policy:
 

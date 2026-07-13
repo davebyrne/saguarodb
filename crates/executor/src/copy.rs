@@ -74,7 +74,7 @@ impl CopyParser {
             Err(err) => err.valid_up_to(),
         };
         let text = std::str::from_utf8(&self.buffer[..valid_len])
-            .expect("valid_up_to bytes are valid UTF-8");
+            .map_err(|_| DbError::internal("validated COPY UTF-8 prefix became invalid"))?;
 
         let mut rows = Vec::new();
         let mut cursor = 0;
@@ -403,7 +403,7 @@ fn parse_csv_fields(content: &str, options: &CopyOptions) -> Result<Vec<Option<S
             match chars.next() {
                 None => break,
                 Some(ch) if ch == delimiter => continue,
-                Some(_) => unreachable!("unquoted scan stops only at the delimiter or end"),
+                Some(_) => return Err(malformed("unexpected data after unquoted CSV field")),
             }
         }
     }
@@ -462,9 +462,9 @@ pub(crate) fn value_text(value: &Value) -> Option<String> {
         Value::Interval(iv) => Some(common::interval::format_interval(iv)),
         Value::Array(array) => Some(
             common::format_array_text_structure::<std::convert::Infallible>(array, |element| {
-                Ok(value_text(element).expect("array formatter skips null elements"))
+                Ok(value_text(element).unwrap_or_default())
             })
-            .expect("infallible array element formatter"),
+            .unwrap_or_else(|never| match never {}),
         ),
     }
 }

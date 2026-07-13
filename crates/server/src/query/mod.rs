@@ -251,9 +251,12 @@ impl QueryCatalogIntrospection {
                     .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
                 let snapshot = MemoryCatalog::try_from_snapshot(components.catalog.snapshot()?)?;
                 let _ = catalog.set(snapshot);
-                Ok(catalog
+                catalog
                     .get()
-                    .expect("catalog introspection snapshot installed above"))
+                    .map(|catalog| catalog as &dyn CatalogManager)
+                    .ok_or_else(|| {
+                        DbError::internal("catalog introspection snapshot was not installed")
+                    })
             }
         }
     }
@@ -274,10 +277,10 @@ impl QueryCatalogIntrospection {
         name: &str,
     ) -> Result<Option<i64>> {
         if let Some(table) = self.catalog()?.get_table_in_schema(schema_id, name)? {
-            return Ok(Some(table_oid(table.id)));
+            return Ok(Some(table_oid(table.id)?));
         }
         if let Some(view) = self.catalog()?.get_view_in_schema(schema_id, name)? {
-            return Ok(Some(table_oid(view.id)));
+            return Ok(Some(table_oid(view.id)?));
         }
         if let Some(index) = self.catalog()?.get_index_in_schema(schema_id, name)?
             && self
@@ -285,7 +288,7 @@ impl QueryCatalogIntrospection {
                 .get_table(index.table)?
                 .is_some_and(|table| table.relation_kind == RelationKind::User)
         {
-            return Ok(Some(index_oid(index.id)));
+            return Ok(Some(index_oid(index.id)?));
         }
         for table in self.catalog()?.list_tables()? {
             if table.schema_id == schema_id
@@ -293,11 +296,11 @@ impl QueryCatalogIntrospection {
                 && !table.primary_key.is_empty()
                 && primary_key_index_name(&table) == name
             {
-                return Ok(Some(synthetic_primary_key_oid(table.id)));
+                return Ok(Some(synthetic_primary_key_oid(table.id)?));
             }
         }
         if let Some(sequence) = self.catalog()?.get_sequence_in_schema(schema_id, name)? {
-            return Ok(Some(sequence_oid(sequence.id)));
+            return Ok(Some(sequence_oid(sequence.id)?));
         }
         Ok(None)
     }
@@ -376,30 +379,30 @@ impl QueryCatalogIntrospection {
             if table.relation_kind != RelationKind::User {
                 continue;
             }
-            if table_oid(table.id) == relation_oid {
+            if table_oid(table.id)? == relation_oid {
                 return Ok(Some(table.name));
             }
             let mut has_primary_key_index = false;
             for index in self.catalog()?.list_indexes_for_table(table.id)? {
                 has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
-                if index_oid(index.id) == relation_oid {
+                if index_oid(index.id)? == relation_oid {
                     return Ok(Some(index.name));
                 }
             }
             if !has_primary_key_index
                 && !table.primary_key.is_empty()
-                && synthetic_primary_key_oid(table.id) == relation_oid
+                && synthetic_primary_key_oid(table.id)? == relation_oid
             {
                 return Ok(Some(primary_key_index_name(&table)));
             }
         }
         for view in self.catalog()?.list_views()? {
-            if table_oid(view.id) == relation_oid {
+            if table_oid(view.id)? == relation_oid {
                 return Ok(Some(view.name));
             }
         }
         for sequence in self.catalog()?.list_sequences()? {
-            if sequence_oid(sequence.id) == relation_oid {
+            if sequence_oid(sequence.id)? == relation_oid {
                 return Ok(Some(sequence.name));
             }
         }
@@ -461,7 +464,7 @@ impl QueryCatalogIntrospection {
             let mut has_primary_key_index = false;
             for index in self.catalog()?.list_indexes_for_table(table.id)? {
                 has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
-                if index_oid(index.id) == index_oid_value {
+                if index_oid(index.id)? == index_oid_value {
                     let schema = self
                         .catalog()?
                         .get_schema(table.schema_id)?
@@ -478,7 +481,7 @@ impl QueryCatalogIntrospection {
             }
             if !has_primary_key_index
                 && !table.primary_key.is_empty()
-                && synthetic_primary_key_oid(table.id) == index_oid_value
+                && synthetic_primary_key_oid(table.id)? == index_oid_value
             {
                 let schema = self
                     .catalog()?
@@ -503,7 +506,7 @@ impl QueryCatalogIntrospection {
                 continue;
             }
             if !table.primary_key.is_empty()
-                && primary_key_constraint_oid(table.id) == constraint_oid
+                && primary_key_constraint_oid(table.id)? == constraint_oid
             {
                 return Ok(Some(format!(
                     "PRIMARY KEY ({})",
@@ -1299,7 +1302,7 @@ impl QueryService {
             self.validate_prepared_schema_versions(schema_versions)?;
             return Ok(None);
         }
-        let mut guard = self.components.lock_manager.statement_owner();
+        let mut guard = self.components.lock_manager.statement_owner()?;
         self.lock_prepared_bound(bound, schema_versions, &mut guard, cancel)?;
         Ok(Some(guard))
     }
@@ -1743,7 +1746,9 @@ impl QueryService {
                             Some(&prepared.schema_versions),
                         )
                         .map(StreamOutcome::Durable),
-                    _ => unreachable!("classify_bound only promotes reads to writes"),
+                    _ => Err(DbError::internal(
+                        "prepared read was reclassified as an unsupported statement class",
+                    )),
                 }
             }
             StatementClass::Write | StatementClass::Ddl => self
@@ -1758,12 +1763,12 @@ impl QueryService {
                     Some(&prepared.schema_versions),
                 )
                 .map(StreamOutcome::Durable),
-            StatementClass::Maintenance => {
-                unreachable!("maintenance is dispatched above before substitution")
-            }
-            StatementClass::SessionConfig => {
-                unreachable!("session configuration is dispatched above before substitution")
-            }
+            StatementClass::Maintenance => Err(DbError::internal(
+                "prepared maintenance reached relational substitution",
+            )),
+            StatementClass::SessionConfig => Err(DbError::internal(
+                "prepared session configuration reached relational substitution",
+            )),
             StatementClass::SqlCursor => Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "SQL cursors require the simple query protocol",
@@ -2024,7 +2029,9 @@ impl QueryService {
                                     Some(&prepared.schema_versions),
                                 )
                                 .map(StreamOutcome::Durable),
-                            _ => unreachable!("classify_bound only promotes reads to writes"),
+                            _ => Err(DbError::internal(
+                                "prepared read was reclassified as an unsupported statement class",
+                            )),
                         }
                     }
                     StatementClass::Write | StatementClass::Ddl => self
@@ -2039,28 +2046,24 @@ impl QueryService {
                             Some(&prepared.schema_versions),
                         )
                         .map(StreamOutcome::Durable),
-                    StatementClass::Maintenance => {
-                        unreachable!("maintenance is dispatched above before substitution")
-                    }
-                    StatementClass::SessionConfig => {
-                        unreachable!(
-                            "session configuration is dispatched above before substitution"
-                        )
-                    }
-                    StatementClass::TransactionControl(_) => {
-                        unreachable!("transaction control is dispatched above before substitution")
-                    }
-                    StatementClass::SqlCursor => {
-                        unreachable!("SQL cursors are rejected at prepare time")
-                    }
-                    StatementClass::Copy(_) => {
-                        unreachable!("COPY is rejected at prepare time for the extended protocol")
-                    }
-                    StatementClass::Savepoint => {
-                        unreachable!(
-                            "savepoints are rejected at prepare time for the extended protocol"
-                        )
-                    }
+                    StatementClass::Maintenance => Err(DbError::internal(
+                        "prepared maintenance reached relational execution",
+                    )),
+                    StatementClass::SessionConfig => Err(DbError::internal(
+                        "prepared session configuration reached relational execution",
+                    )),
+                    StatementClass::TransactionControl(_) => Err(DbError::internal(
+                        "prepared transaction control reached relational execution",
+                    )),
+                    StatementClass::SqlCursor => Err(DbError::internal(
+                        "prepared SQL cursor reached relational execution",
+                    )),
+                    StatementClass::Copy(_) => Err(DbError::internal(
+                        "prepared COPY reached extended-protocol relational execution",
+                    )),
+                    StatementClass::Savepoint => Err(DbError::internal(
+                        "prepared savepoint reached relational execution",
+                    )),
                 };
                 (None, default_isolation, result)
             }
@@ -3238,9 +3241,9 @@ fn run_plan(
             let physical = physical_plan(&logical, catalog)?;
             let text = if *analyze {
                 let analysis = engine.analyze_query(ctx, &physical)?;
-                format_explain_analyze(&physical, catalog, &analysis)
+                format_explain_analyze(&physical, catalog, &analysis)?
             } else {
-                format_explain(&physical, catalog)
+                format_explain(&physical, catalog)?
             };
             return Ok(StreamOutcome::Direct(ExecutionResult::Explanation { text }));
         }
@@ -3891,7 +3894,7 @@ mod tests {
 
         for (drop_sql, create_sql) in cases {
             let statement = parser::parse(drop_sql).unwrap();
-            let mut objects = app.components.lock_manager.statement_owner();
+            let mut objects = app.components.lock_manager.statement_owner().unwrap();
             let baseline = objects.snapshot();
             let (bound, initial) = app
                 .query_service
@@ -4064,10 +4067,13 @@ mod tests {
             .unwrap(),
         );
         let active_txns = ActiveTxnRegistry::new();
-        let lock_manager = Arc::new(crate::lock_manager::LockManager::new(
-            active_txns.clone(),
-            Duration::from_millis(config.deadlock_timeout_ms),
-        ));
+        let lock_manager = Arc::new(
+            crate::lock_manager::LockManager::new(
+                active_txns.clone(),
+                Duration::from_millis(config.deadlock_timeout_ms),
+            )
+            .unwrap(),
+        );
         let ssi_manager = Arc::new(crate::ssi_manager::SerializableConflictManager::new(
             active_txns.clone(),
         ));
@@ -6373,11 +6379,11 @@ mod tests {
         assert_eq!(
             result_values(run(&format!(
                 "select to_regclass('items'), to_regclass('app.items'), pg_table_is_visible({})",
-                table_oid(public_items.id)
+                table_oid(public_items.id).unwrap()
             ))),
             vec![vec![
-                Value::Integer(table_oid(app_items.id)),
-                Value::Integer(table_oid(app_items.id)),
+                Value::Integer(table_oid(app_items.id).unwrap()),
+                Value::Integer(table_oid(app_items.id).unwrap()),
                 Value::Boolean(false),
             ]]
         );
@@ -6395,8 +6401,8 @@ mod tests {
         assert_eq!(
             result_values(run("select to_regclass('ids'), to_regclass('app.ids')")),
             vec![vec![
-                Value::Integer(sequence_oid(app_sequence.id)),
-                Value::Integer(sequence_oid(app_sequence.id)),
+                Value::Integer(sequence_oid(app_sequence.id).unwrap()),
+                Value::Integer(sequence_oid(app_sequence.id).unwrap()),
             ]]
         );
         assert_eq!(
@@ -6681,8 +6687,8 @@ mod tests {
             .get_index_by_name("users_pkey")
             .unwrap()
             .unwrap();
-        let users_pkey_oid = index_oid(users_pkey.id);
-        let users_pkey_constraint_oid = primary_key_constraint_oid(users.id);
+        let users_pkey_oid = index_oid(users_pkey.id).unwrap();
+        let users_pkey_constraint_oid = primary_key_constraint_oid(users.id).unwrap();
         let users_id_lookup = app
             .components
             .catalog
@@ -6695,7 +6701,7 @@ mod tests {
             .get_table_by_name("constrained")
             .unwrap()
             .unwrap();
-        let constrained_check_oid = check_constraint_oid(constrained.id, 0);
+        let constrained_check_oid = check_constraint_oid(constrained.id, 0).unwrap();
         let shadow_pg_class = app
             .components
             .catalog
@@ -6708,7 +6714,7 @@ mod tests {
             .get_table_by_name("toast_probe")
             .unwrap()
             .unwrap();
-        let toast_oid = table_oid(toast_probe.toast_table_id.unwrap());
+        let toast_oid = table_oid(toast_probe.toast_table_id.unwrap()).unwrap();
         let rows = result_values(app.query_service.execute_sql(&format!(
             "select \
              to_regclass('users'), \
@@ -6732,18 +6738,18 @@ mod tests {
              pg_get_constraintdef({constrained_check_oid}), \
              to_regtype('pg_catalog.int4'), \
              to_regclass('missing')",
-            index_oid(users_id_lookup.id),
-            index_oid(users_id_lookup.id),
-            index_oid(users_id_lookup.id)
+            index_oid(users_id_lookup.id).unwrap(),
+            index_oid(users_id_lookup.id).unwrap(),
+            index_oid(users_id_lookup.id).unwrap()
         )));
 
         assert_eq!(
             rows,
             vec![vec![
-                Value::Integer(table_oid(users.id)),
+                Value::Integer(table_oid(users.id).unwrap()),
                 Value::Integer(users_pkey_oid),
                 Value::Integer(catalog::SystemView::PgClass.relation_oid()),
-                Value::Integer(table_oid(shadow_pg_class.id)),
+                Value::Integer(table_oid(shadow_pg_class.id).unwrap()),
                 Value::Boolean(true),
                 Value::Boolean(true),
                 Value::Boolean(true),
@@ -6868,7 +6874,7 @@ mod tests {
                 app.query_service
                     .execute_sql("select target_oid from copy_probe where id = 1")
             ),
-            vec![vec![Value::Integer(table_oid(referenced.id))]]
+            vec![vec![Value::Integer(table_oid(referenced.id).unwrap())]]
         );
     }
 

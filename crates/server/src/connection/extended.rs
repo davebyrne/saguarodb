@@ -66,7 +66,9 @@ impl Session {
                 return Ok(());
             }
             let Some(Portal::Suspended(portal)) = self.portals.remove(portal_name) else {
-                unreachable!("portal state changed after suspended match");
+                return Err(DbError::internal(
+                    "portal state changed after suspended-portal dispatch",
+                ));
             };
             return self
                 .run_suspended_execute(stream, codec, portal_name, portal, max_rows)
@@ -74,7 +76,9 @@ impl Session {
         }
 
         let Portal::Bound(portal) = portal else {
-            unreachable!("suspended portal handled above");
+            return Err(DbError::internal(
+                "suspended portal reached bound-portal execution",
+            ));
         };
         if max_rows > 0
             && self
@@ -89,7 +93,9 @@ impl Session {
                 return Ok(());
             }
             let Some(Portal::Bound(portal)) = self.portals.remove(portal_name) else {
-                unreachable!("portal state changed after bound match");
+                return Err(DbError::internal(
+                    "portal state changed after bound-portal dispatch",
+                ));
             };
             return self
                 .run_limited_bound_execute(

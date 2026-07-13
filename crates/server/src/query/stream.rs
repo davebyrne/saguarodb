@@ -38,8 +38,9 @@ impl AutocommitCopyWrite {
         }
     }
 
-    pub(crate) fn txn_id(&self) -> u64 {
-        self.txn_id.expect("COPY write ownership is still armed")
+    pub(crate) fn txn_id(&self) -> Result<u64> {
+        self.txn_id
+            .ok_or_else(|| DbError::internal("COPY write ownership is no longer armed"))
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -154,9 +155,9 @@ impl StreamOutcome {
                     "COPY requires the PostgreSQL COPY sub-protocol",
                 ))
             }
-            StreamOutcome::Streamed { .. } => {
-                unreachable!("this outcome cannot arise without protocol-level driving")
-            }
+            StreamOutcome::Streamed { .. } => Err(DbError::internal(
+                "streamed query result requires protocol-level driving",
+            )),
         }
     }
 }

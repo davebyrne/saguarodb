@@ -3,15 +3,15 @@
 //! format is not supported. Hex has been PostgreSQL's default `bytea_output`
 //! and a valid input form since 9.0.
 
-use std::fmt::Write;
-
 /// Format bytes as a hex bytea string: `\x` followed by lowercase hex digits
 /// (two per byte). The empty byte string formats as `\x`.
 pub fn format_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("\\x");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in bytes {
-        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
 }

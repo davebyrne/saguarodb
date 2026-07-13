@@ -578,21 +578,30 @@ struct ProfileBuild<'a> {
     init_parent: Option<usize>,
 }
 
+impl<'a> ProfileBuild<'a> {
+    fn child(self, index: usize) -> Result<Self> {
+        let layout = self.layout.child(index).ok_or_else(|| {
+            DbError::internal(format!(
+                "profile layout node {} is missing child {index}",
+                self.layout.id().0
+            ))
+        })?;
+        Ok(Self {
+            layout,
+            collector: self.collector,
+            analysis: self.analysis,
+            init_parent: self.init_parent,
+        })
+    }
+}
+
 fn build_executor_impl<'a>(
     ctx: &'a ExecutionContext<'_>,
     plan: &PhysicalPlan,
     profile: Option<ProfileBuild<'_>>,
 ) -> Result<Box<dyn PlanExecutor + 'a>> {
     let child = |child_plan: &PhysicalPlan, index: usize| {
-        let child_profile = profile.map(|profile| ProfileBuild {
-            layout: profile
-                .layout
-                .child(index)
-                .expect("profile layout validated before construction"),
-            collector: profile.collector,
-            analysis: profile.analysis,
-            init_parent: profile.init_parent,
-        });
+        let child_profile = profile.map(|profile| profile.child(index)).transpose()?;
         build_executor_impl(ctx, child_plan, child_profile)
     };
 
@@ -711,7 +720,7 @@ fn build_executor_impl<'a>(
                 identity_from: *identity_from,
                 build_left: *build_left,
                 spill: ctx.spill.clone(),
-            })))
+            })?))
         }
         PhysicalPlan::MergeJoin {
             left,
@@ -769,16 +778,16 @@ fn build_executor_impl<'a>(
                     *left_join,
                     condition.as_deref().cloned(),
                     output_schema.clone(),
-                    profile.map(|profile| DynamicProfile {
-                        layout: profile
-                            .layout
-                            .child(1)
-                            .expect("profile layout validated before construction")
-                            .clone(),
-                        collector: profile.collector.clone(),
-                        analysis: profile.analysis.cloned(),
-                        init_parent: profile.init_parent,
-                    }),
+                    profile
+                        .map(|profile| {
+                            Ok(DynamicProfile {
+                                layout: profile.child(1)?.layout.clone(),
+                                collector: profile.collector.clone(),
+                                analysis: profile.analysis.cloned(),
+                                init_parent: profile.init_parent,
+                            })
+                        })
+                        .transpose()?,
                 )))
             } else {
                 Ok(Box::new(crate::ops::ApplyOp::new(
@@ -787,17 +796,17 @@ fn build_executor_impl<'a>(
                     subplan,
                     correlations.clone(),
                     kind.clone(),
-                    profile.map(|profile| DynamicProfile {
-                        layout: profile
-                            .layout
-                            .child(1)
-                            .expect("profile layout validated before construction")
-                            .clone(),
-                        collector: profile.collector.clone(),
-                        analysis: profile.analysis.cloned(),
-                        init_parent: profile.init_parent,
-                    }),
-                )))
+                    profile
+                        .map(|profile| {
+                            Ok(DynamicProfile {
+                                layout: profile.child(1)?.layout.clone(),
+                                collector: profile.collector.clone(),
+                                analysis: profile.analysis.cloned(),
+                                init_parent: profile.init_parent,
+                            })
+                        })
+                        .transpose()?,
+                )?))
             }
         }
         PhysicalPlan::Filter { source, predicate } => Ok(Box::new(FilterOp::new(
@@ -977,32 +986,19 @@ fn validate_plan_layout(plan: &PhysicalPlan, layout: &PlanNodeLayout) -> Result<
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. }
-        | PhysicalPlan::Aggregate { source, .. } => validate_plan_layout(
-            source,
-            layout.child(0).expect("child existence checked above"),
-        ),
+        | PhysicalPlan::Aggregate { source, .. } => {
+            validate_plan_layout(source, required_layout_child(layout, 0)?)
+        }
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::MergeJoin { left, right, .. }
         | PhysicalPlan::SetOp { left, right, .. } => {
-            validate_plan_layout(
-                left,
-                layout.child(0).expect("child existence checked above"),
-            )?;
-            validate_plan_layout(
-                right,
-                layout.child(1).expect("child existence checked above"),
-            )
+            validate_plan_layout(left, required_layout_child(layout, 0)?)?;
+            validate_plan_layout(right, required_layout_child(layout, 1)?)
         }
         PhysicalPlan::Apply { input, subplan, .. } => {
-            validate_plan_layout(
-                input,
-                layout.child(0).expect("child existence checked above"),
-            )?;
-            validate_plan_layout(
-                subplan,
-                layout.child(1).expect("child existence checked above"),
-            )
+            validate_plan_layout(input, required_layout_child(layout, 0)?)?;
+            validate_plan_layout(subplan, required_layout_child(layout, 1)?)
         }
         PhysicalPlan::CreateSchema { .. }
         | PhysicalPlan::DropSchema { .. }
@@ -1025,6 +1021,15 @@ fn validate_plan_layout(plan: &PhysicalPlan, layout: &PlanNodeLayout) -> Result<
         | PhysicalPlan::Values { .. }
         | PhysicalPlan::TableFunction { .. } => Ok(()),
     }
+}
+
+fn required_layout_child(layout: &PlanNodeLayout, index: usize) -> Result<&PlanNodeLayout> {
+    layout.child(index).ok_or_else(|| {
+        DbError::internal(format!(
+            "plan layout node {} is missing child {index}",
+            layout.id().0
+        ))
+    })
 }
 
 /// Batch size used to materialize a `SELECT` into an [`ExecutionResult::Query`].

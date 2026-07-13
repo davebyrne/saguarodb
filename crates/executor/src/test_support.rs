@@ -151,7 +151,7 @@ impl ExecutorHarness {
         let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.catalog.as_ref())?;
-        Ok(format_explain(&physical, self.catalog.as_ref()))
+        format_explain(&physical, self.catalog.as_ref())
     }
 
     pub fn analyze_query(&self, sql: &str) -> Result<ExplainAnalysis> {

@@ -1230,7 +1230,9 @@ async fn in_flight_create_schema_is_skipped_but_its_id_is_reserved() {
             .unwrap()
             .unwrap_rows(),
         vec![vec![Some(
-            catalog::schema_oid(CRASHED_SCHEMA_ID + 1).to_string()
+            catalog::schema_oid(CRASHED_SCHEMA_ID + 1)
+                .unwrap()
+                .to_string()
         )]]
     );
 }

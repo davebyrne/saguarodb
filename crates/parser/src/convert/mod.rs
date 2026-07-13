@@ -1360,7 +1360,7 @@ fn normalize_maintenance_target(command: &str, target: &str) -> Result<Qualified
             schema: Some(schema.to_ascii_lowercase()),
             name: name.to_ascii_lowercase(),
         },
-        _ => unreachable!(),
+        _ => return Err(parse_error("VACUUM target has an invalid qualified name")),
     })
 }
 

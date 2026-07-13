@@ -1122,7 +1122,8 @@ async fn cancel_request_signals_the_target_backend() {
     let key = app
         .components
         .cancel_registry
-        .register(cancel.clone(), Arc::new(tokio::sync::Notify::new()));
+        .register(cancel.clone(), Arc::new(tokio::sync::Notify::new()))
+        .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

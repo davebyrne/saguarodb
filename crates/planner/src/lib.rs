@@ -2210,7 +2210,7 @@ mod tests {
         assert!(output_schema.iter().any(|column| column.name == "relname"));
         assert!(filter.is_some());
 
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
         assert!(text.contains("SystemScan view=pg_catalog.pg_class filter=yes"));
     }
 
@@ -2261,7 +2261,7 @@ mod tests {
             filter: None,
         };
 
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
         assert!(text.contains("users(7)"));
     }
 
@@ -2290,7 +2290,7 @@ mod tests {
         };
         let logical = logical_plan(&inner).unwrap();
         let physical = physical_plan(&logical, &catalog).unwrap();
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
 
         assert!(text.contains("IndexScan"));
         assert!(text.contains("users"));
@@ -2323,10 +2323,10 @@ mod tests {
         let expected = "[node=0] Projection exprs=0 (rows=1000)\n  \
                         [node=1] Filter (rows=1000)\n    \
                         [node=2] SeqScan table=t1(1) filter=none (rows=1000)\n";
-        assert_eq!(format_explain(&plan, &catalog), expected);
-        assert_eq!(format_explain(&plan, &catalog), expected);
+        assert_eq!(format_explain(&plan, &catalog).unwrap(), expected);
+        assert_eq!(format_explain(&plan, &catalog).unwrap(), expected);
 
-        let scan_only = format_explain(&explain_test_scan(1), &catalog);
+        let scan_only = format_explain(&explain_test_scan(1), &catalog).unwrap();
         assert!(scan_only.starts_with("[node=0] SeqScan table=t1(1)"));
         assert!(expected.contains("[node=2] SeqScan table=t1(1)"));
     }
@@ -2348,12 +2348,12 @@ mod tests {
             right: Box::new(explain_test_scan(4)),
         };
 
-        let join_text = format_explain(&join, &catalog);
+        let join_text = format_explain(&join, &catalog).unwrap();
         assert!(join_text.starts_with("[node=0] NestedLoopJoin"));
         assert!(join_text.contains("  [node=1] SeqScan table=t1(1)"));
         assert!(join_text.contains("  [node=2] SeqScan table=t2(2)"));
 
-        let set_text = format_explain(&set_op, &catalog);
+        let set_text = format_explain(&set_op, &catalog).unwrap();
         assert!(set_text.starts_with("[node=0] SetOp"));
         assert!(set_text.contains("  [node=1] SeqScan table=t3(3)"));
         assert!(set_text.contains("  [node=2] SeqScan table=t4(4)"));
@@ -2371,7 +2371,7 @@ mod tests {
             },
         };
 
-        let text = format_explain(&plan, &catalog);
+        let text = format_explain(&plan, &catalog).unwrap();
         assert!(text.starts_with("[node=0] Apply"));
         assert!(text.contains("  [node=1] SeqScan table=t1(1)"));
         assert!(text.contains("  [node=2] SeqScan table=t2(2)"));
@@ -2403,7 +2403,7 @@ mod tests {
         };
 
         assert_eq!(
-            format_explain_analyze(&plan, &catalog, &analysis),
+            format_explain_analyze(&plan, &catalog, &analysis).unwrap(),
             "[node=0] Projection exprs=0 (rows=1000) \
              (actual time=0.004..0.009 rows=1.50 loops=2)\n  \
              [node=1] SeqScan table=t1(1) filter=none (rows=1000) \
@@ -2457,7 +2457,7 @@ mod tests {
             execution_time: Duration::from_micros(5),
         };
 
-        let text = format_explain_analyze(&plan, &catalog, &analysis);
+        let text = format_explain_analyze(&plan, &catalog, &analysis).unwrap();
         assert!(text.contains("[node=0] SeqScan"));
         assert!(text.contains("    [node=1] Values"));
         assert!(text.contains(
@@ -2475,7 +2475,11 @@ mod tests {
         let logical = logical_plan(&bound).unwrap();
         let physical = physical_plan(&logical, &catalog).unwrap();
 
-        assert!(format_explain(&physical, &catalog).contains("HashJoin keys=1"));
+        assert!(
+            format_explain(&physical, &catalog)
+                .unwrap()
+                .contains("HashJoin keys=1")
+        );
     }
 
     #[test]
@@ -2490,7 +2494,11 @@ mod tests {
         let logical = logical_plan(&bound).unwrap();
         let physical = physical_plan(&logical, &catalog).unwrap();
 
-        assert!(format_explain(&physical, &catalog).contains("HashJoin keys=2"));
+        assert!(
+            format_explain(&physical, &catalog)
+                .unwrap()
+                .contains("HashJoin keys=2")
+        );
     }
 
     #[test]
@@ -2502,7 +2510,7 @@ mod tests {
         let logical = logical_plan(&bound).unwrap();
         let physical = physical_plan(&logical, &catalog).unwrap();
 
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
         assert!(text.contains("NestedLoopJoin"));
         assert!(!text.contains("HashJoin"));
     }
@@ -2517,7 +2525,7 @@ mod tests {
         let logical = logical_plan(&bound).unwrap();
         let physical = physical_plan(&logical, &catalog).unwrap();
 
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
         assert!(text.contains("MergeJoin type=Left keys=1 residual=none"));
         assert!(!text.contains("HashJoin"));
     }
@@ -2533,7 +2541,7 @@ mod tests {
             let bound = bind(&parse(&sql).unwrap(), &catalog).unwrap();
             let logical = logical_plan(&bound).unwrap();
             let physical = physical_plan(&logical, &catalog).unwrap();
-            let text = format_explain(&physical, &catalog);
+            let text = format_explain(&physical, &catalog).unwrap();
             assert!(
                 text.contains(&format!("MergeJoin type={label} keys=1 residual=yes")),
                 "{text}"
@@ -3630,7 +3638,7 @@ mod tests {
             "select users.id from users join accounts \
              on users.id = accounts.id and users.id < accounts.id",
         );
-        let text = format_explain(&physical, &catalog);
+        let text = format_explain(&physical, &catalog).unwrap();
         assert!(text.contains("HashJoin keys=1"), "got: {text}");
         assert!(
             text.contains("Filter"),

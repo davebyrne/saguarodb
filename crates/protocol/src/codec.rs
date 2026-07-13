@@ -696,7 +696,9 @@ pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Re
             ValueFormat::Text => {
                 let value = decode_value(bytes, DataType::Integer, 0)?;
                 let Value::Integer(int) = value else {
-                    unreachable!("integer decoder returned non-integer value");
+                    return Err(protocol_error(
+                        "integer decoder returned a non-integer value",
+                    ));
                 };
                 u32::try_from(int)
                     .map(|_| value)
@@ -707,7 +709,9 @@ pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Re
     if matches!(pg_type, PgType::Int2 | PgType::Int4) && value_format == ValueFormat::Text {
         let value = decode_value(bytes, DataType::Integer, 0)?;
         let Value::Integer(int) = value else {
-            unreachable!("integer decoder returned non-integer value");
+            return Err(protocol_error(
+                "integer decoder returned a non-integer value",
+            ));
         };
         if let Some(target) = pg_type.narrow_int_overflow(int) {
             return Err(integer_out_of_range(int, target));
