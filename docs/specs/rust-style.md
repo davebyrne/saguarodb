@@ -34,7 +34,12 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 ## Unsafe, Panics, and Assertions
 
-- Do not use `unsafe`. If a future change needs `unsafe`, isolate it in a small module, document the safety invariants, and add targeted tests.
+- Do not use `unsafe`. Every workspace package, including any newly added
+  package, must inherit the workspace-level `unsafe_code = "forbid"` lint via
+  `[lints] workspace = true`, so this is compiler-enforced for repository
+  libraries, binaries, and tests. A future need for `unsafe` requires an
+  explicit policy and lint change; isolate it in a small module, document the
+  safety invariants, and add targeted tests.
 - Production code must not intentionally panic. Return `common::Result<T>` for
   expected runtime failures and unexpected invariant violations alike.
 - Do not use `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
