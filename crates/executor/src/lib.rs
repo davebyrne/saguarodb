@@ -3369,6 +3369,7 @@ mod tests {
             Some(3),
             "the same inner template IDs aggregate all three physical executions"
         );
+        assert!(analysis.init_plans.is_empty());
     }
 
     #[test]
@@ -3392,5 +3393,106 @@ mod tests {
             "one distinct correlation key should execute the memoized inner once"
         );
         assert_eq!(analysis.nodes[&planner::PlanNodeId(0)].rows, 3);
+        assert!(analysis.init_plans.is_empty());
+    }
+
+    fn explain_node_ids(text: &str) -> Vec<usize> {
+        text.lines()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("[node=")?;
+                let (id, _) = rest.split_once(']')?;
+                id.parse().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn analyzed_scalar_exists_and_in_subqueries_are_init_plans() {
+        let harness = ExecutorHarness::with_users();
+        let sql = "select (select 1), exists (select 1), 1 in (select 1)";
+        let plain_ids = explain_node_ids(&harness.explain_plan(sql).unwrap());
+        let analysis = harness.analyze_query(sql).unwrap();
+
+        assert_eq!(
+            analysis
+                .init_plans
+                .iter()
+                .map(|init| (init.ordinal, init.parent))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (2, None), (3, None)]
+        );
+        let max_main = *plain_ids.iter().max().unwrap();
+        assert!(
+            analysis
+                .init_plans
+                .iter()
+                .all(|init| init.layout.id().0 > max_main)
+        );
+        assert!(analysis.init_plans.iter().all(|init| {
+            analysis
+                .nodes
+                .get(&init.layout.id())
+                .is_some_and(|metrics| metrics.loops == 1)
+        }));
+        assert!(
+            plain_ids
+                .iter()
+                .all(|id| analysis.nodes.contains_key(&planner::PlanNodeId(*id)))
+        );
+    }
+
+    #[test]
+    fn analyzed_nested_init_plans_have_deterministic_parentage() {
+        let harness = ExecutorHarness::with_users();
+        let analysis = harness.analyze_query("select (select (select 1))").unwrap();
+
+        assert_eq!(
+            analysis
+                .init_plans
+                .iter()
+                .map(|init| (init.ordinal, init.parent))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (2, Some(1))]
+        );
+        assert!(analysis.init_plans[0].layout.id().0 < analysis.init_plans[1].layout.id().0);
+        let init_total = analysis
+            .init_plans
+            .iter()
+            .map(|init| analysis.nodes[&init.layout.id()].total)
+            .max()
+            .unwrap();
+        assert!(analysis.execution_time >= init_total);
+    }
+
+    #[test]
+    fn analyzed_apply_template_records_uncorrelated_init_plan_once() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+
+        let analysis = harness
+            .analyze_query(
+                "select id from users where exists \
+                 (select (select 1) where users.id > 0)",
+            )
+            .unwrap();
+
+        assert_eq!(analysis.init_plans.len(), 1);
+        assert_eq!(analysis.init_plans[0].parent, None);
+        assert_eq!(analysis.nodes[&analysis.init_plans[0].layout.id()].loops, 1);
+    }
+
+    #[test]
+    fn analyzed_sequence_bearing_init_plan_executes_once() {
+        let harness = ExecutorHarness::with_users();
+        harness.execute("create sequence init_profile_seq").unwrap();
+
+        let analysis = harness
+            .analyze_query("select (select nextval('init_profile_seq'))")
+            .unwrap();
+
+        assert_eq!(analysis.init_plans.len(), 1);
+        assert_eq!(analysis.nodes[&analysis.init_plans[0].layout.id()].loops, 1);
     }
 }

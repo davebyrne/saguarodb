@@ -257,6 +257,12 @@ turn, so nesting works at any depth.
   template, so nested uncorrelated subqueries become constants once per
   statement, not once per outer row. The statement-level pre-pass does **not**
   descend into `Apply` subplans; `ApplyOp` construction owns them.
+- On the analysis-only executor path, the pre-pass shares the statement's
+  profiling state. Uncorrelated work in an Apply template is emitted as an
+  init plan once when that template is constructed; the correlated Apply
+  subplan itself remains in the main layout and its repeated physical
+  executions aggregate under the template node IDs. Ordinary execution keeps
+  the existing resolver and memoization behavior unchanged.
 - **Per outer row**: evaluates the `correlations` expressions against the
   outer row, substitutes `OuterRef { slot }` → `Literal` throughout a clone of
   the template, builds the inner executor, and runs it. `Exists` pulls at most

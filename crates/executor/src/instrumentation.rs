@@ -6,6 +6,7 @@ use common::{ColumnInfo, ExecRow, Result};
 use planner::{NodeExecutionMetrics, PlanNodeId, PlanNodeLayout};
 
 use crate::query::PlanExecutor;
+use crate::subquery::AnalysisState;
 
 #[derive(Clone, Default)]
 pub(crate) struct MetricCollector {
@@ -16,6 +17,8 @@ pub(crate) struct MetricCollector {
 pub(crate) struct DynamicProfile {
     pub(crate) layout: PlanNodeLayout,
     pub(crate) collector: MetricCollector,
+    pub(crate) analysis: Option<AnalysisState>,
+    pub(crate) init_parent: Option<usize>,
 }
 
 impl MetricCollector {

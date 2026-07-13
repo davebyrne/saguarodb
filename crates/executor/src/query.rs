@@ -468,10 +468,15 @@ impl QueryEngine {
         plan: &PhysicalPlan,
     ) -> Result<ExplainAnalysis> {
         let started = Instant::now();
-        let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
-        let layout = PlanNodeLayout::new(&resolved);
         let collector = MetricCollector::default();
-        let executor = build_executor_with_profile(ctx, &resolved, &layout, &collector)?;
+        let mut next_node_id = 0;
+        let layout = PlanNodeLayout::new_with_next(plan, &mut next_node_id);
+        let analysis = crate::subquery::AnalysisState::new(collector.clone(), next_node_id);
+        let resolved =
+            crate::subquery::resolve_plan_subqueries_profiled(ctx, plan, &analysis, None)?;
+        let executor = build_executor_with_analysis_profile(
+            ctx, &resolved, &layout, &collector, &analysis, None,
+        )?;
         let mut query = OpenQuery::from_executor(ctx.cancel, executor)?;
         let mut sink = DiscardRowSink;
         let result = query.fetch(None, &mut sink, MATERIALIZE_BATCH_ROWS);
@@ -484,7 +489,7 @@ impl QueryEngine {
         let execution_time = started.elapsed();
         Ok(ExplainAnalysis {
             nodes: collector.snapshot(),
-            init_plans: Vec::new(),
+            init_plans: analysis.init_plans(),
             execution_time,
         })
     }
@@ -497,6 +502,7 @@ pub(crate) fn build_executor<'a>(
     build_executor_impl(ctx, plan, None)
 }
 
+#[cfg(test)]
 pub(crate) fn build_executor_with_profile<'a>(
     ctx: &'a ExecutionContext<'_>,
     plan: &PhysicalPlan,
@@ -513,13 +519,63 @@ pub(crate) fn build_executor_with_validated_profile<'a>(
     layout: &PlanNodeLayout,
     collector: &MetricCollector,
 ) -> Result<Box<dyn PlanExecutor + 'a>> {
-    build_executor_impl(ctx, plan, Some(ProfileBuild { layout, collector }))
+    build_executor_impl(
+        ctx,
+        plan,
+        Some(ProfileBuild {
+            layout,
+            collector,
+            analysis: None,
+            init_parent: None,
+        }),
+    )
+}
+
+pub(crate) fn build_executor_with_analysis_profile<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    layout: &PlanNodeLayout,
+    collector: &MetricCollector,
+    analysis: &crate::subquery::AnalysisState,
+    init_parent: Option<usize>,
+) -> Result<Box<dyn PlanExecutor + 'a>> {
+    validate_plan_layout(plan, layout)?;
+    build_executor_with_validated_analysis_profile(
+        ctx,
+        plan,
+        layout,
+        collector,
+        analysis,
+        init_parent,
+    )
+}
+
+pub(crate) fn build_executor_with_validated_analysis_profile<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    layout: &PlanNodeLayout,
+    collector: &MetricCollector,
+    analysis: &crate::subquery::AnalysisState,
+    init_parent: Option<usize>,
+) -> Result<Box<dyn PlanExecutor + 'a>> {
+    build_executor_impl(
+        ctx,
+        plan,
+        Some(ProfileBuild {
+            layout,
+            collector,
+            analysis: Some(analysis),
+            init_parent,
+        }),
+    )
 }
 
 #[derive(Clone, Copy)]
 struct ProfileBuild<'a> {
     layout: &'a PlanNodeLayout,
     collector: &'a MetricCollector,
+    analysis: Option<&'a crate::subquery::AnalysisState>,
+    init_parent: Option<usize>,
 }
 
 fn build_executor_impl<'a>(
@@ -534,6 +590,8 @@ fn build_executor_impl<'a>(
                 .child(index)
                 .expect("profile layout validated before construction"),
             collector: profile.collector,
+            analysis: profile.analysis,
+            init_parent: profile.init_parent,
         });
         build_executor_impl(ctx, child_plan, child_profile)
     };
@@ -685,7 +743,15 @@ fn build_executor_impl<'a>(
             // Resolve the template's uncorrelated nested subqueries once at
             // construction (docs/specs/subqueries.md section 5.2); the
             // statement-level pre-pass deliberately did not descend into it.
-            let subplan = crate::subquery::resolve_plan_subqueries(ctx, subplan)?;
+            let subplan = match profile.and_then(|profile| profile.analysis) {
+                Some(analysis) => crate::subquery::resolve_plan_subqueries_profiled(
+                    ctx,
+                    subplan,
+                    analysis,
+                    profile.and_then(|profile| profile.init_parent),
+                )?,
+                None => crate::subquery::resolve_plan_subqueries(ctx, subplan)?,
+            };
             if let planner::ApplyKind::Lateral {
                 left_join,
                 condition,
@@ -710,6 +776,8 @@ fn build_executor_impl<'a>(
                             .expect("profile layout validated before construction")
                             .clone(),
                         collector: profile.collector.clone(),
+                        analysis: profile.analysis.cloned(),
+                        init_parent: profile.init_parent,
                     }),
                 )))
             } else {
@@ -726,6 +794,8 @@ fn build_executor_impl<'a>(
                             .expect("profile layout validated before construction")
                             .clone(),
                         collector: profile.collector.clone(),
+                        analysis: profile.analysis.cloned(),
+                        init_parent: profile.init_parent,
                     }),
                 )))
             }

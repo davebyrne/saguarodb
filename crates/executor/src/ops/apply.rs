@@ -12,8 +12,8 @@ use spill::{Reservation, RetainedSize, SpillContext, SpillTape, SpillTapeReader}
 use crate::expr::{compare_values, eval_expr};
 use crate::instrumentation::DynamicProfile;
 use crate::query::{
-    ExecutionContext, PlanExecutor, build_executor, build_executor_with_validated_profile,
-    check_canceled, close_after, open_executor,
+    ExecutionContext, PlanExecutor, build_executor, build_executor_with_validated_analysis_profile,
+    build_executor_with_validated_profile, check_canceled, close_after, open_executor,
 };
 
 /// One memoized subplan result, keyed by the correlation-value tuple. The
@@ -218,12 +218,22 @@ impl<'a> ApplyOp<'a> {
     fn build_inner(&self, key: &[Value]) -> Result<Box<dyn PlanExecutor + 'a>> {
         let substituted = substitute_template(&self.subplan, key)?;
         match &self.profile {
-            Some(profile) => build_executor_with_validated_profile(
-                self.ctx,
-                &substituted,
-                &profile.layout,
-                &profile.collector,
-            ),
+            Some(profile) => match &profile.analysis {
+                Some(analysis) => build_executor_with_validated_analysis_profile(
+                    self.ctx,
+                    &substituted,
+                    &profile.layout,
+                    &profile.collector,
+                    analysis,
+                    profile.init_parent,
+                ),
+                None => build_executor_with_validated_profile(
+                    self.ctx,
+                    &substituted,
+                    &profile.layout,
+                    &profile.collector,
+                ),
+            },
             None => build_executor(self.ctx, &substituted),
         }
     }
@@ -446,12 +456,22 @@ impl<'a> LateralApplyOp<'a> {
         let watermark = registry.watermark();
         let substituted = substitute_template(&self.subplan, &key)?;
         let inner = match &self.profile {
-            Some(profile) => build_executor_with_validated_profile(
-                self.ctx,
-                &substituted,
-                &profile.layout,
-                &profile.collector,
-            ),
+            Some(profile) => match &profile.analysis {
+                Some(analysis) => build_executor_with_validated_analysis_profile(
+                    self.ctx,
+                    &substituted,
+                    &profile.layout,
+                    &profile.collector,
+                    analysis,
+                    profile.init_parent,
+                ),
+                None => build_executor_with_validated_profile(
+                    self.ctx,
+                    &substituted,
+                    &profile.layout,
+                    &profile.collector,
+                ),
+            },
             None => build_executor(self.ctx, &substituted),
         };
         let mut inner = match inner {
