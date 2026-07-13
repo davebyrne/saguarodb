@@ -926,6 +926,24 @@ fn reclaim_line_pointers_rejects_a_normal_slot() {
 }
 
 #[test]
+fn reclaim_line_pointers_rejects_a_tid_for_another_file() {
+    let fixture = Fixture::new();
+    let live = fixture.insert_committed(10, row(1, "live"));
+    let wrong_file = RowLocation {
+        file_id: live.file_id.saturating_add(1),
+        ..live
+    };
+
+    let err = fixture
+        .engine
+        .reclaim_line_pointers(&users_schema(), &HashSet::from([wrong_file]))
+        .unwrap_err();
+
+    assert!(err.message.contains("different heap file"));
+    assert!(fixture.is_normal(live), "the live slot is untouched");
+}
+
+#[test]
 fn reclaim_line_pointers_empty_set_is_a_noop() {
     let fixture = Fixture::new();
     let _a = fixture.insert_committed(10, row(1, "a"));

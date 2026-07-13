@@ -1,5 +1,16 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
 use bytes::BytesMut;
-use common::{ColumnInfo, DataType, DbError, PgType, Result, SqlState, Value};
+use common::{CheckedSliceReader, ColumnInfo, DataType, DbError, PgType, Result, SqlState, Value};
 
 use crate::{ClientMessage, ServerMessage, StatementKind};
 
@@ -8,6 +19,35 @@ const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 const POSTGRES_PROTOCOL_V3: i32 = 196_608;
 const MAX_FRAME_LEN: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct FrameLength(usize);
+
+impl FrameLength {
+    fn parse(raw: i32, minimum: usize, what: &str) -> Result<Self> {
+        let value = usize::try_from(raw)
+            .map_err(|_| protocol_error(format!("{what} length is invalid")))?;
+        if value < minimum {
+            return Err(protocol_error(format!("{what} length is too short")));
+        }
+        if value > MAX_FRAME_LEN {
+            return Err(protocol_error(format!(
+                "{what} length exceeds maximum frame size"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    fn get(self) -> usize {
+        self.0
+    }
+
+    fn tagged_total(self) -> Result<usize> {
+        self.0
+            .checked_add(1)
+            .ok_or_else(|| protocol_error("tagged message length overflows"))
+    }
+}
 
 pub trait ProtocolCodec: Send {
     fn decode(&mut self, buf: &[u8]) -> Result<Vec<ClientMessage>>;
@@ -30,23 +70,21 @@ impl PostgresCodec {
             return Ok(false);
         }
 
-        let length = read_i32(&self.buffer[..4])?;
-        if length < 8 {
-            return Err(protocol_error("startup packet length is too short"));
-        }
-        let length = usize::try_from(length)
-            .map_err(|_| protocol_error("startup packet length is invalid"))?;
-        if length > MAX_FRAME_LEN {
-            return Err(protocol_error(
-                "startup packet length exceeds maximum frame size",
-            ));
-        }
+        let length_bytes = self
+            .buffer
+            .get(..4)
+            .ok_or_else(|| protocol_error("startup packet length is truncated"))?;
+        let length = FrameLength::parse(read_i32(length_bytes)?, 8, "startup packet")?.get();
         if self.buffer.len() < length {
             return Ok(false);
         }
 
         let packet = self.buffer.split_to(length);
-        let code = read_i32(&packet[4..8])?;
+        let code = read_i32(
+            packet
+                .get(4..8)
+                .ok_or_else(|| protocol_error("startup packet code is truncated"))?,
+        )?;
         if length == 8 && code == SSL_REQUEST_CODE {
             messages.push(ClientMessage::SslRequest);
             return Ok(true);
@@ -56,8 +94,16 @@ impl PostgresCodec {
             return Ok(true);
         }
         if length == 16 && code == CANCEL_REQUEST_CODE {
-            let process_id = read_i32(&packet[8..12])?;
-            let secret_key = read_i32(&packet[12..16])?;
+            let process_id = read_i32(
+                packet
+                    .get(8..12)
+                    .ok_or_else(|| protocol_error("cancel request process id is truncated"))?,
+            )?;
+            let secret_key = read_i32(
+                packet
+                    .get(12..16)
+                    .ok_or_else(|| protocol_error("cancel request secret key is truncated"))?,
+            )?;
             messages.push(ClientMessage::CancelRequest {
                 process_id,
                 secret_key,
@@ -68,7 +114,10 @@ impl PostgresCodec {
             return Err(protocol_error("unsupported PostgreSQL startup protocol"));
         }
 
-        let (user, database, application_name) = decode_startup_params(&packet[8..])?;
+        let startup_params = packet
+            .get(8..)
+            .ok_or_else(|| protocol_error("startup packet parameters are truncated"))?;
+        let (user, database, application_name) = decode_startup_params(startup_params)?;
         messages.push(ClientMessage::Startup {
             user,
             database,
@@ -82,27 +131,30 @@ impl PostgresCodec {
             return Ok(false);
         }
 
-        let tag = self.buffer[0];
-        let length = read_i32(&self.buffer[1..5])?;
-        if length < 4 {
-            return Err(protocol_error("tagged message length is too short"));
-        }
-        let length = usize::try_from(length)
-            .map_err(|_| protocol_error("tagged message length is invalid"))?;
-        if length > MAX_FRAME_LEN {
-            return Err(protocol_error(
-                "tagged message length exceeds maximum frame size",
-            ));
-        }
-        let total_length = length
-            .checked_add(1)
-            .ok_or_else(|| protocol_error("tagged message length overflows"))?;
+        let tag = self
+            .buffer
+            .first()
+            .copied()
+            .ok_or_else(|| protocol_error("tagged message is empty"))?;
+        let length = FrameLength::parse(
+            read_i32(
+                self.buffer
+                    .get(1..5)
+                    .ok_or_else(|| protocol_error("tagged message length is truncated"))?,
+            )?,
+            4,
+            "tagged message",
+        )?;
+        let total_length = length.tagged_total()?;
+        let length = length.get();
         if self.buffer.len() < total_length {
             return Ok(false);
         }
 
         let packet = self.buffer.split_to(total_length);
-        let body = &packet[5..];
+        let body = packet
+            .get(5..)
+            .ok_or_else(|| protocol_error("tagged message body is truncated"))?;
         match tag {
             b'Q' => {
                 let sql = decode_nul_terminated_text(body, "query message is not nul terminated")?;
@@ -166,7 +218,12 @@ impl ProtocolCodec for PostgresCodec {
                 break;
             }
 
-            let decoded = match self.buffer[0] {
+            let tag = self
+                .buffer
+                .first()
+                .copied()
+                .ok_or_else(|| protocol_error("frontend message is empty"))?;
+            let decoded = match tag {
                 b'Q' | b'X' | b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' | b'd' | b'c'
                 | b'f' => self.decode_tagged(&mut messages)?,
                 0 => self.decode_startup_style(&mut messages)?,
@@ -318,10 +375,16 @@ fn read_cstr<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a str> {
         .get(start..)
         .and_then(|remaining| remaining.iter().position(|byte| *byte == 0))
         .ok_or_else(|| protocol_error("string field is not nul terminated"))?;
-    let end = start + relative_nul;
-    *offset = end + 1;
-    std::str::from_utf8(&bytes[start..end])
-        .map_err(|_| protocol_error("string field is not valid UTF-8"))
+    let end = start
+        .checked_add(relative_nul)
+        .ok_or_else(|| protocol_error("string field offset overflows"))?;
+    *offset = end
+        .checked_add(1)
+        .ok_or_else(|| protocol_error("string field terminator offset overflows"))?;
+    let value = bytes
+        .get(start..end)
+        .ok_or_else(|| protocol_error("string field range is invalid"))?;
+    std::str::from_utf8(value).map_err(|_| protocol_error("string field is not valid UTF-8"))
 }
 
 fn decode_parse(body: &[u8]) -> Result<ClientMessage> {
@@ -329,7 +392,7 @@ fn decode_parse(body: &[u8]) -> Result<ClientMessage> {
     let name = read_cstr(body, &mut offset)?.to_string();
     let query = read_cstr(body, &mut offset)?.to_string();
     let count = read_count(body, &mut offset, "parse parameter type")?;
-    let mut param_types = Vec::with_capacity(count);
+    let mut param_types = fallible_vec(count, "parse parameter types")?;
     for _ in 0..count {
         param_types.push(read_i32_at(body, &mut offset)?);
     }
@@ -347,7 +410,7 @@ fn decode_bind(body: &[u8]) -> Result<ClientMessage> {
     let statement = read_cstr(body, &mut offset)?.to_string();
     let param_formats = read_i16_array(body, &mut offset, "bind parameter format")?;
     let param_count = read_count(body, &mut offset, "bind parameter")?;
-    let mut params = Vec::with_capacity(param_count);
+    let mut params = fallible_vec(param_count, "bind parameters")?;
     for _ in 0..param_count {
         params.push(read_param_value(body, &mut offset)?);
     }
@@ -387,10 +450,11 @@ fn decode_execute(body: &[u8]) -> Result<ClientMessage> {
 }
 
 fn read_kind(bytes: &[u8], offset: &mut usize) -> Result<StatementKind> {
-    let tag = *bytes
-        .get(*offset)
-        .ok_or_else(|| protocol_error("describe/close message is truncated"))?;
-    *offset += 1;
+    let mut reader = reader_at(bytes, *offset, "describe/close message")?;
+    let tag = reader
+        .read_u8()
+        .map_err(|_| protocol_error("describe/close message is truncated"))?;
+    *offset = reader.position();
     match tag {
         b'S' => Ok(StatementKind::Statement),
         b'P' => Ok(StatementKind::Portal),
@@ -400,7 +464,7 @@ fn read_kind(bytes: &[u8], offset: &mut usize) -> Result<StatementKind> {
 
 fn read_i16_array(bytes: &[u8], offset: &mut usize, what: &str) -> Result<Vec<i16>> {
     let count = read_count(bytes, offset, what)?;
-    let mut values = Vec::with_capacity(count);
+    let mut values = fallible_vec(count, what)?;
     for _ in 0..count {
         values.push(read_i16_at(bytes, offset)?);
     }
@@ -414,14 +478,11 @@ fn read_param_value(bytes: &[u8], offset: &mut usize) -> Result<Option<Vec<u8>>>
     }
     let length =
         usize::try_from(length).map_err(|_| protocol_error("bind parameter has invalid length"))?;
-    let start = *offset;
-    let end = start
-        .checked_add(length)
-        .ok_or_else(|| protocol_error("bind parameter length overflows"))?;
-    let slice = bytes
-        .get(start..end)
-        .ok_or_else(|| protocol_error("bind parameter is truncated"))?;
-    *offset = end;
+    let mut reader = reader_at(bytes, *offset, "bind parameter")?;
+    let slice = reader
+        .take(length)
+        .map_err(|err| protocol_error(format!("bind parameter is invalid: {err}")))?;
+    *offset = reader.position();
     Ok(Some(slice.to_vec()))
 }
 
@@ -432,48 +493,65 @@ fn read_count(bytes: &[u8], offset: &mut usize, what: &str) -> Result<usize> {
 }
 
 fn read_i16_at(bytes: &[u8], offset: &mut usize) -> Result<i16> {
-    let start = *offset;
-    let end = start + 2;
-    let slice = bytes
-        .get(start..end)
-        .ok_or_else(|| protocol_error("message is truncated reading int16"))?;
-    *offset = end;
-    Ok(i16::from_be_bytes([slice[0], slice[1]]))
+    let mut reader = reader_at(bytes, *offset, "int16 field")?;
+    let value = reader
+        .read_i16_be()
+        .map_err(|err| protocol_error(format!("message is truncated reading int16: {err}")))?;
+    *offset = reader.position();
+    Ok(value)
 }
 
 fn read_i32_at(bytes: &[u8], offset: &mut usize) -> Result<i32> {
-    let start = *offset;
-    let end = start + 4;
-    let slice = bytes
-        .get(start..end)
-        .ok_or_else(|| protocol_error("message is truncated reading int32"))?;
-    *offset = end;
-    Ok(i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    let mut reader = reader_at(bytes, *offset, "int32 field")?;
+    let value = reader
+        .read_i32_be()
+        .map_err(|err| protocol_error(format!("message is truncated reading int32: {err}")))?;
+    *offset = reader.position();
+    Ok(value)
 }
 
 fn require_consumed(body: &[u8], offset: usize) -> Result<()> {
-    if offset != body.len() {
-        return Err(protocol_error("message has unexpected trailing bytes"));
-    }
-    Ok(())
+    reader_at(body, offset, "message")?
+        .finish()
+        .map_err(|_| protocol_error("message has unexpected trailing bytes"))
+}
+
+fn reader_at<'a>(bytes: &'a [u8], offset: usize, what: &str) -> Result<CheckedSliceReader<'a>> {
+    CheckedSliceReader::at(bytes, offset)
+        .map_err(|err| protocol_error(format!("{what} has an invalid offset: {err}")))
+}
+
+fn fallible_vec<T>(capacity: usize, what: &str) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| encoding_error(format!("cannot allocate {what}")))?;
+    Ok(values)
 }
 
 fn decode_nul_terminated_text<'a>(bytes: &'a [u8], error: &'static str) -> Result<&'a str> {
     match bytes.iter().position(|byte| *byte == 0) {
-        Some(nul) if nul + 1 == bytes.len() => std::str::from_utf8(&bytes[..nul])
-            .map_err(|_| protocol_error("message text is not valid UTF-8")),
+        Some(nul) if nul.checked_add(1) == Some(bytes.len()) => {
+            let text = bytes
+                .get(..nul)
+                .ok_or_else(|| protocol_error("message text range is invalid"))?;
+            std::str::from_utf8(text).map_err(|_| protocol_error("message text is not valid UTF-8"))
+        }
         Some(_) => Err(protocol_error("message has bytes after nul terminator")),
         None => Err(protocol_error(error)),
     }
 }
 
 fn encode_server_message(tag: u8, body: Vec<u8>) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(body.len() + 5);
-    bytes.push(tag);
     let frame_len = body
         .len()
         .checked_add(4)
         .ok_or_else(|| encoding_error("server message too large"))?;
+    let encoded_len = frame_len
+        .checked_add(1)
+        .ok_or_else(|| encoding_error("server message too large"))?;
+    let mut bytes = fallible_vec(encoded_len, "server message")?;
+    bytes.push(tag);
     put_i32(
         &mut bytes,
         checked_i32(frame_len, "server message too large")?,
@@ -485,8 +563,15 @@ fn encode_server_message(tag: u8, body: Vec<u8>) -> Result<Vec<u8>> {
 /// Body shared by `CopyInResponse`/`CopyOutResponse`: `int8 overall_format`,
 /// `int16 column_count`, then one `int16 format_code` per column.
 fn encode_copy_response(overall_format: i8, column_formats: &[i16]) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(3 + column_formats.len() * 2);
-    body.push(overall_format as u8);
+    let format_bytes = column_formats
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| encoding_error("copy response length overflows"))?;
+    let body_len = format_bytes
+        .checked_add(3)
+        .ok_or_else(|| encoding_error("copy response length overflows"))?;
+    let mut body = fallible_vec(body_len, "copy response")?;
+    body.push(overall_format.cast_unsigned());
     put_i16(
         &mut body,
         checked_i16(column_formats.len(), "too many copy columns")?,
@@ -773,12 +858,18 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
         // parameter as int2 (2 bytes), int4 (4 bytes), or int8 (8 bytes); each is
         // sign-extended to the internal 64-bit integer.
         (DataType::Integer, ValueFormat::Binary) => match bytes.len() {
-            2 => Ok(Value::Integer(i64::from(i16::from_be_bytes([
-                bytes[0], bytes[1],
-            ])))),
-            4 => Ok(Value::Integer(i64::from(i32::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ])))),
+            2 => {
+                let array: [u8; 2] = bytes.try_into().map_err(|_| {
+                    protocol_error("binary integer parameter must be exactly 2 bytes")
+                })?;
+                Ok(Value::Integer(i64::from(i16::from_be_bytes(array))))
+            }
+            4 => {
+                let array: [u8; 4] = bytes.try_into().map_err(|_| {
+                    protocol_error("binary integer parameter must be exactly 4 bytes")
+                })?;
+                Ok(Value::Integer(i64::from(i32::from_be_bytes(array))))
+            }
             8 => {
                 let array: [u8; 8] = bytes.try_into().map_err(|_| {
                     protocol_error("binary integer parameter must be exactly 8 bytes")
@@ -887,9 +978,10 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
             let array: [u8; 4] = bytes
                 .try_into()
                 .map_err(|_| protocol_error("binary date parameter must be 4 bytes"))?;
-            Ok(Value::Date(
-                i32::from_be_bytes(array) as i64 + PG_DATE_EPOCH_OFFSET_DAYS,
-            ))
+            i64::from(i32::from_be_bytes(array))
+                .checked_add(PG_DATE_EPOCH_OFFSET_DAYS)
+                .map(Value::Date)
+                .ok_or_else(|| protocol_error("binary date parameter is out of range"))
         }
         (DataType::Timestamp, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "timestamp parameter")?;
@@ -965,10 +1057,14 @@ fn put_i32(bytes: &mut Vec<u8>, value: i32) {
 }
 
 fn read_i32(bytes: &[u8]) -> Result<i32> {
-    let bytes: [u8; 4] = bytes
-        .try_into()
+    let mut reader = CheckedSliceReader::new(bytes);
+    let value = reader
+        .read_i32_be()
         .map_err(|_| protocol_error("integer field is incomplete"))?;
-    Ok(i32::from_be_bytes(bytes))
+    reader
+        .finish()
+        .map_err(|_| protocol_error("integer field has trailing bytes"))?;
+    Ok(value)
 }
 
 fn checked_i16(value: usize, message: &'static str) -> Result<i16> {

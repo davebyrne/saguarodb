@@ -1,4 +1,15 @@
-use common::{DbError, Lsn, Result, SqlState};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState};
 use crc32fast::Hasher;
 
 use crate::{WalRecord, WalRecordKind};
@@ -47,7 +58,14 @@ pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| wal_error("WAL payload is too large to encode"))?;
 
-    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len() + CRC_LEN);
+    let capacity = HEADER_LEN
+        .checked_add(payload.len())
+        .and_then(|length| length.checked_add(CRC_LEN))
+        .ok_or_else(|| wal_error("encoded WAL record length overflows"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| wal_error("cannot allocate encoded WAL record"))?;
     bytes.extend_from_slice(&record.lsn.to_le_bytes());
     bytes.extend_from_slice(&record.txn_id.to_le_bytes());
     bytes.push(record_type(&record.kind));
@@ -82,10 +100,22 @@ pub(crate) fn read_records(bytes: &[u8]) -> Result<(Vec<(WalRecord, u64)>, usize
                 record,
                 next_offset,
             } => {
-                records.push((*record, (next_offset - offset) as u64));
+                let encoded_len = next_offset
+                    .checked_sub(offset)
+                    .ok_or_else(|| wal_error("WAL decoder moved backwards"))?;
+                let encoded_len = u64::try_from(encoded_len)
+                    .map_err(|_| wal_error("WAL record length does not fit u64"))?;
+                records.push((*record, encoded_len));
                 offset = next_offset;
             }
-            DecodeResult::Incomplete if suffix_contains_complete_record(bytes, offset + 1)? => {
+            DecodeResult::Incomplete
+                if suffix_contains_complete_record(
+                    bytes,
+                    offset
+                        .checked_add(1)
+                        .ok_or_else(|| wal_error("WAL scan offset overflows"))?,
+                )? =>
+            {
                 return Err(wal_error(
                     "incomplete WAL record before later complete record",
                 ));
@@ -102,54 +132,53 @@ pub(crate) fn max_lsn(records: &[WalRecord]) -> Lsn {
 }
 
 fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
-    let Some(header_end) = offset.checked_add(HEADER_LEN) else {
-        return Err(wal_error("WAL record offset overflow"));
-    };
-    if bytes.len() < header_end {
+    let mut reader = CheckedSliceReader::at(bytes, offset)
+        .map_err(|err| wal_error(format!("invalid WAL record offset: {err}")))?;
+    if reader.remaining() < HEADER_LEN {
         return Ok(DecodeResult::Incomplete);
     }
 
-    let header = &bytes[offset..header_end];
-    let lsn = u64::from_le_bytes(
-        header[0..8]
-            .try_into()
-            .map_err(|_| wal_error("invalid WAL LSN header"))?,
-    );
-    let txn_id = u64::from_le_bytes(
-        header[8..16]
-            .try_into()
-            .map_err(|_| wal_error("invalid WAL transaction header"))?,
-    );
-    let type_id = header[16];
-    let payload_len = u32::from_le_bytes(
-        header[17..21]
-            .try_into()
-            .map_err(|_| wal_error("invalid WAL payload length header"))?,
-    ) as usize;
-
-    let Some(payload_end) = header_end.checked_add(payload_len) else {
-        return Err(wal_error("WAL payload length overflow"));
-    };
-    let Some(record_end) = payload_end.checked_add(CRC_LEN) else {
-        return Err(wal_error("WAL record length overflow"));
-    };
-    if bytes.len() < record_end {
+    let lsn = reader
+        .read_u64_le()
+        .map_err(|err| wal_error(format!("invalid WAL LSN header: {err}")))?;
+    let txn_id = reader
+        .read_u64_le()
+        .map_err(|err| wal_error(format!("invalid WAL transaction header: {err}")))?;
+    let type_id = reader
+        .read_u8()
+        .map_err(|err| wal_error(format!("invalid WAL record type header: {err}")))?;
+    let payload_len = usize::try_from(
+        reader
+            .read_u32_le()
+            .map_err(|err| wal_error(format!("invalid WAL payload length header: {err}")))?,
+    )
+    .map_err(|_| wal_error("WAL payload length does not fit usize"))?;
+    let payload_and_crc_len = payload_len
+        .checked_add(CRC_LEN)
+        .ok_or_else(|| wal_error("WAL record length overflow"))?;
+    if reader.remaining() < payload_and_crc_len {
         return Ok(DecodeResult::Incomplete);
     }
 
-    let stored_crc = u32::from_le_bytes(
-        bytes[payload_end..record_end]
-            .try_into()
-            .map_err(|_| wal_error("invalid WAL CRC footer"))?,
-    );
+    let payload = reader
+        .take(payload_len)
+        .map_err(|err| wal_error(format!("invalid WAL payload: {err}")))?;
+    let payload_end = reader.position();
+    let stored_crc = reader
+        .read_u32_le()
+        .map_err(|err| wal_error(format!("invalid WAL CRC footer: {err}")))?;
+    let record_end = reader.position();
     let mut hasher = Hasher::new();
-    hasher.update(&bytes[offset..payload_end]);
+    let checksummed = bytes
+        .get(offset..payload_end)
+        .ok_or_else(|| wal_error("WAL checksum range is outside the input"))?;
+    hasher.update(checksummed);
     let computed_crc = hasher.finalize();
     if computed_crc != stored_crc {
         return Err(wal_error("WAL record CRC mismatch"));
     }
 
-    let kind = decode_payload(type_id, &bytes[header_end..payload_end])?;
+    let kind = decode_payload(type_id, payload)?;
 
     Ok(DecodeResult::Record {
         record: Box::new(WalRecord { lsn, txn_id, kind }),
@@ -208,7 +237,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             slot,
             row_bytes,
         } => {
-            let mut payload = Vec::with_capacity(10 + row_bytes.len());
+            let mut payload = encoded_payload_buffer(10, row_bytes.len())?;
             payload.extend_from_slice(&file_id.to_le_bytes());
             payload.extend_from_slice(&page_num.to_le_bytes());
             payload.extend_from_slice(&slot.to_le_bytes());
@@ -250,7 +279,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             page_num,
             image,
         } => {
-            let mut payload = Vec::with_capacity(8 + image.len());
+            let mut payload = encoded_payload_buffer(8, image.len())?;
             payload.extend_from_slice(&file_id.to_le_bytes());
             payload.extend_from_slice(&page_num.to_le_bytes());
             payload.extend_from_slice(image);
@@ -263,7 +292,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             dict_id,
             payload,
         } => {
-            let mut buf = Vec::with_capacity(13 + payload.len());
+            let mut buf = encoded_payload_buffer(13, payload.len())?;
             buf.extend_from_slice(&file_id.to_le_bytes());
             buf.extend_from_slice(&page_num.to_le_bytes());
             buf.push(*codec);
@@ -276,7 +305,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             table_id,
             bytes,
         } => {
-            let mut buf = Vec::with_capacity(8 + bytes.len());
+            let mut buf = encoded_payload_buffer(8, bytes.len())?;
             buf.extend_from_slice(&dict_id.to_le_bytes());
             buf.extend_from_slice(&table_id.to_le_bytes());
             buf.extend_from_slice(bytes);
@@ -312,75 +341,88 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
             if payload.len() != 8 {
                 return Err(wal_error("WAL heap-init payload is malformed"));
             }
-            Ok(WalRecordKind::HeapInit {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-            })
+            let mut reader = physical_reader(payload);
+            let record = WalRecordKind::HeapInit {
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+            };
+            finish_physical(reader)?;
+            Ok(record)
         }
         TYPE_HEAP_INSERT => {
             if payload.len() < 10 {
                 return Err(wal_error("WAL heap-insert payload is truncated"));
             }
+            let mut reader = physical_reader(payload);
             Ok(WalRecordKind::HeapInsert {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-                slot: read_u16(payload, 8)?,
-                row_bytes: payload[10..].to_vec(),
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+                slot: read_u16(&mut reader)?,
+                row_bytes: take_remaining(&mut reader)?.to_vec(),
             })
         }
         TYPE_HEAP_DELETE => {
             if payload.len() != 10 {
                 return Err(wal_error("WAL heap-delete payload is malformed"));
             }
-            Ok(WalRecordKind::HeapDelete {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-                slot: read_u16(payload, 8)?,
-            })
+            let mut reader = physical_reader(payload);
+            let record = WalRecordKind::HeapDelete {
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+                slot: read_u16(&mut reader)?,
+            };
+            finish_physical(reader)?;
+            Ok(record)
         }
         TYPE_HEAP_UPDATE_HEADER => {
             if payload.len() != HEAP_UPDATE_HEADER_LEN {
                 return Err(wal_error("WAL heap-update-header payload is malformed"));
             }
-            Ok(WalRecordKind::HeapUpdateHeader {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-                slot: read_u16(payload, 8)?,
-                xmax: read_u64(payload, 10)?,
-                t_ctid: (read_u32(payload, 18)?, read_u16(payload, 22)?),
-                infomask: read_u16(payload, 24)?,
-            })
+            let mut reader = physical_reader(payload);
+            let record = WalRecordKind::HeapUpdateHeader {
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+                slot: read_u16(&mut reader)?,
+                xmax: read_u64(&mut reader)?,
+                t_ctid: (read_u32(&mut reader)?, read_u16(&mut reader)?),
+                infomask: read_u16(&mut reader)?,
+            };
+            finish_physical(reader)?;
+            Ok(record)
         }
         TYPE_FULL_PAGE_IMAGE => {
             if payload.len() < 8 {
                 return Err(wal_error("WAL full-page-image payload is truncated"));
             }
+            let mut reader = physical_reader(payload);
             Ok(WalRecordKind::FullPageImage {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-                image: payload[8..].to_vec(),
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+                image: take_remaining(&mut reader)?.to_vec(),
             })
         }
         TYPE_FULL_PAGE_IMAGE_COMPRESSED => {
             if payload.len() < 13 {
                 return Err(wal_error("compressed full-page-image payload too short"));
             }
+            let mut reader = physical_reader(payload);
             Ok(WalRecordKind::FullPageImageCompressed {
-                file_id: read_u32(payload, 0)?,
-                page_num: read_u32(payload, 4)?,
-                codec: payload[8],
-                dict_id: read_u32(payload, 9)?,
-                payload: payload[13..].to_vec(),
+                file_id: read_u32(&mut reader)?,
+                page_num: read_u32(&mut reader)?,
+                codec: read_u8(&mut reader)?,
+                dict_id: read_u32(&mut reader)?,
+                payload: take_remaining(&mut reader)?.to_vec(),
             })
         }
         TYPE_CREATE_DICTIONARY => {
             if payload.len() < 8 {
                 return Err(wal_error("create-dictionary payload too short"));
             }
+            let mut reader = physical_reader(payload);
             Ok(WalRecordKind::CreateDictionary {
-                dict_id: read_u32(payload, 0)?,
-                table_id: read_u32(payload, 4)?,
-                bytes: payload[8..].to_vec(),
+                dict_id: read_u32(&mut reader)?,
+                table_id: read_u32(&mut reader)?,
+                bytes: take_remaining(&mut reader)?.to_vec(),
             })
         }
         _ => {
@@ -394,28 +436,55 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
     }
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    bytes
-        .get(offset..offset + 4)
-        .and_then(|slice| slice.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(|| wal_error("WAL physical payload is truncated"))
+fn encoded_payload_buffer(header_len: usize, body_len: usize) -> Result<Vec<u8>> {
+    let capacity = header_len
+        .checked_add(body_len)
+        .ok_or_else(|| wal_error("WAL payload length overflows"))?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| wal_error("cannot allocate WAL payload"))?;
+    Ok(payload)
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    bytes
-        .get(offset..offset + 8)
-        .and_then(|slice| slice.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or_else(|| wal_error("WAL physical payload is truncated"))
+fn physical_reader(payload: &[u8]) -> CheckedSliceReader<'_> {
+    CheckedSliceReader::new(payload)
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    bytes
-        .get(offset..offset + 2)
-        .and_then(|slice| slice.try_into().ok())
-        .map(u16::from_le_bytes)
-        .ok_or_else(|| wal_error("WAL physical payload is truncated"))
+fn read_u8(reader: &mut CheckedSliceReader<'_>) -> Result<u8> {
+    reader
+        .read_u8()
+        .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn read_u16(reader: &mut CheckedSliceReader<'_>) -> Result<u16> {
+    reader
+        .read_u16_le()
+        .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn read_u32(reader: &mut CheckedSliceReader<'_>) -> Result<u32> {
+    reader
+        .read_u32_le()
+        .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn read_u64(reader: &mut CheckedSliceReader<'_>) -> Result<u64> {
+    reader
+        .read_u64_le()
+        .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn take_remaining<'a>(reader: &mut CheckedSliceReader<'a>) -> Result<&'a [u8]> {
+    reader
+        .take_remaining()
+        .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn finish_physical(reader: CheckedSliceReader<'_>) -> Result<()> {
+    reader
+        .finish()
+        .map_err(|err| wal_error(format!("WAL physical payload is malformed: {err}")))
 }
 
 fn wal_error(message: impl Into<String>) -> DbError {

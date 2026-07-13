@@ -12,7 +12,18 @@
 //! over a JSON payload, written whole at each checkpoint via temp + rename +
 //! directory fsync.
 
-use common::{DbError, Lsn, Result, SqlState, TxnId};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TxnId};
 use serde::{Deserialize, Serialize};
 
 const CLOG_MAGIC: &[u8; 4] = b"SGCL";
@@ -69,7 +80,13 @@ pub(crate) fn encode_clog(snapshot: &ClogSnapshot) -> Result<Vec<u8>> {
         .map_err(|_| corrupt_clog("CLOG payload is too large"))?;
     let checksum = crc32fast::hash(&payload_bytes);
 
-    let mut bytes = Vec::with_capacity(CLOG_HEADER_LEN + payload_bytes.len());
+    let envelope_len = CLOG_HEADER_LEN
+        .checked_add(payload_bytes.len())
+        .ok_or_else(|| corrupt_clog("CLOG envelope length overflows"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(envelope_len)
+        .map_err(|_| corrupt_clog("cannot allocate CLOG envelope"))?;
     bytes.extend_from_slice(CLOG_MAGIC);
     bytes.extend_from_slice(&CLOG_VERSION.to_le_bytes());
     bytes.extend_from_slice(&payload_len.to_le_bytes());
@@ -87,27 +104,34 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
     if bytes.len() < CLOG_HEADER_LEN {
         return Err(corrupt_clog("CLOG file is too short"));
     }
-    if &bytes[0..4] != CLOG_MAGIC {
+    let mut reader = CheckedSliceReader::new(bytes);
+    let magic = reader
+        .take(CLOG_MAGIC.len())
+        .map_err(|_| corrupt_clog("CLOG file is too short"))?;
+    if magic != CLOG_MAGIC {
         return Err(corrupt_clog("CLOG file magic mismatch"));
     }
 
-    let version = read_u32(&bytes[4..8], "CLOG file version")?;
+    let version = read_u32(&mut reader, "CLOG file version")?;
     if version != CLOG_VERSION {
         return Err(corrupt_clog(format!(
             "unsupported CLOG file version {version}"
         )));
     }
 
-    let payload_len = read_u32(&bytes[8..12], "CLOG file payload length")? as usize;
-    let expected_len = CLOG_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or_else(|| corrupt_clog("CLOG file length overflows"))?;
-    if bytes.len() != expected_len {
+    let payload_len = usize::try_from(read_u32(&mut reader, "CLOG file payload length")?)
+        .map_err(|_| corrupt_clog("CLOG payload length does not fit usize"))?;
+    let expected_checksum = read_u32(&mut reader, "CLOG file checksum")?;
+    if reader.remaining() != payload_len {
         return Err(corrupt_clog("CLOG file length mismatch"));
     }
 
-    let expected_checksum = read_u32(&bytes[12..16], "CLOG file checksum")?;
-    let payload_bytes = &bytes[CLOG_HEADER_LEN..];
+    let payload_bytes = reader
+        .take(payload_len)
+        .map_err(|_| corrupt_clog("CLOG file length mismatch"))?;
+    reader
+        .finish()
+        .map_err(|_| corrupt_clog("CLOG file length mismatch"))?;
     if crc32fast::hash(payload_bytes) != expected_checksum {
         return Err(corrupt_clog("CLOG file checksum mismatch"));
     }
@@ -133,18 +157,26 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
 /// insurance against a same-id-in-both-lists mistake.
 fn validate_status_lists(committed: &[TxnId], aborted: &[TxnId]) -> Result<()> {
     for list in [committed, aborted] {
-        if list.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if list
+            .windows(2)
+            .any(|pair| matches!(pair, [left, right] if left >= right))
+        {
             return Err(corrupt_clog(
                 "CLOG status lists must be sorted without duplicates",
             ));
         }
     }
     // Both are sorted; a linear merge finds any shared id without allocating.
-    let (mut i, mut j) = (0, 0);
-    while i < committed.len() && j < aborted.len() {
-        match committed[i].cmp(&aborted[j]) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
+    let mut committed = committed.iter().peekable();
+    let mut aborted = aborted.iter().peekable();
+    while let (Some(left), Some(right)) = (committed.peek(), aborted.peek()) {
+        match left.cmp(right) {
+            std::cmp::Ordering::Less => {
+                committed.next();
+            }
+            std::cmp::Ordering::Greater => {
+                aborted.next();
+            }
             std::cmp::Ordering::Equal => {
                 return Err(corrupt_clog(
                     "CLOG status lists must not record the same id as both committed and aborted",
@@ -155,11 +187,10 @@ fn validate_status_lists(committed: &[TxnId], aborted: &[TxnId]) -> Result<()> {
     Ok(())
 }
 
-fn read_u32(bytes: &[u8], field: &str) -> Result<u32> {
-    let bytes: [u8; 4] = bytes
-        .try_into()
-        .map_err(|_| corrupt_clog(format!("{field} is incomplete")))?;
-    Ok(u32::from_le_bytes(bytes))
+fn read_u32(reader: &mut CheckedSliceReader<'_>, field: &str) -> Result<u32> {
+    reader
+        .read_u32_le()
+        .map_err(|_| corrupt_clog(format!("{field} is incomplete")))
 }
 
 fn corrupt_clog(message: impl Into<String>) -> DbError {

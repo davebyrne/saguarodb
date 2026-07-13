@@ -1,3 +1,16 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_macros,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
 //! Compression codecs, the at-rest page envelope, per-table dictionaries, and
 //! the shared `CompressionRegistry` (`docs/specs/compression.md`).
 

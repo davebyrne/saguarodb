@@ -364,17 +364,17 @@ impl ActiveTxnRegistry {
     fn release_advertised(&self, xmin: TxnId) {
         let mut guard = self.lock();
         if let std::collections::btree_map::Entry::Occupied(mut entry) = guard.xmins.entry(xmin) {
-            let count = entry.get_mut();
-            *count -= 1;
-            if *count == 0 {
-                entry.remove();
+            match entry.get().checked_sub(1) {
+                Some(0) | None => {
+                    entry.remove();
+                }
+                Some(next) => {
+                    *entry.get_mut() = next;
+                }
             }
-        } else {
-            debug_assert!(
-                false,
-                "released an advertised xmin={xmin} that was not advertised"
-            );
         }
+        // This is called from Drop and must be total. A missing entry already
+        // represents the desired released state, so there is no recovery action.
     }
 
     fn lock(&self) -> MutexGuard<'_, RegistryState> {
@@ -525,6 +525,15 @@ mod tests {
 
         // Dropping the last clears it.
         drop(g2);
+        assert_eq!(registry.oldest_xmin(), None);
+    }
+
+    #[test]
+    fn releasing_a_missing_advertisement_is_total() {
+        let registry = ActiveTxnRegistry::new();
+
+        registry.release_advertised(99);
+
         assert_eq!(registry.oldest_xmin(), None);
     }
 

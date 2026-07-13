@@ -1,3 +1,16 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_macros,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod copy;
 mod expr;
 mod instrumentation;
@@ -1458,6 +1471,16 @@ mod tests {
                 values: vec![Value::Integer(9)]
             }
         );
+
+        let err = crate::query::build_insert_row(
+            &common::StatementContext::new(0),
+            &schema,
+            &[0],
+            vec![Value::Integer(9), Value::Integer(10)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.message.contains("different lengths"));
     }
 
     #[test]

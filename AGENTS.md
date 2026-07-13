@@ -76,6 +76,12 @@ precedence.
 - Production code must not intentionally panic. Do not use `unwrap()`,
   `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`,
   `assert_eq!`, `assert_ne!`, or their `debug_assert*` variants outside tests.
+- Keep the production-only panic-policy Clippy block at every library and binary
+  crate root. It denies `unwrap_used`, `expect_used`, `panic`, `unreachable`,
+  `todo`, `unimplemented`, and the assertion macros configured in
+  `clippy.toml`; new crates must add the same block. Keep the workspace
+  `disallowed_macros = "allow"` default so test targets may assert; production
+  crate roots override it with `deny`.
 - Convert fallible operations and invariant checks to `common::Result<T>` and a
   structured `common::DbError`. Use the error kind and SQLSTATE appropriate to
   the boundary; use `DbError::internal` only for an unexpected internal state.
@@ -91,6 +97,23 @@ precedence.
   bounds/length validation or use checked accessors. A prior validation may
   establish an internal invariant, but violating it must still produce an error
   at the nearest fallible boundary rather than an assertion or panic.
+- Decode untrusted wire and durable bytes with `common::CheckedSliceReader` or a
+  format-specific wrapper around it. Do not combine input-derived offsets and
+  lengths with ad hoc arithmetic and direct slicing.
+- Validate input-derived lengths, counts, offsets, and identifiers into private
+  domain types when the invariant is reused. Keep fallible range and arithmetic
+  operations as methods returning `Result`; do not implement `Index`, `Add`, or
+  `Mul` when malformed input or overflow can make the operation fail.
+- Use checked arithmetic for input-derived sizes and positions, `TryFrom` for
+  narrowing or signed-to-unsigned conversions, format-defined hard limits before
+  allocation, and `try_reserve`/`try_reserve_exact` for input-controlled
+  capacity. Saturation is allowed only when it is the documented domain
+  behavior.
+- New wire/durable decoder modules must deny Clippy's
+  `arithmetic_side_effects`, `cast_possible_truncation`, `cast_possible_wrap`,
+  `cast_sign_loss`, and `indexing_slicing` lints outside tests. The workspace denies
+  `unused_io_amount`; handle partial I/O explicitly with exact/all operations or
+  a retry loop. Any narrow lint exception must document its proven invariant.
 - Panic helpers and assertion macros remain acceptable in `#[cfg(test)]` unit
   tests and integration-test targets. Test-only usage must not be compiled into
   a production execution path.

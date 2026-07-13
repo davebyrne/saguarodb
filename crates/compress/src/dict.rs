@@ -1,10 +1,21 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use common::{DbError, QueryCancel, Result, SqlState};
+use common::{CheckedSliceReader, DbError, QueryCancel, Result, SqlState};
 
 /// Dictionary file: [magic "SGDC"][version u8][dict_id u32 LE][table_id u32 LE]
 /// [payload_len u32 LE][crc32(payload) u32 LE][payload] (`compression.md` §7).
@@ -118,12 +129,22 @@ impl DictStore {
         if path.exists() {
             return Ok(());
         }
-        let mut out = Vec::with_capacity(DICT_HEADER_LEN + bytes.len());
+        if bytes.len() > MAX_DICT_BYTES {
+            return Err(corrupt("dictionary payload exceeds the supported limit"));
+        }
+        let payload_len = u32::try_from(bytes.len())
+            .map_err(|_| corrupt("dictionary payload length does not fit u32"))?;
+        let file_len = DICT_HEADER_LEN
+            .checked_add(bytes.len())
+            .ok_or_else(|| corrupt("dictionary file length overflows"))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(file_len)
+            .map_err(|_| corrupt("cannot allocate dictionary file"))?;
         out.extend_from_slice(&DICT_MAGIC);
         out.push(DICT_FORMAT_VERSION);
         out.extend_from_slice(&dict_id.to_le_bytes());
         out.extend_from_slice(&table_id.to_le_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
         out.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
         out.extend_from_slice(bytes);
 
@@ -190,62 +211,74 @@ impl DictStore {
     }
 }
 
-fn dict_field<const N: usize>(
-    bytes: &[u8],
-    offset: usize,
-    path: &Path,
-    field: &str,
-) -> Result<[u8; N]> {
-    let end = offset.checked_add(N).ok_or_else(|| {
+fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    if bytes.len() < DICT_HEADER_LEN || !bytes.starts_with(&DICT_MAGIC) {
+        return Err(corrupt(format!("bad dictionary file {}", path.display())));
+    }
+    let mut reader = CheckedSliceReader::new(bytes);
+    reader
+        .take(DICT_MAGIC.len())
+        .map_err(|_| corrupt(format!("bad dictionary file {}", path.display())))?;
+    let version = reader.read_u8().map_err(|_| {
         corrupt(format!(
-            "dict file {} {field} offset overflows",
+            "dict file {} has a truncated version",
             path.display()
         ))
     })?;
-    bytes
-        .get(offset..end)
-        .ok_or_else(|| {
-            corrupt(format!(
-                "dict file {} has a truncated {field}",
-                path.display()
-            ))
-        })?
-        .try_into()
-        .map_err(|_| {
-            corrupt(format!(
-                "dict file {} has a malformed {field}",
-                path.display()
-            ))
-        })
-}
-
-fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
-    if bytes.len() < DICT_HEADER_LEN || bytes[..4] != DICT_MAGIC {
-        return Err(corrupt(format!("bad dictionary file {}", path.display())));
-    }
-    if bytes[4] != DICT_FORMAT_VERSION {
+    if version != DICT_FORMAT_VERSION {
         return Err(corrupt(format!(
             "unknown dict file version in {}",
             path.display()
         )));
     }
-    let dict_id = u32::from_le_bytes(dict_field(bytes, 5, path, "dictionary id")?);
-    let table_id = u32::from_le_bytes(dict_field(bytes, 9, path, "table id")?);
-    let len = u32::from_le_bytes(dict_field(bytes, 13, path, "payload length")?) as usize;
-    let stored_crc = u32::from_le_bytes(dict_field(bytes, 17, path, "CRC")?);
-    let payload_end = DICT_HEADER_LEN
-        .checked_add(len)
-        .ok_or_else(|| corrupt(format!("dict file {} length overflows", path.display())))?;
-    let payload = bytes
-        .get(DICT_HEADER_LEN..payload_end)
-        .ok_or_else(|| corrupt(format!("dict file {} truncated", path.display())))?;
+    let dict_id = read_dict_u32(&mut reader, path, "dictionary id")?;
+    let table_id = read_dict_u32(&mut reader, path, "table id")?;
+    let len =
+        usize::try_from(read_dict_u32(&mut reader, path, "payload length")?).map_err(|_| {
+            corrupt(format!(
+                "dict file {} length does not fit usize",
+                path.display()
+            ))
+        })?;
+    if len > MAX_DICT_BYTES {
+        return Err(corrupt(format!(
+            "dict file {} payload exceeds the supported limit",
+            path.display()
+        )));
+    }
+    let stored_crc = read_dict_u32(&mut reader, path, "CRC")?;
+    let payload = reader
+        .take(len)
+        .map_err(|_| corrupt(format!("dict file {} truncated", path.display())))?;
+    reader
+        .finish()
+        .map_err(|_| corrupt(format!("dict file {} has trailing bytes", path.display())))?;
     if crc32fast::hash(payload) != stored_crc {
         return Err(corrupt(format!(
             "dict file {} CRC mismatch",
             path.display()
         )));
     }
-    Ok((dict_id, table_id, payload.to_vec()))
+    let mut owned_payload = Vec::new();
+    owned_payload
+        .try_reserve_exact(payload.len())
+        .map_err(|_| {
+            corrupt(format!(
+                "cannot allocate dict file {} payload",
+                path.display()
+            ))
+        })?;
+    owned_payload.extend_from_slice(payload);
+    Ok((dict_id, table_id, owned_payload))
+}
+
+fn read_dict_u32(reader: &mut CheckedSliceReader<'_>, path: &Path, field: &str) -> Result<u32> {
+    reader.read_u32_le().map_err(|_| {
+        corrupt(format!(
+            "dict file {} has a truncated {field}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -292,6 +325,19 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
+        assert!(store.load_all().is_err());
+    }
+
+    #[test]
+    fn dict_store_rejects_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DictStore::open(dir.path().join("dicts")).unwrap();
+        store.save(1, 42, b"dict-one-bytes").unwrap();
+        let path = dir.path().join("dicts").join("1.dict");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, bytes).unwrap();
+
         assert!(store.load_all().is_err());
     }
 

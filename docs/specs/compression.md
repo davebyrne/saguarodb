@@ -134,7 +134,7 @@ A compressed page slot begins with an 18-byte envelope header:
 [18..)   compressed payload
 ```
 
-Detection on load: `bytes[0..6] == [SGCP, 0xFF, 0xFF]` ⇒ envelope; anything
+Detection on load: `bytes.starts_with(ENVELOPE_MARKER)` ⇒ envelope; anything
 else ⇒ raw page bytes. A valid raw v2 page always carries `PageVersion = 2`
 at offset 5 and `PageType ∈ {1, 2}` at offset 4, so no raw page can collide
 with the envelope marker. An all-zero slot (sparse hole / never-written) is
@@ -264,7 +264,10 @@ envelopes are self-describing and mixed encodings are legal.
 ```
 
   Written with the control-file pattern: temp file → fsync → rename →
-  fsync directory. Never modified after creation; never deleted in v1.
+  fsync directory. The declared payload length must consume the file exactly;
+  truncation, trailing bytes, an oversized payload, or a CRC mismatch is
+  corruption and fails startup with a structured error. Never modified after
+  creation; never deleted in v1.
 - **WAL:** a binary logical record
   `CreateDictionary { dict_id, table_id, bytes }` is appended (and flushed
   with the creating statement's commit) so replay can resolve dict ids

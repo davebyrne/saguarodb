@@ -1211,8 +1211,9 @@ impl QueryService {
                 self.components.next_txn_id.load(Ordering::Acquire)
             })?;
         let xip = active.iter().copied().filter(|&id| id != own_txn).collect();
-        let xmin = active.first().copied().unwrap_or(xmax);
-        debug_assert_eq!(advertised.xmin(), xmin);
+        // The registry guard is the authority for the value published to the GC
+        // horizon; using it directly makes a mismatch unrepresentable here.
+        let xmin = advertised.xmin();
         Some((Arc::new(Snapshot { xmin, xmax, xip }), advertised))
     }
 
@@ -1248,12 +1249,9 @@ impl QueryService {
             .active_txns
             .capture(|| self.components.next_txn_id.load(Ordering::Acquire));
         let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
-        let xmin = active.first().copied().unwrap_or(xmax);
-        debug_assert_eq!(
-            advertised.xmin(),
-            xmin,
-            "advertised xmin must match the snapshot's xmin"
-        );
+        // The registry guard is the authority for the value published to the GC
+        // horizon; using it directly makes a mismatch unrepresentable here.
+        let xmin = advertised.xmin();
         (Arc::new(Snapshot { xmin, xmax, xip }), advertised)
     }
 

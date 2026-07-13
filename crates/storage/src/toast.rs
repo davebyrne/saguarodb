@@ -1,4 +1,17 @@
-use common::{DbError, RelationKind, Result, Row, SqlState, TableSchema, Value};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use common::{
+    CheckedSliceReader, DbError, RelationKind, Result, Row, SqlState, TableSchema, Value,
+};
 
 use crate::codec::{DecodedPhysicalValue, ToastPointer, decode_physical_row};
 
@@ -7,7 +20,7 @@ pub(crate) const FIRST_TOAST_VALUE_ID: u64 = 1;
     dead_code,
     reason = "used by the allocator once TOAST writes are wired in"
 )]
-pub(crate) const MAX_TOAST_VALUE_ID: u64 = i64::MAX as u64;
+pub(crate) const MAX_TOAST_VALUE_ID: u64 = i64::MAX.cast_unsigned();
 pub(crate) const TOAST_CHUNK_PAYLOAD: usize = 1900;
 
 pub(crate) fn ensure_toast_relation(schema: &TableSchema) -> Result<()> {
@@ -22,7 +35,9 @@ pub(crate) fn ensure_toast_relation(schema: &TableSchema) -> Result<()> {
 
 pub(crate) fn value_id_from_chunk_row(schema: &TableSchema, row: &Row) -> Result<u64> {
     match row.values.first() {
-        Some(Value::Integer(value)) if *value > 0 => Ok(*value as u64),
+        Some(Value::Integer(value)) if *value > 0 => {
+            u64::try_from(*value).map_err(|_| toast_corruption("TOAST value_id does not fit u64"))
+        }
         Some(Value::Integer(value)) => Err(DbError::storage(
             SqlState::InternalError,
             format!(
@@ -78,7 +93,7 @@ pub(crate) fn build_external_stream(
 ) -> Result<Vec<u8>> {
     match (codec, dict_id) {
         (compress::CODEC_NONE | compress::CODEC_ZSTD, None) => {
-            let mut stream = Vec::with_capacity(4 + payload.len());
+            let mut stream = external_stream_buffer(4, payload.len())?;
             stream.extend_from_slice(&raw_crc32.to_le_bytes());
             stream.extend_from_slice(payload);
             Ok(stream)
@@ -87,7 +102,7 @@ pub(crate) fn build_external_stream(
             "dictionary id is invalid for dict-less TOAST stream",
         )),
         (compress::CODEC_ZSTD_DICT, Some(dict_id)) if dict_id != 0 => {
-            let mut stream = Vec::with_capacity(8 + payload.len());
+            let mut stream = external_stream_buffer(8, payload.len())?;
             stream.extend_from_slice(&dict_id.to_le_bytes());
             stream.extend_from_slice(&raw_crc32.to_le_bytes());
             stream.extend_from_slice(payload);
@@ -103,20 +118,23 @@ pub(crate) fn build_external_stream(
 }
 
 pub(crate) fn parse_external_stream(codec: u8, stream: &[u8]) -> Result<(Option<u32>, u32, &[u8])> {
+    let mut reader = CheckedSliceReader::new(stream);
     match codec {
         compress::CODEC_NONE | compress::CODEC_ZSTD => {
-            let raw_crc32 = read_u32(stream, 0, "external TOAST stream")?;
-            Ok((None, raw_crc32, &stream[4..]))
+            let raw_crc32 = read_u32(&mut reader, "external TOAST stream")?;
+            let payload = take_remaining(&mut reader, "external TOAST stream")?;
+            Ok((None, raw_crc32, payload))
         }
         compress::CODEC_ZSTD_DICT => {
-            let dict_id = read_u32(stream, 0, "external TOAST stream")?;
+            let dict_id = read_u32(&mut reader, "external TOAST stream")?;
             if dict_id == 0 {
                 return Err(toast_corruption(
                     "dictionary id 0 is invalid for zstd-dict TOAST stream",
                 ));
             }
-            let raw_crc32 = read_u32(stream, 4, "external TOAST stream")?;
-            Ok((Some(dict_id), raw_crc32, &stream[8..]))
+            let raw_crc32 = read_u32(&mut reader, "external TOAST stream")?;
+            let payload = take_remaining(&mut reader, "external TOAST stream")?;
+            Ok((Some(dict_id), raw_crc32, payload))
         }
         other => Err(toast_corruption(format!(
             "unknown external TOAST stream codec {other}"
@@ -152,24 +170,36 @@ pub(crate) fn chunk_row(value_id: u64, seq: usize, data: &[u8]) -> Result<Row> {
     })?;
     Ok(Row {
         values: vec![
-            Value::Integer(value_id as i64),
+            Value::Integer(i64::try_from(value_id).map_err(|_| {
+                toast_corruption("TOAST chunk value_id does not fit signed storage")
+            })?),
             Value::Integer(seq),
             Value::Bytes(data.to_vec()),
         ],
     })
 }
 
-fn read_u32(bytes: &[u8], offset: usize, what: &str) -> Result<u32> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| toast_corruption(format!("{what} offset overflows")))?;
-    let raw = bytes
-        .get(offset..end)
-        .ok_or_else(|| toast_corruption(format!("{what} is truncated")))?;
-    let raw = raw
-        .try_into()
-        .map_err(|_| toast_corruption(format!("{what} has an invalid fixed width")))?;
-    Ok(u32::from_le_bytes(raw))
+fn external_stream_buffer(header_len: usize, payload_len: usize) -> Result<Vec<u8>> {
+    let capacity = header_len
+        .checked_add(payload_len)
+        .ok_or_else(|| toast_corruption("external TOAST stream length overflows"))?;
+    let mut stream = Vec::new();
+    stream
+        .try_reserve_exact(capacity)
+        .map_err(|_| toast_corruption("cannot allocate external TOAST stream"))?;
+    Ok(stream)
+}
+
+fn read_u32(reader: &mut CheckedSliceReader<'_>, what: &str) -> Result<u32> {
+    reader
+        .read_u32_le()
+        .map_err(|_| toast_corruption(format!("{what} is truncated")))
+}
+
+fn take_remaining<'a>(reader: &mut CheckedSliceReader<'a>, what: &str) -> Result<&'a [u8]> {
+    reader
+        .take_remaining()
+        .map_err(|_| toast_corruption(format!("{what} has an invalid remaining range")))
 }
 
 pub(crate) fn toast_corruption(message: impl Into<String>) -> DbError {

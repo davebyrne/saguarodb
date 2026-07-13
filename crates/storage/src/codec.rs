@@ -1,6 +1,7 @@
 use common::{
-    ArrayDimension, ColumnDef, DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum,
-    Result, Row, SqlArray, SqlState, TableSchema, TxnId, Value, XMIN_COMMITTED,
+    ArrayDimension, CheckedSliceReader, ColumnDef, DataType, DbError, Decimal, FROZEN_XID,
+    INVALID_XID, Key, PageNum, Result, Row, SqlArray, SqlState, TableSchema, TxnId, Value,
+    XMIN_COMMITTED,
 };
 
 /// On-page row encoding version emitted by the legacy `encode_row` helper. The
@@ -117,7 +118,7 @@ impl ToastPointer {
             value_id: u64::from_le_bytes(read_array(bytes, &mut offset)?),
             raw_len: u32::from_le_bytes(read_array(bytes, &mut offset)?),
             stored_len: u32::from_le_bytes(read_array(bytes, &mut offset)?),
-            codec: read_exact(bytes, &mut offset, 1)?[0],
+            codec: read_u8(bytes, &mut offset)?,
         };
         validate_toast_pointer_value_id(pointer.value_id)?;
         validate_decoded_varlena_u32_len(pointer.raw_len, "toast pointer raw length")?;
@@ -260,10 +261,16 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
     }
     let bitmap_len = array.cardinality().div_ceil(8);
     let bitmap_start = bytes.len();
-    bytes.resize(bitmap_start + bitmap_len, 0);
+    let bitmap_end = bitmap_start
+        .checked_add(bitmap_len)
+        .ok_or_else(|| array_size_error("array bitmap range overflows"))?;
+    bytes.resize(bitmap_end, 0);
     for (index, value) in array.elements().iter().enumerate() {
         if matches!(value, Value::Null) {
-            bytes[bitmap_start + index / 8] |= 1 << (index % 8);
+            let bitmap = bytes
+                .get_mut(bitmap_start..bitmap_end)
+                .ok_or_else(|| DbError::internal("array bitmap range is outside encoded bytes"))?;
+            set_null(bitmap, index)?;
         } else {
             encode_array_element(&mut bytes, array.element_type(), value)?;
         }
@@ -322,22 +329,23 @@ fn array_size_error(message: &'static str) -> DbError {
 pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     validate_decoded_array_payload_len(bytes.len())?;
     let mut offset = 0;
-    let version = read_exact(bytes, &mut offset, 1)?[0];
+    let version = read_u8(bytes, &mut offset)?;
     if version != ARRAY_PAYLOAD_VERSION {
         return Err(corrupt_row(format!(
             "unknown array payload version {version}"
         )));
     }
     let element_type = decode_array_element_type(bytes, &mut offset)?;
-    let ndim = usize::from(read_exact(bytes, &mut offset, 1)?[0]);
+    let ndim = usize::from(read_u8(bytes, &mut offset)?);
     if ndim > common::MAX_ARRAY_DIMENSIONS {
         return Err(corrupt_row("array has too many dimensions"));
     }
-    let cardinality = read_u32(bytes, &mut offset)? as usize;
+    let cardinality = usize::try_from(read_u32(bytes, &mut offset)?)
+        .map_err(|_| corrupt_row("array cardinality does not fit usize"))?;
     if cardinality > common::MAX_ARRAY_ELEMENTS {
         return Err(corrupt_row("array cardinality exceeds the supported limit"));
     }
-    let mut dimensions = Vec::with_capacity(ndim);
+    let mut dimensions = fallible_decode_vec(ndim, "array dimensions")?;
     for _ in 0..ndim {
         let len = read_u32(bytes, &mut offset)?;
         let lower_bound = i32::from_le_bytes(read_array(bytes, &mut offset)?);
@@ -351,7 +359,10 @@ pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     }
     let described = dimensions.iter().try_fold(1_usize, |product, dimension| {
         product
-            .checked_mul(dimension.len() as usize)
+            .checked_mul(
+                usize::try_from(dimension.len())
+                    .map_err(|_| corrupt_row("array dimension does not fit usize"))?,
+            )
             .ok_or_else(|| corrupt_row("array dimension product overflows"))
     })?;
     if cardinality != 0 && described != cardinality {
@@ -366,9 +377,9 @@ pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     {
         return Err(corrupt_row("array null bitmap has nonzero padding bits"));
     }
-    let mut elements = Vec::with_capacity(cardinality);
+    let mut elements = fallible_decode_vec(cardinality, "array elements")?;
     for index in 0..cardinality {
-        if bitmap[index / 8] & (1 << (index % 8)) != 0 {
+        if is_null(bitmap, index)? {
             elements.push(Value::Null);
         } else {
             elements.push(decode_array_element(bytes, &mut offset, &element_type)?);
@@ -421,7 +432,7 @@ fn encode_array_element_type(bytes: &mut Vec<u8>, data_type: &DataType) -> Resul
 }
 
 fn decode_array_element_type(bytes: &[u8], offset: &mut usize) -> Result<DataType> {
-    let data_type = match read_exact(bytes, offset, 1)?[0] {
+    let data_type = match read_u8(bytes, offset)? {
         0 => DataType::Integer,
         1 => DataType::Text,
         2 => DataType::Boolean,
@@ -502,7 +513,7 @@ fn decode_array_element(bytes: &[u8], offset: &mut usize, data_type: &DataType) 
             String::from_utf8(read_array_bytes(bytes, offset)?.to_vec())
                 .map_err(|_| corrupt_row("array text element is not valid UTF-8"))?,
         ),
-        DataType::Boolean => match read_exact(bytes, offset, 1)?[0] {
+        DataType::Boolean => match read_u8(bytes, offset)? {
             0 => Value::Boolean(false),
             1 => Value::Boolean(true),
             _ => return Err(corrupt_row("array boolean element is not 0 or 1")),
@@ -531,7 +542,7 @@ fn put_array_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 }
 
 fn read_array_bytes<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
-    let len = read_u32(bytes, offset)? as usize;
+    let len = decoded_usize(read_u32(bytes, offset)?, "array element length")?;
     read_exact(bytes, offset, len)
 }
 
@@ -651,21 +662,25 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
 pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
     let mut offset = 0;
     let count = u16::from_le_bytes(read_array(bytes, &mut offset)?);
-    let mut values = Vec::with_capacity(count as usize);
+    let count = usize::from(count);
+    let mut values = fallible_decode_vec(count, "key values")?;
     for _ in 0..count {
-        let tag = read_exact(bytes, &mut offset, 1)?[0];
+        let tag = read_u8(bytes, &mut offset)?;
         let value = match tag {
             KEY_TAG_NULL => Value::Null,
             KEY_TAG_INTEGER => Value::Integer(i64::from_le_bytes(read_array(bytes, &mut offset)?)),
             KEY_TAG_TEXT => {
-                let len = u32::from_le_bytes(read_array(bytes, &mut offset)?) as usize;
+                let len = decoded_usize(
+                    u32::from_le_bytes(read_array(bytes, &mut offset)?),
+                    "key text length",
+                )?;
                 let raw = read_exact(bytes, &mut offset, len)?;
                 Value::Text(
                     String::from_utf8(raw.to_vec())
                         .map_err(|_| corrupt_row("key text is not valid UTF-8"))?,
                 )
             }
-            KEY_TAG_BOOLEAN => match read_exact(bytes, &mut offset, 1)?[0] {
+            KEY_TAG_BOOLEAN => match read_u8(bytes, &mut offset)? {
                 0 => Value::Boolean(false),
                 1 => Value::Boolean(true),
                 _ => return Err(corrupt_row("key boolean is not 0 or 1")),
@@ -680,7 +695,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
             }
             KEY_TAG_INTERVAL => Value::Interval(read_interval(bytes, &mut offset)?),
             KEY_TAG_BYTEA => {
-                let len = u32::from_le_bytes(read_array(bytes, &mut offset)?) as usize;
+                let len = decoded_usize(
+                    u32::from_le_bytes(read_array(bytes, &mut offset)?),
+                    "key bytea length",
+                )?;
                 Value::Bytes(read_exact(bytes, &mut offset, len)?.to_vec())
             }
             KEY_TAG_UUID => Value::Uuid(read_array(bytes, &mut offset)?),
@@ -690,7 +708,7 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
             KEY_TAG_NUMERIC => Value::Numeric(read_numeric(bytes, &mut offset)?),
             KEY_TAG_REAL => Value::Real(f32::from_le_bytes(read_array(bytes, &mut offset)?).into()),
             KEY_TAG_ARRAY => {
-                let len = read_u32(bytes, &mut offset)? as usize;
+                let len = decoded_usize(read_u32(bytes, &mut offset)?, "key array length")?;
                 Value::Array(decode_array_payload(read_exact(bytes, &mut offset, len)?)?)
             }
             _ => return Err(corrupt_row("unknown key value tag")),
@@ -752,7 +770,10 @@ pub(crate) fn encode_row_with_infomask(
                         format!("column {} cannot be NULL", column.name),
                     ));
                 }
-                set_null(&mut bytes[bitmap_start..bitmap_end], index);
+                let bitmap = bytes.get_mut(bitmap_start..bitmap_end).ok_or_else(|| {
+                    DbError::internal("row bitmap range is outside encoded bytes")
+                })?;
+                set_null(bitmap, index)?;
             }
             Value::Integer(value) if column.data_type == DataType::Integer => {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -859,7 +880,10 @@ pub(crate) fn encode_row_v3_prepared(
                         format!("column {} cannot be NULL", column.name),
                     ));
                 }
-                set_null(&mut bytes[bitmap_start..bitmap_end], index);
+                let bitmap = bytes.get_mut(bitmap_start..bitmap_end).ok_or_else(|| {
+                    DbError::internal("row bitmap range is outside encoded bytes")
+                })?;
+                set_null(bitmap, index)?;
             }
             PreparedColumnValue::Value(value) => {
                 encode_column_value_v3(&mut bytes, column, value)?;
@@ -951,12 +975,17 @@ pub(crate) fn decode_physical_row(
         }
     };
 
-    let null_bitmap = &bytes[header_len - bitmap_len..header_len];
+    let bitmap_start = header_len
+        .checked_sub(bitmap_len)
+        .ok_or_else(|| corrupt_row("row bitmap begins before the row header"))?;
+    let null_bitmap = bytes
+        .get(bitmap_start..header_len)
+        .ok_or_else(|| corrupt_row("row bitmap range is outside the tuple"))?;
     let mut offset = header_len;
     let mut values = Vec::with_capacity(schema.columns.len());
 
     for (index, column) in schema.columns.iter().enumerate() {
-        if is_null(null_bitmap, index) {
+        if is_null(null_bitmap, index)? {
             values.push(DecodedPhysicalValue::Null);
             continue;
         }
@@ -993,7 +1022,7 @@ pub(crate) fn decode_physical_row(
                 continue;
             }
             DataType::Boolean => {
-                let raw = read_exact(bytes, &mut offset, 1)?[0];
+                let raw = read_u8(bytes, &mut offset)?;
                 match raw {
                     0 => Value::Boolean(false),
                     1 => Value::Boolean(true),
@@ -1206,7 +1235,7 @@ fn decode_varlena_physical(
     let (tag, stored_len) = if version == ROW_FORMAT_VERSION_V3 {
         unpack_varlena_len(word)?
     } else {
-        (TAG_PLAIN, word as usize)
+        (TAG_PLAIN, decoded_usize(word, "varlena value length")?)
     };
     let stored = read_exact(bytes, offset, stored_len)?;
 
@@ -1252,7 +1281,7 @@ fn decode_varlena_physical(
 
 fn decode_inline_compressed(column: usize, stored: &[u8]) -> Result<DecodedPhysicalValue> {
     let mut offset = 0;
-    let codec = read_exact(stored, &mut offset, 1)?[0];
+    let codec = read_u8(stored, &mut offset)?;
     let dict_id_raw = read_u32(stored, &mut offset)?;
     let dict_id = (dict_id_raw != 0).then_some(dict_id_raw);
     let raw_len = read_u32(stored, &mut offset)?;
@@ -1340,11 +1369,15 @@ pub(crate) fn pack_varlena_len(tag: u8, stored_len: usize) -> Result<u32> {
 }
 
 pub(crate) fn unpack_varlena_len(word: u32) -> Result<(u8, usize)> {
-    let tag = (word >> VARLENA_TAG_SHIFT) as u8;
+    let tag = u8::try_from(word >> VARLENA_TAG_SHIFT)
+        .map_err(|_| corrupt_row("varlena tag does not fit u8"))?;
     if tag > TAG_EXTERNAL {
         return Err(corrupt_row("reserved varlena tag"));
     }
-    Ok((tag, (word & VARLENA_LEN_MASK) as usize))
+    Ok((
+        tag,
+        decoded_usize(word & VARLENA_LEN_MASK, "varlena value length")?,
+    ))
 }
 
 fn validate_varlena_u32_len(len: u32, what: &str) -> Result<()> {
@@ -1493,22 +1526,28 @@ pub(crate) fn null_bitmap_len(columns: usize) -> usize {
     columns.div_ceil(8)
 }
 
-fn set_null(bitmap: &mut [u8], index: usize) {
-    bitmap[index / 8] |= 1 << (index % 8);
+fn set_null(bitmap: &mut [u8], index: usize) -> Result<()> {
+    let byte = bitmap
+        .get_mut(index / 8)
+        .ok_or_else(|| corrupt_row("null bitmap index is outside the bitmap"))?;
+    *byte |= 1 << (index % 8);
+    Ok(())
 }
 
-fn is_null(bitmap: &[u8], index: usize) -> bool {
-    bitmap[index / 8] & (1 << (index % 8)) != 0
+fn is_null(bitmap: &[u8], index: usize) -> Result<bool> {
+    let byte = bitmap
+        .get(index / 8)
+        .ok_or_else(|| corrupt_row("null bitmap index is outside the bitmap"))?;
+    Ok(*byte & (1 << (index % 8)) != 0)
 }
 
 fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| corrupt_row("row offset overflow"))?;
-    let raw = bytes
-        .get(*offset..end)
-        .ok_or_else(|| corrupt_row("row ended unexpectedly"))?;
-    *offset = end;
+    let mut reader = CheckedSliceReader::at(bytes, *offset)
+        .map_err(|err| corrupt_row(format!("invalid row offset: {err}")))?;
+    let raw = reader
+        .take(len)
+        .map_err(|err| corrupt_row(format!("row ended unexpectedly: {err}")))?;
+    *offset = reader.position();
     Ok(raw)
 }
 
@@ -1522,6 +1561,26 @@ fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N
 
 fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
     Ok(u32::from_le_bytes(read_array(bytes, offset)?))
+}
+
+fn read_u8(bytes: &[u8], offset: &mut usize) -> Result<u8> {
+    let [value] = read_array::<1>(bytes, offset)?;
+    Ok(value)
+}
+
+fn decoded_usize(value: u32, what: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| corrupt_row(format!("{what} does not fit usize")))
+}
+
+fn fallible_decode_vec<T>(capacity: usize, what: &str) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(capacity).map_err(|_| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            format!("cannot allocate {what}"),
+        )
+    })?;
+    Ok(values)
 }
 
 fn corrupt_row(message: impl Into<String>) -> common::DbError {

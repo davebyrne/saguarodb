@@ -15,6 +15,12 @@
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
   parameter path and the `COPY` import path so both share one accept-set; each
   caller maps `None` to its own SQLSTATE.
+- Checked byte-boundary primitives: `CheckedSliceReader`, `SliceReadError`, and
+  `SliceReadErrorKind`. The reader owns a private, forward-only position; its
+  fixed-width reads, range extraction, and exact-consumption check are fallible,
+  use checked offset arithmetic, and never advance after a failed read. Durable
+  and wire-format codecs map its format-neutral error into their boundary's
+  structured `DbError` and SQLSTATE.
 - Schema description types: `QualifiedName`, `NamespaceSchema`, `DataType`, `ParsedColumnDef`, `ColumnDef`,
   `ColumnInfo`, `TableSchema`, `IndexSchema`, `ViewColumn`,
   `ViewDependency`, `ViewSchema`, `SequenceOptions`, and `SequenceSchema`.

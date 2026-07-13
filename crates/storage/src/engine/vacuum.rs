@@ -665,10 +665,11 @@ impl PageBackedStorageEngine {
     /// would resolve to the new tuple written into the reclaimed slot (silent
     /// corruption). [`vacuum`](Self::vacuum) (F4a) enforces the F2b → F3a → F3b order
     /// by calling these three phases in sequence on one set of dead TIDs.
-    /// `page::reclaim_line_pointers` debug-asserts each slot is currently `DEAD` (a
-    /// `NORMAL`/`UNUSED`/out-of-bounds slot is a hard error), which catches the gross
-    /// misordering of reclaiming a never-pruned slot, though it cannot by itself
-    /// prove the *index* entries are gone — that is F4a's ordering responsibility.
+    /// `page::reclaim_line_pointers` returns an error unless each slot is currently
+    /// `DEAD` (a `NORMAL`/`UNUSED`/out-of-bounds slot is a hard error), which catches
+    /// the gross misordering of reclaiming a never-pruned slot, though it cannot by
+    /// itself prove the *index* entries are gone — that is F4a's ordering
+    /// responsibility.
     ///
     /// **Per page, lock order structural → frame → WAL.** TIDs are grouped by heap
     /// page; each page is reclaimed under the per-heap structural latch then the
@@ -710,13 +711,13 @@ impl PageBackedStorageEngine {
         // `vacuum_heap` returned for this table's heap file.
         let mut by_page: BTreeMap<PageNum, Vec<u16>> = BTreeMap::new();
         for tid in dead_tids {
-            debug_assert_eq!(
-                tid.file_id, file_id,
-                "reclaim_line_pointers expects heap TIDs for this table's heap file",
-            );
-            if tid.file_id == file_id {
-                by_page.entry(tid.page_num).or_default().push(tid.slot_num);
+            if tid.file_id != file_id {
+                return Err(DbError::storage(
+                    SqlState::InternalError,
+                    "line-pointer reclaim received a TID for a different heap file",
+                ));
             }
+            by_page.entry(tid.page_num).or_default().push(tid.slot_num);
         }
 
         for (page_num, slots) in by_page {

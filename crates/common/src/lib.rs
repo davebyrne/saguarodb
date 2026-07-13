@@ -1,6 +1,20 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_macros,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod array;
 pub mod bytea;
 pub mod cancel;
+pub mod checked_bytes;
 pub mod concurrency;
 pub mod context;
 pub mod copy;
@@ -29,6 +43,7 @@ pub use array::{
     format_array_text_structure, parse_array_text_structure, value_matches_type,
 };
 pub use cancel::{CancelReason, QueryCancel};
+pub use checked_bytes::{CheckedSliceReader, SliceReadError, SliceReadErrorKind};
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };

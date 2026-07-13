@@ -1,3 +1,16 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::disallowed_macros,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
 //! Query-local spill files, memory accounting, rewindable tapes, and external sort.
 
 use std::cmp::Ordering;

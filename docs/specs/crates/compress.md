@@ -250,7 +250,7 @@ A compressed page slot begins with an 18-byte header:
 [18..)   compressed payload
 ```
 
-Detection (`is_envelope`) checks only `bytes[0..6] == ENVELOPE_MARKER`
+Detection (`is_envelope`) checks only `bytes.starts_with(ENVELOPE_MARKER)`
 (`"SGCP"` + `0xFF` + `0xFF`). A valid raw v2 page always carries
 `PageVersion = 2` at offset 5 and `PageType ∈ {1, 2}` at offset 4, so no raw
 page can collide with the marker; an all-zero slot (a sparse hole) is not an
@@ -268,9 +268,11 @@ is smaller than the page, and the format supports page sizes up to 32 KiB
 
 21-byte header (`4 + 1 + 4 + 4 + 4 + 4`) followed by the `ZDICT`-trained
 dictionary payload. Written with the control-file durability pattern (temp
-file → fsync → rename → fsync directory) and never modified after creation —
-dictionary files are small and immutable; garbage collection is future work
-(`compression.md` §15).
+file → fsync → rename → fsync directory). Decode requires the declared payload
+length to consume the file exactly and rejects truncation, trailing bytes,
+payloads above `MAX_DICT_BYTES`, and CRC mismatch as corruption. The file is
+never modified after creation — dictionary files are small and immutable;
+garbage collection is future work (`compression.md` §15).
 
 ## Acceptance Tests
 
@@ -279,6 +281,8 @@ dictionary files are small and immutable; garbage collection is future work
   tamper, version tamper, value-only `CODEC_NONE`, unknown-codec tamper, and truncation are all
   rejected by `decode_envelope`; an oversized payload (`> u16::MAX`) is
   rejected by `encode_envelope`.
+- Dictionary files round-trip through durable save/load and reject CRC
+  tampering, trailing bytes, and payloads above the supported bound.
 - `CompressionRegistry`: a file with no config round-trips raw; a configured
   file's at-rest round-trip through `compress_page_at_rest`/`decompress_page`
   works both dict-less and with a registered dictionary; an incompressible

@@ -1,4 +1,15 @@
-use common::{DbError, Lsn, Result, SqlState, TableId};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
@@ -37,7 +48,13 @@ pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
         .map_err(|_| corrupt_control("control payload is too large"))?;
     let checksum = crc32fast::hash(&payload_bytes);
 
-    let mut bytes = Vec::with_capacity(MANIFEST_HEADER_LEN + payload_bytes.len());
+    let envelope_len = MANIFEST_HEADER_LEN
+        .checked_add(payload_bytes.len())
+        .ok_or_else(|| corrupt_control("control envelope length overflows"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(envelope_len)
+        .map_err(|_| corrupt_control("cannot allocate control envelope"))?;
     bytes.extend_from_slice(MANIFEST_MAGIC);
     bytes.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
     bytes.extend_from_slice(&payload_len.to_le_bytes());
@@ -50,27 +67,34 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
     if bytes.len() < MANIFEST_HEADER_LEN {
         return Err(corrupt_control("control file is too short"));
     }
-    if &bytes[0..4] != MANIFEST_MAGIC {
+    let mut reader = CheckedSliceReader::new(bytes);
+    let magic = reader
+        .take(MANIFEST_MAGIC.len())
+        .map_err(|_| corrupt_control("control file is too short"))?;
+    if magic != MANIFEST_MAGIC {
         return Err(corrupt_control("control file magic mismatch"));
     }
 
-    let version = read_u32(&bytes[4..8], "control file version")?;
+    let version = read_u32(&mut reader, "control file version")?;
     if version != MANIFEST_VERSION {
         return Err(corrupt_control(format!(
             "unsupported control file version {version}",
         )));
     }
 
-    let payload_len = read_u32(&bytes[8..12], "control file payload length")? as usize;
-    let expected_len = MANIFEST_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or_else(|| corrupt_control("control file length overflows"))?;
-    if bytes.len() != expected_len {
+    let payload_len = usize::try_from(read_u32(&mut reader, "control file payload length")?)
+        .map_err(|_| corrupt_control("control file payload length does not fit usize"))?;
+    let expected_checksum = read_u32(&mut reader, "control file checksum")?;
+    if reader.remaining() != payload_len {
         return Err(corrupt_control("control file length mismatch"));
     }
 
-    let expected_checksum = read_u32(&bytes[12..16], "control file checksum")?;
-    let payload_bytes = &bytes[MANIFEST_HEADER_LEN..];
+    let payload_bytes = reader
+        .take(payload_len)
+        .map_err(|_| corrupt_control("control file length mismatch"))?;
+    reader
+        .finish()
+        .map_err(|_| corrupt_control("control file length mismatch"))?;
     if crc32fast::hash(payload_bytes) != expected_checksum {
         return Err(corrupt_control("control file checksum mismatch"));
     }
@@ -86,15 +110,17 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
     })
 }
 
-fn read_u32(bytes: &[u8], field: &str) -> Result<u32> {
-    let bytes: [u8; 4] = bytes
-        .try_into()
-        .map_err(|_| corrupt_control(format!("{field} is incomplete")))?;
-    Ok(u32::from_le_bytes(bytes))
+fn read_u32(reader: &mut CheckedSliceReader<'_>, field: &str) -> Result<u32> {
+    reader
+        .read_u32_le()
+        .map_err(|_| corrupt_control(format!("{field} is incomplete")))
 }
 
 fn validate_sorted_tables(tables: &[TableId]) -> Result<()> {
-    if tables.windows(2).any(|pair| pair[0] >= pair[1]) {
+    if tables
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left >= right))
+    {
         return Err(corrupt_control(
             "control file tables must contain sorted table ids without duplicates",
         ));

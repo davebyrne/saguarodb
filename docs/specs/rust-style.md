@@ -46,6 +46,13 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
   `unimplemented!`, `assert!`, `assert_eq!`, `assert_ne!`, or `debug_assert*`
   in production code. Replace invariant assertions with a structured error at
   the nearest fallible boundary.
+- Every library and binary crate root must retain the production-only Clippy
+  denial for `unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`,
+  `unimplemented`, and `disallowed_macros`. `clippy.toml` disallows assertion
+  and debug-assertion macros for those production targets. The `not(test)` gate
+  and workspace-level `disallowed_macros = "allow"` default permit normal
+  assertion ergonomics in unit and integration tests; each production crate
+  root overrides that default with `deny`.
 - Fixed-width decoders validate length before conversion and propagate failed
   `try_into`; they never use `try_into().unwrap()` or `try_into().expect()`.
 - Infallible trait methods and `Drop` implementations must be total. Recover
@@ -74,6 +81,51 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
   - duplicate primary key: `SqlState::UniqueViolation`
 - Map low-level IO errors to `ErrorKind::Io` and `SqlState::IoError` at the boundary where context is available.
 - Include concise, user-facing `message` text. Use `detail` and `hint` only when they add actionable context.
+
+## Checked Boundaries, Arithmetic, and Allocation
+
+- Decode untrusted wire data and durable bytes through
+  `common::CheckedSliceReader` or a format-specific wrapper around it. Do not
+  maintain an ad hoc mutable offset and combine `offset + length` with direct
+  indexing or slicing. Map `SliceReadError` to the format's structured error at
+  that boundary.
+- Validate raw lengths, counts, offsets, and identifiers once, then carry a
+  private validated type when the invariant is reused. For example, protocol
+  frame lengths are represented by a private type only after minimum, maximum,
+  sign, and conversion checks. Do not implement infallible arithmetic traits or
+  `Index` for a wrapper when the operation can fail; expose fallible methods.
+- Use `checked_add`, `checked_sub`, and `checked_mul` for arithmetic involving
+  input-derived lengths, counts, offsets, page positions, and allocation sizes.
+  Use saturating arithmetic only when saturation is the domain's documented
+  behavior, not to conceal invalid input or a broken invariant.
+- Convert integer widths with `From` for widening and `TryFrom` for narrowing or
+  signed-to-unsigned conversion. A failed conversion must be mapped to the
+  boundary's error; do not use `as` to truncate or reinterpret runtime values.
+- Apply a format-defined hard limit before allocating from an external count.
+  Reserve with `try_reserve` or `try_reserve_exact` and propagate allocation
+  failure instead of relying on `Vec::with_capacity` for input-controlled
+  capacity.
+- New modules that decode wire or durable formats must enable these
+  production-only lints, and existing boundary modules should adopt them when
+  touched:
+
+```rust
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+```
+
+  A targeted `allow` requires a nearby explanation of the fixed-layout or
+  otherwise proven invariant. The workspace denies `clippy::unused_io_amount`;
+  callers must handle partial reads and writes with `read_exact`, `write_all`,
+  or an explicit retry/partial-progress loop.
 
 ## Public APIs and Visibility
 

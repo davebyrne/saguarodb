@@ -1,4 +1,15 @@
-use common::{DbError, Result, SqlState};
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use common::{CheckedSliceReader, DbError, Result, SqlState};
 
 /// Codec ids shared by page/WAL compression and TOAST value payloads
 /// (`compression.md` §3). `CODEC_NONE` is valid only for value payloads;
@@ -32,17 +43,6 @@ fn corrupt(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 
-fn fixed_width<const N: usize>(bytes: &[u8], offset: usize, field: &str) -> Result<[u8; N]> {
-    let end = offset
-        .checked_add(N)
-        .ok_or_else(|| corrupt(format!("compressed page {field} offset overflows")))?;
-    bytes
-        .get(offset..end)
-        .ok_or_else(|| corrupt(format!("compressed page {field} is truncated")))?
-        .try_into()
-        .map_err(|_| corrupt(format!("compressed page {field} has the wrong width")))
-}
-
 fn validate_envelope_codec(codec: u8) -> Result<()> {
     if codec != CODEC_ZSTD && codec != CODEC_ZSTD_DICT {
         return Err(corrupt(format!("unknown envelope codec {codec}")));
@@ -51,14 +51,19 @@ fn validate_envelope_codec(codec: u8) -> Result<()> {
 }
 
 pub fn is_envelope(slot: &[u8]) -> bool {
-    slot.len() >= ENVELOPE_MARKER.len() && slot[..ENVELOPE_MARKER.len()] == ENVELOPE_MARKER
+    slot.starts_with(&ENVELOPE_MARKER)
 }
 
 pub fn encode_envelope(codec: u8, dict_id: u32, payload: &[u8]) -> Result<Vec<u8>> {
     validate_envelope_codec(codec)?;
     let payload_len = u16::try_from(payload.len())
         .map_err(|_| corrupt(format!("envelope payload too large: {}", payload.len())))?;
-    let mut out = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
+    let envelope_len = ENVELOPE_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or_else(|| corrupt("compressed page envelope length overflows"))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(envelope_len)
+        .map_err(|_| corrupt("cannot allocate compressed page envelope"))?;
     out.extend_from_slice(&ENVELOPE_MARKER);
     out.push(ENVELOPE_VERSION);
     out.push(codec);
@@ -103,22 +108,34 @@ pub fn decode_envelope(slot: &[u8]) -> Result<Envelope<'_>> {
     if slot.len() < ENVELOPE_HEADER_LEN {
         return Err(corrupt("compressed page envelope truncated"));
     }
-    let version = slot[6];
+    let mut reader = CheckedSliceReader::new(slot);
+    reader
+        .take(ENVELOPE_MARKER.len())
+        .map_err(|_| corrupt("compressed page envelope truncated"))?;
+    let version = reader
+        .read_u8()
+        .map_err(|_| corrupt("compressed page envelope version is truncated"))?;
     if version != ENVELOPE_VERSION {
         return Err(corrupt(format!("unknown envelope version {version}")));
     }
-    let codec = slot[7];
+    let codec = reader
+        .read_u8()
+        .map_err(|_| corrupt("compressed page envelope codec is truncated"))?;
     validate_envelope_codec(codec)?;
-    let dict_id = u32::from_le_bytes(fixed_width(slot, 8, "dictionary id")?);
-    let payload_len = u16::from_le_bytes(fixed_width(slot, 12, "payload length")?) as usize;
-    let stored_crc = u32::from_le_bytes(fixed_width(slot, 14, "CRC")?);
-    let end = ENVELOPE_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or_else(|| corrupt("envelope payload length overflow"))?;
-    if slot.len() < end {
-        return Err(corrupt("envelope payload extends past the page slot"));
-    }
-    let payload = &slot[ENVELOPE_HEADER_LEN..end];
+    let dict_id = reader
+        .read_u32_le()
+        .map_err(|_| corrupt("compressed page dictionary id is truncated"))?;
+    let payload_len = usize::from(
+        reader
+            .read_u16_le()
+            .map_err(|_| corrupt("compressed page payload length is truncated"))?,
+    );
+    let stored_crc = reader
+        .read_u32_le()
+        .map_err(|_| corrupt("compressed page CRC is truncated"))?;
+    let payload = reader
+        .take(payload_len)
+        .map_err(|_| corrupt("envelope payload extends past the page slot"))?;
     if crc32fast::hash(payload) != stored_crc {
         return Err(corrupt("compressed page envelope CRC mismatch"));
     }

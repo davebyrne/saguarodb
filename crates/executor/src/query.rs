@@ -646,20 +646,15 @@ fn build_executor_impl<'a>(
             // (`docs/specs/ssi.md` §5). Catalog index scans stay relation reads
             // because an old relation snapshot may fall back to a full scan if the
             // current-catalog index is unavailable for that generation.
-            let full_primary_key_exact_read = if *index == common::PRIMARY_KEY_INDEX_ID
-                && let KeyRange::Exact(key) = range
-            {
-                key.0.len()
+            let full_primary_key = match range {
+                KeyRange::Exact(key) if *index == common::PRIMARY_KEY_INDEX_ID => (key.0.len()
                     == require_table(ctx.catalog.as_ref(), *table)?
                         .primary_key
-                        .len()
-            } else {
-                false
+                        .len())
+                .then_some(key),
+                _ => None,
             };
-            if full_primary_key_exact_read {
-                let KeyRange::Exact(key) = range else {
-                    unreachable!("full_primary_key_exact_read requires an exact range");
-                };
+            if let Some(key) = full_primary_key {
                 ctx.statement
                     .ssi_tracker
                     .record_tuple_read(ctx.statement.txn_id, *table, key);
@@ -1307,7 +1302,11 @@ pub(crate) fn build_insert_row(
     values: Vec<Value>,
     default_exprs: &[(ColumnId, BoundExpr)],
 ) -> Result<Row> {
-    debug_assert_eq!(values.len(), columns.len());
+    if values.len() != columns.len() {
+        return Err(DbError::internal(
+            "insert values and target columns have different lengths",
+        ));
+    }
     let mut full = vec![Value::Null; schema.columns.len()];
     for (column, value) in columns.iter().zip(values) {
         let slot = column_slot(schema, *column)?;
@@ -2433,7 +2432,11 @@ fn execute_create_view(
             schema
         }
     };
-    debug_assert_eq!(schema.name, name);
+    if schema.name != name {
+        return Err(DbError::internal(
+            "catalog returned a view with an unexpected name",
+        ));
+    }
     Ok(ExecutionResult::Modified {
         command: "CREATE VIEW".to_string(),
         count: 0,

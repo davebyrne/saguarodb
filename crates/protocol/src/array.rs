@@ -1,6 +1,17 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
 use common::{
-    ArrayDimension, DbError, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, PgType, Result, SqlArray,
-    SqlState, Value, format_array_text_structure, parse_array_text_structure,
+    ArrayDimension, CheckedSliceReader, DbError, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, PgType,
+    Result, SqlArray, SqlState, Value, format_array_text_structure, parse_array_text_structure,
 };
 
 pub(crate) fn encode(array: &SqlArray, element_type: &PgType, binary: bool) -> Result<Vec<u8>> {
@@ -65,8 +76,9 @@ fn encode_binary(array: &SqlArray, element_type: &PgType) -> Result<Vec<u8>> {
 
 fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
     let mut cursor = Cursor::new(bytes);
-    let ndim = cursor.i32()?;
-    if !(0..=MAX_ARRAY_DIMENSIONS as i32).contains(&ndim) {
+    let ndim = usize::try_from(cursor.i32()?)
+        .map_err(|_| array_error("invalid binary array dimension count"))?;
+    if ndim > MAX_ARRAY_DIMENSIONS {
         return Err(array_error("invalid binary array dimension count"));
     }
     let has_null = cursor.i32()?;
@@ -79,14 +91,12 @@ fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
             "binary array element OID does not match parameter type",
         ));
     }
-    let mut dimensions = Vec::with_capacity(ndim as usize);
+    let mut dimensions = fallible_vec(ndim, "binary array dimensions")?;
     let mut cardinality = usize::from(ndim == 0);
     for _ in 0..ndim {
         let len = cursor.i32()?;
-        if len < 0 {
-            return Err(array_error("binary array dimension length is negative"));
-        }
-        let len = len as usize;
+        let len = usize::try_from(len)
+            .map_err(|_| array_error("binary array dimension length is negative"))?;
         cardinality = if dimensions.is_empty() {
             len
         } else {
@@ -97,14 +107,16 @@ fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
         if cardinality > MAX_ARRAY_ELEMENTS {
             return Err(array_error("binary array has too many elements"));
         }
-        dimensions.push(ArrayDimension::new(len as u32, cursor.i32()?));
+        let dimension_len = u32::try_from(len)
+            .map_err(|_| array_error("binary array dimension length exceeds unsigned int32"))?;
+        dimensions.push(ArrayDimension::new(dimension_len, cursor.i32()?));
     }
     if ndim == 0 {
         cardinality = 0;
     } else if cardinality == 0 {
         return Err(array_error("empty binary array must have zero dimensions"));
     }
-    let mut elements = Vec::with_capacity(cardinality);
+    let mut elements = fallible_vec(cardinality, "binary array elements")?;
     let mut saw_null = false;
     for _ in 0..cardinality {
         let len = cursor.i32()?;
@@ -122,9 +134,7 @@ fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
             )?);
         }
     }
-    if cursor.remaining() != 0 {
-        return Err(array_error("binary array has trailing bytes"));
-    }
+    cursor.finish()?;
     if saw_null != (has_null == 1) {
         return Err(array_error(
             "binary array null flag does not match its elements",
@@ -172,43 +182,48 @@ fn decode_text(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
 }
 
 struct Cursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
+    inner: CheckedSliceReader<'a>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            inner: CheckedSliceReader::new(bytes),
+        }
     }
 
     fn i32(&mut self) -> Result<i32> {
-        let bytes = self
-            .take(4)?
-            .try_into()
-            .map_err(|_| array_error("binary array fixed-width field has the wrong length"))?;
-        Ok(i32::from_be_bytes(bytes))
+        self.inner
+            .read_i32_be()
+            .map_err(|err| array_error(format!("invalid binary array field: {err}")))
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| array_error("binary array length overflows"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| array_error("binary array is truncated"))?;
-        self.offset = end;
-        Ok(value)
+        self.inner
+            .take(len)
+            .map_err(|err| array_error(format!("invalid binary array payload: {err}")))
     }
 
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
+    fn finish(self) -> Result<()> {
+        self.inner
+            .finish()
+            .map_err(|_| array_error("binary array has trailing bytes"))
     }
 }
 
 fn array_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::InvalidTextRepresentation, message)
+}
+
+fn fallible_vec<T>(capacity: usize, what: &str) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(capacity).map_err(|_| {
+        DbError::protocol(
+            SqlState::ProgramLimitExceeded,
+            format!("cannot allocate {what}"),
+        )
+    })?;
+    Ok(values)
 }
 
 fn validate_binary_element_width(element_type: &PgType, len: usize) -> Result<()> {

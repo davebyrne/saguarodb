@@ -23,6 +23,10 @@ license = "GPL-3.0-or-later"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+disallowed_macros = "allow"
+unused_io_amount = "deny"
+
 [workspace.dependencies]
 bytes = "1"
 crc32fast = "1"

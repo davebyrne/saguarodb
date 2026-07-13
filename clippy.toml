@@ -1,0 +1,8 @@
+disallowed-macros = [
+  { path = "std::assert", reason = "production invariant failures must return a structured error" },
+  { path = "std::assert_eq", reason = "production invariant failures must return a structured error" },
+  { path = "std::assert_ne", reason = "production invariant failures must return a structured error" },
+  { path = "std::debug_assert", reason = "production invariant failures must return a structured error" },
+  { path = "std::debug_assert_eq", reason = "production invariant failures must return a structured error" },
+  { path = "std::debug_assert_ne", reason = "production invariant failures must return a structured error" },
+]
