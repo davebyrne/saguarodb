@@ -1682,7 +1682,10 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 - **Filter, Sort, Limit**: Pass `ExecRow` through unchanged (identity preserved).
 - **Projection**: Rewrites `exec_row.row` (narrowed columns) but preserves `identity`.
 - **Join, Aggregate**: Produce new rows — `identity` is `None` (these rows don't correspond to a single source row).
-- **UPDATE/DELETE executor**: Reads `identity` from each `ExecRow` to call `storage.delete(ctx, table, &key)` or `storage.update(ctx, table, &key, new_row)`.
+- **UPDATE/DELETE executor**: Reads `identity` from each `ExecRow`, acquires and
+  resolves the appropriate tuple lock, applies isolation-specific EvalPlanQual,
+  then calls `storage.delete_locked` or `storage.update_locked` with the exact
+  locked version.
 - **SELECT protocol layer**: Ignores `identity`, sends only `exec_row.row`.
 
 ### Operators
@@ -2145,7 +2148,7 @@ This gives the invariants:
 - Normal operation and recovery both spill dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory). The steal path forces the WAL durable before writing a stolen page (write-ahead), so a possibly-uncommitted stolen page is always recoverable.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
-**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. Locking SELECT uses tuple lock/resolve for latest-version recheck and projection; exact-version mutation plumbing remains available for the forthcoming DML EvalPlanQual path.
+**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. Locking SELECT uses tuple lock/resolve for latest-version recheck and projection. UPDATE/DELETE use the same resolution boundary, rerun their source plan with a latest locked target under Read Committed, and mutate that exact version; retained-snapshot isolation returns `40001` on advancement.
 
 ### WAL Record Format
 

@@ -536,14 +536,11 @@ async fn extended_execute_is_gated_by_failed_transaction_state() {
     assert!(rows.is_empty());
 }
 
-/// End-to-end lost-update / `40001` (E2b): two connections each `BEGIN; UPDATE` the
-/// SAME row under their own in-flight transaction. First-updater-wins: exactly one
-/// UPDATE commits; the other surfaces `40001` (`SerializationFailure`) over the
-/// protocol and is poisoned to 'E' (must ROLLBACK). The surviving committed value is
-/// the winner's. The two UPDATEs are aligned with a barrier (no sleeps); the test
-/// asserts the OUTCOME (one winner, one 40001), not which connection wins.
+/// Two Read Committed writers racing to increment one row serialize through the
+/// tuple lock. The waiter follows the winner's committed successor, re-evaluates
+/// `balance + 1` over that row, and commits without losing either increment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_update_same_row_yields_one_winner_and_one_40001() {
+async fn concurrent_read_committed_updates_follow_the_committed_successor() {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -560,63 +557,28 @@ async fn concurrent_update_same_row_yields_one_winner_and_one_40001() {
     // the conflicting UPDATE so both transactions are in-flight when they race.
     let barrier = Arc::new(Barrier::new(2));
     let mut handles = Vec::new();
-    for (conn_idx, new_balance) in [(0u8, 200), (1u8, 300)] {
+    for _ in 0..2 {
         let server = server.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
             let mut conn = Connection::connect(&server).await.unwrap();
             conn.ok("begin").await;
             barrier.wait().await;
-            let outcome = conn
-                .ok(&format!(
-                    "update accounts set balance = {new_balance} where id = 1"
-                ))
+            conn.ok("update accounts set balance = balance + 1 where id = 1")
                 .await;
-            match outcome.result {
-                Ok(_) => {
-                    // The winner commits its update durably.
-                    conn.ok("commit").await;
-                    (conn_idx, Ok(new_balance))
-                }
-                Err(err) => {
-                    // The loser is poisoned to 'E' and must roll back. Its error must
-                    // be the 40001 serialization failure (wire SQLSTATE 40001).
-                    assert_eq!(outcome.status, b'E', "the losing updater enters 'E'");
-                    conn.ok("rollback").await;
-                    (conn_idx, Err(err.message))
-                }
-            }
+            conn.ok("commit").await;
         }));
     }
 
-    let mut winners = 0;
-    let mut conflicts = 0;
-    let mut winning_balance = 0;
     for handle in handles {
-        let (_idx, result) = handle.await.expect("updater task finished");
-        match result {
-            Ok(balance) => {
-                winners += 1;
-                winning_balance = balance;
-            }
-            Err(message) => {
-                conflicts += 1;
-                assert!(
-                    message.contains("40001"),
-                    "the loser must surface SQLSTATE 40001, got: {message}"
-                );
-            }
-        }
+        handle.await.expect("updater task finished");
     }
-    assert_eq!(winners, 1, "exactly one updater commits");
-    assert_eq!(conflicts, 1, "exactly one updater gets 40001");
 
-    // The surviving committed balance is the winner's.
     let rows = setup
         .ok("select balance from accounts where id = 1")
         .await
         .rows();
-    assert_eq!(rows, vec![vec![Some(winning_balance.to_string())]]);
+    assert_eq!(rows, vec![vec![Some("102".to_string())]]);
     assert_eq!(server.active_txn_count(), 0);
 }
 
@@ -1410,8 +1372,8 @@ async fn serializable_records_siread_locks_but_read_committed_does_not() {
 
 /// Repeatable Read write-write conflict: an RR transaction reads a row, another
 /// transaction updates+commits it, and the RR transaction's UPDATE of that row
-/// surfaces `40001` (`SerializationFailure`) — the first-updater-wins machinery
-/// also enforces RR's "cannot write a row changed after my snapshot".
+/// surfaces `40001` (`SerializationFailure`) — retained-snapshot tuple resolution
+/// enforces RR's "cannot write a row changed after my snapshot".
 #[tokio::test]
 async fn repeatable_read_update_of_a_concurrently_changed_row_is_40001() {
     let server = TestServer::start().await.unwrap();

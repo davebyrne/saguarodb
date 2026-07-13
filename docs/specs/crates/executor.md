@@ -333,24 +333,33 @@ in `docs/specs/subqueries.md`.
 
 - Build source executor.
 - For each source `ExecRow`, read identity key.
-- Evaluate assignments against the source row.
+- Acquire `NoKeyUpdate`, or `Update` when any primary-key column is assigned,
+  and resolve the latest tuple version.
+- Under Read Committed, when resolution advances, inject the locked row into a
+  clone of the DML source plan and execute it to recheck all qualifications and
+  rebuild the combined target/FROM row. Under retained-snapshot isolation, a
+  successor or concurrent delete returns `40001`.
+- Evaluate assignments against the qualifying latest source row.
 - Build a full replacement row. If the update changes primary-key columns, storage writes a non-HOT version and enforces primary-key uniqueness on the replacement key.
 - Validate per-column row constraints on the replacement row (`validate_row_constraints`): non-null and bounded character-type length, same as INSERT.
 - Validate `CHECK` constraints on the replacement row (`validate_check_constraints`), same as INSERT: a constraint evaluating to `false` is rejected with `SqlState::CheckViolation` (`23514`); `true`/`NULL` passes. The `ON CONFLICT DO UPDATE` path applies the same check to the row it writes.
-- Call `StorageEngine::update`.
+- Call `StorageEngine::update_locked` with the exact locked capability.
 - Return count.
 
 `DELETE`:
 
 - Build source executor.
 - For each source `ExecRow`, read identity key.
-- Call `StorageEngine::delete`.
+- Acquire `Update` and resolve the latest tuple version, applying the same
+  isolation and source-plan EPQ rules as UPDATE.
+- Call `StorageEngine::delete_locked`; `RETURNING` sees the latest deleted row.
 - Return count.
 
 `LockRowsOp` implements top-level locking SELECT. For each identity-preserving
 candidate from its child it calls `StorageEngine::lock_row` with the bound tuple
-mode and wait policy. Deleted and `SKIP LOCKED` candidates are skipped. A granted
-candidate is rebuilt from the latest locked version. If locking advanced to a
+mode and wait policy. `SKIP LOCKED` candidates are skipped. A concurrently deleted
+candidate is skipped under Read Committed; Repeatable Read / Serializable return
+`40001`. A granted candidate is rebuilt from the latest locked version. If locking advanced to a
 successor, the original WHERE predicate is re-evaluated; an unchanged candidate
 is not evaluated twice, which preserves volatile-expression semantics. The SELECT
 projection is evaluated over the locked row. Advancing to a successor is allowed
@@ -360,7 +369,7 @@ Because LIMIT/OFFSET wrap `LockRows`, the operator locks only rows consumed by t
 limit; sort keys are computed from the pre-lock snapshot row and are not resorted
 if a concurrent update changes them.
 
-`RETURNING` (INSERT/UPDATE/DELETE): when the plan carries a `BoundReturning`, the executor evaluates the projection expressions over each affected full row — the inserted/updated NEW row for INSERT/UPDATE, the deleted OLD row for DELETE — and collects the result rows. For UPDATE/DELETE a row is collected only when storage actually mutated it (`update`/`delete` returned `true`); for an INSERT every inserted row is returned. The statement then returns `ModifiedReturning { command, count, columns, rows }` (with the `BoundReturning.output_schema` as `columns`) instead of `Modified`, so the affected-row count still drives the DML command tag.
+`RETURNING` (INSERT/UPDATE/DELETE): when the plan carries a `BoundReturning`, the executor evaluates the projection expressions over each affected full row — the inserted/updated NEW row for INSERT/UPDATE, the deleted OLD row for DELETE — and collects the result rows. For UPDATE/DELETE a row is collected only when exact-version storage mutation (`update_locked`/`delete_locked`) returned `true`; for an INSERT every inserted row is returned. The statement then returns `ModifiedReturning { command, count, columns, rows }` (with the `BoundReturning.output_schema` as `columns`) instead of `Modified`, so the affected-row count still drives the DML command tag.
 
 If a write errors after mutating pages or storage-owned metadata, the executor propagates the error without rolling back itself (consistent with `QueryEngine::execute` not calling storage/buffer commit or rollback). The server query orchestration — or the test harness — owns recovery and calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` before returning the error.
 

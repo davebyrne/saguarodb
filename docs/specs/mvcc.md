@@ -527,29 +527,31 @@ Committed**.
 
 ### 7.3 Write-write conflicts (Stage 2)
 
-`xmax` doubles as a row lock. A writer re-reads the target version's physical
-tuple header immediately before stamping and tentatively stamps `xmax = my_txn`.
-Another writer encountering a non-invalid `xmax` it did not stamp itself consults
-the other transaction's status:
+`xmax` doubles as a row lock. UPDATE/DELETE first acquire the requested tuple-lock
+mode and resolve the snapshot-selected identity to its current version before
+stamping. Another writer encountering a non-invalid `xmax` it did not stamp itself
+consults the other transaction's status:
 
 - **aborted** (`XMAX_ABORTED` hint, or CLOG `Aborted`) → **proceed**: the prior
   lock evaporated, its delete never happened;
-- **committed** (`XMAX_COMMITTED` hint, or CLOG `Committed`) → **serialization
-  failure**;
+- **committed** (`XMAX_COMMITTED` hint, or CLOG `Committed`) → follow the
+  successor and requalify it under Read Committed, or return **serialization
+  failure** under Repeatable Read / Serializable;
 - **in-progress** (another live writer holds the lock) → **block** (wait for the
   holder to finish), then re-check.
 
 **Policy decision (blocking + deadlock detection):** SaguaroDB **blocks** on an
 in-progress conflict — the later writer waits for the lock holder to finish, then
-re-checks (holder aborted → proceed; holder committed → `40001`). Deadlocks
+re-checks (holder aborted → proceed; holder committed → Read Committed follows
+and requalifies the successor, retained-snapshot isolation returns `40001`). Deadlocks
 (waiters forming a cycle) are broken by a timeout-based detector that aborts a
 victim with `SqlState::DeadlockDetected` (`40P01`). Only a *committed*-superseded
-conflict yields `SqlState::SerializationFailure` (`40001`) now; an in-progress one
-no longer fails fast. The wait happens per row, after releasing the page latch, by
-re-attempting only the stamp — see **`docs/specs/deadlock.md`** for the full
-contract (lock manager, wait-for graph, victim = the detecting waiter, and cancel /
-shutdown interaction). This replaces the earlier fail-fast first-updater-wins
-policy.
+conflict yields `SqlState::SerializationFailure` (`40001`) under Repeatable Read or
+Serializable; an in-progress one no longer fails fast. The wait and any EvalPlanQual
+source-plan recheck happen per candidate row after releasing page latches — see
+**`docs/specs/deadlock.md`** for the full contract (lock manager, wait-for graph,
+victim = the detecting waiter, and cancel / shutdown interaction). This replaces
+the earlier fail-fast first-updater-wins policy.
 
 The pure classifier is `common::mvcc::write_conflict(xmax, infomask, current_txns,
 status) -> WriteConflict` (`Proceed` / `Conflict` / `WouldBlock(holder)` — the last

@@ -51,10 +51,10 @@ async fn writer_blocks_then_proceeds_when_holder_rolls_back() {
     );
 }
 
-/// A blocked writer that waits on a holder which COMMITS gets `40001` (the row
-/// changed since its snapshot) — the only remaining serialization-failure case.
+/// A Read Committed writer that waits on a holder which commits follows the
+/// successor, rechecks it, and evaluates assignments over the latest row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn writer_blocks_then_serialization_failure_when_holder_commits() {
+async fn read_committed_writer_updates_the_latest_committed_successor() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -69,21 +69,148 @@ async fn writer_blocks_then_serialization_failure_when_holder_commits() {
     let mut b = Connection::connect(&server).await.unwrap();
     b.ok("begin").await;
     let b_task =
-        tokio::spawn(async move { (b.query("update t set v = 30 where id = 1").await, b) });
+        tokio::spawn(async move { (b.query("update t set v = v + 1 where id = 1").await, b) });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!b_task.is_finished(), "B must block on A");
 
-    // A commits ⇒ the row changed under B's snapshot ⇒ B aborts with 40001.
+    // A commits. B follows A's successor and applies `v + 1` to 20, not the
+    // scan-time value 10.
     a.ok("commit").await;
     let (b_result, mut b) = b_task.await.unwrap();
-    let err = b_result.unwrap().result.err().expect("B must conflict");
-    assert!(err.message.contains("C=40001"), "message: {}", err.message);
-    b.ok("rollback").await;
+    assert!(
+        b_result.unwrap().result.is_ok(),
+        "B must complete through EPQ"
+    );
+    b.ok("commit").await;
 
-    // A's update is the one that committed.
     assert_eq!(
         setup.ok("select v from t where id = 1").await.rows(),
+        vec![vec![Some("21".to_string())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_committed_writer_skips_successor_that_fails_epq_recheck() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+
+    let mut holder = Connection::connect(&server).await.unwrap();
+    holder.ok("begin").await;
+    holder.ok("update t set v = 20 where id = 1").await;
+
+    let mut waiter = Connection::connect(&server).await.unwrap();
+    waiter.ok("begin").await;
+    let waiter_task = tokio::spawn(async move {
+        let result = waiter
+            .query("update t set v = 30 where id = 1 and v = 10 returning v")
+            .await;
+        (result, waiter)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiter_task.is_finished(),
+        "waiter must reach the held tuple"
+    );
+
+    holder.ok("commit").await;
+    let (result, mut waiter) = waiter_task.await.unwrap();
+    assert!(
+        result.unwrap().result.unwrap().unwrap_rows().is_empty(),
+        "the successor no longer satisfies v = 10"
+    );
+    waiter.ok("commit").await;
+    assert_eq!(
+        setup.ok("select v from t where id = 1").await.rows(),
+        vec![vec![Some("20".to_string())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_committed_delete_follows_the_latest_committed_successor() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t values (1, 10)").await;
+
+    let mut holder = Connection::connect(&server).await.unwrap();
+    holder.ok("begin").await;
+    holder.ok("update t set v = 20 where id = 1").await;
+
+    let mut deleter = Connection::connect(&server).await.unwrap();
+    deleter.ok("begin").await;
+    let delete_task = tokio::spawn(async move {
+        let result = deleter
+            .query("delete from t where id = 1 returning v")
+            .await;
+        (result, deleter)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !delete_task.is_finished(),
+        "deleter must wait for the holder"
+    );
+
+    holder.ok("commit").await;
+    let (result, mut deleter) = delete_task.await.unwrap();
+    assert_eq!(
+        result.unwrap().rows(),
+        vec![vec![Some("20".to_string())]],
+        "DELETE RETURNING must see the latest locked row"
+    );
+    deleter.ok("commit").await;
+    assert!(setup.ok("select * from t").await.rows().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_committed_update_from_rechecks_the_joined_source_plan() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup
+        .ok("create table src (id integer primary key, new_v integer)")
+        .await;
+    setup.ok("insert into t values (1, 10)").await;
+    setup.ok("insert into src values (1, 99)").await;
+
+    let mut holder = Connection::connect(&server).await.unwrap();
+    holder.ok("begin").await;
+    holder.ok("update t set v = 20 where id = 1").await;
+
+    let mut waiter = Connection::connect(&server).await.unwrap();
+    waiter.ok("begin").await;
+    let waiter_task = tokio::spawn(async move {
+        let result = waiter
+            .query(
+                "update t set v = src.new_v from src \
+                 where t.id = src.id and t.v = 10 returning v",
+            )
+            .await;
+        (result, waiter)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiter_task.is_finished(),
+        "joined UPDATE must wait for the tuple"
+    );
+
+    holder.ok("commit").await;
+    let (result, mut waiter) = waiter_task.await.unwrap();
+    assert!(
+        result.unwrap().rows().is_empty(),
+        "the latest target must be rechecked against the joined WHERE clause"
+    );
+    waiter.ok("commit").await;
+    assert_eq!(
+        setup.ok("select v from t").await.rows(),
         vec![vec![Some("20".to_string())]]
     );
 }

@@ -319,10 +319,12 @@ versions reclaimed by VACUUM.
 ## 9. Coexistence and recovery
 
 - **Blocking + deadlock detection** (`docs/specs/deadlock.md`) is orthogonal:
-  write-write conflicts still block and can raise 40001 (committed conflict) or 40P01
-  (deadlock); SSI adds its own 40001 path on rw-cycles. A `SERIALIZABLE` writer can
-  both block on a write-write conflict and participate in SSI edges; the two
-  mechanisms do not interact beyond sharing the registry and the abort path.
+  write-write conflicts still block and can raise 40001 for a post-snapshot
+  committed successor under Serializable, or 40P01 for a deadlock; SSI adds its
+  own 40001 path on rw-cycles. (Read Committed instead follows and requalifies a
+  committed successor.) A `SERIALIZABLE` writer can both block on a write-write
+  conflict and participate in SSI edges; the two mechanisms do not interact beyond
+  sharing the registry and the abort path.
 - **VACUUM / HOT.** SIREAD locks reference `(table, key)` and `(table)`, not physical
   TIDs, so HOT chain collapse and VACUUM are unaffected. The SIREAD-lifetime horizon
   (§5.3) is the existing GC horizon; SSI does not hold versions back beyond it.

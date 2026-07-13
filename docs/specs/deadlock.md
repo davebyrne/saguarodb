@@ -13,54 +13,51 @@ to finish instead of aborting immediately; deadlocks (waiters forming a cycle) a
 broken by aborting a victim.
 
 This reverses the prior deliberate "no blocking, no deadlock detection" decision,
-so the previous `40001`-on-in-progress-conflict behavior is gone (the `40001`
-serialization failure now arises only for a *committed*-superseded conflict — see
-§3).
+so the previous `40001`-on-in-progress-conflict behavior is gone. A settled
+post-snapshot successor raises `40001` under Repeatable Read / Serializable;
+Read Committed follows it through EvalPlanQual (see §3).
 
 ### Scope
 
-- Applies to write-write conflicts at both isolation levels (Read Committed and
-  Repeatable Read). The wait is identical; only the post-wait outcome differs by
-  what the holder did (§3), not by isolation level.
+- Applies to write-write conflicts at Read Committed, Repeatable Read, and
+  Serializable. The wait is identical; the post-wait outcome depends on both the
+  holder's outcome and the waiter's isolation level (§3).
 - Covers the two conflict sites: the `xmax` row lock (UPDATE/DELETE, and an
   UPDATE's old-version stamp) and the unique-key conflict (INSERT, and an UPDATE
   that writes a new index entry).
 - Covers transaction- and statement-owned table-lock waits. Table-lock modes,
   compatibility, acquisition order, and lifetime are specified in
   `docs/specs/table-locks.md`.
-- **DML EvalPlanQual remains deferred.** After a wait, an UPDATE/DELETE writer either proceeds
-  (holder aborted) or fails with `40001` (holder committed) — it does not re-read
-  and re-qualify the updated row version. (PostgreSQL's Read Committed
-  DML re-evaluation is intentionally out of scope.) Locking SELECT is different:
-  after acquiring its tuple lock it resolves the latest committed version,
-  rechecks its predicate, and projects that latest row.
+- **EvalPlanQual.** Under Read Committed, UPDATE/DELETE and locking SELECT follow
+  a committed successor after waiting. Locking SELECT rechecks its predicate and
+  projects the latest row. UPDATE/DELETE substitute the latest locked target into
+  their source plan, rerun qualification (including FROM/USING, LATERAL, and
+  subqueries), then evaluate assignments/RETURNING and mutate that exact version.
+  Repeatable Read and Serializable instead return `40001` for a post-snapshot
+  successor or delete.
 
 ## 2. Where the wait happens
 
-The conflict is detected deep in the storage engine, under a page latch, when a
-writer re-reads the target version's header before stamping `xmax`. A writer
-**must not block while holding a latch**, and **must not re-run the whole
-statement** (a multi-row UPDATE would double-apply already-stamped rows). So the
-wait is **per row, after releasing the latch, re-attempting only the stamp**:
+The conflict is detected while storage locks/resolves the target version. A writer
+**must not block while holding a latch**, and **must not re-run already-mutated
+rows** (a multi-row UPDATE would double-apply them). The wait and EPQ retry are
+per candidate row:
 
 ```
-under page latch: re-read xmax / scan unique candidates
+lock/resolve candidate or scan unique candidates
    conflict with an in-progress holder B  → return WouldBlock(B)   (latch dropped)
-   conflict with a committed holder        → 40001
-   no conflict                              → stamp / proceed
+   no conflict                              → resolve latest / proceed
 caller loop (holds the StatementContext, not a latch):
-   WouldBlock(B) → conflict_waiter.wait_for(me, B)?   // parks the spawn_blocking thread
-                 → re-attempt the stamp/scan:
-                       B aborted    → row free → stamp / proceed
-                       B committed  → 40001
+   WouldBlock(B) → conflict_waiter.wait_for(me, B)?
+                 → re-attempt resolution:
+                       B aborted    → predecessor remains current
+                       B committed  → RC follows successor; RR/Serializable 40001
                        new holder C → wait_for(me, C)?   (loop)
 ```
 
-The new row version (for INSERT/UPDATE) is still written **once, before** the
-wait loop, exactly as today; a successful proceed makes it the live version, an
-abort leaves it an invisible orphan reclaimed by VACUUM. The wait loop re-attempts
-only the `xmax` stamp (or the unique scan), so it adds **no extra orphans** and
-never re-executes the statement.
+UPDATE/DELETE write a replacement or delete stamp only after the tuple lock,
+resolution, and any EPQ source-plan recheck succeed. Already-mutated rows are not
+re-executed. Unique-key waits keep their existing candidate-rescan behavior.
 
 Execution runs on `tokio::task::spawn_blocking` threads, so parking a writer's
 thread does not stall the async runtime.
@@ -71,10 +68,10 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 
 - **B aborted** → its lock evaporated; the row is free → proceed (stamp `xmax`, or
   treat the unique candidate as non-conflicting).
-- **B committed** → the row changed under the writer's snapshot →
-  `SqlState::SerializationFailure` (`40001`) for the `xmax` lock, or
-  `SqlState::UniqueViolation` (`23505`) for a unique-key conflict. Identical at
-  Read Committed and Repeatable Read (no re-evaluation).
+- **B committed** → Read Committed follows and requalifies the latest row for
+  UPDATE/DELETE; a non-matching or deleted successor is skipped. Repeatable Read
+  and Serializable return `SqlState::SerializationFailure` (`40001`). A committed
+  unique-key conflict remains `SqlState::UniqueViolation` (`23505`).
 - **A different in-progress holder C** appeared → wait again on C.
 
 `wait_for` itself returns early (without the holder finishing) only for:
@@ -233,9 +230,11 @@ Each lands as a reviewed commit:
   `WouldBlock(holder)` for an in-progress holder, `Conflict` / `Violation` for a
   committed one, `Proceed` / `None` for an aborted one or self.
 - **server** concurrency tests: a second writer blocks on an in-progress writer and
-  then **proceeds** when the holder aborts, or fails **`40001`** when it commits; a
-  two-transaction **deadlock** aborts exactly one victim with `40P01` while the
-  other proceeds; a `CancelRequest` interrupts a blocked writer with `57014`.
+  then **proceeds** when the holder aborts; after holder commit, Read Committed
+  follows and requalifies the successor while Repeatable Read / Serializable fail
+  with **`40001`**. A two-transaction **deadlock** aborts exactly one victim with
+  `40P01` while the other proceeds; a `CancelRequest` interrupts a blocked writer
+  with `57014`.
 - **no-regression**: existing single-writer and reader-not-blocked behavior is
   unchanged; recovery is unaffected (blocking changes only runtime conflict
   handling, not durable records).

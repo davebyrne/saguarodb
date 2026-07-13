@@ -433,8 +433,10 @@ reference to FROM-clause entry" error, and the same predicate belongs in
 `WHERE`.
 
 `ON CONFLICT` is unaffected (INSERT-only). `UPDATE ... FROM` follows the same
-first-updater-wins / row-lock rules as plain `UPDATE` (`docs/specs/mvcc.md`
-§7, `docs/specs/deadlock.md`).
+tuple-lock and EvalPlanQual rules as plain `UPDATE`: Read Committed substitutes a
+concurrent successor into the complete joined source and reruns qualification;
+Repeatable Read / Serializable return `40001` (`docs/specs/mvcc.md` §7,
+`docs/specs/deadlock.md`).
 
 ## 9. EXPLAIN
 

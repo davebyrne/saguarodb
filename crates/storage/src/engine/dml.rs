@@ -1239,20 +1239,20 @@ impl PageBackedStorageEngine {
     /// new tuple (invariant 5). It never removes the tuple or its index entries
     /// (VACUUM reclaims them, Milestone F).
     ///
-    /// **First-updater-wins conflict check (E1b, `docs/specs/mvcc.md` §7.3).**
-    /// `xmax` doubles as the row lock. Under the `write_page` frame latch — and
+    /// **Atomic `xmax` conflict check (`docs/specs/mvcc.md` §7.3).** Under the
+    /// `write_page` frame latch — and
     /// **before** appending any WAL record or mutating the page — this re-reads the
     /// target version's *current physical* header (`xmax`/`infomask`) and runs
     /// [`common::write_conflict`]. The read-classify-stamp sequence is atomic on the
-    /// frame latch: two concurrent writers racing to claim this version serialize on
-    /// the latch, so the loser observes the winner's just-stamped `xmax` and aborts
-    /// with [`SqlState::SerializationFailure`] (`40001`) — no WAL is appended and the
-    /// header is left untouched on conflict. Checking `xmax` earlier (e.g. at
+    /// frame latch: two callers racing to claim this exact version serialize on the
+    /// latch, so the loser observes the winner's just-stamped `xmax`; no WAL is
+    /// appended and the header is left untouched on conflict. Production
+    /// UPDATE/DELETE normally arrive with a tuple lock and an exact-version
+    /// capability after isolation-specific resolution/EPQ. This classifier remains
+    /// the final atomic safety boundary and serves legacy key-based mutation paths.
+    /// Checking `xmax` earlier (e.g. at
     /// `locate_visible_version` time) and stamping later under a fresh latch would be
-    /// a TOCTOU race that defeats first-updater-wins, so the check lives here, inside
-    /// the latch, next to the stamp. As of E2b (concurrent writers) this is
-    /// load-bearing: when two writers race to delete/update the same version, the
-    /// loser observes the winner's `xmax` and aborts with `40001`.
+    /// a TOCTOU race, so the check lives here, inside the latch, next to the stamp.
     pub(super) fn stamp_xmax_logged(
         &self,
         location: RowLocation,
@@ -1265,11 +1265,11 @@ impl PageBackedStorageEngine {
             .buffer_pool
             .write_page(location.file_id, location.page_num, txn_id)?;
 
-        // Atomic first-updater-wins check: read the version's CURRENT physical
+        // Atomic conflict check: read the version's CURRENT physical
         // `xmax`/`infomask` under this frame latch and classify against the live
-        // CLOG. A `Conflict` (the deleter committed-after-my-snapshot or is another
-        // in-flight writer) fails fast — returning here appends NO WAL record and
-        // leaves the header unstamped, so the winning writer's `xmax` stands.
+        // CLOG. A non-Proceed outcome appends NO WAL record and leaves the header
+        // unstamped, so the winning writer's `xmax` stands. Callers decide whether
+        // to wait/retry or surface a legacy-path serialization failure.
         let current = page::read_row(guard.data(), location.slot_num)?
             .ok_or_else(|| storage_internal("cannot stamp xmax on a non-live slot"))?;
         let (_xmin, current_xmax, _t_ctid, current_infomask) =

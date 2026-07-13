@@ -173,10 +173,11 @@ ordinary `update`/`delete` entry points remain available for existing callers, b
 they also take a blocking `NoKeyUpdate`/`Update` tuple lock before mutation so they
 cannot bypass an explicit row lock. Those legacy entry points retain
 first-updater-wins behavior: if resolution advances beyond their snapshot-selected
-identity or finds it deleted, they return `40001`. `lock_row` is used by the
-locking-SELECT `LockRows` operator for latest-version predicate recheck and
-projection. The exact-version mutation methods are reserved for DML EvalPlanQual;
-production DML still uses the ordinary first-updater-wins entry points.
+identity or finds it deleted, they return `40001`. `lock_row` is used by both the
+locking-SELECT `LockRows` operator and UPDATE/DELETE EvalPlanQual. Production
+UPDATE/DELETE lock and resolve a scan identity, requalify a successor through the
+executor, then call `update_locked`/`delete_locked`; the ordinary entry points
+remain for callers that explicitly require legacy first-updater-wins behavior.
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions/storage ids a statement should resolve plus the storage relation epoch observed
@@ -712,8 +713,10 @@ parents and chunks belong to aborted transactions, the server may still use
 `vacuum_after_toast_cleanup`; the hidden relation's own VACUUM reclaims those aborted
 chunks by their MVCC headers.
 
-### MVCC Delete
+### Legacy MVCC Delete Entry Point
 
+The executor's production DELETE path resolves and requalifies a locked identity,
+then uses `delete_locked` as described above. The compatibility entry point
 `delete(ctx, table, key)` marks the **visible** version of `key` deleted in place
 rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
 

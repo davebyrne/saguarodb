@@ -74,7 +74,16 @@ impl PlanExecutor for LockRowsOp<'_> {
                 self.wait_policy,
             )? {
                 LockRowResult::Locked(locked) => locked,
-                LockRowResult::Deleted | LockRowResult::Skipped => continue,
+                LockRowResult::Deleted => {
+                    if self.ctx.isolation == IsolationLevel::ReadCommitted {
+                        continue;
+                    }
+                    return Err(common::DbError::execute(
+                        common::SqlState::SerializationFailure,
+                        "could not serialize access due to concurrent update",
+                    ));
+                }
+                LockRowResult::Skipped => continue,
             };
             let latest = ExecRow {
                 row: locked.row().clone(),

@@ -196,6 +196,9 @@ map, and reclaimed later by VACUUM.
   with ordinary DML writers. A top-level SELECT over one base table can use
   `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`, optionally
   with `NOWAIT` or `SKIP LOCKED`; it locks and rechecks the latest row version.
+  Read Committed UPDATE/DELETE likewise resolve a concurrently updated row,
+  rerun qualification, and mutate the latest version when it still matches;
+  retained-snapshot isolation returns `40001` instead.
   SQL statements also take transaction- or statement-owned
   table locks, so a reader can wait behind an `AccessExclusive` operation such as
   `TRUNCATE` or table-rewrite DDL. Writers run concurrently, coordinated by table

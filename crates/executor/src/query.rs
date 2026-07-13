@@ -6,16 +6,18 @@ use std::time::Instant;
 use catalog::{CatalogManager, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
-    ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault,
-    QueryCancel, Result, Row, SchemaId, SequenceOptions, SequenceSchema, SqlState,
-    StatementContext, StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, Value,
-    ViewColumn,
+    ExecRow, IndexConstraintKind, IndexId, IsolationLevel, Key, KeyRange, ParsedColumnDef,
+    ParsedDefault, QueryCancel, Result, Row, RowIdentity, SchemaId, SequenceOptions,
+    SequenceSchema, SqlState, StatementContext, StoredRow, TableId, TableSchema, ToastOptions,
+    TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, Value, ViewColumn,
 };
 use planner::{
     BindOptions, BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, ExplainAnalysis,
     PhysicalPlan, PlanNodeLayout, bind_default_expr_with_options,
 };
-use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
+use storage::{
+    LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+};
 
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
@@ -1610,6 +1612,157 @@ struct EmptyRowIterator {
     schema: Vec<ColumnInfo>,
 }
 
+fn concurrent_update_error() -> DbError {
+    DbError::execute(
+        SqlState::SerializationFailure,
+        "could not serialize access due to concurrent update",
+    )
+}
+
+fn epq_values_plan(schema: &TableSchema, row: &Row) -> PhysicalPlan {
+    PhysicalPlan::Values {
+        rows: vec![
+            schema
+                .columns
+                .iter()
+                .zip(&row.values)
+                .map(|(column, value)| BoundExpr::Literal {
+                    value: value.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: matches!(value, Value::Null),
+                })
+                .collect(),
+        ],
+        output_schema: schema
+            .columns
+            .iter()
+            .map(|column| ColumnInfo {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                table_id: Some(schema.id),
+                column_id: Some(column.id),
+                pg_type: column.pg_type.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Replace the DML target's identity-bearing scan with the latest locked tuple.
+/// The surrounding source plan is then executed normally, rechecking pushed scan
+/// predicates, joins, LATERAL inputs, and hoisted subqueries as one EPQ row.
+fn inject_epq_target(
+    plan: &mut PhysicalPlan,
+    table: TableId,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<bool> {
+    match plan {
+        PhysicalPlan::SeqScan {
+            table: scan_table,
+            filter,
+            ..
+        } if *scan_table == table => {
+            let values = epq_values_plan(schema, row);
+            *plan = match filter.clone() {
+                Some(predicate) => PhysicalPlan::Filter {
+                    source: Box::new(values),
+                    predicate,
+                },
+                None => values,
+            };
+            Ok(true)
+        }
+        PhysicalPlan::IndexScan {
+            table: scan_table,
+            full_filter,
+            ..
+        } if *scan_table == table => {
+            let values = epq_values_plan(schema, row);
+            *plan = match full_filter.clone() {
+                Some(predicate) => PhysicalPlan::Filter {
+                    source: Box::new(values),
+                    predicate,
+                },
+                None => values,
+            };
+            Ok(true)
+        }
+        PhysicalPlan::NestedLoopJoin { left, .. } | PhysicalPlan::HashJoin { left, .. } => {
+            inject_epq_target(left, table, schema, row)
+        }
+        PhysicalPlan::MergeJoin { left, .. } => inject_epq_target(left, table, schema, row),
+        PhysicalPlan::Apply { input, .. } => inject_epq_target(input, table, schema, row),
+        PhysicalPlan::Filter { source, .. }
+        | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Distinct { source, .. }
+        | PhysicalPlan::Limit { source, .. }
+        | PhysicalPlan::LockRows { source, .. } => inject_epq_target(source, table, schema, row),
+        _ => Ok(false),
+    }
+}
+
+fn epq_recheck_source(
+    ctx: &ExecutionContext<'_>,
+    source: &PhysicalPlan,
+    table: TableId,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<Option<ExecRow>> {
+    let mut plan = source.clone();
+    if !inject_epq_target(&mut plan, table, schema, row)? {
+        return Err(DbError::internal(
+            "DML EPQ could not locate the target's identity-bearing scan",
+        ));
+    }
+    let mut executor = build_executor(ctx, &plan)?;
+    open_executor(executor.as_mut())?;
+    let result = executor.next();
+    close_after(executor.as_mut(), result)
+}
+
+fn lock_dml_candidate(
+    ctx: &ExecutionContext<'_>,
+    source: &PhysicalPlan,
+    schema: &TableSchema,
+    identity: &RowIdentity,
+    mode: TupleLockMode,
+    source_row: ExecRow,
+) -> Result<Option<(LockedRow, ExecRow)>> {
+    let locked = match ctx.storage.lock_row(
+        &ctx.statement,
+        ctx.relations.as_ref(),
+        schema.id,
+        identity,
+        mode,
+        TupleLockWaitPolicy::Block,
+    )? {
+        LockRowResult::Locked(locked) => locked,
+        LockRowResult::Deleted => {
+            return if ctx.statement.isolation == IsolationLevel::ReadCommitted {
+                Ok(None)
+            } else {
+                Err(concurrent_update_error())
+            };
+        }
+        LockRowResult::Skipped => {
+            return Err(DbError::internal(
+                "blocking DML tuple-lock acquisition unexpectedly skipped a row",
+            ));
+        }
+    };
+    if locked.identity() == identity {
+        return Ok(Some((locked, source_row)));
+    }
+    if ctx.statement.isolation != IsolationLevel::ReadCommitted {
+        return Err(concurrent_update_error());
+    }
+    let Some(rechecked) = epq_recheck_source(ctx, source, schema.id, schema, locked.row())? else {
+        return Ok(None);
+    };
+    Ok(Some((locked, rechecked)))
+}
+
 impl RowIterator for EmptyRowIterator {
     fn next(&mut self) -> Result<Option<StoredRow>> {
         Ok(None)
@@ -1631,6 +1784,14 @@ fn execute_update(
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog.as_ref(), table)?;
+    let lock_mode = if assignments
+        .iter()
+        .any(|(column, _)| schema.primary_key.contains(column))
+    {
+        TupleLockMode::Update
+    } else {
+        TupleLockMode::NoKeyUpdate
+    };
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
@@ -1646,8 +1807,7 @@ fn execute_update(
             let identity = source_row.identity.clone().ok_or_else(|| {
                 DbError::internal("UPDATE source row did not include storage identity")
             })?;
-            let mut values = source_row.row.values.clone();
-            if values.len() < schema.columns.len() {
+            if source_row.row.values.len() < schema.columns.len() {
                 return Err(DbError::internal(
                     "UPDATE source row shape does not match table schema",
                 ));
@@ -1659,6 +1819,17 @@ fn execute_update(
             {
                 continue;
             }
+            let Some((locked, source_row)) =
+                lock_dml_candidate(ctx, source, &schema, &identity, lock_mode, source_row)?
+            else {
+                continue;
+            };
+            let mut values = source_row.row.values.clone();
+            if values.len() < schema.columns.len() {
+                return Err(DbError::internal(
+                    "UPDATE EPQ row shape does not match table schema",
+                ));
+            }
             for (column, expr) in assignments {
                 let slot = column_slot(&schema, *column)?;
                 values[slot] = eval_expr(&ctx.statement, expr, &source_row)?;
@@ -1668,11 +1839,11 @@ fn execute_update(
             validate_row_constraints(&schema, &values)?;
             validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
             let returning_values = returning.map(|_| values.clone());
-            if ctx.storage.update(
+            if ctx.storage.update_locked(
                 &ctx.statement,
                 ctx.relations.as_ref(),
                 table,
-                &identity.key,
+                &locked,
                 Row { values },
             )? {
                 if let (Some(returning), Some(values)) = (returning, returning_values) {
@@ -1718,6 +1889,17 @@ fn execute_delete(
             {
                 continue;
             }
+            let Some((locked, source_row)) = lock_dml_candidate(
+                ctx,
+                source,
+                &schema,
+                &identity,
+                TupleLockMode::Update,
+                source_row,
+            )?
+            else {
+                continue;
+            };
             let returning_values = returning.map(|_| {
                 let mut values = source_row.row.values.clone();
                 // RETURNING sees the deleted (old) row: the target prefix.
@@ -1726,7 +1908,7 @@ fn execute_delete(
             });
             if ctx
                 .storage
-                .delete(&ctx.statement, ctx.relations.as_ref(), table, &identity.key)?
+                .delete_locked(&ctx.statement, ctx.relations.as_ref(), table, &locked)?
             {
                 if let (Some(returning), Some(values)) = (returning, returning_values) {
                     returned.push(eval_returning(ctx, returning, &values)?);
