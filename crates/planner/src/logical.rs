@@ -445,7 +445,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 returning: returning.clone(),
             })
         }
-        BoundStatement::Explain(_) => Err(DbError::plan(
+        BoundStatement::Explain { .. } => Err(DbError::plan(
             common::SqlState::SyntaxError,
             "logical_plan does not accept EXPLAIN; plan the inner statement",
         )),

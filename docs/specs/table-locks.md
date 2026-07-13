@@ -107,7 +107,9 @@ xid is the table-lock owner and later row-wait owner. A single statement is neve
 split across statement and transaction graph nodes. If lock acquisition fails or
 is canceled, normal pre-commit abort cleanup settles and deregisters the xid.
 Generated statement owners are limited to operations that cannot later own row
-locks, principally reads/COPY TO/EXPLAIN. VACUUM preallocates one maintenance xid
+locks, principally reads/COPY TO/plain or non-sequence-mutating EXPLAIN. Analyzed
+EXPLAIN with `nextval`/`setval` follows the existing write-xid and sequence-lock
+lifecycle. VACUUM preallocates one maintenance xid
 because its TOAST cleanup may perform row writes.
 
 VACUUM is the one xid-keyed statement-lifetime owner: after its optional TOAST

@@ -634,9 +634,10 @@ fn bind_inner(
             returning.as_deref(),
             declared,
         ),
-        Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
-            inner, catalog, declared, options,
-        )?))),
+        Statement::Explain { analyze, statement } => Ok(BoundStatement::Explain {
+            analyze: *analyze,
+            statement: Box::new(bind_inner(statement, catalog, declared, options)?),
+        }),
         // Transaction control is dispatched before binding (see `statement_class`
         // in the server), so the binder should not normally see these; this
         // defensive arm keeps the public `bind` API honest if called directly, and

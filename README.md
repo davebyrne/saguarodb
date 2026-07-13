@@ -65,6 +65,8 @@ trait seams.
   blocking operators where needed. ANALYZE statistics feed cardinality
   estimates (shown as `rows=` in `EXPLAIN`) and the first cost-based
   decisions: hash-join build-side choice and seq-vs-index scan selection.
+  SELECT-only `EXPLAIN ANALYZE` adds per-node actual time, rows, and loops while
+  discarding query rows; `EXPLAIN (ANALYZE FALSE)` remains planner-only.
 - Page-backed MVCC storage with heap files, durable non-clustered
   storage-identity B-trees, secondary B-tree indexes, TOAST relations for large
   values, at-rest page compression, dictionary-backed zstd payload compression,
@@ -305,7 +307,8 @@ QueryService
     |
     +--> classify statement
     |       |
-    |       +-- SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks
+    |       +-- SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks;
+    |       |                      writer guard only for sequence-mutating analysis
     |       +-- DML / COPY FROM:  shared writer guard + txn_id + table locks + snapshot
     |       +-- DDL / maintenance:
     |                            shared writer guard + object locks/catalog gate

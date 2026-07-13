@@ -152,7 +152,7 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<ParamUse>
             collect_select(source, used)?;
             collect_returning(returning, used)
         }
-        BoundStatement::Explain(inner) => collect_statement(inner, used),
+        BoundStatement::Explain { statement, .. } => collect_statement(statement, used),
     }
 }
 
@@ -406,7 +406,7 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
             substitute_select(source, params)?;
             substitute_returning(returning, params)
         }
-        BoundStatement::Explain(inner) => substitute_statement(inner, params),
+        BoundStatement::Explain { statement, .. } => substitute_statement(statement, params),
     }
 }
 

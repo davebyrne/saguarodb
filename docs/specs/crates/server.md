@@ -322,14 +322,14 @@ transaction`, or `idle in transaction (aborted)` after the session's transaction
 slot has been restored. Parse/Bind/Describe are not activity-tracked;
 `client_addr`, `client_port`, and wait-event columns are reported as `NULL`.
 
-`EXPLAIN` is a query-service exception to the uniform execution path. For `BoundStatement::Explain(inner)`, `QueryService` plans `inner` to a `PhysicalPlan`, calls planner `format_explain(&physical)`, and returns `ExecutionResult::Explanation { text }` without calling `QueryEngine::execute`.
+`EXPLAIN` converges in `run_plan` after normal snapshot, relation-snapshot, object-lock, SSI, cancellation, and timeout setup. For `BoundStatement::Explain { analyze, statement }`, `QueryService` plans the inner SELECT. Plain mode calls planner `format_explain`; analyzed mode drains it exactly once through `QueryEngine::analyze_query` and calls `format_explain_analyze`. Both return `StreamOutcome::Direct(ExecutionResult::Explanation)` and ignore a connection-provided SELECT row sink, so no inner rows escape and extended `max_rows` cannot suspend the result. Errors use the same panic firewall and explicit-transaction poisoning as SELECT.
 
 Statement guard policy:
 
-- No `ConcurrencyController` guard: autocommit SELECT and EXPLAIN that do not
-  mutate sequences. Explicit transactions take the shared side before their first
+- No `ConcurrencyController` guard: autocommit SELECT, plain EXPLAIN, and analyzed
+  EXPLAIN that does not mutate sequences. Explicit transactions take the shared side before their first
   object lock. Both take `AccessShare` and may wait for relation-changing work.
-- Shared writer/participant guard (`begin_writer`, many concurrent): all writes, DDL, and WAL-writing maintenance; plus an explicit transaction before its first object lock even when that statement is read-only. DDL takes the catalog publication gate only after object locks.
+- Shared writer/participant guard (`begin_writer`, many concurrent): all writes, DDL, and WAL-writing maintenance, including analyzed EXPLAIN whose SELECT calls `nextval` or `setval`; plus an explicit transaction before its first object lock even when that statement is read-only. DDL takes the catalog publication gate only after object locks. Plain EXPLAIN never advances sequences.
 - Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): actual checkpoint and its internal auto-prune only. Existing readers take no controller guard; relation locks separately exclude conflicting table access.
 
 Simple-query bind discovers relation ids before snapshot capture; execution then

@@ -838,7 +838,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("explain select * from users").unwrap(),
-            Statement::Explain(_)
+            Statement::Explain { .. }
         ));
         assert!(matches!(
             parse("drop index users_name").unwrap(),
@@ -2315,15 +2315,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_explain_and_create_table_options() {
-        let err = parse("explain analyze select * from users").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::SyntaxError);
+    fn parses_explain_analyze_spellings_and_rejects_other_options() {
+        for (sql, expected) in [
+            ("explain select 1", false),
+            ("explain analyze select 1", true),
+            ("explain (analyze) select 1", true),
+            ("explain (ANALYZE TRUE) select 1", true),
+            ("explain (analyze 'yes') select 1", true),
+            ("explain (analyze on) select 1", true),
+            ("explain (analyze false) select 1", false),
+            ("explain (analyze 0) select 1", false),
+        ] {
+            let Statement::Explain { analyze, statement } = parse(sql).unwrap() else {
+                panic!("expected EXPLAIN for {sql}");
+            };
+            assert_eq!(analyze, expected, "{sql}");
+            assert!(matches!(*statement, Statement::Query(_)));
+        }
 
-        let err = parse("explain update users set name = 'Ada'").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::SyntaxError);
+        for sql in [
+            "explain (analyze, analyze) select 1",
+            "explain (verbose) select 1",
+            "explain (format text) select 1",
+            "explain (analyze maybe) select 1",
+            "explain (\"ANALYZE\") select 1",
+            "explain (analyze \"yes\") select 1",
+            "explain verbose select 1",
+            "explain query plan select 1",
+            "explain estimate select 1",
+            "explain update users set name = 'Ada'",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "{sql}");
+            assert_eq!(err.code, SqlState::SyntaxError, "{sql}");
+        }
+    }
 
+    #[test]
+    fn rejects_unsupported_create_table_options() {
         let err = parse("insert into users values (1) limit 1").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
         assert_eq!(err.code, SqlState::SyntaxError);

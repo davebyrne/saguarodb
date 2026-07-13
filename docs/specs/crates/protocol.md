@@ -145,11 +145,14 @@ For DML/DDL:
 
 For EXPLAIN:
 
-1. Server executes the planner-only statement.
+1. Server plans the inner SELECT and, for `EXPLAIN ANALYZE`, executes it exactly once while discarding its rows.
 2. Protocol encodes `RowDescription` with one `TEXT` column named `QUERY PLAN`.
 3. Protocol encodes one `DataRow` containing the formatted explanation text.
 4. Protocol encodes `CommandComplete("EXPLAIN")`.
 5. Protocol encodes `ReadyForQuery`.
+
+The same one-row shape is used by the extended protocol. `Execute.max_rows`
+does not suspend an explanation, so it never produces `PortalSuspended`.
 
 On error:
 

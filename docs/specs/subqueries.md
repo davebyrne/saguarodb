@@ -443,6 +443,12 @@ first-updater-wins / row-lock rules as plain `UPDATE` (`docs/specs/mvcc.md`
 `Hash Anti Join`, `Nested Loop Semi Join`, `Nested Loop Anti Join`, following
 the existing plan-tree text format.
 
+`EXPLAIN ANALYZE` aggregates every physical execution of a correlated Apply
+template under its fixed node IDs, so inner loop counts reflect executed keys;
+memo hits do not fabricate loops. Executed uncorrelated scalar, EXISTS, and IN
+subqueries appear once in deterministic `InitPlan` sections (including parent
+markers for nesting), with node IDs allocated after the complete main tree.
+
 ## 10. Errors
 
 | Condition | SQLSTATE |

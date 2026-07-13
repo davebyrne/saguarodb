@@ -52,8 +52,8 @@ pub fn mutates_sequences(statement: &BoundStatement) -> bool {
         | BoundStatement::DropSequence { .. }
         | BoundStatement::CreateView { .. }
         | BoundStatement::DropView { .. }
-        | BoundStatement::Copy { .. }
-        | BoundStatement::Explain(_) => false,
+        | BoundStatement::Copy { .. } => false,
+        BoundStatement::Explain { analyze, statement } => *analyze && mutates_sequences(statement),
         BoundStatement::Query(query) => query_mutates_sequences(query),
         BoundStatement::Insert {
             source,
@@ -2281,7 +2281,11 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("explain select name from users where id = 7").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let BoundStatement::Explain(inner) = bound else {
+        let BoundStatement::Explain {
+            analyze: false,
+            statement: inner,
+        } = bound
+        else {
             panic!("expected explain");
         };
         let logical = logical_plan(&inner).unwrap();

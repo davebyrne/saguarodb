@@ -4,15 +4,14 @@ use std::sync::{Arc, RwLockWriteGuard};
 use common::{CopyDirection, DbError, IsolationLevel, QueryCancel, Result, SqlState};
 use executor::{CopyJob, ExecutionResult, RowSink};
 use parser::Statement;
-use planner::{BoundStatement, format_explain, logical_plan, physical_plan};
+use planner::{BoundStatement, logical_plan, physical_plan};
 
 use super::{
     AutocommitCopyWrite, BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput,
     QueryService, QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome,
     Transaction, TransactionSnapshots, WriteUnitGuard, changed_rows_in, classify_bound,
-    dead_versions_in, exec_or_stream, mark_failed_on_error, object_lock_requests,
-    prepared_schema_versions, run_plan, statement_class,
-    validate_prepared_schema_versions_in_catalog,
+    dead_versions_in, mark_failed_on_error, object_lock_requests, prepared_schema_versions,
+    run_plan, statement_class, validate_prepared_schema_versions_in_catalog,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -874,9 +873,6 @@ impl QueryService {
         captured: CapturedSnapshots,
         _object_guard: Option<crate::lock_manager::ObjectLockGuard>,
     ) -> Result<StreamOutcome> {
-        if let BoundStatement::Explain(inner) = &bound {
-            return self.explain(inner.as_ref()).map(StreamOutcome::Direct);
-        }
         // A read is not its own transaction (txn_id 0 / INVALID_XID), so no own
         // txn is excluded; the snapshot sees all committed rows and skips any
         // in-flight writer's uncommitted versions via MVCC visibility.
@@ -913,12 +909,16 @@ impl QueryService {
             },
             &bound,
         )?;
-        let logical = logical_plan(&bound)?;
-        let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // `_advertised` is held across the drive (including any producer block on a
         // full channel) and dropped when this returns, exactly as on the
         // materializing path (`docs/specs/streaming.md` §5).
-        exec_or_stream(&self.engine, &ctx, &physical, sink)
+        run_plan(
+            &self.engine,
+            &ctx,
+            bound,
+            self.components.catalog.as_ref(),
+            sink,
+        )
     }
 
     /// Execute a write/DDL statement as an autocommit unit, committing durably on
@@ -1075,18 +1075,22 @@ impl QueryService {
         } else {
             None
         };
-        let logical = match logical_plan(&bound) {
-            Ok(logical) => logical,
-            Err(err) => {
-                self.rollback_pre_durable_or_die(txn_id, None);
-                return Err(err);
-            }
-        };
-        let physical = match physical_plan(&logical, self.components.catalog.as_ref()) {
-            Ok(physical) => physical,
-            Err(err) => {
-                self.rollback_pre_durable_or_die(txn_id, None);
-                return Err(err);
+        let physical = if matches!(&bound, BoundStatement::Explain { .. }) {
+            None
+        } else {
+            let logical = match logical_plan(&bound) {
+                Ok(logical) => logical,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            match physical_plan(&logical, self.components.catalog.as_ref()) {
+                Ok(physical) => Some(physical),
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
             }
         };
         let catalog_before = if bound_mutates_catalog(&bound) {
@@ -1174,7 +1178,26 @@ impl QueryService {
             }
         };
 
-        let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
+        let result = match physical {
+            Some(physical) => {
+                catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)))
+            }
+            None => catch_unwind(AssertUnwindSafe(|| {
+                run_plan(
+                    &self.engine,
+                    &ctx,
+                    bound,
+                    self.components.catalog.as_ref(),
+                    None,
+                )
+                .and_then(|outcome| match outcome {
+                    StreamOutcome::Direct(result) => Ok(result),
+                    _ => Err(DbError::internal(
+                        "EXPLAIN returned a non-direct outcome on the write path",
+                    )),
+                })
+            })),
+        };
         drop(ctx);
         drop(advertised);
         let result = match result {
@@ -1218,20 +1241,6 @@ impl QueryService {
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
 
         Ok(result)
-    }
-
-    fn explain(&self, inner: &BoundStatement) -> Result<ExecutionResult> {
-        if !matches!(inner, BoundStatement::Query(_)) {
-            return Err(DbError::plan(
-                SqlState::SyntaxError,
-                "EXPLAIN supports SELECT only in v1",
-            ));
-        }
-        let logical = logical_plan(inner)?;
-        let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-        Ok(ExecutionResult::Explanation {
-            text: format_explain(&physical, self.components.catalog.as_ref()),
-        })
     }
 }
 

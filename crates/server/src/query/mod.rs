@@ -20,8 +20,8 @@ use planner::{
     BindOptions, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
     BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues,
     bind_default_expr_with_options, bind_parameterized_with_pg_types_and_options,
-    bind_with_options, collect_param_pg_types, format_explain, logical_plan, mutates_sequences,
-    physical_plan, substitute_params,
+    bind_with_options, collect_param_pg_types, format_explain, format_explain_analyze,
+    logical_plan, mutates_sequences, physical_plan, substitute_params,
 };
 use storage::RelationSnapshot;
 
@@ -2441,7 +2441,9 @@ fn collect_bound_statement_objects(
                 collect_returning_objects(returning, references)?;
             }
         }
-        BoundStatement::Explain(inner) => collect_bound_statement_objects(inner, references)?,
+        BoundStatement::Explain { statement, .. } => {
+            collect_bound_statement_objects(statement, references)?
+        }
         BoundStatement::AlterTableAddColumn { table, .. }
         | BoundStatement::AlterTableDropColumn { table, .. }
         | BoundStatement::AlterTableRenameColumn { table, .. }
@@ -3225,25 +3227,29 @@ fn run_plan(
     catalog: &dyn catalog::CatalogManager,
     sink: Option<&mut dyn RowSink>,
 ) -> Result<StreamOutcome> {
-    if let BoundStatement::Explain(inner) = &bound {
-        if !matches!(inner.as_ref(), BoundStatement::Query(_)) {
-            return Err(DbError::plan(
-                SqlState::SyntaxError,
-                "EXPLAIN supports SELECT only in v1",
-            ));
-        }
-        let logical = logical_plan(inner.as_ref())?;
-        let physical = physical_plan(&logical, catalog)?;
-        return Ok(StreamOutcome::Direct(ExecutionResult::Explanation {
-            text: format_explain(&physical, catalog),
-        }));
-    }
-    let logical = logical_plan(&bound)?;
-    let physical = physical_plan(&logical, catalog)?;
-    // The caller only supplies a sink for a read (a `SELECT`); a write plan is
-    // materialized (`sink` is `None`), so `exec_or_stream` never asks the executor
-    // to stream a DML plan. The panic firewall wraps both paths.
     let result = catch_unwind(AssertUnwindSafe(|| {
+        if let BoundStatement::Explain { analyze, statement } = &bound {
+            if !matches!(statement.as_ref(), BoundStatement::Query(_)) {
+                return Err(DbError::plan(
+                    SqlState::SyntaxError,
+                    "EXPLAIN supports SELECT only in v1",
+                ));
+            }
+            let logical = logical_plan(statement.as_ref())?;
+            let physical = physical_plan(&logical, catalog)?;
+            let text = if *analyze {
+                let analysis = engine.analyze_query(ctx, &physical)?;
+                format_explain_analyze(&physical, catalog, &analysis)
+            } else {
+                format_explain(&physical, catalog)
+            };
+            return Ok(StreamOutcome::Direct(ExecutionResult::Explanation { text }));
+        }
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, catalog)?;
+        // The caller only supplies a sink for a read (a `SELECT`); a write plan is
+        // materialized (`sink` is `None`), so `exec_or_stream` never asks the executor
+        // to stream a DML plan. The panic firewall wraps both paths.
         exec_or_stream(engine, ctx, &physical, sink)
     }));
     match result {
@@ -3521,7 +3527,7 @@ fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
         | BoundStatement::Delete { returning, .. } => returning
             .as_ref()
             .map(|returning| returning.output_schema.clone()),
-        BoundStatement::Explain(_) => Some(vec![ColumnInfo {
+        BoundStatement::Explain { .. } => Some(vec![ColumnInfo {
             name: "QUERY PLAN".to_string(),
             data_type: DataType::Text,
             table_id: None,
@@ -3535,7 +3541,7 @@ fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
 fn statement_class(statement: &Statement) -> Result<StatementClass> {
     match statement {
         Statement::Query(_) => Ok(StatementClass::Read),
-        Statement::Explain(inner) => match inner.as_ref() {
+        Statement::Explain { statement, .. } => match statement.as_ref() {
             Statement::Query(_) => Ok(StatementClass::Read),
             _ => Err(DbError::plan(
                 SqlState::SyntaxError,
@@ -7905,6 +7911,77 @@ mod tests {
 
         assert!(text.contains("IndexScan"));
         assert!(text.contains("users"));
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_spellings_execute_and_false_stays_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+
+        for sql in [
+            "explain analyze select id from users",
+            "explain (analyze) select id from users",
+            "explain (analyze true) select id from users",
+        ] {
+            let ExecutionResult::Explanation { text } = app.query_service.execute_sql(sql).unwrap()
+            else {
+                panic!("expected explanation for {sql}");
+            };
+            assert!(text.contains("actual time="), "{sql}: {text}");
+            assert!(text.contains("rows=3 loops=1"), "{sql}: {text}");
+            assert!(text.contains("Execution Time:"), "{sql}: {text}");
+        }
+
+        for sql in [
+            "explain select id from users",
+            "explain (analyze false) select id from users",
+        ] {
+            let ExecutionResult::Explanation { text } = app.query_service.execute_sql(sql).unwrap()
+            else {
+                panic!("expected explanation for {sql}");
+            };
+            assert!(!text.contains("actual time="), "{sql}: {text}");
+            assert!(!text.contains("Execution Time:"), "{sql}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_sequence_side_effects_follow_execution_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create sequence profile_seq")
+            .unwrap();
+
+        app.query_service
+            .execute_sql("explain select nextval('profile_seq')")
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select nextval('profile_seq')")
+            .unwrap()
+        else {
+            panic!("expected nextval query result");
+        };
+        assert_eq!(rows[0].values, vec![Value::Integer(1)]);
+
+        app.query_service
+            .execute_sql("explain analyze select nextval('profile_seq')")
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select nextval('profile_seq')")
+            .unwrap()
+        else {
+            panic!("expected nextval query result");
+        };
+        assert_eq!(rows[0].values, vec![Value::Integer(3)]);
     }
 
     #[tokio::test]

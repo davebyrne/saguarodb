@@ -279,7 +279,10 @@ pub enum BoundStatement {
         joined_source: bool,
         returning: Option<BoundReturning>,
     },
-    Explain(Box<BoundStatement>),
+    Explain {
+        analyze: bool,
+        statement: Box<BoundStatement>,
+    },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. Resolved table
     /// and column ids (in COPY order; defaulted to all columns in catalog order).
     /// COPY is not lowered to a `LogicalPlan` — the server drives it over the COPY

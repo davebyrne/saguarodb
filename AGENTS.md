@@ -89,7 +89,8 @@ precedence.
   (upsert; the conflict arbiter is the primary key only — `excluded.<col>` is the
   proposed row; `UPDATE ... FROM <items>` and `DELETE ... USING <items>` join
   extra relations with the target — `docs/specs/subqueries.md`),
-  `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
+  SELECT-only `EXPLAIN [ANALYZE]` (including parenthesized `ANALYZE [bool]`),
+  transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`

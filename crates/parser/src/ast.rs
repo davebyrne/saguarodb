@@ -146,7 +146,10 @@ pub enum Statement {
     CloseCursor {
         name: String,
     },
-    Explain(Box<Statement>),
+    Explain {
+        analyze: bool,
+        statement: Box<Statement>,
+    },
     /// `BEGIN [TRANSACTION] [ISOLATION LEVEL <level>] [READ WRITE]` /
     /// `START TRANSACTION ...`. `isolation` carries an explicit
     /// `ISOLATION LEVEL <level>` mode mapped onto our two levels (the four SQL

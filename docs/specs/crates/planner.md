@@ -169,7 +169,7 @@ pub enum BoundStatement {
     Query(BoundQuery),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
     Delete { table: TableId, source: BoundSelect, returning: Option<BoundReturning> },
-    Explain(Box<BoundStatement>),
+    Explain { analyze: bool, statement: Box<BoundStatement> },
     // COPY <table> [(cols)] FROM STDIN | TO STDOUT. Resolved table + column ids
     // (COPY order; defaulted to all columns in catalog order). Not lowered to a
     // LogicalPlan — the server drives COPY directly (docs/specs/copy.md).
@@ -773,13 +773,11 @@ pub enum PhysicalPlan {
 
 `EXPLAIN` ownership is split cleanly:
 
-- Parser emits `Statement::Explain(inner)`.
-- Binder emits `BoundStatement::Explain(inner_bound)`.
+- Parser emits `Statement::Explain { analyze, statement }`.
+- Binder preserves the flag in `BoundStatement::Explain { analyze, statement }`.
 - `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly; callers must unwrap and plan the inner bound statement.
 - The planner crate exposes `PlanNodeLayout::new(plan)`, `format_explain(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> String`, and `estimated_rows(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> u64` (the cardinality estimator, `docs/specs/statistics.md` §9.1).
-- The server `QueryService` handles the outer `EXPLAIN` statement by binding and object-locking the inner statement, building logical and physical plans for that inner statement, formatting the physical plan with `format_explain`, and returning `ExecutionResult::Explanation` without invoking the executor.
-
-The executor crate is not called for `EXPLAIN`.
+- The server `QueryService` handles the outer statement after normal snapshot and object-lock setup. Plain EXPLAIN formats the inner physical plan without execution; analyzed EXPLAIN calls the executor's analysis-only driver and passes its report to `format_explain_analyze`.
 
 `format_explain` appends ` (rows=N)` — the estimated output row count — to every data-producing node line (scans, joins, Apply, filters, projections, sorts, distinct, limits, aggregates, `Values`, set operations, and the `Insert`/`Update`/`Delete` heads); DDL nodes carry no estimate. Estimates come from `planner::estimate` reading ANALYZE statistics through the catalog: base scans use the stored `row_count` (default 1000 when never analyzed), scan-level predicates resolve `column op literal` shapes against MCVs, histograms, and null fractions, and every unresolvable shape uses fixed defaults (equality `0.005`, ranges `1/3`, other predicates `0.5`, join-key/grouping distinct counts `200`, semi/anti joins keep half the left side, system views `100` rows). Upper `Filter` nodes estimate from predicate shape alone — column statistics resolve only at scan level in v1. Estimates are advisory and never affect correctness.
 
@@ -787,7 +785,7 @@ The executor crate is not called for `EXPLAIN`.
 
 `format_explain` renders each physical node on its own indented line, prefixed exactly once by `[node=N]`, with a stable label vocabulary including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N build=left|right`, `MergeJoin type=Left|Right|Full keys=N residual=yes|none`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
-The planner also owns the executor-to-formatter reporting DTOs `NodeExecutionMetrics`, `InitPlanAnalysis`, and `ExplainAnalysis`, plus `format_explain_analyze`. Cumulative node metrics are keyed by `PlanNodeId`; the formatter divides startup time, total time, and rows by `loops`, rendering exact average rows as an integer and fractional averages with two decimal places. Times use three decimal milliseconds. A missing/zero-loop node renders `(never executed)`. Estimated rows remain on analyzed lines, init-plan sections (when present) precede the final `Execution Time: N.NNN ms` line, and node timing is inclusive rather than additive. These APIs are executor-facing at this milestone; SQL `EXPLAIN ANALYZE` is not yet enabled.
+The planner also owns the executor-to-formatter reporting DTOs `NodeExecutionMetrics`, `InitPlanAnalysis`, and `ExplainAnalysis`, plus `format_explain_analyze`. Cumulative node metrics are keyed by `PlanNodeId`; the formatter divides startup time, total time, and rows by `loops`, rendering exact average rows as an integer and fractional averages with two decimal places. Times use three decimal milliseconds. A missing/zero-loop node renders `(never executed)`. Estimated rows remain on analyzed lines, init-plan sections (when present) precede the final `Execution Time: N.NNN ms` line, and node timing is inclusive rather than additive. SQL exposes this through SELECT-only `EXPLAIN ANALYZE` and `EXPLAIN (ANALYZE [TRUE|FALSE])`; false uses the plain formatter.
 
 ## Acceptance Tests
 

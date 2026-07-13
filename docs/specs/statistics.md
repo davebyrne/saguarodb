@@ -43,8 +43,8 @@ defines:
   index-eligible, and parameters substitute to literals before planning.
 - Extended statistics (multi-column correlations, expression statistics),
   physical-order correlation, per-index statistics.
-- `ANALYZE <table> (columns...)` column lists; `EXPLAIN ANALYZE` (still
-  rejected); `pg_statistic` raw catalog emulation (only the `pg_stats` view);
+- `ANALYZE <table> (columns...)` column lists; `pg_statistic` raw catalog
+  emulation (only the `pg_stats` view);
   `pg_stat_user_tables` / `last_analyze` tracking.
 - A background analyze daemon. Auto-analyze piggybacks on the checkpoint like
   auto-prune (Milestone H).
@@ -264,8 +264,8 @@ the existing GUC table and readable via `SHOW`/`current_setting`.
 
 - **`ANALYZE`** and **`ANALYZE <table>`**: new `Statement::Analyze { table:
   Option<String> }`, intercepted before sqlparser like VACUUM. The intercept
-  fires only on a statement-initial `ANALYZE` token; `EXPLAIN ANALYZE` remains
-  a parse error. Command tag: `ANALYZE` (added to the protocol
+  fires only on a statement-initial `ANALYZE` token, so `EXPLAIN ANALYZE
+  SELECT ...` remains on the EXPLAIN parser path. Command tag: `ANALYZE` (added to the protocol
   `CommandComplete` tag list).
 - **`VACUUM ANALYZE [<table>]`**: `Statement::Vacuum` gains `analyze: bool`.
   The reclamation pass runs first (unchanged), then the ANALYZE pass over the

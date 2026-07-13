@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use common::{
     CompressionSetting, DbError, IsolationLevel, PgType, QualifiedName, Result, SequenceOptions,
-    SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptions,
+    SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptions, parse_bool_text,
 };
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -323,19 +323,19 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             options,
         } => {
             if describe_alias != sql::DescribeAlias::Explain
-                || analyze
                 || verbose
                 || query_plan
                 || estimate
                 || format.is_some()
-                || options.is_some()
             {
                 return unsupported("unsupported EXPLAIN form");
             }
+            let analyze = convert_explain_analyze(analyze, options.as_deref())?;
             match convert_statement(*statement)? {
-                Statement::Query(query) => {
-                    Ok(Statement::Explain(Box::new(Statement::Query(query))))
-                }
+                Statement::Query(query) => Ok(Statement::Explain {
+                    analyze,
+                    statement: Box::new(Statement::Query(query)),
+                }),
                 _ => unsupported("EXPLAIN supports SELECT only in v1"),
             }
         }
@@ -412,6 +412,38 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
         } => convert_copy(source, to, target, options, legacy_options, values),
         _ => unsupported("unsupported SQL statement"),
     }
+}
+
+fn convert_explain_analyze(
+    keyword_analyze: bool,
+    options: Option<&[sql::UtilityOption]>,
+) -> Result<bool> {
+    let Some(options) = options else {
+        return Ok(keyword_analyze);
+    };
+    if keyword_analyze || options.len() != 1 {
+        return unsupported("EXPLAIN supports exactly one ANALYZE option");
+    }
+    let option = &options[0];
+    if option.name.quote_style.is_some() || !option.name.value.eq_ignore_ascii_case("analyze") {
+        return unsupported("unsupported EXPLAIN option");
+    }
+    let Some(arg) = &option.arg else {
+        return Ok(true);
+    };
+    let text = match arg {
+        sql::Expr::Value(value) => value
+            .value
+            .clone()
+            .into_string()
+            .unwrap_or_else(|| value.value.to_string()),
+        sql::Expr::Identifier(ident) if ident.quote_style.is_none() => ident.value.clone(),
+        sql::Expr::Identifier(_) => {
+            return unsupported("EXPLAIN ANALYZE requires an unquoted boolean value");
+        }
+        _ => return unsupported("EXPLAIN ANALYZE requires a boolean value"),
+    };
+    parse_bool_text(&text).ok_or_else(|| parse_error("invalid boolean value for EXPLAIN ANALYZE"))
 }
 
 fn convert_declare_cursor(mut stmts: Vec<sql::Declare>) -> Result<Statement> {

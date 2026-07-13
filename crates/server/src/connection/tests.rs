@@ -1977,21 +1977,32 @@ async fn extended_protocol_max_rows_does_not_suspend_explain() {
         read_until_ready(&mut client).await;
     }
 
-    let mut seq = parse_bytes("", "explain select id from users order by id", &[]);
-    seq.extend(bind_bytes("", "", &[], &[], &[0]));
-    seq.extend(execute_bytes_with_max("", 1));
-    seq.extend(sync_bytes());
-    client.write_all(&seq).await.unwrap();
-    let response = read_until_ready(&mut client).await;
-    assert_eq!(message_tag_count(&response, b'D'), 1);
-    assert!(
-        response.windows(8).any(|w| w == b"EXPLAIN\0"),
-        "EXPLAIN completes normally"
-    );
-    assert!(
-        !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
-        "EXPLAIN is not portal-suspended"
-    );
+    for (sql, analyzed) in [
+        ("explain select id from users order by id", false),
+        ("explain analyze select id from users order by id", true),
+    ] {
+        let mut seq = parse_bytes("", sql, &[]);
+        seq.extend(bind_bytes("", "", &[], &[], &[0]));
+        seq.extend(execute_bytes_with_max("", 1));
+        seq.extend(sync_bytes());
+        client.write_all(&seq).await.unwrap();
+        let response = read_until_ready(&mut client).await;
+        assert_eq!(message_tag_count(&response, b'D'), 1);
+        assert!(
+            response.windows(8).any(|w| w == b"EXPLAIN\0"),
+            "EXPLAIN completes normally"
+        );
+        assert!(
+            !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+            "EXPLAIN is not portal-suspended"
+        );
+        assert_eq!(
+            response
+                .windows(b"Execution Time:".len())
+                .any(|window| window == b"Execution Time:"),
+            analyzed
+        );
+    }
 
     client.write_all(&terminate_bytes()).await.unwrap();
     server.await.unwrap();
