@@ -320,3 +320,39 @@ async fn transactional_truncate_relation_write_participates_in_ssi() {
     predecessor.ok("commit").await;
     assert_eq!(server.active_txn_count(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_analyze_reads_participate_in_serializable_conflicts() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table explain_ssi (id integer primary key, v integer)")
+        .await;
+    setup
+        .ok("insert into explain_ssi values (1, 10), (2, 20)")
+        .await;
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level serializable").await;
+    t2.ok("begin isolation level serializable").await;
+    let explanation = t1.ok("explain analyze select v from explain_ssi").await;
+    assert_eq!(explanation.status, b'T');
+    assert_eq!(explanation.rows().len(), 1);
+    t2.ok("select v from explain_ssi").await;
+    t1.ok("update explain_ssi set v = 100 where id = 1").await;
+    t2.ok("update explain_ssi set v = 200 where id = 2").await;
+
+    let r1 = t1.query("commit").await.unwrap().result;
+    let r2 = t2.query("commit").await.unwrap().result;
+    assert_eq!(
+        [&r1, &r2]
+            .into_iter()
+            .filter(|result| result.is_err())
+            .count(),
+        1,
+        "analyzed reads must create the same SSI edges as SELECT"
+    );
+    assert!(r1.err().or(r2.err()).unwrap().message.contains("C=40001"));
+    assert_eq!(server.active_txn_count(), 0);
+}

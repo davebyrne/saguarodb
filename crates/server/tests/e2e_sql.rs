@@ -7,6 +7,89 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+async fn explain_text(server: &TestServer, sql: &str) -> String {
+    let rows = server.simple_query(sql).await.unwrap().unwrap_rows();
+    assert_eq!(rows.len(), 1, "EXPLAIN returns exactly one row: {sql}");
+    assert_eq!(
+        rows[0].len(),
+        1,
+        "EXPLAIN returns exactly one column: {sql}"
+    );
+    rows[0][0].clone().expect("QUERY PLAN is non-null")
+}
+
+fn explain_node_ids(text: &str) -> Vec<usize> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, suffix) = line.split_once("[node=")?;
+            let (id, _) = suffix.split_once(']')?;
+            id.parse().ok()
+        })
+        .collect()
+}
+
+fn explain_loops(text: &str) -> Vec<u64> {
+    text.split("loops=")
+        .skip(1)
+        .filter_map(|suffix| {
+            suffix
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+fn explain_line<'a>(text: &'a str, label: &str, occurrence: usize) -> &'a str {
+    text.lines()
+        .filter(|line| line.contains(label))
+        .nth(occurrence)
+        .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {label}: {text}"))
+}
+
+fn assert_executed_line(line: &str, rows_and_loops: &str) {
+    assert!(line.contains("actual time="), "missing timing: {line}");
+    assert!(line.contains(rows_and_loops), "missing metrics: {line}");
+    assert!(!line.contains("never executed"), "node did not run: {line}");
+}
+
+fn protocol_message_tags(bytes: &[u8]) -> Vec<u8> {
+    let mut tags = Vec::new();
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let len = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        assert!(len >= 4 && offset + 1 + len <= bytes.len());
+        tags.push(bytes[offset]);
+        offset += 1 + len;
+    }
+    assert_eq!(offset, bytes.len(), "response ends on a frame boundary");
+    tags
+}
+
+fn assert_explain_timings_are_parseable(text: &str) {
+    let mut actual_count = 0;
+    for suffix in text.split("actual time=").skip(1) {
+        let (startup, rest) = suffix.split_once("..").expect("startup separator");
+        let (total, _) = rest.split_once(' ').expect("total terminator");
+        let startup = startup.parse::<f64>().expect("parse startup milliseconds");
+        let total = total.parse::<f64>().expect("parse total milliseconds");
+        assert!(startup.is_finite() && startup >= 0.0);
+        assert!(total.is_finite() && total >= startup);
+        actual_count += 1;
+    }
+    assert!(actual_count > 0, "at least one executed node: {text}");
+    let execution = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Execution Time: "))
+        .and_then(|value| value.strip_suffix(" ms"))
+        .expect("Execution Time line")
+        .parse::<f64>()
+        .expect("parse execution milliseconds");
+    assert!(execution.is_finite() && execution >= 0.0);
+}
+
 #[tokio::test]
 async fn e2e_unnest_and_generate_series_table_functions() {
     let server = TestServer::start().await.unwrap();
@@ -5454,4 +5537,289 @@ async fn e2e_set_operation_null_column_typing() {
         "expected a type-determination error: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn e2e_explain_analyze_profiles_core_plan_shapes() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table profile_t (id integer primary key, group_id integer)")
+        .await
+        .unwrap();
+    let values = (1..=200)
+        .map(|id| format!("({id},{id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    server
+        .simple_query(&format!("insert into profile_t values {values}"))
+        .await
+        .unwrap();
+    server
+        .simple_query("create index profile_group_idx on profile_t (group_id)")
+        .await
+        .unwrap();
+
+    let index = explain_text(
+        &server,
+        "explain analyze select id from profile_t where group_id = 7",
+    )
+    .await;
+    assert!(
+        index.contains("IndexScan table=profile_t") && index.contains("index=2"),
+        "secondary index must be selected: {index}"
+    );
+    assert!(index.contains("rows=1 loops=1"), "{index}");
+
+    server.simple_query("analyze profile_t").await.unwrap();
+    let seq = explain_text(&server, "explain analyze select id from profile_t").await;
+    assert!(seq.contains("SeqScan table=profile_t"), "{seq}");
+    assert!(seq.contains("(rows=200)"), "{seq}");
+    assert!(seq.contains("rows=200 loops=1"), "{seq}");
+    assert_explain_timings_are_parseable(&seq);
+
+    server
+        .simple_query("create table profile_u (id integer primary key, label text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into profile_u values (7, 'seven'), (17, 'seventeen')")
+        .await
+        .unwrap();
+    let join = explain_text(
+        &server,
+        "explain analyze select t.id, u.label from profile_t t join profile_u u on t.id = u.id",
+    )
+    .await;
+    assert!(join.contains("HashJoin"), "{join}");
+    assert_executed_line(explain_line(&join, "HashJoin", 0), "rows=2 loops=1");
+    assert_executed_line(
+        explain_line(&join, "Scan table=profile_t", 0),
+        "rows=200 loops=1",
+    );
+    assert_executed_line(
+        explain_line(&join, "Scan table=profile_u", 0),
+        "rows=2 loops=1",
+    );
+    let join_ids = explain_node_ids(&join);
+    assert!(join_ids.len() >= 3, "{join}");
+    assert_eq!(
+        join_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        join_ids.len(),
+        "every join-tree node has a distinct id: {join}"
+    );
+
+    let blocking = explain_text(
+        &server,
+        "explain analyze select group_id, count(*) from profile_t group by group_id order by group_id",
+    )
+    .await;
+    assert_executed_line(explain_line(&blocking, "Aggregate", 0), "rows=200 loops=1");
+    assert_executed_line(
+        explain_line(&blocking, "Sort keys=1", 0),
+        "rows=200 loops=1",
+    );
+
+    let system = explain_text(
+        &server,
+        "explain analyze select relname from pg_catalog.pg_class",
+    )
+    .await;
+    assert!(
+        system.contains("SystemScan view=pg_catalog.pg_class"),
+        "{system}"
+    );
+    let system_scan = explain_line(&system, "SystemScan view=pg_catalog.pg_class", 0);
+    assert!(system_scan.contains("actual time="), "{system_scan}");
+    assert!(system_scan.contains("loops=1"), "{system_scan}");
+    assert!(!system_scan.contains("never executed"), "{system_scan}");
+
+    let never = explain_text(&server, "explain analyze select id from profile_t limit 0").await;
+    assert!(never.contains("Limit count=0"), "{never}");
+    assert_executed_line(explain_line(&never, "Limit count=0", 0), "rows=0 loops=1");
+    assert_executed_line(
+        explain_line(&never, "Scan table=profile_t", 0),
+        "rows=0 loops=1",
+    );
+
+    server
+        .simple_query("create table profile_empty (id integer)")
+        .await
+        .unwrap();
+    let empty = explain_text(&server, "explain analyze select id from profile_empty").await;
+    assert!(empty.contains("rows=0 loops=1"), "{empty}");
+    let never_subtree = explain_text(
+        &server,
+        "explain analyze select id from profile_empty where exists \
+         (select 1 where profile_empty.id > 0)",
+    )
+    .await;
+    assert!(never_subtree.contains("Apply"), "{never_subtree}");
+    assert!(
+        never_subtree.contains("(never executed)"),
+        "{never_subtree}"
+    );
+
+    let plain = explain_text(&server, "explain select id from profile_t where id < 4").await;
+    let analyzed = explain_text(
+        &server,
+        "explain analyze select id from profile_t where id < 4",
+    )
+    .await;
+    assert_eq!(explain_node_ids(&plain), explain_node_ids(&analyzed));
+}
+
+#[tokio::test]
+async fn e2e_explain_analyze_profiles_apply_and_init_plans() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table apply_t (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into apply_t values (1, 'xx'), (2, 'xx'), (3, 'xx')")
+        .await
+        .unwrap();
+    server
+        .simple_query("create sequence apply_profile_seq")
+        .await
+        .unwrap();
+    explain_text(&server, "explain select nextval('apply_profile_seq')").await;
+    assert_eq!(
+        server
+            .simple_query("select nextval('apply_profile_seq')")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string())]],
+        "plain EXPLAIN does not advance the sequence"
+    );
+
+    let volatile = explain_text(
+        &server,
+        "explain analyze select id from apply_t where exists \
+         (select nextval('apply_profile_seq') where apply_t.id > 0)",
+    )
+    .await;
+    assert!(volatile.contains("Apply"), "{volatile}");
+    assert!(explain_loops(&volatile).contains(&3), "{volatile}");
+    assert_eq!(
+        server
+            .simple_query("select nextval('apply_profile_seq')")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("5".to_string())]],
+        "analyzed volatile Apply executes once per outer row"
+    );
+
+    let memoized = explain_text(
+        &server,
+        "explain analyze select id from apply_t where exists \
+         (select 1 from apply_t inner_t where inner_t.id < length(apply_t.name))",
+    )
+    .await;
+    assert!(memoized.contains("Apply"), "{memoized}");
+    assert_executed_line(
+        explain_line(&memoized, "Scan table=apply_t", 1),
+        "rows=1 loops=1",
+    );
+
+    let init = explain_text(
+        &server,
+        "explain analyze select (select 1), exists (select 1), 1 in (select 1)",
+    )
+    .await;
+    assert!(init.contains("Init Plans:"), "{init}");
+    assert!(init.contains("InitPlan 1"), "{init}");
+    assert!(init.contains("InitPlan 2"), "{init}");
+    assert!(init.contains("InitPlan 3"), "{init}");
+    let ids = explain_node_ids(&init);
+    assert_eq!(
+        ids.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        ids.len(),
+        "main and init-plan ids are globally distinct: {init}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_explain_analyze_timeout_cancellation_and_execution_error() {
+    let server = TestServer::start().await.unwrap();
+    let mut timed = Connection::connect(&server).await.unwrap();
+    timed.ok("set statement_timeout = '1 ms'").await;
+    let timeout = timed
+        .query(
+            "explain analyze select count(*) \
+             from generate_series(1, 10000) a(n), generate_series(1, 10000) b(n)",
+        )
+        .await
+        .unwrap();
+    let err = timeout.result.err().expect("analysis must time out");
+    assert!(err.message.contains("C=57014"), "{err}");
+    assert_eq!(timeout.status, b'I');
+
+    let mut canceled = Connection::connect(&server).await.unwrap();
+    let (pid, secret) = canceled.backend_key();
+    let query = tokio::spawn(async move {
+        let outcome = canceled
+            .query(
+                "explain analyze select count(*) \
+                 from generate_series(1, 10000) a(n), generate_series(1, 10000) b(n)",
+            )
+            .await;
+        (canceled, outcome)
+    });
+    let mut observer = Connection::connect(&server).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rows = observer
+                .ok(&format!(
+                    "select state, query from pg_stat_activity where pid = {pid}"
+                ))
+                .await
+                .rows();
+            if rows.iter().any(|row| {
+                row[0].as_deref() == Some("active")
+                    && row[1]
+                        .as_deref()
+                        .is_some_and(|query| query.starts_with("explain analyze"))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("analysis becomes active before cancellation");
+    server.send_cancel(pid, secret).await.unwrap();
+    let (mut canceled, outcome) = tokio::time::timeout(Duration::from_secs(5), query)
+        .await
+        .expect("canceled analysis terminates promptly")
+        .unwrap();
+    let outcome = outcome.unwrap();
+    let err = outcome.result.err().expect("analysis must be canceled");
+    assert!(err.message.contains("C=57014"), "{err}");
+    assert_eq!(outcome.status, b'I');
+    assert!(
+        canceled.ok("select 1").await.result.is_ok(),
+        "connection remains usable"
+    );
+
+    let mut failing = Connection::connect(&server).await.unwrap();
+    let response = failing
+        .query_raw("explain analyze select (select n from generate_series(1, 2) g(n))")
+        .await
+        .unwrap();
+    let tags = protocol_message_tags(&response);
+    assert_eq!(tags.iter().filter(|tag| **tag == b'E').count(), 1);
+    assert_eq!(tags.iter().filter(|tag| **tag == b'D').count(), 0);
+    assert_eq!(tags.iter().filter(|tag| **tag == b'T').count(), 0);
+    assert_eq!(tags.iter().filter(|tag| **tag == b'C').count(), 0);
+    assert_eq!(tags.last(), Some(&b'Z'));
 }

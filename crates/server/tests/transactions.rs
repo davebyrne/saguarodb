@@ -1865,3 +1865,34 @@ async fn committed_savepoint_txn_exposes_released_hides_rolled_back() {
         "the released row is visible; the rolled-back row is not"
     );
 }
+
+#[tokio::test]
+async fn explain_analyze_preserves_or_poisons_explicit_transaction_state_like_select() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table explain_tx (id integer primary key)")
+        .await;
+    conn.ok("insert into explain_tx values (1), (2)").await;
+
+    assert_eq!(conn.ok("begin").await.status, b'T');
+    let analyzed = conn
+        .ok("explain analyze select id from explain_tx order by id")
+        .await;
+    assert_eq!(analyzed.status, b'T');
+    let rows = analyzed.rows();
+    assert_eq!(rows.len(), 1, "only the explanation row is returned");
+    assert!(rows[0][0].as_deref().unwrap().contains("actual time="));
+    assert_eq!(conn.ok("commit").await.status, b'I');
+
+    assert_eq!(conn.ok("begin").await.status, b'T');
+    let failed = conn
+        .query("explain analyze select (select id from explain_tx)")
+        .await
+        .unwrap();
+    assert!(failed.result.is_err());
+    assert_eq!(failed.status, b'E');
+    let gated = conn.query("select 1").await.unwrap();
+    assert!(gated.result.is_err());
+    assert_eq!(gated.status, b'E');
+    assert_eq!(conn.ok("rollback").await.status, b'I');
+}

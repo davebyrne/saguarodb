@@ -1982,12 +1982,19 @@ async fn extended_protocol_max_rows_does_not_suspend_explain() {
         ("explain analyze select id from users order by id", true),
     ] {
         let mut seq = parse_bytes("", sql, &[]);
+        seq.extend(describe_statement_bytes(""));
         seq.extend(bind_bytes("", "", &[], &[], &[0]));
+        seq.extend(describe_portal_bytes(""));
         seq.extend(execute_bytes_with_max("", 1));
         seq.extend(sync_bytes());
         client.write_all(&seq).await.unwrap();
         let response = read_until_ready(&mut client).await;
         assert_eq!(message_tag_count(&response, b'D'), 1);
+        assert_eq!(
+            message_tag_count(&response, b'T'),
+            2,
+            "statement and portal Describe both report QUERY PLAN"
+        );
         assert!(
             response.windows(8).any(|w| w == b"EXPLAIN\0"),
             "EXPLAIN completes normally"
