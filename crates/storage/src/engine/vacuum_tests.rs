@@ -182,14 +182,14 @@ impl Fixture {
 fn ctx(txn_id: u64) -> StatementContext {
     // A snapshot that sees every committed id below the next id, with no in-flight
     // exclusions — DML under it reads the latest committed state.
-    StatementContext::with_snapshot(
+    crate::with_test_tuple_locks(StatementContext::with_snapshot(
         txn_id,
         Arc::new(Snapshot {
             xmin: 1,
             xmax: txn_id + 1,
             xip: vec![],
         }),
-    )
+    ))
 }
 
 fn users_schema() -> TableSchema {

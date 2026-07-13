@@ -278,13 +278,19 @@ impl Fixture {
 }
 
 fn ctx(txn_id: u64, snapshot: Snapshot) -> StatementContext {
-    StatementContext::with_snapshot(txn_id, std::sync::Arc::new(snapshot))
+    crate::with_test_tuple_locks(StatementContext::with_snapshot(
+        txn_id,
+        std::sync::Arc::new(snapshot),
+    ))
 }
 
 /// Like [`ctx`] but carries an explicit GC horizon (for the H3 update-path prune).
 fn ctx_h(txn_id: u64, snapshot: Snapshot, gc_horizon: u64) -> StatementContext {
-    StatementContext::with_snapshot(txn_id, std::sync::Arc::new(snapshot))
-        .with_gc_horizon(gc_horizon)
+    crate::with_test_tuple_locks(StatementContext::with_snapshot(
+        txn_id,
+        std::sync::Arc::new(snapshot),
+    ))
+    .with_gc_horizon(gc_horizon)
 }
 
 /// A snapshot that sees every settled (committed) id below `xmax` except the

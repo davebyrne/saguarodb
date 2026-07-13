@@ -179,6 +179,7 @@ pub struct Key(pub Vec<Value>);
 /// primary key columns being present in the projected output.
 pub struct StoredRow {
     pub row_id: RowId,
+    pub xmin: TxnId,
     pub key: Key,
     pub row: Row,
 }
@@ -1612,7 +1613,7 @@ Each plan node implements a pull-based iterator. The root pulls rows one at a ti
 
 ```rust
 /// Row envelope that flows through the executor pipeline. Carries optional
-/// physical identity (RowId + Key) so UPDATE/DELETE can target the source row.
+/// physical identity (RowId + creator xid + Key) so UPDATE/DELETE can target the source row.
 /// SELECT operators ignore the handle; DML operators use it.
 pub struct ExecRow {
     pub row: Row,
@@ -1621,6 +1622,7 @@ pub struct ExecRow {
 
 pub struct RowIdentity {
     pub row_id: RowId,
+    pub xmin: TxnId,
     pub key: Key,
 }
 
@@ -1660,7 +1662,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 `next_batch` has a default implementation so operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
 
 **ExecRow identity flow:**
-- **Scan operators** (`SeqScanOp`, `IndexScanOp`): Construct `ExecRow` from `StoredRow`, populating `identity` from the `StoredRow`'s `row_id` and `key`.
+- **Scan operators** (`SeqScanOp`, `IndexScanOp`): Construct `ExecRow` from `StoredRow`, populating `identity` from the `StoredRow`'s `row_id`, `xmin`, and `key`.
 - **System scan operator** (`SystemScanOp`): Materializes read-only virtual `pg_catalog`/`information_schema` rows from catalog metadata, static compatibility registries, and `StatementContext.system_state`, applies the scan filter, and emits rows with no identity. `pg_settings` reads the connection-backed GUC provider, and `pg_stat_activity` reads the server `SessionRegistry` in real connections; library/no-op contexts return empty activity rows.
 - **Filter, Sort, Limit**: Pass `ExecRow` through unchanged (identity preserved).
 - **Projection**: Rewrites `exec_row.row` (narrowed columns) but preserves `identity`.
@@ -1730,7 +1732,11 @@ The executor's scan operators convert `StoredRow` → `ExecRow`:
 ```rust
 ExecRow {
     row: stored_row.row,
-    identity: Some(RowIdentity { row_id: stored_row.row_id, key: stored_row.key }),
+    identity: Some(RowIdentity {
+        row_id: stored_row.row_id,
+        xmin: stored_row.xmin,
+        key: stored_row.key,
+    }),
 }
 ```
 
@@ -1761,6 +1767,34 @@ pub trait StorageEngine: Send + Sync {
         table: TableId,
         key: &Key,
     ) -> Result<Option<Row>>;
+
+    /// Lock a scan-time identity and resolve its latest physical row version.
+    fn lock_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        identity: &RowIdentity,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+    ) -> Result<LockRowResult>;
+
+    /// Mutate the exact row version returned by lock_row.
+    fn update_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+        row: Row,
+    ) -> Result<bool>;
+    fn delete_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+    ) -> Result<bool>;
 
     /// Delete by storage identity key
     fn delete(
@@ -2096,7 +2130,7 @@ This gives the invariants:
 - Normal operation and recovery both spill dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory). The steal path forces the WAL durable before writing a stolen page (write-ahead), so a possibly-uncommitted stolen page is always recoverable.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
-**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. (None of this changed the `BufferPool` or `StorageEngine` traits.)
+**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. The buffer-pool boundary remains unchanged; the storage trait also exposes tuple lock/resolve and exact-version mutation plumbing intended for the forthcoming EvalPlanQual executor path.
 
 ### WAL Record Format
 

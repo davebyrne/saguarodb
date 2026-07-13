@@ -228,6 +228,7 @@ mod tests {
                             page_num: 1,
                             slot_num: ordinal as u16,
                         },
+                        xmin: 1,
                         key: Key(vec![Value::Integer(ordinal as i64)]),
                     }),
                 })

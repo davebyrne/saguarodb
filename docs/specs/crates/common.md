@@ -149,6 +149,7 @@ pub enum KeyRange {
 
 pub struct StoredRow {
     pub row_id: RowId,
+    pub xmin: TxnId,
     pub key: Key,
     pub row: Row,
 }
@@ -160,9 +161,13 @@ pub struct ExecRow {
 
 pub struct RowIdentity {
     pub row_id: RowId,
+    pub xmin: TxnId,
     pub key: Key,
 }
 ```
+
+`RowIdentity` includes the physical version's creator transaction so a stale
+identity cannot alias a different tuple after VACUUM reuses its page slot.
 
 `Value` ordering is used for B-tree keys. The ordering is total and deterministic, following the enum's declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid < Array`, with natural ordering inside each scalar variant. Arrays compare by element type, row-major elements, cardinality, dimension count, lengths, and lower bounds. Because the derived `Ord` **is** the durable B-tree key ordering, variant order is a durable contract: new variants must be appended at the end of the enum — never inserted or reordered mid-enum — unless the key ordering/encoding is deliberately revisited and migrated (see `docs/specs/rust-style.md`, Serialization and Durable Formats). SQL comparison semantics still apply in expression evaluation; B-tree ordering is a storage ordering.
 

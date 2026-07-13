@@ -1116,6 +1116,7 @@ mod tests {
                     page_num: 1,
                     slot_num: 0,
                 },
+                xmin: 1,
                 key: Key(vec![Value::Integer(7)]),
             }),
         };
@@ -1149,6 +1150,7 @@ mod tests {
                         page_num: 1,
                         slot_num: 0,
                     },
+                    xmin: 1,
                     key: Key(vec![Value::Integer(1)]),
                 }),
             },
@@ -1161,6 +1163,7 @@ mod tests {
                         page_num: 2,
                         slot_num: 0,
                     },
+                    xmin: 2,
                     key: Key(vec![Value::Text("x".to_string())]),
                 }),
             },

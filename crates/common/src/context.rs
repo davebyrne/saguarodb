@@ -123,6 +123,10 @@ impl TupleLockManager for NoTupleLockManager {
             "no tuple lock manager configured: xid {xid} attempted to restore tuple grants"
         )))
     }
+
+    fn holds_tuple(&self, _xid: TxnId, _tag: &TupleLockTag, _mode: TupleLockMode) -> bool {
+        false
+    }
 }
 
 /// Sequence value runtime used by the executor's `nextval` and `setval` scalar

@@ -2,10 +2,71 @@ use std::any::Any;
 use std::sync::Arc;
 
 use common::{
-    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId, SchemaId,
-    SequenceId, SequenceSchema, StatementContext, StoredRow, TableId, TableSchema,
-    TruncateCatalogUpdate, ViewSchema,
+    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId,
+    RowIdentity, SchemaId, SequenceId, SequenceSchema, StatementContext, StoredRow, TableId,
+    TableSchema, TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, ViewSchema,
 };
+
+/// The latest physical version reached after taking the requested tuple lock.
+/// The identity names that version, which may differ from the scan-time identity
+/// when a committed updater advanced the chain while the caller waited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockedRow {
+    identity: RowIdentity,
+    row: Row,
+    table: TableId,
+    owner: u64,
+    mode: TupleLockMode,
+}
+
+impl LockedRow {
+    /// Construct the capability returned by a `StorageEngine` implementation after
+    /// its lock manager grants `mode`. This is public for out-of-crate test/storage
+    /// implementations; callers must not synthesize capabilities.
+    #[doc(hidden)]
+    pub fn from_lock_grant(
+        table: TableId,
+        owner: u64,
+        identity: RowIdentity,
+        row: Row,
+        mode: TupleLockMode,
+    ) -> Self {
+        Self {
+            identity,
+            row,
+            table,
+            owner,
+            mode,
+        }
+    }
+
+    pub fn table(&self) -> TableId {
+        self.table
+    }
+
+    pub fn identity(&self) -> &RowIdentity {
+        &self.identity
+    }
+
+    pub fn row(&self) -> &Row {
+        &self.row
+    }
+
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    pub fn mode(&self) -> TupleLockMode {
+        self.mode
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockRowResult {
+    Locked(LockedRow),
+    Deleted,
+    Skipped,
+}
 
 pub trait RowIterator: Send {
     fn next(&mut self) -> Result<Option<StoredRow>>;
@@ -52,6 +113,41 @@ pub trait StorageEngine: Send + Sync {
         relations: &dyn RelationSnapshot,
         table: TableId,
         key: &Key,
+    ) -> Result<bool>;
+    /// Acquire a transaction-owned tuple lock for a scan-time identity, then resolve
+    /// the current version while retaining that lock. Page-backed storage overrides
+    /// this to follow committed update chains. Every implementation must define how
+    /// its physical identity is validated; there is no snapshot-relative default.
+    fn lock_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        identity: &RowIdentity,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+    ) -> Result<LockRowResult>;
+
+    /// Mutate the exact current version returned by [`StorageEngine::lock_row`].
+    /// Callers must retain its transaction-owned tuple lock. Implementations reject
+    /// a target whose recorded mode is weaker than the requested mutation requires.
+    fn update_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+        row: Row,
+    ) -> Result<bool>;
+
+    /// Delete the exact current version returned by [`StorageEngine::lock_row`].
+    /// Callers must retain its transaction-owned tuple lock.
+    fn delete_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
     ) -> Result<bool>;
     /// Update the visible version of `key` to `row`. The HOT update-path prune
     /// (`docs/specs/mvcc.md` §10 Milestone H3) reads the GC horizon from

@@ -37,11 +37,32 @@ pub trait RelationSnapshot: Send + Sync {
     fn table_storage_id(&self, table: TableId) -> Option<FileId>;
 }
 
+pub struct LockedRow {
+    // private: identity, row, table, owning transaction, granted mode
+}
+
+pub enum LockRowResult {
+    Locked(LockedRow),
+    Deleted,
+    Skipped,
+}
+
 pub trait StorageEngine: Send + Sync {
     fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>>;
     fn insert(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, row: Row) -> Result<RowId>;
     fn get(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<Option<Row>>;
     fn delete(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<bool>;
+    fn lock_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        identity: &RowIdentity,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+    ) -> Result<LockRowResult>;
+    fn update_locked(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, target: &LockedRow, row: Row) -> Result<bool>;
+    fn delete_locked(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, target: &LockedRow) -> Result<bool>;
     fn update(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key, row: Row) -> Result<bool>;
     fn scan(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId) -> Result<Box<dyn RowIterator>>;
     fn for_each_visible_row(
@@ -110,6 +131,52 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;
 }
 ```
+
+### Tuple lock, resolve, mutate pipeline
+
+`lock_row` is the storage boundary between a scan-time `RowIdentity` and a tuple
+version safe to recheck or mutate. It first acquires the requested transaction-owned
+tuple mode through `StatementContext::tuple_locks`, then follows the physical
+`t_ctid` update chain independently of the statement snapshot. An aborted updater
+leaves the predecessor current; an in-progress legacy `xmax` holder is waited out
+without a page latch for `Block`, rejected with `55P03` for `NoWait`, or returned as
+`Skipped` for `SkipLocked`; a committed update advances to its successor; and a
+committed delete returns `Deleted`. REDIRECT roots and cross-page/non-HOT successors
+are followed with cycle detection.
+
+The returned `LockedRow` contains the latest physical `RowId`, logical identity,
+and materialized row. A primary-key-changing successor is protected by acquiring
+both its predecessor and current logical tags before return. For a heap-identity
+table, a HOT successor retains the root's hidden identity; an independently indexed
+non-HOT successor uses its own physical identity. If a successor tag cannot be
+obtained under `NOWAIT`/`SKIP LOCKED`, or resolution ends in an error, skip, or
+delete, acquisition receipts restore only the grants made by that attempt.
+The initial physical member must match the scan identity's creator transaction and
+logical primary key (or its physical heap identity for an independently indexed heap
+tuple); a mismatched or reused TID is treated as deleted rather than retargeted to an
+unrelated row, including a same-key tuple inserted into a VACUUM-reused slot.
+
+Successor materialization uses a sees-all-committed snapshot while preserving the
+caller's live-subxid set, so external TOAST chunks owned by a post-snapshot successor
+can be read. `update_locked` and `delete_locked` verify that the supplied physical
+identity is still the latest version and that the context's tuple-lock manager still
+reports the required live grant. They also compare the capability's materialized row
+with that freshly resolved version before using it for SSI write accounting, then
+mutate that exact heap location. They do
+not re-run a key lookup that could retarget the operation after verification.
+`delete_locked` and a primary-key-changing `update_locked` require `Update`; an
+identity-preserving update requires at least `NoKeyUpdate`. A weaker recorded mode
+is rejected rather than treated as mutation authority. Capabilities are also bound
+to their table and owning transaction, so they cannot be replayed through another
+statement context or relation. The
+ordinary `update`/`delete` entry points remain available for existing callers, but
+they also take a blocking `NoKeyUpdate`/`Update` tuple lock before mutation so they
+cannot bypass an explicit row lock. Those legacy entry points retain
+first-updater-wins behavior: if resolution advances beyond their snapshot-selected
+identity or finds it deleted, they return `40001`. The explicit
+lock/resolve/mutate methods are plumbing for the locking SELECT and EvalPlanQual
+executor orchestration; until that wiring ships, production DML continues through
+the ordinary first-updater-wins entry points.
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions/storage ids a statement should resolve plus the storage relation epoch observed

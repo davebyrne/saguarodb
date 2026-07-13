@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RowId, Value};
+use crate::{RowId, TxnId, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
@@ -22,6 +22,7 @@ pub enum KeyRange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRow {
     pub row_id: RowId,
+    pub xmin: TxnId,
     pub key: Key,
     pub row: Row,
 }
@@ -35,6 +36,9 @@ pub struct ExecRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowIdentity {
     pub row_id: RowId,
+    /// Creator transaction of the physical tuple version. Together with `row_id`,
+    /// this prevents a stale identity from aliasing a vacuum-reused heap slot.
+    pub xmin: TxnId,
     pub key: Key,
 }
 
@@ -51,6 +55,7 @@ mod tests {
                 page_num: 3,
                 slot_num: 9,
             },
+            xmin: 7,
             key: Key(vec![Value::Integer(42)]),
         };
 

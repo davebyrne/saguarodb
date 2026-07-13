@@ -11,6 +11,12 @@ pub(super) enum StampOutcome {
     WouldBlock(u64),
 }
 
+pub(super) enum LatestRowVersion {
+    Live { row: LockedRow, infomask: u16 },
+    Deleted,
+    WouldBlock(u64),
+}
+
 pub(super) struct HotUpdateRequest<'a> {
     pub(super) ctx: &'a StatementContext,
     pub(super) relations: &'a PageBackedRelationSnapshot,
@@ -21,9 +27,55 @@ pub(super) struct HotUpdateRequest<'a> {
     pub(super) row: &'a Row,
 }
 
+pub(super) struct DeleteRowVersionRequest<'a> {
+    pub(super) ctx: &'a StatementContext,
+    pub(super) table: TableId,
+    pub(super) schema: &'a TableSchema,
+    pub(super) key: &'a Key,
+    pub(super) previous_row: &'a Row,
+    pub(super) location: RowLocation,
+    pub(super) infomask: u16,
+}
+
+pub(super) struct UpdateRowVersionRequest<'a> {
+    pub(super) ctx: &'a StatementContext,
+    pub(super) relations: &'a PageBackedRelationSnapshot,
+    pub(super) table: TableId,
+    pub(super) schema: &'a TableSchema,
+    pub(super) index_fid: FileId,
+    pub(super) key: &'a Key,
+    pub(super) previous_row: &'a Row,
+    pub(super) previous_location: RowLocation,
+    pub(super) infomask: u16,
+    pub(super) row: Row,
+}
+
 enum ToastStreamPayload {
     RawColumn,
     Owned(std::sync::Arc<[u8]>),
+}
+
+pub(super) fn restore_tuple_changes(
+    ctx: &StatementContext,
+    changes: Vec<TupleLockGrantChange>,
+) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    ctx.tuple_locks.restore_tuple_grants(ctx.txn_id, changes)
+}
+
+pub(super) fn restore_tuple_changes_after_error<T>(
+    ctx: &StatementContext,
+    changes: Vec<TupleLockGrantChange>,
+    original: DbError,
+) -> Result<T> {
+    match restore_tuple_changes(ctx, changes) {
+        Ok(()) => Err(original),
+        Err(restore) => Err(DbError::internal(format!(
+            "tuple-lock acquisition failed ({original}); restoring its grants also failed ({restore})"
+        ))),
+    }
 }
 
 struct ToastCandidate {
@@ -447,6 +499,296 @@ fn materialize_prepared_values(
 }
 
 impl PageBackedStorageEngine {
+    fn hidden_identity_reaches(
+        &self,
+        relations: &PageBackedRelationSnapshot,
+        schema: &TableSchema,
+        key: &Key,
+        target: RowLocation,
+    ) -> Result<bool> {
+        let index_fid = self
+            .table_handle(relations, schema.id)?
+            .primary_index_file_id;
+        for root in self.btree(index_fid).scan_key(key)? {
+            if self
+                .collect_chain_versions(schema, root)?
+                .iter()
+                .any(|(location, _)| *location == target)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Follow the physical update chain from a scan-time row identity to its latest
+    /// committed (or own) version. This deliberately ignores the statement snapshot:
+    /// callers invoke it only after taking the tuple lock, so it is the storage half
+    /// of EvalPlanQual rather than an ordinary MVCC read.
+    pub(super) fn resolve_latest_row_version(
+        &self,
+        ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
+        schema: &TableSchema,
+        start: &common::RowIdentity,
+    ) -> Result<LatestRowVersion> {
+        let file_id = heap_file_id(schema.storage_id);
+        let mut location = RowLocation {
+            file_id,
+            page_num: start.row_id.page_num,
+            slot_num: start.row_id.slot_num,
+        };
+        let mut current_key = start.key.clone();
+        let mut visited = HashSet::new();
+        let mut first_member = true;
+
+        loop {
+            let readable = self
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)?;
+            let data = readable.data();
+            location.slot_num = match page::slot_state(data, location.slot_num)? {
+                page::LinePointer::Normal => location.slot_num,
+                page::LinePointer::Redirect(target) => match page::slot_state(data, target)? {
+                    page::LinePointer::Normal => target,
+                    _ => {
+                        return Err(storage_internal(
+                            "redirect line pointer target is not a NORMAL tuple",
+                        ));
+                    }
+                },
+                page::LinePointer::Dead | page::LinePointer::Unused => {
+                    return Ok(LatestRowVersion::Deleted);
+                }
+            };
+            if !visited.insert((location.page_num, location.slot_num)) {
+                return Err(storage_internal("cyclic update chain detected"));
+            }
+            let bytes = page::read_row(data, location.slot_num)?
+                .ok_or_else(|| storage_internal("update chain member is not a live tuple"))?;
+            let physical = decode_physical_row(schema, &bytes)?;
+            drop(readable);
+            let current_xmin = physical.header.xmin;
+            if first_member && current_xmin != start.xmin {
+                return Ok(LatestRowVersion::Deleted);
+            }
+            if first_member && !schema.primary_key.is_empty() {
+                let mut validation_ctx = ctx.clone();
+                validation_ctx.snapshot = Arc::new(Snapshot::sees_all_committed());
+                let logical = self.materialize_physical_row(
+                    &validation_ctx,
+                    relations,
+                    schema,
+                    physical.clone(),
+                )?;
+                if primary_key_for_row(schema, &logical)? != start.key {
+                    return Ok(LatestRowVersion::Deleted);
+                }
+            } else if first_member {
+                let matches_identity = if physical.header.infomask & crate::codec::HEAP_ONLY == 0 {
+                    storage_key_for_location(location) == start.key
+                } else {
+                    self.hidden_identity_reaches(relations, schema, &start.key, location)?
+                };
+                if !matches_identity {
+                    return Ok(LatestRowVersion::Deleted);
+                }
+            }
+            first_member = false;
+            let xmax = physical.header.xmax;
+            let t_ctid = physical.header.t_ctid;
+            let infomask = physical.header.infomask;
+            if schema.primary_key.is_empty() && infomask & crate::codec::HEAP_ONLY == 0 {
+                current_key = storage_key_for_location(location);
+            }
+
+            let deleter = if xmax == common::INVALID_XID {
+                None
+            } else if ctx.live_txns.contains(&xmax) {
+                Some(TxnStatus::Committed)
+            } else if infomask & XMAX_ABORTED != 0 {
+                Some(TxnStatus::Aborted)
+            } else if infomask & XMAX_COMMITTED != 0 {
+                Some(TxnStatus::Committed)
+            } else {
+                Some(self.txn_status_view().status(xmax))
+            };
+
+            match deleter {
+                None | Some(TxnStatus::Aborted) => {
+                    let mut latest_ctx = ctx.clone();
+                    latest_ctx.snapshot = Arc::new(Snapshot::sees_all_committed());
+                    let row =
+                        self.materialize_physical_row(&latest_ctx, relations, schema, physical)?;
+                    let key = if schema.primary_key.is_empty() {
+                        current_key
+                    } else {
+                        primary_key_for_row(schema, &row)?
+                    };
+                    return Ok(LatestRowVersion::Live {
+                        row: LockedRow::from_lock_grant(
+                            schema.id,
+                            ctx.txn_id,
+                            common::RowIdentity {
+                                row_id: RowId {
+                                    page_num: location.page_num,
+                                    slot_num: location.slot_num,
+                                },
+                                xmin: current_xmin,
+                                key,
+                            },
+                            row,
+                            TupleLockMode::KeyShare,
+                        ),
+                        infomask,
+                    });
+                }
+                Some(TxnStatus::InProgress) => {
+                    return Ok(LatestRowVersion::WouldBlock(xmax));
+                }
+                Some(TxnStatus::Committed) => {
+                    if t_ctid == crate::codec::INVALID_TID {
+                        return Ok(LatestRowVersion::Deleted);
+                    }
+                    location = RowLocation {
+                        file_id,
+                        page_num: t_ctid.0,
+                        slot_num: t_ctid.1,
+                    };
+                }
+            }
+        }
+    }
+
+    pub(super) fn locked_row_location(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+    ) -> Result<(RowLocation, u16, Row)> {
+        let relations = pagebacked_relations(relations)?;
+        let schema = self.table_handle(relations, table)?.schema.clone();
+        loop {
+            match self.resolve_latest_row_version(ctx, relations, &schema, target.identity())? {
+                LatestRowVersion::Live { row, infomask } if row.identity() == target.identity() => {
+                    if row.row() != target.row() {
+                        return Err(storage_internal(
+                            "locked row payload does not match the current tuple version",
+                        ));
+                    }
+                    return Ok((
+                        RowLocation {
+                            file_id: heap_file_id(schema.storage_id),
+                            page_num: row.identity().row_id.page_num,
+                            slot_num: row.identity().row_id.slot_num,
+                        },
+                        infomask,
+                        row.row().clone(),
+                    ));
+                }
+                LatestRowVersion::Live { .. } | LatestRowVersion::Deleted => {
+                    return Err(storage_internal(
+                        "locked row target is no longer the current tuple version",
+                    ));
+                }
+                LatestRowVersion::WouldBlock(blocker) => self.wait_for_conflict(ctx, blocker)?,
+            }
+        }
+    }
+
+    pub(super) fn delete_row_version(&self, request: DeleteRowVersionRequest<'_>) -> Result<bool> {
+        let DeleteRowVersionRequest {
+            ctx,
+            table,
+            schema,
+            key,
+            previous_row,
+            location,
+            infomask,
+        } = request;
+        let ssi_key = ssi_write_key_for_row(schema, previous_row, key)?;
+        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
+            location,
+            crate::codec::INVALID_TID,
+            infomask,
+            ctx.txn_id,
+            &ctx.live_txns,
+        )? {
+            self.wait_for_conflict(ctx, blocker)?;
+        }
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, &ssi_key)?;
+        Ok(true)
+    }
+
+    pub(super) fn update_row_version(&self, request: UpdateRowVersionRequest<'_>) -> Result<bool> {
+        let UpdateRowVersionRequest {
+            ctx,
+            relations,
+            table,
+            schema,
+            index_fid,
+            key,
+            previous_row,
+            previous_location,
+            infomask,
+            row,
+        } = request;
+        let ssi_keys = ssi_write_keys_for_update(schema, previous_row, &row, key)?;
+        if let Some(result) = self.try_hot_update(HotUpdateRequest {
+            ctx,
+            relations,
+            schema,
+            table,
+            previous_location,
+            infomask,
+            row: &row,
+        })? {
+            if result {
+                for ssi_key in &ssi_keys {
+                    ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
+                }
+            }
+            return Ok(result);
+        }
+
+        let row_bytes = self.prepare_row_for_storage(
+            ctx,
+            relations,
+            schema,
+            &crate::codec::MvccHeader::fresh(ctx.txn_id, 0),
+            &row,
+        )?;
+        let new_location = self.write_new_row_bytes(schema, &row_bytes, ctx.txn_id)?;
+        let new_tid = (new_location.page_num, new_location.slot_num);
+        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
+            previous_location,
+            new_tid,
+            infomask,
+            ctx.txn_id,
+            &ctx.live_txns,
+        )? {
+            self.wait_for_conflict(ctx, blocker)?;
+        }
+
+        let replacement_key = storage_identity_key_for_row(schema, &row, new_location)?;
+        self.insert_storage_identity_entry(
+            ctx,
+            schema,
+            index_fid,
+            &replacement_key,
+            &new_location,
+        )?;
+        for index in self.table_indexes(relations, table)? {
+            let (new_key, has_null) = secondary_index_key(schema, &index, &row)?;
+            self.insert_secondary_entry(ctx, schema, &index, &new_key, has_null, &new_location)?;
+        }
+        for ssi_key in &ssi_keys {
+            ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn prepare_row_for_storage(
         &self,
         ctx: &StatementContext,

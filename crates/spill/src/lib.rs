@@ -1118,7 +1118,7 @@ pub mod codec {
             .ok_or_else(|| io_error("spill row length overflow"))?;
         if let Some(identity) = &row.identity {
             len = len
-                .checked_add(6)
+                .checked_add(14)
                 .and_then(|v| v.checked_add(values_len(&identity.key.0).ok()?))
                 .ok_or_else(|| io_error("spill row length overflow"))?;
         }
@@ -1137,6 +1137,9 @@ pub mod codec {
                 writer
                     .write_all(&identity.row_id.slot_num.to_le_bytes())
                     .map_err(io_error)?;
+                writer
+                    .write_all(&identity.xmin.to_le_bytes())
+                    .map_err(io_error)?;
                 encode_values(&identity.key.0, writer)?;
             }
         }
@@ -1154,6 +1157,7 @@ pub mod codec {
                     page_num: read_u32(reader)?,
                     slot_num: read_u16(reader)?,
                 },
+                xmin: read_u64(reader)?,
                 key: Key(decode_values(reader)?),
             }),
             _ => return Err(io_error("invalid spill row identity tag")),
@@ -1582,6 +1586,7 @@ mod tests {
                     page_num: 3,
                     slot_num: 4,
                 },
+                xmin: 11,
                 key: Key(vec![Value::Integer(9)]),
             }),
         };

@@ -1,4 +1,5 @@
 use super::*;
+use common::TxnId;
 
 fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> Result<Value> {
     let column = schema.columns.get(column).ok_or_else(|| {
@@ -479,7 +480,7 @@ impl PageBackedStorageEngine {
         relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         location: RowLocation,
-    ) -> Result<Option<(RowLocation, Row)>> {
+    ) -> Result<Option<(RowLocation, TxnId, Row)>> {
         let Some((resolved, _infomask)) =
             self.resolve_visible_in_chain(location, &ctx.snapshot, &ctx.live_txns)?
         else {
@@ -493,9 +494,10 @@ impl PageBackedStorageEngine {
             return Ok(None);
         };
         let physical = decode_physical_row(schema, &bytes)?;
+        let xmin = physical.header.xmin;
         drop(readable);
         let row = self.materialize_physical_row(ctx, relations, schema, physical)?;
-        Ok(Some((resolved, row)))
+        Ok(Some((resolved, xmin, row)))
     }
     /// Locate the single version of `key` visible to `snapshot` from `current_txns`
     /// and return its heap location together with the version's current `infomask`

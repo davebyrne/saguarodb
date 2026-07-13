@@ -825,6 +825,22 @@ impl TupleLockManager for LockManager {
         let owner = LockOwner::Transaction(self.registry.top_of(xid));
         self.restore_tuple_changes(owner, changes)
     }
+
+    fn holds_tuple(&self, xid: TxnId, tag: &TupleLockTag, mode: TupleLockMode) -> bool {
+        if !self.registry.is_active(xid) {
+            return false;
+        }
+        let owner = LockOwner::Transaction(self.registry.top_of(xid));
+        let resource = LockResource::Tuple {
+            table: tag.table,
+            key: tag.key.clone(),
+        };
+        self.lock()
+            .grants
+            .get(&resource)
+            .and_then(|grants| grants.get(&owner))
+            .is_some_and(|held| held.covers(ObjectLockMode::Tuple(mode)))
+    }
 }
 
 fn next_id(counter: &AtomicU64, kind: &str) -> Result<u64> {
@@ -1106,6 +1122,33 @@ mod tests {
         );
         manager.restore_tuple_grants(1, vec![first]).unwrap();
         assert!(guard.snapshot().grants.is_empty());
+    }
+
+    #[test]
+    fn tuple_grant_authority_requires_the_live_owner_resource_and_mode() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        registry.register(2);
+        let guard = manager.transaction_owner(1).unwrap();
+        let cancel = QueryCancel::new();
+        manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::NoKeyUpdate,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+
+        assert!(manager.holds_tuple(1, &tuple_tag(7), TupleLockMode::KeyShare));
+        assert!(manager.holds_tuple(1, &tuple_tag(7), TupleLockMode::NoKeyUpdate));
+        assert!(!manager.holds_tuple(1, &tuple_tag(7), TupleLockMode::Update));
+        assert!(!manager.holds_tuple(1, &tuple_tag(8), TupleLockMode::KeyShare));
+        assert!(!manager.holds_tuple(2, &tuple_tag(7), TupleLockMode::KeyShare));
+
+        drop(guard);
+        assert!(!manager.holds_tuple(1, &tuple_tag(7), TupleLockMode::KeyShare));
     }
 
     #[test]

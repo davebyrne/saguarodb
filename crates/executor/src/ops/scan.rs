@@ -72,6 +72,7 @@ impl PlanExecutor for SeqScanOp<'_> {
                 row: stored.row,
                 identity: Some(RowIdentity {
                     row_id: stored.row_id,
+                    xmin: stored.xmin,
                     key: stored.key,
                 }),
             };
@@ -209,6 +210,7 @@ impl PlanExecutor for IndexScanOp<'_> {
                 row: stored.row,
                 identity: Some(RowIdentity {
                     row_id: stored.row_id,
+                    xmin: stored.xmin,
                     key: stored.key,
                 }),
             };

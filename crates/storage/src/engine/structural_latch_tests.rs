@@ -49,14 +49,14 @@ fn commit(wal: &FileWalManager, txn_id: u64) {
 }
 
 fn ctx(txn_id: u64) -> StatementContext {
-    StatementContext::with_snapshot(
+    crate::with_test_tuple_locks(StatementContext::with_snapshot(
         txn_id,
         Arc::new(Snapshot {
             xmin: 1,
             xmax: txn_id + 1,
             xip: vec![],
         }),
-    )
+    ))
 }
 
 fn users_schema() -> TableSchema {

@@ -182,7 +182,7 @@ execution error under the same statement-snapshot contract as `SeqScanOp`.
 
 ## Identity Rules
 
-- Scans set `identity = Some(RowIdentity { row_id, key })`.
+- Scans set `identity = Some(RowIdentity { row_id, xmin, key })`.
 - System scans set `identity = None`; they are read-only virtual relations.
 - Filter, sort, limit, and projection preserve identity.
 - Join, aggregate, and distinct clear identity.

@@ -48,8 +48,10 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, DataType, DbError, FileId, IndexId,
     IndexSchema, Key, KeyRange, Lsn, PageNum, QueryCancel, RelationKind, Result, Row, RowId,
     SequenceId, SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow,
-    TableId, TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TxnStatusView, UniqueConflict,
-    Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
+    TableId, TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TupleLockAcquire,
+    TupleLockGrantChange, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnStatus,
+    TxnStatusView, UniqueConflict, Value, WriteConflict, XMAX_ABORTED, XMAX_COMMITTED,
+    classify_unique_conflict, is_visible, write_conflict,
 };
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -60,7 +62,9 @@ use crate::codec::{
 };
 use crate::heap::{heap_file_id, primary_index_file_id, secondary_index_file_id};
 use crate::page;
-use crate::traits::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
+use crate::traits::{
+    LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+};
 
 mod dml;
 mod index;
@@ -68,7 +72,10 @@ mod recovery;
 mod vacuum;
 mod visibility;
 
-use dml::{HotUpdateRequest, StampOutcome};
+use dml::{
+    DeleteRowVersionRequest, LatestRowVersion, UpdateRowVersionRequest, restore_tuple_changes,
+    restore_tuple_changes_after_error,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageMode {
@@ -2188,13 +2195,165 @@ impl StorageEngine for PageBackedStorageEngine {
         // once versioning lands (B4); collect every candidate TID and return the
         // single one visible to this snapshot. Today there is one entry per key.
         for location in locations {
-            if let Some((_resolved, row)) =
+            if let Some((_resolved, _xmin, row)) =
                 self.read_visible_row(ctx, relations, &schema, location)?
             {
                 return Ok(Some(row));
             }
         }
         Ok(None)
+    }
+
+    fn lock_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        identity: &common::RowIdentity,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+    ) -> Result<LockRowResult> {
+        let relations = pagebacked_relations(relations)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let mut next_tag = TupleLockTag {
+            table,
+            key: identity.key.clone(),
+        };
+        let mut held_tags = BTreeSet::new();
+        let mut changes = Vec::new();
+
+        loop {
+            if held_tags.insert(next_tag.clone()) {
+                let acquisition = ctx.tuple_locks.acquire_tuple(
+                    ctx.txn_id,
+                    &next_tag,
+                    mode,
+                    wait_policy,
+                    ctx.cancel.as_ref(),
+                );
+                match acquisition {
+                    Ok(TupleLockAcquire::Acquired(change)) => changes.push(change),
+                    Ok(TupleLockAcquire::Skipped) => {
+                        restore_tuple_changes(ctx, changes)?;
+                        return Ok(LockRowResult::Skipped);
+                    }
+                    Err(err) => return restore_tuple_changes_after_error(ctx, changes, err),
+                }
+            }
+
+            let latest = loop {
+                match self.resolve_latest_row_version(ctx, relations, &schema, identity) {
+                    Ok(LatestRowVersion::WouldBlock(blocker)) => match wait_policy {
+                        TupleLockWaitPolicy::Block => {
+                            if let Err(err) = self.wait_for_conflict(ctx, blocker) {
+                                return restore_tuple_changes_after_error(ctx, changes, err);
+                            }
+                        }
+                        TupleLockWaitPolicy::NoWait => {
+                            return restore_tuple_changes_after_error(
+                                ctx,
+                                changes,
+                                DbError::execute(
+                                    SqlState::LockNotAvailable,
+                                    "could not obtain tuple lock on row",
+                                ),
+                            );
+                        }
+                        TupleLockWaitPolicy::SkipLocked => {
+                            restore_tuple_changes(ctx, changes)?;
+                            return Ok(LockRowResult::Skipped);
+                        }
+                    },
+                    Ok(other) => break other,
+                    Err(err) => return restore_tuple_changes_after_error(ctx, changes, err),
+                }
+            };
+            match latest {
+                LatestRowVersion::Live { row, .. } => {
+                    let current_tag = TupleLockTag {
+                        table,
+                        key: row.identity().key.clone(),
+                    };
+                    if held_tags.contains(&current_tag) {
+                        return Ok(LockRowResult::Locked(LockedRow::from_lock_grant(
+                            table,
+                            ctx.txn_id,
+                            row.identity().clone(),
+                            row.row().clone(),
+                            mode,
+                        )));
+                    }
+                    next_tag = current_tag;
+                }
+                LatestRowVersion::Deleted => {
+                    restore_tuple_changes(ctx, changes)?;
+                    return Ok(LockRowResult::Deleted);
+                }
+                LatestRowVersion::WouldBlock(_) => {
+                    unreachable!("in-progress versions are handled by the inner wait loop")
+                }
+            }
+        }
+    }
+
+    fn update_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+        row: Row,
+    ) -> Result<bool> {
+        let relations = pagebacked_relations(relations)?;
+        self.ensure_current_generation_for_write(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let required_mode = if table_handle.schema.primary_key.is_empty()
+            || primary_key_for_row(&table_handle.schema, &row)? == target.identity().key
+        {
+            TupleLockMode::NoKeyUpdate
+        } else {
+            TupleLockMode::Update
+        };
+        ensure_locked_authority(target, ctx, table, required_mode)?;
+        let (location, infomask, previous_row) =
+            self.locked_row_location(ctx, relations, table, target)?;
+        self.update_row_version(UpdateRowVersionRequest {
+            ctx,
+            relations,
+            table,
+            schema: &table_handle.schema,
+            index_fid: table_handle.primary_index_file_id,
+            key: &target.identity().key,
+            previous_row: &previous_row,
+            previous_location: location,
+            infomask,
+            row,
+        })
+    }
+
+    fn delete_locked(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        target: &LockedRow,
+    ) -> Result<bool> {
+        let relations = pagebacked_relations(relations)?;
+        ensure_locked_authority(target, ctx, table, TupleLockMode::Update)?;
+        self.ensure_current_generation_for_write(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let (location, infomask, previous_row) =
+            self.locked_row_location(ctx, relations, table, target)?;
+        self.delete_row_version(DeleteRowVersionRequest {
+            ctx,
+            table,
+            schema: &table_handle.schema,
+            key: &target.identity().key,
+            previous_row: &previous_row,
+            location,
+            infomask,
+        })
     }
 
     fn delete(
@@ -2220,34 +2379,37 @@ impl StorageEngine for PageBackedStorageEngine {
             let _rewrite_guard = rewrite_latch.read();
             self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
         };
-        let Some((location, infomask)) = visible else {
+        let Some((location, _infomask)) = visible else {
             return Ok(false);
         };
-        let previous_row = self
+        let (resolved, xmin, _previous_row) = self
             .read_visible_row(ctx, relations, &schema, location)?
-            .map(|(_resolved, row)| row)
             .ok_or_else(|| storage_internal("visible row disappeared during delete"))?;
-        let ssi_key = ssi_write_key_for_row(&schema, &previous_row, key)?;
-
-        // MVCC delete: stamp xmax on the still-NORMAL line pointer in place. The
-        // tuple and *all* its index entries (PK and secondary) are retained — the
-        // row is hidden by visibility (xmax committed ⇒ invisible to later
-        // snapshots), and VACUUM (Milestone F) reclaims the dead version and its
-        // entries. No tombstone, no index-entry removal.
-        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
-            location,
-            crate::codec::INVALID_TID,
-            infomask,
-            ctx.txn_id,
-            &ctx.live_txns,
+        let identity = common::RowIdentity {
+            row_id: RowId {
+                page_num: resolved.page_num,
+                slot_num: resolved.slot_num,
+            },
+            xmin,
+            key: key.clone(),
+        };
+        match StorageEngine::lock_row(
+            self,
+            ctx,
+            relations,
+            table,
+            &identity,
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
         )? {
-            // An in-progress writer holds this row's lock: wait, then re-check.
-            self.wait_for_conflict(ctx, blocker)?;
+            LockRowResult::Locked(target) if *target.identity() == identity => {
+                StorageEngine::delete_locked(self, ctx, relations, table, &target)
+            }
+            LockRowResult::Locked(_) | LockRowResult::Deleted => Err(concurrent_update_error()),
+            LockRowResult::Skipped => {
+                unreachable!("blocking tuple-lock acquisition cannot skip a row")
+            }
         }
-        // SSI: this delete overwrote the row a concurrent serializable reader may have
-        // read (`docs/specs/ssi.md` §6).
-        ctx.ssi_tracker.note_write(ctx.txn_id, table, &ssi_key)?;
-        Ok(true)
     }
 
     fn update(
@@ -2276,123 +2438,42 @@ impl StorageEngine for PageBackedStorageEngine {
             let _rewrite_guard = rewrite_latch.read();
             self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
         };
-        let Some((previous_location, infomask)) = visible else {
+        let Some((previous_location, _infomask)) = visible else {
             return Ok(false);
         };
-        let previous_row = self
+        let (resolved, xmin, _previous_row) = self
             .read_visible_row(ctx, relations, &schema, previous_location)?
-            .map(|(_resolved, row)| row)
             .ok_or_else(|| storage_internal("visible row disappeared during update"))?;
-        let ssi_keys = ssi_write_keys_for_update(&schema, &previous_row, &row, key)?;
-        // HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2). When BOTH (a)
-        // no indexed column changed and (b) the new tuple fits on the predecessor's
-        // own page, write the new version as a heap-only tuple on that page, chain the
-        // predecessor to it, and insert NO index entries — the index keeps pointing at
-        // the chain root, and H1's bounded `t_ctid` walk reaches the new version via
-        // the `HOT_UPDATED → HEAP_ONLY` segment. TOAST-enabled tables use this path
-        // only when the predecessor and successor both stay inline; external TOAST
-        // pointers fall back to the fully-indexed path so chunk cleanup remains owned
-        // by full VACUUM. When the predecessor's page is full, the H3 update-path
-        // prune (under the heap latch, `ctx.gc_horizon` threaded in) tries to reclaim
-        // same-page room first; only if it still cannot fit does it fall back.
-        if let Some(result) = self.try_hot_update(HotUpdateRequest {
+        let mode = if schema.primary_key.is_empty() || primary_key_for_row(&schema, &row)? == *key {
+            TupleLockMode::NoKeyUpdate
+        } else {
+            TupleLockMode::Update
+        };
+        let identity = common::RowIdentity {
+            row_id: RowId {
+                page_num: resolved.page_num,
+                slot_num: resolved.slot_num,
+            },
+            xmin,
+            key: key.clone(),
+        };
+        match StorageEngine::lock_row(
+            self,
             ctx,
             relations,
-            schema: &schema,
             table,
-            previous_location,
-            infomask,
-            row: &row,
-        })? {
-            // SSI: a successful HOT update overwrote the row a concurrent serializable
-            // reader may have read (`docs/specs/ssi.md` §6).
-            if result {
-                for ssi_key in &ssi_keys {
-                    ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
-                }
-            }
-            return Ok(result);
-        }
-
-        // MVCC UPDATE (Postgres-style, non-HOT): write the new tuple as a fresh heap
-        // version (`xmin = txn`, `xmax = invalid`, `t_ctid = self`), then chain the
-        // old version forward to it and insert per-version index entries for the new
-        // version into *every* index. The old version and all old index entries are
-        // retained; VACUUM (Milestone F) reclaims them. Reads do not walk `t_ctid`
-        // (every version is independently indexed), so the new version needs its own
-        // entry in *all* indexes — including indexes whose columns did not change —
-        // or a scan on an unchanged secondary value would never find it (the
-        // changed-index-only skip is a HOT optimization, Milestone H; applying it
-        // here would be a correctness bug — `docs/specs/mvcc.md` Appendix A commit 9).
-        let row_bytes = self.prepare_row_for_storage(
-            ctx,
-            relations,
-            &schema,
-            &crate::codec::MvccHeader::fresh(ctx.txn_id, 0),
-            &row,
-        )?;
-        let new_location = self.write_new_row_bytes(&schema, &row_bytes, ctx.txn_id)?;
-
-        // Stamp the old version *before* the new version's uniqueness checks, so its
-        // `xmax = ctx.txn_id` makes `unique_conflict_kind` treat it as own-deleted
-        // (non-conflicting): the new version must not collide with the logical row it
-        // supersedes, but must still collide with any *other* live row. The forward
-        // `t_ctid` points at the new version (invariant 5).
-        //
-        // The atomic first-updater-wins check lives in `stamp_xmax_logged` (E1b,
-        // §7.3): if another writer already claimed the old version's `xmax`, this
-        // returns `40001` *after* the new version was written above (the index
-        // inserts below have not run yet, so only the heap tuple is orphaned). That
-        // transient new tuple is an **orphan-on-conflict** and needs no manual
-        // cleanup: the `40001` error aborts the transaction, so the new version
-        // (xmin = the aborting txn) becomes invisible via CLOG = Aborted and is
-        // reclaimed by VACUUM (Milestone F) — the abort + visibility machinery
-        // handles it. (A pre-write conflict check to avoid the transient orphan is a
-        // deferred optimization; the authoritative check stays atomic at stamp time
-        // to keep first-updater-wins race-free.)
-        let new_tid = (new_location.page_num, new_location.slot_num);
-        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
-            previous_location,
-            new_tid,
-            infomask,
-            ctx.txn_id,
-            &ctx.live_txns,
+            &identity,
+            mode,
+            TupleLockWaitPolicy::Block,
         )? {
-            // An in-progress writer holds the predecessor's lock: wait, then
-            // re-attempt the stamp (the new version is already written).
-            self.wait_for_conflict(ctx, blocker)?;
+            LockRowResult::Locked(target) if *target.identity() == identity => {
+                StorageEngine::update_locked(self, ctx, relations, table, &target, row)
+            }
+            LockRowResult::Locked(_) | LockRowResult::Deleted => Err(concurrent_update_error()),
+            LockRowResult::Skipped => {
+                unreachable!("blocking tuple-lock acquisition cannot skip a row")
+            }
         }
-
-        // New non-HOT versions get their own identity entry. For PK tables that is
-        // the logical primary-key value; for no-PK tables it is the hidden heap key.
-        // Old identity entries are retained until VACUUM, like every other MVCC
-        // index entry.
-        let replacement_key = storage_identity_key_for_row(&schema, &row, new_location)?;
-        self.insert_storage_identity_entry(
-            ctx,
-            &schema,
-            index_fid,
-            &replacement_key,
-            &new_location,
-        )?;
-
-        // A new per-version entry for the new tuple in *every* secondary index
-        // (changed-column or not), pointing at `new_location`. Old entries are
-        // retained. `insert_secondary_entry` enforces unique-secondary constraints
-        // visibility-aware: an unchanged unique value does not self-conflict (the old
-        // version is own-deleted), but a value colliding with a different live row
-        // raises `UniqueViolation`.
-        for index in self.table_indexes(relations, table)? {
-            let (new_key, has_null) = secondary_index_key(&schema, &index, &row)?;
-            self.insert_secondary_entry(ctx, &schema, &index, &new_key, has_null, &new_location)?;
-        }
-
-        // SSI: the non-HOT update overwrote the row a concurrent serializable reader
-        // may have read (`docs/specs/ssi.md` §6).
-        for ssi_key in &ssi_keys {
-            ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
-        }
-        Ok(true)
     }
 
     fn scan(
@@ -2420,7 +2501,7 @@ impl StorageEngine for PageBackedStorageEngine {
             &KeyRange::All,
             Some(ctx.cancel.as_ref()),
             |key, location| {
-                let Some((resolved, row)) =
+                let Some((resolved, xmin, row)) =
                     self.read_visible_row(ctx, relations, &schema, location)?
                 else {
                     return Ok(());
@@ -2430,6 +2511,7 @@ impl StorageEngine for PageBackedStorageEngine {
                         page_num: resolved.page_num,
                         slot_num: resolved.slot_num,
                     },
+                    xmin,
                     key,
                     row,
                 })
@@ -2466,7 +2548,8 @@ impl StorageEngine for PageBackedStorageEngine {
             // why the bounded walk's stop-at-indexed-successor rule prevents a row
             // from being returned twice (`mvcc.md` §10 Milestone H1). The yielded
             // `RowId` is the resolved live version, not the index TID.
-            let Some((resolved, row)) = self.read_visible_row(ctx, relations, &schema, location)?
+            let Some((resolved, xmin, row)) =
+                self.read_visible_row(ctx, relations, &schema, location)?
             else {
                 continue;
             };
@@ -2475,6 +2558,7 @@ impl StorageEngine for PageBackedStorageEngine {
                     page_num: resolved.page_num,
                     slot_num: resolved.slot_num,
                 },
+                xmin,
                 key,
                 row,
             });
@@ -2517,7 +2601,8 @@ impl StorageEngine for PageBackedStorageEngine {
             ctx.cancel.check()?;
             // Resolve to the visible version; an invisible chain (or a DEAD/absent
             // root line pointer) is skipped, not an error.
-            let Some((resolved, row)) = self.read_visible_row(ctx, relations, &schema, location)?
+            let Some((resolved, xmin, row)) =
+                self.read_visible_row(ctx, relations, &schema, location)?
             else {
                 continue;
             };
@@ -2532,6 +2617,7 @@ impl StorageEngine for PageBackedStorageEngine {
                     page_num: resolved.page_num,
                     slot_num: resolved.slot_num,
                 },
+                xmin,
                 key,
                 row,
             });
@@ -4011,6 +4097,43 @@ fn relation_generation_write_conflict(table: TableId) -> DbError {
 
 fn storage_internal(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
+}
+
+fn concurrent_update_error() -> DbError {
+    DbError::execute(
+        SqlState::SerializationFailure,
+        "could not serialize access due to concurrent update",
+    )
+}
+
+fn ensure_locked_authority(
+    target: &LockedRow,
+    ctx: &StatementContext,
+    table: TableId,
+    required: TupleLockMode,
+) -> Result<()> {
+    if target.table() != table || target.owner() != ctx.txn_id {
+        return Err(storage_internal(
+            "locked row capability belongs to a different table or transaction",
+        ));
+    }
+    let tag = TupleLockTag {
+        table,
+        key: target.identity().key.clone(),
+    };
+    if !ctx.tuple_locks.holds_tuple(ctx.txn_id, &tag, required) {
+        return Err(storage_internal(
+            "locked row capability has no matching live tuple-lock grant",
+        ));
+    }
+    if target.mode() < required {
+        return Err(storage_internal(format!(
+            "tuple lock mode {:?} is insufficient; {:?} is required",
+            target.mode(),
+            required
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

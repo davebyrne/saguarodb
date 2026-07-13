@@ -74,14 +74,14 @@ impl SharedEngine {
 /// `xip`, `xmax` past every allocated id, so it sees all committed rows plus its
 /// own writes (via `current_txn`).
 fn ctx(txn_id: u64, xmax: u64) -> StatementContext {
-    StatementContext::with_snapshot(
+    crate::with_test_tuple_locks(StatementContext::with_snapshot(
         txn_id,
         Arc::new(Snapshot {
             xmin: 1,
             xmax,
             xip: vec![],
         }),
-    )
+    ))
 }
 
 fn users_schema() -> TableSchema {

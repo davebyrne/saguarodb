@@ -28,22 +28,72 @@ pub use heap::HeapPageStore;
 pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;
 pub use traits::{
-    RecoveryOperations, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+    LockRowResult, LockedRow, RecoveryOperations, RelationSnapshot, RowIterator, SchemaOperations,
+    StorageEngine,
 };
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PermissiveTestTupleLocks;
+
+#[cfg(test)]
+impl common::TupleLockManager for PermissiveTestTupleLocks {
+    fn acquire_tuple(
+        &self,
+        _xid: common::TxnId,
+        _tag: &common::TupleLockTag,
+        _mode: common::TupleLockMode,
+        _wait_policy: common::TupleLockWaitPolicy,
+        _cancel: &common::QueryCancel,
+    ) -> common::Result<common::TupleLockAcquire> {
+        Ok(common::TupleLockAcquire::Acquired(
+            common::TupleLockGrantChange::manager_receipt(()),
+        ))
+    }
+
+    fn restore_tuple_grants(
+        &self,
+        _xid: common::TxnId,
+        _changes: Vec<common::TupleLockGrantChange>,
+    ) -> common::Result<()> {
+        Ok(())
+    }
+
+    fn holds_tuple(
+        &self,
+        _xid: common::TxnId,
+        _tag: &common::TupleLockTag,
+        _mode: common::TupleLockMode,
+    ) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_tuple_locks(ctx: common::StatementContext) -> common::StatementContext {
+    ctx.with_tuple_lock_manager(std::sync::Arc::new(PermissiveTestTupleLocks))
+}
+
+#[cfg(test)]
+pub(crate) fn test_statement_context(txn_id: common::TxnId) -> common::StatementContext {
+    with_test_tuple_locks(common::StatementContext::new(txn_id))
+}
 
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        CancelReason, ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID,
-        IndexSchema, Key, KeyRange, Lsn, RelationKind, Result, Row, SequenceManager,
-        SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression, ToastMode,
-        ToastOptions, TxnId, TxnStatus, TxnStatusView, Value, toast_schema,
+        CancelReason, ColumnDef, CompressionSetting, ConflictWaiter, DataType, DbError, FileId,
+        INVALID_XID, IndexSchema, Key, KeyRange, Lsn, QueryCancel, RelationKind, Result, Row,
+        SequenceManager, SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression,
+        ToastMode, ToastOptions, TupleLockAcquire, TupleLockGrantChange, TupleLockManager,
+        TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnId, TxnStatus, TxnStatusView, Value,
+        toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -94,7 +144,7 @@ mod tests {
     #[test]
     fn insert_get_update_delete_round_trip_through_pages() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
 
         harness
@@ -144,6 +194,899 @@ mod tests {
     }
 
     #[test]
+    fn tuple_lock_resolves_key_changing_successor_before_locked_mutation() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+
+        harness
+            .storage
+            .update(
+                &crate::test_statement_context(2),
+                1,
+                &original.key,
+                user_row(2, "Grace", true),
+            )
+            .unwrap();
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(3).with_tuple_lock_manager(locks.clone());
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: original.row_id,
+                xmin: original.xmin,
+                key: original.key.clone(),
+            },
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        let crate::LockRowResult::Locked(locked) = result else {
+            panic!("updated row should resolve to its successor");
+        };
+        assert_eq!(locked.identity().key, Key(vec![Value::Integer(2)]));
+        assert_eq!(locked.row(), &user_row(2, "Grace", true));
+        assert_eq!(
+            locks.acquired.lock().unwrap().as_slice(),
+            &[
+                TupleLockTag {
+                    table: 1,
+                    key: Key(vec![Value::Integer(1)]),
+                },
+                TupleLockTag {
+                    table: 1,
+                    key: Key(vec![Value::Integer(2)]),
+                },
+            ]
+        );
+
+        assert!(
+            <PageBackedStorageEngine as StorageEngine>::update_locked(
+                &harness.storage,
+                &ctx,
+                relations.as_ref(),
+                1,
+                &locked,
+                user_row(2, "Hopper", false),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, 1, &Key(vec![Value::Integer(2)]))
+                .unwrap(),
+            Some(user_row(2, "Hopper", false))
+        );
+    }
+
+    #[test]
+    fn tuple_lock_deleted_resolution_restores_acquisition() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        harness
+            .storage
+            .delete(&crate::test_statement_context(2), 1, &original.key)
+            .unwrap();
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(3).with_tuple_lock_manager(locks.clone());
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: original.row_id,
+                xmin: original.xmin,
+                key: original.key,
+            },
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        assert_eq!(result, crate::LockRowResult::Deleted);
+        assert_eq!(locks.restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tuple_lock_rejects_a_row_id_with_the_wrong_logical_key() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(2, "Grace", false))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let first = scan.next().unwrap().unwrap();
+        let second = scan.next().unwrap().unwrap();
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(2).with_tuple_lock_manager(locks.clone());
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+
+        assert_eq!(
+            <PageBackedStorageEngine as StorageEngine>::lock_row(
+                &harness.storage,
+                &ctx,
+                relations.as_ref(),
+                1,
+                &common::RowIdentity {
+                    row_id: first.row_id,
+                    xmin: first.xmin,
+                    key: second.key,
+                },
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Deleted
+        );
+        assert_eq!(locks.restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tuple_lock_rejects_a_same_key_tuple_in_a_vacuum_reused_slot() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "original", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        let stale = common::RowIdentity {
+            row_id: original.row_id,
+            xmin: original.xmin,
+            key: original.key.clone(),
+        };
+
+        harness
+            .storage
+            .delete(&crate::test_statement_context(2), 1, &original.key)
+            .unwrap();
+        assert_eq!(harness.storage.vacuum(&users_schema(), 100).unwrap(), 1);
+        harness
+            .storage
+            .insert(
+                &crate::test_statement_context(3),
+                1,
+                user_row(1, "replacement", false),
+            )
+            .unwrap();
+        let mut replacement_scan = harness
+            .storage
+            .scan(&crate::test_statement_context(3), 1)
+            .unwrap();
+        let replacement = replacement_scan.next().unwrap().unwrap();
+        assert_eq!(replacement.row_id, stale.row_id);
+        assert_ne!(replacement.xmin, stale.xmin);
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(4).with_tuple_lock_manager(locks.clone());
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        assert_eq!(
+            StorageEngine::lock_row(
+                &harness.storage,
+                &ctx,
+                relations.as_ref(),
+                1,
+                &stale,
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Deleted
+        );
+        assert_eq!(locks.restored.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &stale.key).unwrap(),
+            Some(user_row(1, "replacement", false))
+        );
+    }
+
+    #[test]
+    fn exact_mutation_rejects_an_insufficient_tuple_lock_mode() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(2, "Grace", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let stored = scan.next().unwrap().unwrap();
+        let other = scan.next().unwrap().unwrap();
+        let identity = common::RowIdentity {
+            row_id: stored.row_id,
+            xmin: stored.xmin,
+            key: stored.key,
+        };
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+
+        let key_share_ctx = crate::test_statement_context(2)
+            .with_tuple_lock_manager(Arc::new(RecordingTupleLocks::default()));
+        let crate::LockRowResult::Locked(key_share) = StorageEngine::lock_row(
+            &harness.storage,
+            &key_share_ctx,
+            relations.as_ref(),
+            1,
+            &identity,
+            TupleLockMode::KeyShare,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap() else {
+            panic!("row should lock");
+        };
+        let delete_err = StorageEngine::delete_locked(
+            &harness.storage,
+            &key_share_ctx,
+            relations.as_ref(),
+            1,
+            &key_share,
+        )
+        .unwrap_err();
+        assert_eq!(delete_err.code, SqlState::InternalError);
+
+        let synthesized = crate::LockedRow::from_lock_grant(
+            1,
+            key_share_ctx.txn_id,
+            common::RowIdentity {
+                row_id: other.row_id,
+                xmin: other.xmin,
+                key: other.key.clone(),
+            },
+            other.row.clone(),
+            TupleLockMode::Update,
+        );
+        let retarget_err = StorageEngine::delete_locked(
+            &harness.storage,
+            &key_share_ctx,
+            relations.as_ref(),
+            1,
+            &synthesized,
+        )
+        .unwrap_err();
+        assert_eq!(retarget_err.code, SqlState::InternalError);
+
+        let no_key_ctx = crate::test_statement_context(3)
+            .with_tuple_lock_manager(Arc::new(RecordingTupleLocks::default()));
+        let crate::LockRowResult::Locked(no_key) = StorageEngine::lock_row(
+            &harness.storage,
+            &no_key_ctx,
+            relations.as_ref(),
+            1,
+            &identity,
+            TupleLockMode::NoKeyUpdate,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap() else {
+            panic!("row should lock");
+        };
+        let update_err = StorageEngine::update_locked(
+            &harness.storage,
+            &no_key_ctx,
+            relations.as_ref(),
+            1,
+            &no_key,
+            user_row(2, "Ada", true),
+        )
+        .unwrap_err();
+        assert_eq!(update_err.code, SqlState::InternalError);
+
+        let wrong_owner = crate::test_statement_context(4)
+            .with_tuple_lock_manager(Arc::new(RecordingTupleLocks::default()));
+        let owner_err = StorageEngine::update_locked(
+            &harness.storage,
+            &wrong_owner,
+            relations.as_ref(),
+            1,
+            &no_key,
+            user_row(1, "Byron", false),
+        )
+        .unwrap_err();
+        assert_eq!(owner_err.code, SqlState::InternalError);
+
+        let forged_ctx = crate::test_statement_context(5)
+            .with_tuple_lock_manager(Arc::new(RecordingTupleLocks::default()));
+        let other_identity = common::RowIdentity {
+            row_id: other.row_id,
+            xmin: other.xmin,
+            key: other.key,
+        };
+        let crate::LockRowResult::Locked(other_locked) = StorageEngine::lock_row(
+            &harness.storage,
+            &forged_ctx,
+            relations.as_ref(),
+            1,
+            &other_identity,
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap() else {
+            panic!("second row should lock");
+        };
+        let forged_payload = crate::LockedRow::from_lock_grant(
+            1,
+            forged_ctx.txn_id,
+            other_locked.identity().clone(),
+            user_row(999, "forged", false),
+            TupleLockMode::Update,
+        );
+        let payload_err = StorageEngine::delete_locked(
+            &harness.storage,
+            &forged_ctx,
+            relations.as_ref(),
+            1,
+            &forged_payload,
+        )
+        .unwrap_err();
+        assert_eq!(payload_err.code, SqlState::InternalError);
+    }
+
+    #[test]
+    fn ordinary_update_and_delete_wait_for_a_held_tuple_lock() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(2, "Grace", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let rows = [scan.next().unwrap().unwrap(), scan.next().unwrap().unwrap()];
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let storage = Arc::new(harness.storage);
+        let locks = Arc::new(BlockingTestTupleLocks::default());
+
+        let update_holder = crate::test_statement_context(2).with_tuple_lock_manager(locks.clone());
+        let update_identity = common::RowIdentity {
+            row_id: rows[0].row_id,
+            xmin: rows[0].xmin,
+            key: rows[0].key.clone(),
+        };
+        assert!(matches!(
+            StorageEngine::lock_row(
+                storage.as_ref(),
+                &update_holder,
+                relations.as_ref(),
+                1,
+                &update_identity,
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Locked(_)
+        ));
+        let (update_tx, update_rx) = mpsc::channel();
+        let update_storage = storage.clone();
+        let update_relations = relations.clone();
+        let update_locks = locks.clone();
+        let update_thread = std::thread::spawn(move || {
+            let ctx = crate::test_statement_context(3).with_tuple_lock_manager(update_locks);
+            update_tx
+                .send(StorageEngine::update(
+                    update_storage.as_ref(),
+                    &ctx,
+                    update_relations.as_ref(),
+                    1,
+                    &Key(vec![Value::Integer(1)]),
+                    user_row(1, "Updated", false),
+                ))
+                .unwrap();
+        });
+        assert!(update_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        locks.release(2);
+        assert!(
+            update_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+        );
+        update_thread.join().unwrap();
+        locks.release(3);
+
+        let delete_holder = crate::test_statement_context(4).with_tuple_lock_manager(locks.clone());
+        let delete_identity = common::RowIdentity {
+            row_id: rows[1].row_id,
+            xmin: rows[1].xmin,
+            key: rows[1].key.clone(),
+        };
+        assert!(matches!(
+            StorageEngine::lock_row(
+                storage.as_ref(),
+                &delete_holder,
+                relations.as_ref(),
+                1,
+                &delete_identity,
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Locked(_)
+        ));
+        let (delete_tx, delete_rx) = mpsc::channel();
+        let delete_storage = storage.clone();
+        let delete_relations = relations.clone();
+        let delete_locks = locks.clone();
+        let delete_thread = std::thread::spawn(move || {
+            let ctx = crate::test_statement_context(5).with_tuple_lock_manager(delete_locks);
+            delete_tx
+                .send(StorageEngine::delete(
+                    delete_storage.as_ref(),
+                    &ctx,
+                    delete_relations.as_ref(),
+                    1,
+                    &Key(vec![Value::Integer(2)]),
+                ))
+                .unwrap();
+        });
+        assert!(delete_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        locks.release(4);
+        assert!(
+            delete_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+        );
+        delete_thread.join().unwrap();
+    }
+
+    #[test]
+    fn tuple_lock_preserves_hidden_identity_across_hot_successor() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        let mut schema = users_schema();
+        schema.primary_key.clear();
+        harness.storage.create_table(&setup, &schema).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        harness
+            .storage
+            .update(
+                &crate::test_statement_context(2),
+                1,
+                &original.key,
+                user_row(1, "Lovelace", false),
+            )
+            .unwrap();
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(3).with_tuple_lock_manager(locks.clone());
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: original.row_id,
+                xmin: original.xmin,
+                key: original.key.clone(),
+            },
+            TupleLockMode::NoKeyUpdate,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        let crate::LockRowResult::Locked(locked) = result else {
+            panic!("HOT-updated row should resolve to its heap-only successor");
+        };
+        assert_eq!(locked.identity().key, original.key);
+        assert_ne!(locked.identity().row_id, original.row_id);
+        assert_eq!(locked.row(), &user_row(1, "Lovelace", false));
+        assert_eq!(locks.acquired.lock().unwrap().len(), 1);
+
+        assert!(
+            <PageBackedStorageEngine as StorageEngine>::update_locked(
+                &harness.storage,
+                &ctx,
+                relations.as_ref(),
+                1,
+                &locked,
+                user_row(1, "Byron", true),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &original.key).unwrap(),
+            Some(user_row(1, "Byron", true))
+        );
+    }
+
+    #[test]
+    fn heap_only_successor_must_belong_to_the_supplied_hidden_root() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        let mut schema = users_schema();
+        schema.primary_key.clear();
+        harness.storage.create_table(&setup, &schema).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(2, "Grace", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let first = scan.next().unwrap().unwrap();
+        let second = scan.next().unwrap().unwrap();
+        harness
+            .storage
+            .update(
+                &crate::test_statement_context(2),
+                1,
+                &first.key,
+                user_row(1, "Lovelace", false),
+            )
+            .unwrap();
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(3).with_tuple_lock_manager(locks);
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let crate::LockRowResult::Locked(first_successor) = StorageEngine::lock_row(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: first.row_id,
+                xmin: first.xmin,
+                key: first.key,
+            },
+            TupleLockMode::NoKeyUpdate,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap() else {
+            panic!("first HOT successor should resolve");
+        };
+
+        assert_eq!(
+            StorageEngine::lock_row(
+                &harness.storage,
+                &ctx,
+                relations.as_ref(),
+                1,
+                &common::RowIdentity {
+                    row_id: first_successor.identity().row_id,
+                    xmin: first_successor.identity().xmin,
+                    key: second.key,
+                },
+                TupleLockMode::NoKeyUpdate,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Deleted
+        );
+    }
+
+    #[test]
+    fn tuple_lock_honors_wait_policy_for_legacy_in_progress_xmax() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        harness
+            .storage
+            .delete(&crate::test_statement_context(2), 1, &original.key)
+            .unwrap();
+        harness.wal.mark_in_progress(2);
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let identity = common::RowIdentity {
+            row_id: original.row_id,
+            xmin: original.xmin,
+            key: original.key,
+        };
+
+        let no_wait_locks = Arc::new(RecordingTupleLocks::default());
+        let no_wait =
+            crate::test_statement_context(3).with_tuple_lock_manager(no_wait_locks.clone());
+        let err = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &no_wait,
+            relations.as_ref(),
+            1,
+            &identity,
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::NoWait,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::LockNotAvailable);
+        assert_eq!(no_wait_locks.restored.load(Ordering::SeqCst), 1);
+
+        let skip_locks = Arc::new(RecordingTupleLocks::default());
+        let skip = crate::test_statement_context(4).with_tuple_lock_manager(skip_locks.clone());
+        assert_eq!(
+            <PageBackedStorageEngine as StorageEngine>::lock_row(
+                &harness.storage,
+                &skip,
+                relations.as_ref(),
+                1,
+                &identity,
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::SkipLocked,
+            )
+            .unwrap(),
+            crate::LockRowResult::Skipped
+        );
+        assert_eq!(skip_locks.restored.load(Ordering::SeqCst), 1);
+
+        let block_locks = Arc::new(RecordingTupleLocks::default());
+        let block = crate::test_statement_context(5)
+            .with_tuple_lock_manager(block_locks)
+            .with_conflict_waiter(
+                Arc::new(AbortBlockerOnWait {
+                    wal: harness.wal.clone(),
+                }),
+                Arc::new(QueryCancel::new()),
+            );
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &block,
+            relations.as_ref(),
+            1,
+            &identity,
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        let crate::LockRowResult::Locked(locked) = result else {
+            panic!("an aborted legacy deleter should leave the predecessor live");
+        };
+        assert_eq!(locked.row(), &user_row(1, "Ada", true));
+    }
+
+    #[test]
+    fn tuple_lock_materializes_external_successor_outside_scan_snapshot() {
+        let harness = StorageHarness::new();
+        let insert_ctx = crate::test_statement_context(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text("old note".to_string()),
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+        let mut scan = harness.storage.scan(&insert_ctx, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(false),
+                Value::Text("new external note ".repeat(700)),
+            ],
+        };
+        harness
+            .storage
+            .update(
+                &crate::test_statement_context(2),
+                1,
+                &original.key,
+                new_row.clone(),
+            )
+            .unwrap();
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let old_snapshot = StatementContext::with_snapshot(
+            10,
+            Arc::new(common::Snapshot {
+                xmin: 1,
+                xmax: 2,
+                xip: Vec::new(),
+            }),
+        )
+        .with_tuple_lock_manager(locks);
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &old_snapshot,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: original.row_id,
+                xmin: original.xmin,
+                key: original.key,
+            },
+            TupleLockMode::NoKeyUpdate,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        let crate::LockRowResult::Locked(locked) = result else {
+            panic!("committed successor should resolve despite the scan snapshot");
+        };
+        assert_eq!(locked.row(), &new_row);
+    }
+
+    #[test]
+    fn compressed_text_primary_key_can_be_locked_updated_and_deleted() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.primary_key = vec![1];
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&setup, &base).unwrap();
+        harness.storage.create_table(&setup, &toast).unwrap();
+        let primary_key = "compressible-primary-key".repeat(65);
+        let original = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(primary_key.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+        harness.storage.insert(&setup, 1, original.clone()).unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let stored = scan.next().unwrap().unwrap();
+        let physical = physical_row_at(
+            &harness,
+            &base,
+            RowLocation {
+                file_id: heap_file_id(base.storage_id),
+                page_num: stored.row_id.page_num,
+                slot_num: stored.row_id.slot_num,
+            },
+        );
+        assert!(matches!(
+            physical.values[1],
+            DecodedPhysicalValue::Compressed { .. }
+        ));
+
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let lock_ctx = crate::test_statement_context(2).with_tuple_lock_manager(locks);
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        assert!(matches!(
+            StorageEngine::lock_row(
+                &harness.storage,
+                &lock_ctx,
+                relations.as_ref(),
+                1,
+                &common::RowIdentity {
+                    row_id: stored.row_id,
+                    xmin: stored.xmin,
+                    key: stored.key.clone(),
+                },
+                TupleLockMode::NoKeyUpdate,
+                TupleLockWaitPolicy::Block,
+            )
+            .unwrap(),
+            crate::LockRowResult::Locked(_)
+        ));
+
+        let updated = Row {
+            values: vec![
+                Value::Integer(2),
+                Value::Text(primary_key),
+                Value::Boolean(false),
+                Value::Null,
+            ],
+        };
+        assert!(
+            harness
+                .storage
+                .update(&lock_ctx, 1, &stored.key, updated)
+                .unwrap()
+        );
+        assert!(
+            harness
+                .storage
+                .delete(&crate::test_statement_context(3), 1, &stored.key)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn locked_mutation_rejects_a_target_that_advanced_after_locking() {
+        let harness = StorageHarness::new();
+        let setup = crate::test_statement_context(1);
+        harness.create_users_table(&setup).unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let original = scan.next().unwrap().unwrap();
+        let locks = Arc::new(RecordingTupleLocks::default());
+        let ctx = crate::test_statement_context(2).with_tuple_lock_manager(locks);
+        let relations = harness.storage.capture_relation_snapshot().unwrap();
+        let result = <PageBackedStorageEngine as StorageEngine>::lock_row(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &common::RowIdentity {
+                row_id: original.row_id,
+                xmin: original.xmin,
+                key: original.key.clone(),
+            },
+            TupleLockMode::Update,
+            TupleLockWaitPolicy::Block,
+        )
+        .unwrap();
+        let crate::LockRowResult::Locked(locked) = result else {
+            panic!("row should lock");
+        };
+
+        harness
+            .storage
+            .update(
+                &crate::test_statement_context(3),
+                1,
+                &original.key,
+                user_row(1, "Grace", false),
+            )
+            .unwrap();
+        let err = <PageBackedStorageEngine as StorageEngine>::update_locked(
+            &harness.storage,
+            &ctx,
+            relations.as_ref(),
+            1,
+            &locked,
+            user_row(1, "Byron", true),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(
+            harness
+                .storage
+                .get(&crate::test_statement_context(4), 1, &pk(1))
+                .unwrap(),
+            Some(user_row(1, "Grace", false))
+        );
+    }
+
+    #[test]
     fn recovery_apply_ddl_does_not_append_wal() {
         let harness = StorageHarness::new();
         harness.storage.apply_create_table(users_schema()).unwrap();
@@ -173,7 +1116,7 @@ mod tests {
         harness
             .storage
             .create_sequence(
-                &StatementContext::new(1),
+                &crate::test_statement_context(1),
                 &sequence_schema(7, "users_id_seq", 1, 1, 3, 1, false),
             )
             .unwrap();
@@ -194,7 +1137,7 @@ mod tests {
         harness
             .storage
             .create_sequence(
-                &StatementContext::new(1),
+                &crate::test_statement_context(1),
                 &sequence_schema(7, "users_id_seq", 1, 1, 10, 1, false),
             )
             .unwrap();
@@ -215,7 +1158,7 @@ mod tests {
         );
         storage
             .create_sequence(
-                &StatementContext::new(1),
+                &crate::test_statement_context(1),
                 &sequence_schema(7, "users_id_seq", 1, 1, 10, 1, false),
             )
             .unwrap();
@@ -248,7 +1191,7 @@ mod tests {
         harness
             .storage
             .create_sequence(
-                &StatementContext::new(1),
+                &crate::test_statement_context(1),
                 &sequence_schema(8, "bounded", 1, 1, 2, 1, false),
             )
             .unwrap();
@@ -260,7 +1203,7 @@ mod tests {
         harness
             .storage
             .create_sequence(
-                &StatementContext::new(3),
+                &crate::test_statement_context(3),
                 &sequence_schema(9, "cycling", 1, 1, 2, 1, true),
             )
             .unwrap();
@@ -271,7 +1214,7 @@ mod tests {
         harness
             .storage
             .create_sequence(
-                &StatementContext::new(5),
+                &crate::test_statement_context(5),
                 &sequence_schema(10, "settable", 5, 1, 20, 1, false),
             )
             .unwrap();
@@ -293,7 +1236,7 @@ mod tests {
     #[test]
     fn failed_heap_insert_wal_append_does_not_leave_tuple_bytes() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
 
         // A first insert into an empty heap appends HeapInit, initializes the page,
@@ -323,7 +1266,7 @@ mod tests {
     #[test]
     fn failed_heap_init_append_does_not_leave_dirty_zero_page() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness.buffer.mark_all_clean().unwrap();
 
@@ -379,7 +1322,7 @@ mod tests {
     #[test]
     fn failed_heap_insert_fpi_append_restores_page_and_fpi_flag() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -418,7 +1361,7 @@ mod tests {
     #[test]
     fn failed_xmax_fpi_append_does_not_stamp_header_and_restores_fpi_flag() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
+        let insert_ctx = crate::test_statement_context(1);
         harness.create_users_table(&insert_ctx).unwrap();
         harness
             .storage
@@ -427,7 +1370,7 @@ mod tests {
         harness.buffer.mark_all_clean().unwrap();
 
         harness.wal.fail_next_full_page_image();
-        let delete_ctx = StatementContext::new(2);
+        let delete_ctx = crate::test_statement_context(2);
         let err = harness
             .storage
             .delete(&delete_ctx, 1, &Key(vec![Value::Integer(1)]))
@@ -448,7 +1391,7 @@ mod tests {
         );
         drop(page);
 
-        let retry_ctx = StatementContext::new(3);
+        let retry_ctx = crate::test_statement_context(3);
         assert!(
             harness
                 .storage
@@ -465,7 +1408,7 @@ mod tests {
     #[test]
     fn failed_xmax_delta_append_does_not_stamp_header() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
+        let insert_ctx = crate::test_statement_context(1);
         harness.create_users_table(&insert_ctx).unwrap();
         harness
             .storage
@@ -477,7 +1420,7 @@ mod tests {
             .unwrap();
 
         harness.wal.fail_next_heap_update_header();
-        let delete_ctx = StatementContext::new(2);
+        let delete_ctx = crate::test_statement_context(2);
         let err = harness
             .storage
             .delete(&delete_ctx, 1, &Key(vec![Value::Integer(1)]))
@@ -501,7 +1444,7 @@ mod tests {
     #[test]
     fn failed_xmax_preflight_restores_fpi_flag_without_wal() {
         let harness = StorageHarness::new();
-        let setup_ctx = StatementContext::new(1);
+        let setup_ctx = crate::test_statement_context(1);
         harness.create_users_table(&setup_ctx).unwrap();
 
         let mut page = harness.buffer.new_page(1, setup_ctx.txn_id).unwrap();
@@ -529,7 +1472,11 @@ mod tests {
         let before = harness.wal.record_count();
         let err = harness
             .storage
-            .delete(&StatementContext::new(2), 1, &Key(vec![Value::Integer(1)]))
+            .delete(
+                &crate::test_statement_context(2),
+                1,
+                &Key(vec![Value::Integer(1)]),
+            )
             .unwrap_err();
         assert!(
             err.message.contains("cannot mutate header"),
@@ -543,7 +1490,11 @@ mod tests {
 
         harness
             .storage
-            .insert(&StatementContext::new(3), 1, user_row(2, "Grace", true))
+            .insert(
+                &crate::test_statement_context(3),
+                1,
+                user_row(2, "Grace", true),
+            )
             .unwrap();
         assert_eq!(
             harness.wal.full_page_image_count(1),
@@ -559,7 +1510,7 @@ mod tests {
         let wal = Arc::new(wal::FileWalManager::open(dir.path().join("wal.dat")).unwrap());
         let storage =
             PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         storage.create_table(&ctx, &users_schema()).unwrap();
         storage.create_index(&ctx, &name_index(false), 0).unwrap();
         wal.flush().unwrap();
@@ -575,7 +1526,7 @@ mod tests {
     #[test]
     fn storage_routes_files_by_storage_id_not_logical_id() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut schema = users_schema();
         schema.id = 2;
         schema.storage_id = 42;
@@ -665,7 +1616,7 @@ mod tests {
     #[test]
     fn duplicate_insert_returns_unique_violation_without_replacing_row() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -690,7 +1641,7 @@ mod tests {
     #[test]
     fn primary_key_null_is_rejected_by_storage_insert() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness
             .storage
             .create_table(&ctx, &nullable_primary_key_users_schema())
@@ -707,7 +1658,7 @@ mod tests {
     #[test]
     fn primary_key_null_is_rejected_by_storage_update() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness
             .storage
             .create_table(&ctx, &nullable_primary_key_users_schema())
@@ -740,7 +1691,7 @@ mod tests {
     #[test]
     fn scan_range_walks_primary_key_directory_in_key_order() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -774,7 +1725,7 @@ mod tests {
     #[test]
     fn set_table_primary_key_rebuilds_storage_identity() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut heap_schema = users_schema();
         heap_schema.primary_key.clear();
         harness.storage.create_table(&ctx, &heap_schema).unwrap();
@@ -815,7 +1766,7 @@ mod tests {
     #[test]
     fn set_table_primary_key_rebuilds_current_storage_generation() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut heap_schema = users_schema();
         heap_schema.storage_id = 42;
         heap_schema.primary_key.clear();
@@ -853,7 +1804,7 @@ mod tests {
     #[test]
     fn logged_set_table_primary_key_emits_identity_index_fpis() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut heap_schema = users_schema();
         heap_schema.primary_key.clear();
         harness.storage.create_table(&ctx, &heap_schema).unwrap();
@@ -890,7 +1841,7 @@ mod tests {
         let harness = StorageHarness::new();
         let mut heap_schema = users_schema();
         heap_schema.primary_key.clear();
-        let setup = StatementContext::new(1);
+        let setup = crate::test_statement_context(1);
         harness.storage.create_table(&setup, &heap_schema).unwrap();
         harness
             .storage
@@ -905,7 +1856,7 @@ mod tests {
         let hidden_key = scan.next().unwrap().unwrap().key;
         assert!(scan.next().unwrap().is_none());
 
-        let update = StatementContext::new(2);
+        let update = crate::test_statement_context(2);
         harness
             .storage
             .update(&update, 1, &hidden_key, user_row(1, "Lovelace", true))
@@ -915,7 +1866,7 @@ mod tests {
         pk_schema.primary_key = vec![0];
         harness
             .storage
-            .validate_table_primary_key_change(&StatementContext::new(3), &pk_schema, 1)
+            .validate_table_primary_key_change(&crate::test_statement_context(3), &pk_schema, 1)
             .unwrap();
         harness
             .storage
@@ -925,7 +1876,11 @@ mod tests {
         assert_eq!(
             harness
                 .storage
-                .get(&StatementContext::new(4), 1, &Key(vec![Value::Integer(1)]))
+                .get(
+                    &crate::test_statement_context(4),
+                    1,
+                    &Key(vec![Value::Integer(1)])
+                )
                 .unwrap(),
             Some(user_row(1, "Lovelace", true))
         );
@@ -936,7 +1891,7 @@ mod tests {
         let harness = StorageHarness::new();
         let mut heap_schema = users_schema();
         heap_schema.primary_key.clear();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.storage.create_table(&ctx, &heap_schema).unwrap();
         harness
             .storage
@@ -959,7 +1914,7 @@ mod tests {
     #[test]
     fn scan_returns_stored_row_identity_and_bounded_range() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -997,7 +1952,7 @@ mod tests {
     #[test]
     fn reopened_engine_reads_rows_through_durable_index() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1032,9 +1987,9 @@ mod tests {
         // VISIBILITY, the new abort contract.)
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext::new(0))
+            .create_users_table(&crate::test_statement_context(0))
             .unwrap();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness
             .storage
             .insert(&ctx, 1, user_row(1, "Ada", true))
@@ -1048,7 +2003,11 @@ mod tests {
         assert_eq!(
             harness
                 .storage
-                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
+                .get(
+                    &crate::test_statement_context(0),
+                    1,
+                    &Key(vec![Value::Integer(1)])
+                )
                 .unwrap(),
             None
         );
@@ -1068,9 +2027,9 @@ mod tests {
         // metadata, not before-image page undo, so it survives D1).
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext::new(0))
+            .create_users_table(&crate::test_statement_context(0))
             .unwrap();
-        let insert_ctx = StatementContext::new(1);
+        let insert_ctx = crate::test_statement_context(1);
         harness
             .storage
             .insert(&insert_ctx, 1, user_row(1, "Ada", true))
@@ -1078,7 +2037,7 @@ mod tests {
         harness.storage.commit_txn(insert_ctx.txn_id).unwrap();
         harness.buffer.commit(insert_ctx.txn_id).unwrap();
 
-        let update_ctx = StatementContext::new(2);
+        let update_ctx = crate::test_statement_context(2);
         harness
             .storage
             .update(
@@ -1096,19 +2055,27 @@ mod tests {
         assert_eq!(
             harness
                 .storage
-                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
+                .get(
+                    &crate::test_statement_context(0),
+                    1,
+                    &Key(vec![Value::Integer(1)])
+                )
                 .unwrap(),
             Some(user_row(1, "Ada", true))
         );
 
-        let drop_ctx = StatementContext::new(3);
+        let drop_ctx = crate::test_statement_context(3);
         harness.storage.drop_table(&drop_ctx, 1).unwrap();
         harness.storage.rollback_txn(drop_ctx.txn_id).unwrap();
 
         assert_eq!(
             harness
                 .storage
-                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
+                .get(
+                    &crate::test_statement_context(0),
+                    1,
+                    &Key(vec![Value::Integer(1)])
+                )
                 .unwrap(),
             Some(user_row(1, "Ada", true))
         );
@@ -1123,7 +2090,7 @@ mod tests {
         // buffer pool removed the new page on rollback; updated to assert the page
         // REMAINS and the row is invisible, matching the recovered state.)
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let large_row = Row {
@@ -1137,7 +2104,7 @@ mod tests {
         harness.storage.commit_txn(ctx.txn_id).unwrap();
         harness.buffer.commit(ctx.txn_id).unwrap();
 
-        let failed_ctx = StatementContext::new(2);
+        let failed_ctx = crate::test_statement_context(2);
         // This row needs a second heap page (page 1 of file 2): the first page is
         // full of the committed large row.
         harness
@@ -1152,7 +2119,11 @@ mod tests {
         assert_eq!(
             harness
                 .storage
-                .get(&StatementContext::new(0), 2, &Key(vec![Value::Integer(2)]))
+                .get(
+                    &crate::test_statement_context(0),
+                    2,
+                    &Key(vec![Value::Integer(2)])
+                )
                 .unwrap(),
             None
         );
@@ -1170,7 +2141,7 @@ mod tests {
     #[test]
     fn insert_accepts_row_that_fills_single_page_payload_capacity() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
@@ -1196,7 +2167,7 @@ mod tests {
     #[test]
     fn insert_rejects_row_too_large_before_allocating_page() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
@@ -1236,7 +2207,7 @@ mod tests {
     #[test]
     fn insert_allocates_new_page_when_first_page_has_no_next_slot_space() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let large_row = Row {
@@ -1273,7 +2244,7 @@ mod tests {
     #[test]
     fn create_index_backfills_existing_rows() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1302,7 +2273,7 @@ mod tests {
     #[test]
     fn dml_keeps_secondary_index_in_sync() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1334,7 +2305,7 @@ mod tests {
     #[test]
     fn non_unique_index_returns_every_row_for_a_value() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1357,7 +2328,7 @@ mod tests {
     #[test]
     fn index_scan_returns_a_range_in_index_order() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1391,7 +2362,7 @@ mod tests {
     #[test]
     fn unique_index_rejects_duplicate_value_on_insert() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1412,7 +2383,7 @@ mod tests {
     #[test]
     fn unique_index_backfill_rejects_duplicate_existing_values() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1433,7 +2404,7 @@ mod tests {
     #[test]
     fn unique_index_allows_multiple_nulls() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1463,7 +2434,7 @@ mod tests {
         // must return the row's current contents — which only holds if the entry's
         // value is the heap TID, not the (unchanged) primary key.
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1496,7 +2467,7 @@ mod tests {
         // A non-unique secondary point scan returns every row sharing the indexed
         // value, each resolved straight to its heap TID.
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1521,7 +2492,7 @@ mod tests {
         // differing heap TIDs rather than an embedded primary key. A scan of the
         // NULL key returns every such row.
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1560,7 +2531,7 @@ mod tests {
         // the temporary presence-probe, even though the key no longer embeds the
         // primary key as a tiebreaker.
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1581,7 +2552,7 @@ mod tests {
     #[test]
     fn dropped_index_is_not_maintained_but_existing_entries_remain_scannable() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1622,9 +2593,9 @@ mod tests {
     fn rollback_removes_a_created_index() {
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext::new(0))
+            .create_users_table(&crate::test_statement_context(0))
             .unwrap();
-        let ctx = StatementContext::new(5);
+        let ctx = crate::test_statement_context(5);
         harness
             .storage
             .create_index(&ctx, &name_index(false), 0)
@@ -1635,7 +2606,7 @@ mod tests {
 
         let err = harness
             .storage
-            .index_scan(&StatementContext::new(6), 1, 1, &KeyRange::All)
+            .index_scan(&crate::test_statement_context(6), 1, 1, &KeyRange::All)
             .err()
             .expect("rolled-back index should not be scannable");
         assert_eq!(err.code, SqlState::UndefinedTable);
@@ -1644,7 +2615,7 @@ mod tests {
     #[test]
     fn drop_table_cascades_to_its_secondary_indexes() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -1670,7 +2641,7 @@ mod tests {
     #[test]
     fn drop_table_cascades_to_hidden_toast_relation_metadata() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut base = users_schema();
         base.toast_table_id = Some(2);
         let mut toast = users_schema();
@@ -1692,7 +2663,7 @@ mod tests {
     #[test]
     fn recovery_toast_metadata_update_is_wal_free_and_drives_drop_cascade() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let base = users_schema();
         let mut toast_relation = users_schema();
         toast_relation.id = 2;
@@ -1755,7 +2726,7 @@ mod tests {
     #[test]
     fn toast_value_id_allocator_seeds_from_physical_chunk_rows() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1825,7 +2796,7 @@ mod tests {
     #[test]
     fn toast_value_id_allocator_seeds_from_aborted_physical_chunk_rows() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(77);
+        let ctx = crate::test_statement_context(77);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1850,7 +2821,7 @@ mod tests {
     #[test]
     fn toast_value_id_allocator_rejects_ids_past_i64_max() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1875,7 +2846,7 @@ mod tests {
     #[test]
     fn write_toast_stream_creates_expected_chunks() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1912,7 +2883,7 @@ mod tests {
     #[test]
     fn read_toast_stream_reconstructs_exact_stream() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1951,7 +2922,7 @@ mod tests {
     #[test]
     fn read_toast_stream_rejects_missing_sequence() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -1986,7 +2957,7 @@ mod tests {
     #[test]
     fn read_toast_stream_rejects_duplicate_sequence() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2034,7 +3005,7 @@ mod tests {
     #[test]
     fn read_toast_stream_rejects_wrong_stored_length() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2070,7 +3041,7 @@ mod tests {
     #[test]
     fn write_toast_stream_requires_hidden_toast_relation() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let base = users_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         let relations = harness
@@ -2091,7 +3062,7 @@ mod tests {
     #[test]
     fn prepare_row_under_target_with_no_eligible_values_stays_plain() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2111,7 +3082,7 @@ mod tests {
     #[test]
     fn prepare_hidden_toast_relation_does_not_recurse() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2132,7 +3103,7 @@ mod tests {
     #[test]
     fn prepare_legacy_table_without_toast_relation_stays_plain() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, _) = base_and_toast_schema();
         base.toast_table_id = None;
         base.toast.min_value_size = 128;
@@ -2156,7 +3127,7 @@ mod tests {
     #[test]
     fn prepare_medium_compressible_text_under_target_becomes_inline_compressed() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -2195,7 +3166,7 @@ mod tests {
     #[test]
     fn external_array_is_toasted_and_materialized_on_read() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, _) = bytea_base_and_toast_schema();
         base.columns[1].data_type =
             DataType::Array(common::ArrayType::new(DataType::Integer).unwrap());
@@ -2250,7 +3221,7 @@ mod tests {
     #[test]
     fn legacy_table_rejects_oversized_array_before_row_materialization() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, _) = array_base_and_toast_schema();
         base.toast_table_id = None;
         harness.storage.create_table(&ctx, &base).unwrap();
@@ -2278,7 +3249,7 @@ mod tests {
     #[test]
     fn inline_compressed_array_is_materialized_on_read() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, _) = array_base_and_toast_schema();
         base.toast.compression = ToastCompression::Zstd;
         base.toast.tuple_target = 2048;
@@ -2312,7 +3283,7 @@ mod tests {
     #[test]
     fn compressed_external_array_is_materialized_on_read() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, _) = array_base_and_toast_schema();
         base.toast.compression = ToastCompression::Zstd;
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
@@ -2341,7 +3312,7 @@ mod tests {
     #[test]
     fn array_primary_key_supports_insert_get_and_exact_range_scan() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let mut schema = users_schema();
         schema.columns.truncate(2);
         schema.columns[0].data_type =
@@ -2373,7 +3344,7 @@ mod tests {
     #[test]
     fn prepare_default_auto_uses_1024_min_value_size() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         harness.storage.create_table(&ctx, &base).unwrap();
@@ -2396,7 +3367,7 @@ mod tests {
     #[test]
     fn prepare_aggressive_uses_256_min_value_size() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.mode = ToastMode::Aggressive;
@@ -2428,7 +3399,7 @@ mod tests {
     #[test]
     fn prepare_incompressible_large_bytea_externalizes_raw_stream() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2467,7 +3438,7 @@ mod tests {
     #[test]
     fn prepare_zstd_dict_inline_records_dictionary_id() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -2508,7 +3479,7 @@ mod tests {
     #[test]
     fn prepare_zstd_dict_external_stream_records_dictionary_id_and_crc() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = dict_external_base_and_toast_schema();
         base.toast.compression = ToastCompression::ZstdDict;
         base.toast.active_dict_id = Some(7);
@@ -2550,8 +3521,8 @@ mod tests {
     #[test]
     fn sample_toast_values_skips_invisible_tuple_before_varlena_decode() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let sample_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let sample_ctx = crate::test_statement_context(2);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -2594,8 +3565,8 @@ mod tests {
     #[test]
     fn sample_toast_values_observes_statement_cancellation() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let sample_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let sample_ctx = crate::test_statement_context(2);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -2626,8 +3597,8 @@ mod tests {
     #[test]
     fn sample_toast_values_skips_oversized_inline_compressed_before_decompress() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
-        let sample_ctx = StatementContext::new(2);
+        let ctx = crate::test_statement_context(1);
+        let sample_ctx = crate::test_statement_context(2);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2667,8 +3638,8 @@ mod tests {
     #[test]
     fn sample_toast_values_skips_oversized_external_before_reading_chunks() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
-        let sample_ctx = StatementContext::new(2);
+        let ctx = crate::test_statement_context(1);
+        let sample_ctx = crate::test_statement_context(2);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2707,7 +3678,7 @@ mod tests {
     #[test]
     fn prepare_externalizes_largest_value_first() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = two_bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2738,7 +3709,7 @@ mod tests {
     #[test]
     fn prepare_non_toastable_row_over_page_limit_is_rejected() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let schema = integer_heavy_schema(1100);
         harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
@@ -2765,7 +3736,7 @@ mod tests {
     #[test]
     fn prepare_toast_off_rejects_row_that_requires_externalization() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = bytea_base_and_toast_schema();
         base.toast.mode = ToastMode::Off;
         harness.storage.create_table(&ctx, &base).unwrap();
@@ -2795,7 +3766,7 @@ mod tests {
     #[test]
     fn prepare_rejects_after_all_candidates_externalized_without_chunks() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = wide_bytea_base_and_toast_schema(1100);
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2824,7 +3795,7 @@ mod tests {
     #[test]
     fn prepare_oversized_indexed_text_rejects_before_writing_chunks() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -2864,7 +3835,7 @@ mod tests {
     #[test]
     fn read_materializes_inline_compressed_text_for_get_scan_and_index_scan() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -2933,7 +3904,7 @@ mod tests {
     #[test]
     fn read_materializes_external_bytea_for_get_and_scan() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2973,7 +3944,7 @@ mod tests {
     #[test]
     fn read_visible_external_value_with_missing_chunks_errors() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -2989,8 +3960,8 @@ mod tests {
     #[test]
     fn read_skips_invisible_external_value_without_touching_missing_chunks() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(10);
-        let read_ctx = StatementContext::new(20);
+        let insert_ctx = crate::test_statement_context(10);
+        let read_ctx = crate::test_statement_context(20);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -3013,7 +3984,7 @@ mod tests {
     #[test]
     fn read_rejects_inline_crc_mismatch() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -3047,7 +4018,7 @@ mod tests {
     #[test]
     fn insert_large_text_writes_toast_and_reads_logical_value() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3097,7 +4068,7 @@ mod tests {
     #[test]
     fn insert_large_bytea_round_trips() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -3117,7 +4088,7 @@ mod tests {
     #[test]
     fn primary_key_conflict_ignores_toast_physical_pointer() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
@@ -3149,7 +4120,7 @@ mod tests {
     #[test]
     fn create_index_backfills_toasted_logical_values() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext::new(1);
+        let ctx = crate::test_statement_context(1);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3186,8 +4157,8 @@ mod tests {
     #[test]
     fn create_index_skips_aborted_toasted_rows_before_detoast() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let index_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let index_ctx = crate::test_statement_context(2);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3231,8 +4202,8 @@ mod tests {
     #[test]
     fn update_toasted_value_creates_new_value_id() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -3264,16 +4235,16 @@ mod tests {
     #[test]
     fn update_non_toast_column_retoasts_owned_value_and_old_snapshot_reads_old_value() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
-        let old_snapshot_ctx = StatementContext::with_snapshot(
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
+        let old_snapshot_ctx = crate::with_test_tuple_locks(StatementContext::with_snapshot(
             10,
             Arc::new(common::Snapshot {
                 xmin: 1,
                 xmax: 2,
                 xip: Vec::new(),
             }),
-        );
+        ));
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3326,8 +4297,8 @@ mod tests {
     #[test]
     fn update_inline_toastable_text_uses_hot() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.compression = ToastCompression::None;
@@ -3391,8 +4362,8 @@ mod tests {
     #[test]
     fn update_inline_compressed_toastable_text_uses_hot() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3456,8 +4427,8 @@ mod tests {
     #[test]
     fn update_external_toastable_text_falls_back_to_normal_update() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3522,8 +4493,8 @@ mod tests {
     #[test]
     fn update_inline_to_external_toastable_text_falls_back_to_normal_update() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let (mut base, toast) = base_and_toast_schema();
         base.toast = ToastOptions::default_new_table();
         base.toast.min_value_size = 128;
@@ -3587,8 +4558,8 @@ mod tests {
     #[test]
     fn update_toast_enabled_row_above_target_without_candidates_uses_hot() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let update_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let update_ctx = crate::test_statement_context(2);
         let integer_columns = 270;
         let (base, toast) = wide_bytea_base_and_toast_schema(integer_columns);
         harness.storage.create_table(&insert_ctx, &base).unwrap();
@@ -3645,8 +4616,8 @@ mod tests {
     #[test]
     fn vacuum_rejects_toast_parent_when_chunk_cleanup_pending() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let delete_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let delete_ctx = crate::test_statement_context(2);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -3671,9 +4642,9 @@ mod tests {
     #[test]
     fn vacuum_toast_cleanup_deletes_chunks_before_parent_prune() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let delete_ctx = StatementContext::new(2);
-        let cleanup_ctx = StatementContext::new(3);
+        let insert_ctx = crate::test_statement_context(1);
+        let delete_ctx = crate::test_statement_context(2);
+        let cleanup_ctx = crate::test_statement_context(3);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -3725,8 +4696,8 @@ mod tests {
     #[test]
     fn vacuum_hidden_toast_relation_reclaims_aborted_chunks() {
         let harness = StorageHarness::new();
-        let insert_ctx = StatementContext::new(1);
-        let read_ctx = StatementContext::new(2);
+        let insert_ctx = crate::test_statement_context(1);
+        let read_ctx = crate::test_statement_context(2);
         let (base, toast) = bytea_base_and_toast_schema();
         harness.storage.create_table(&insert_ctx, &base).unwrap();
         harness.storage.create_table(&insert_ctx, &toast).unwrap();
@@ -3808,7 +4779,7 @@ mod tests {
     fn index_ids(harness: &StorageHarness, name: &str) -> Vec<i64> {
         let iter = harness
             .storage
-            .index_scan(&StatementContext::new(1), 1, 1, &name_eq(name))
+            .index_scan(&crate::test_statement_context(1), 1, 1, &name_eq(name))
             .unwrap();
         collect(iter)
             .into_iter()
@@ -3922,6 +4893,123 @@ mod tests {
         wal: Arc<CountingWal>,
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingTupleLocks {
+        acquired: std::sync::Mutex<Vec<TupleLockTag>>,
+        grants: std::sync::Mutex<std::collections::BTreeMap<TupleLockTag, TupleLockMode>>,
+        restored: AtomicUsize,
+    }
+
+    struct AbortBlockerOnWait {
+        wal: Arc<CountingWal>,
+    }
+
+    impl std::fmt::Debug for AbortBlockerOnWait {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("AbortBlockerOnWait")
+        }
+    }
+
+    impl ConflictWaiter for AbortBlockerOnWait {
+        fn wait_for(&self, _waiter: u64, blocker: u64, _cancel: &QueryCancel) -> Result<()> {
+            self.wal.mark_aborted(blocker);
+            Ok(())
+        }
+    }
+
+    impl TupleLockManager for RecordingTupleLocks {
+        fn acquire_tuple(
+            &self,
+            _xid: TxnId,
+            tag: &TupleLockTag,
+            mode: TupleLockMode,
+            _wait_policy: TupleLockWaitPolicy,
+            _cancel: &common::QueryCancel,
+        ) -> Result<TupleLockAcquire> {
+            self.acquired.lock().unwrap().push(tag.clone());
+            self.grants
+                .lock()
+                .unwrap()
+                .entry(tag.clone())
+                .and_modify(|held| *held = (*held).max(mode))
+                .or_insert(mode);
+            Ok(TupleLockAcquire::Acquired(
+                TupleLockGrantChange::manager_receipt(()),
+            ))
+        }
+
+        fn restore_tuple_grants(
+            &self,
+            _xid: TxnId,
+            changes: Vec<TupleLockGrantChange>,
+        ) -> Result<()> {
+            self.restored.fetch_add(changes.len(), Ordering::SeqCst);
+            if !changes.is_empty() {
+                self.grants.lock().unwrap().clear();
+            }
+            Ok(())
+        }
+
+        fn holds_tuple(&self, _xid: TxnId, tag: &TupleLockTag, mode: TupleLockMode) -> bool {
+            self.grants
+                .lock()
+                .unwrap()
+                .get(tag)
+                .is_some_and(|held| *held >= mode)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingTestTupleLocks {
+        owner: Mutex<Option<TxnId>>,
+        released: Condvar,
+    }
+
+    impl BlockingTestTupleLocks {
+        fn release(&self, xid: TxnId) {
+            let mut owner = self.owner.lock().unwrap();
+            assert_eq!(*owner, Some(xid));
+            *owner = None;
+            self.released.notify_all();
+        }
+    }
+
+    impl TupleLockManager for BlockingTestTupleLocks {
+        fn acquire_tuple(
+            &self,
+            xid: TxnId,
+            _tag: &TupleLockTag,
+            _mode: TupleLockMode,
+            _wait_policy: TupleLockWaitPolicy,
+            cancel: &QueryCancel,
+        ) -> Result<TupleLockAcquire> {
+            let mut owner = self.owner.lock().unwrap();
+            while owner.is_some_and(|owner| owner != xid) {
+                cancel.check()?;
+                owner = self.released.wait(owner).unwrap();
+            }
+            *owner = Some(xid);
+            Ok(TupleLockAcquire::Acquired(
+                TupleLockGrantChange::manager_receipt(()),
+            ))
+        }
+
+        fn restore_tuple_grants(
+            &self,
+            xid: TxnId,
+            changes: Vec<TupleLockGrantChange>,
+        ) -> Result<()> {
+            if !changes.is_empty() && *self.owner.lock().unwrap() == Some(xid) {
+                self.release(xid);
+            }
+            Ok(())
+        }
+
+        fn holds_tuple(&self, xid: TxnId, _tag: &TupleLockTag, _mode: TupleLockMode) -> bool {
+            *self.owner.lock().unwrap() == Some(xid)
+        }
+    }
+
     impl StorageHarness {
         fn new() -> Self {
             let buffer = Arc::new(MemoryBufferPool::empty(64));
@@ -3956,6 +5044,7 @@ mod tests {
         /// the CLOG rather than by physical undo, so a test that rolls a txn back
         /// marks it here to model `CLOG[txn] = Aborted` and assert invisibility.
         aborted: std::sync::Mutex<std::collections::HashSet<TxnId>>,
+        in_progress: std::sync::Mutex<std::collections::HashSet<TxnId>>,
     }
 
     impl CountingWal {
@@ -4002,7 +5091,12 @@ mod tests {
         /// Model `CLOG[txn] = Aborted` so the visibility predicate hides the txn's
         /// (physically retained, no-undo) rows.
         fn mark_aborted(&self, txn_id: TxnId) {
+            self.in_progress.lock().unwrap().remove(&txn_id);
             self.aborted.lock().unwrap().insert(txn_id);
+        }
+
+        fn mark_in_progress(&self, txn_id: TxnId) {
+            self.in_progress.lock().unwrap().insert(txn_id);
         }
     }
 
@@ -4110,6 +5204,8 @@ mod tests {
         fn status(&self, txn_id: TxnId) -> TxnStatus {
             if self.aborted.lock().unwrap().contains(&txn_id) {
                 TxnStatus::Aborted
+            } else if self.in_progress.lock().unwrap().contains(&txn_id) {
+                TxnStatus::InProgress
             } else {
                 TxnStatus::Committed
             }

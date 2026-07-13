@@ -2,8 +2,9 @@ use std::any::Any;
 
 use crate::{Key, QueryCancel, Result, TableId, TxnId};
 
-/// Logical identity of a row lock. The key is the table's primary key or its
-/// stable hidden heap identity, so it survives non-key updates and HOT moves.
+/// Logical identity of a row lock. The key is the table's primary key or a hidden
+/// heap identity. A hidden identity is stable within a HOT root chain; an
+/// independently indexed non-HOT successor has its own physical identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TupleLockTag {
     pub table: TableId,
@@ -69,4 +70,7 @@ pub trait TupleLockManager: Send + Sync + std::fmt::Debug {
     ) -> Result<TupleLockAcquire>;
 
     fn restore_tuple_grants(&self, xid: TxnId, changes: Vec<TupleLockGrantChange>) -> Result<()>;
+
+    /// Return whether `xid` currently holds `mode` (or stronger) on `tag`.
+    fn holds_tuple(&self, xid: TxnId, tag: &TupleLockTag, mode: TupleLockMode) -> bool;
 }
