@@ -1,5 +1,6 @@
 pub mod copy;
 mod expr;
+mod instrumentation;
 mod query;
 mod result;
 mod subquery;
@@ -3346,5 +3347,50 @@ mod tests {
             "no batches for an empty result"
         );
         assert_eq!(sink.columns.len(), 2, "schema is still reported");
+    }
+
+    #[test]
+    fn analyzed_apply_reuses_inner_node_ids_across_loops() {
+        let harness = ExecutorHarness::with_users();
+        harness.execute("create sequence profile_seq").unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'xx'), (2, 'xx'), (3, 'xx')")
+            .unwrap();
+
+        let analysis = harness
+            .analyze_query(
+                "select id from users where exists \
+                 (select nextval('profile_seq') where users.id > 0)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            analysis.nodes.values().map(|node| node.loops).max(),
+            Some(3),
+            "the same inner template IDs aggregate all three physical executions"
+        );
+    }
+
+    #[test]
+    fn analyzed_memoized_apply_counts_executed_keys_not_outer_rows() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'xx'), (2, 'xx'), (3, 'xx')")
+            .unwrap();
+
+        let analysis = harness
+            .analyze_query(
+                "select id from users where exists \
+                 (select 1 from users inner_users \
+                  where inner_users.id < length(users.name))",
+            )
+            .unwrap();
+
+        assert_eq!(
+            analysis.nodes.values().map(|node| node.loops).max(),
+            Some(1),
+            "one distinct correlation key should execute the memoized inner once"
+        );
+        assert_eq!(analysis.nodes[&planner::PlanNodeId(0)].rows, 3);
     }
 }

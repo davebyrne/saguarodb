@@ -4,7 +4,7 @@ use common::{
     IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result, Row, RowId, SqlState,
     StatementContext, StoredRow, TableId, TableSchema, Value,
 };
-use planner::{PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
+use planner::{ExplainAnalysis, PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +12,23 @@ use std::sync::{Arc, Mutex};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
 use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine, RowSink};
+
+#[derive(Debug)]
+struct TestSequenceRuntime;
+
+impl common::SequenceManager for TestSequenceRuntime {
+    fn sequence_exists(&self, _sequence: u32) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn nextval(&self, _txn_id: u64, _sequence: u32) -> Result<i64> {
+        Ok(1)
+    }
+
+    fn setval(&self, _txn_id: u64, _sequence: u32, value: i64, _is_called: bool) -> Result<i64> {
+        Ok(value)
+    }
+}
 
 pub struct ExecutorHarness {
     catalog: Arc<MemoryCatalog>,
@@ -135,6 +152,25 @@ impl ExecutorHarness {
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.catalog.as_ref())?;
         Ok(format_explain(&physical, self.catalog.as_ref()))
+    }
+
+    pub fn analyze_query(&self, sql: &str) -> Result<ExplainAnalysis> {
+        let statement = parser::parse(sql)?;
+        let bound = bind(&statement, self.catalog.as_ref())?;
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, self.catalog.as_ref())?;
+        let cancel = QueryCancel::new();
+        let ctx = ExecutionContext {
+            statement: StatementContext::new(1)
+                .with_sequence_manager(Arc::new(TestSequenceRuntime)),
+            relations: self.storage.capture_relation_snapshot()?,
+            catalog: self.catalog.clone(),
+            storage: &self.storage,
+            schema_ops: &self.storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
+            cancel: &cancel,
+        };
+        self.engine.analyze_query(&ctx, &physical)
     }
 
     /// Stream a read query through `execute_query_streamed`, driving the provided

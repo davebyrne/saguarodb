@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Instant;
 
 use catalog::{CatalogManager, TableColumnAlteration};
 use common::{
@@ -11,8 +12,8 @@ use common::{
     ViewColumn,
 };
 use planner::{
-    BindOptions, BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, PhysicalPlan,
-    bind_default_expr_with_options,
+    BindOptions, BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, ExplainAnalysis,
+    PhysicalPlan, PlanNodeLayout, bind_default_expr_with_options,
 };
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
@@ -20,6 +21,7 @@ use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
 use crate::expr::cast_value_to_pg_type;
+use crate::instrumentation::{DynamicProfile, InstrumentedExecutor, MetricCollector};
 use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinInput, HashJoinOp, IndexScanInput, IndexScanOp,
@@ -459,13 +461,84 @@ impl QueryEngine {
         let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
         open_resolved_query(ctx, &resolved)
     }
+
+    pub fn analyze_query(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        plan: &PhysicalPlan,
+    ) -> Result<ExplainAnalysis> {
+        let started = Instant::now();
+        let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
+        let layout = PlanNodeLayout::new(&resolved);
+        let collector = MetricCollector::default();
+        let executor = build_executor_with_profile(ctx, &resolved, &layout, &collector)?;
+        let mut query = OpenQuery::from_executor(ctx.cancel, executor)?;
+        let mut sink = DiscardRowSink;
+        let result = query.fetch(None, &mut sink, MATERIALIZE_BATCH_ROWS);
+        let close_result = query.close();
+        match (result, close_result) {
+            (Err(err), _) => return Err(err),
+            (Ok(_), Err(err)) => return Err(err),
+            (Ok(_), Ok(())) => {}
+        }
+        let execution_time = started.elapsed();
+        Ok(ExplainAnalysis {
+            nodes: collector.snapshot(),
+            init_plans: Vec::new(),
+            execution_time,
+        })
+    }
 }
 
 pub(crate) fn build_executor<'a>(
     ctx: &'a ExecutionContext<'_>,
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanExecutor + 'a>> {
-    match plan {
+    build_executor_impl(ctx, plan, None)
+}
+
+pub(crate) fn build_executor_with_profile<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    layout: &PlanNodeLayout,
+    collector: &MetricCollector,
+) -> Result<Box<dyn PlanExecutor + 'a>> {
+    validate_plan_layout(plan, layout)?;
+    build_executor_with_validated_profile(ctx, plan, layout, collector)
+}
+
+pub(crate) fn build_executor_with_validated_profile<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    layout: &PlanNodeLayout,
+    collector: &MetricCollector,
+) -> Result<Box<dyn PlanExecutor + 'a>> {
+    build_executor_impl(ctx, plan, Some(ProfileBuild { layout, collector }))
+}
+
+#[derive(Clone, Copy)]
+struct ProfileBuild<'a> {
+    layout: &'a PlanNodeLayout,
+    collector: &'a MetricCollector,
+}
+
+fn build_executor_impl<'a>(
+    ctx: &'a ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    profile: Option<ProfileBuild<'_>>,
+) -> Result<Box<dyn PlanExecutor + 'a>> {
+    let child = |child_plan: &PhysicalPlan, index: usize| {
+        let child_profile = profile.map(|profile| ProfileBuild {
+            layout: profile
+                .layout
+                .child(index)
+                .expect("profile layout validated before construction"),
+            collector: profile.collector,
+        });
+        build_executor_impl(ctx, child_plan, child_profile)
+    };
+
+    let executor: Result<Box<dyn PlanExecutor + 'a>> = match plan {
         PhysicalPlan::SeqScan { table, filter, .. } => {
             // SSI: a sequential scan reads the whole relation (`docs/specs/ssi.md` §5).
             // No-op unless this is a SERIALIZABLE statement (NoSsiTracker otherwise).
@@ -547,8 +620,8 @@ pub(crate) fn build_executor<'a>(
             join_type,
             identity_from,
         } => {
-            let left = build_executor(ctx, left)?;
-            let right = build_executor(ctx, right)?;
+            let left = child(left, 0)?;
+            let right = child(right, 1)?;
             Ok(Box::new(NestedLoopJoinOp::new(
                 ctx.statement.clone(),
                 left,
@@ -568,8 +641,8 @@ pub(crate) fn build_executor<'a>(
             identity_from,
             build_left,
         } => {
-            let left = build_executor(ctx, left)?;
-            let right = build_executor(ctx, right)?;
+            let left = child(left, 0)?;
+            let right = child(right, 1)?;
             Ok(Box::new(HashJoinOp::new(HashJoinInput {
                 ctx: ctx.statement.clone(),
                 left,
@@ -590,8 +663,8 @@ pub(crate) fn build_executor<'a>(
             residual,
             join_type,
         } => {
-            let left = build_executor(ctx, left)?;
-            let right = build_executor(ctx, right)?;
+            let left = child(left, 0)?;
+            let right = child(right, 1)?;
             Ok(Box::new(MergeJoinOp::new(
                 ctx.statement.clone(),
                 left,
@@ -622,27 +695,44 @@ pub(crate) fn build_executor<'a>(
                 // The ON condition's own uncorrelated subqueries were already
                 // resolved by whichever pre-pass walked this Apply node (the
                 // rewriter's Apply arm covers the Lateral condition).
-                return Ok(Box::new(crate::ops::LateralApplyOp::new(
+                Ok(Box::new(crate::ops::LateralApplyOp::new(
                     ctx,
-                    build_executor(ctx, input)?,
+                    child(input, 0)?,
                     subplan,
                     correlations.clone(),
                     *left_join,
                     condition.as_deref().cloned(),
                     output_schema.clone(),
-                )));
+                    profile.map(|profile| DynamicProfile {
+                        layout: profile
+                            .layout
+                            .child(1)
+                            .expect("profile layout validated before construction")
+                            .clone(),
+                        collector: profile.collector.clone(),
+                    }),
+                )))
+            } else {
+                Ok(Box::new(crate::ops::ApplyOp::new(
+                    ctx,
+                    child(input, 0)?,
+                    subplan,
+                    correlations.clone(),
+                    kind.clone(),
+                    profile.map(|profile| DynamicProfile {
+                        layout: profile
+                            .layout
+                            .child(1)
+                            .expect("profile layout validated before construction")
+                            .clone(),
+                        collector: profile.collector.clone(),
+                    }),
+                )))
             }
-            Ok(Box::new(crate::ops::ApplyOp::new(
-                ctx,
-                build_executor(ctx, input)?,
-                subplan,
-                correlations.clone(),
-                kind.clone(),
-            )))
         }
         PhysicalPlan::Filter { source, predicate } => Ok(Box::new(FilterOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             predicate.clone(),
         ))),
         PhysicalPlan::Projection {
@@ -651,19 +741,19 @@ pub(crate) fn build_executor<'a>(
             output_schema,
         } => Ok(Box::new(ProjectionOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             expressions.clone(),
             output_schema.clone(),
         ))),
         PhysicalPlan::Distinct { source, on_keys } => Ok(Box::new(DistinctOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             on_keys.clone(),
             ctx.spill.clone(),
         ))),
         PhysicalPlan::Sort { source, order_by } => Ok(Box::new(SortOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             order_by.clone(),
             ctx.spill.clone(),
         ))),
@@ -673,7 +763,7 @@ pub(crate) fn build_executor<'a>(
             offset,
         } => Ok(Box::new(LimitOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             *count,
             offset.unwrap_or(0),
         ))),
@@ -684,7 +774,7 @@ pub(crate) fn build_executor<'a>(
             output_schema,
         } => Ok(Box::new(AggregateOp::new(
             ctx.statement.clone(),
-            build_executor(ctx, source)?,
+            child(source, 0)?,
             group_by.clone(),
             aggregates.clone(),
             output_schema.clone(),
@@ -717,8 +807,8 @@ pub(crate) fn build_executor<'a>(
             ctx.statement.clone(),
             *op,
             *all,
-            build_executor(ctx, left)?,
-            build_executor(ctx, right)?,
+            child(left, 0)?,
+            child(right, 1)?,
             ctx.spill.clone(),
         ))),
         PhysicalPlan::CreateSchema { .. }
@@ -741,6 +831,129 @@ pub(crate) fn build_executor<'a>(
         | PhysicalPlan::Delete { .. } => Err(DbError::internal(
             "DML and DDL plans are not valid executor sources",
         )),
+    };
+    let executor = executor?;
+    match profile {
+        Some(profile) => Ok(Box::new(InstrumentedExecutor::new(
+            executor,
+            profile.layout.id(),
+            profile.collector.clone(),
+        ))),
+        None => Ok(executor),
+    }
+}
+
+fn executor_child_count(plan: &PhysicalPlan) -> usize {
+    match plan {
+        PhysicalPlan::NestedLoopJoin { .. }
+        | PhysicalPlan::HashJoin { .. }
+        | PhysicalPlan::MergeJoin { .. }
+        | PhysicalPlan::Apply { .. }
+        | PhysicalPlan::SetOp { .. } => 2,
+        PhysicalPlan::Insert { .. }
+        | PhysicalPlan::Update { .. }
+        | PhysicalPlan::Delete { .. }
+        | PhysicalPlan::Filter { .. }
+        | PhysicalPlan::Projection { .. }
+        | PhysicalPlan::Sort { .. }
+        | PhysicalPlan::Distinct { .. }
+        | PhysicalPlan::Limit { .. }
+        | PhysicalPlan::Aggregate { .. } => 1,
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
+        | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
+        | PhysicalPlan::CreateIndex { .. }
+        | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
+        | PhysicalPlan::SeqScan { .. }
+        | PhysicalPlan::SystemScan { .. }
+        | PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::Values { .. }
+        | PhysicalPlan::TableFunction { .. } => 0,
+    }
+}
+
+fn validate_plan_layout(plan: &PhysicalPlan, layout: &PlanNodeLayout) -> Result<()> {
+    let expected_children = executor_child_count(plan);
+    for index in 0..expected_children {
+        if layout.child(index).is_none() {
+            return Err(DbError::internal(format!(
+                "plan/layout mismatch at node {}: missing child {index}",
+                layout.id().0
+            )));
+        }
+    }
+    if layout.child(expected_children).is_some() {
+        return Err(DbError::internal(format!(
+            "plan/layout mismatch at node {}: unexpected child {expected_children}",
+            layout.id().0
+        )));
+    }
+    match plan {
+        PhysicalPlan::Insert { source, .. }
+        | PhysicalPlan::Update { source, .. }
+        | PhysicalPlan::Delete { source, .. }
+        | PhysicalPlan::Filter { source, .. }
+        | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Distinct { source, .. }
+        | PhysicalPlan::Limit { source, .. }
+        | PhysicalPlan::Aggregate { source, .. } => validate_plan_layout(
+            source,
+            layout.child(0).expect("child existence checked above"),
+        ),
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. }
+        | PhysicalPlan::SetOp { left, right, .. } => {
+            validate_plan_layout(
+                left,
+                layout.child(0).expect("child existence checked above"),
+            )?;
+            validate_plan_layout(
+                right,
+                layout.child(1).expect("child existence checked above"),
+            )
+        }
+        PhysicalPlan::Apply { input, subplan, .. } => {
+            validate_plan_layout(
+                input,
+                layout.child(0).expect("child existence checked above"),
+            )?;
+            validate_plan_layout(
+                subplan,
+                layout.child(1).expect("child existence checked above"),
+            )
+        }
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
+        | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
+        | PhysicalPlan::CreateIndex { .. }
+        | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
+        | PhysicalPlan::SeqScan { .. }
+        | PhysicalPlan::SystemScan { .. }
+        | PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::Values { .. }
+        | PhysicalPlan::TableFunction { .. } => Ok(()),
     }
 }
 
@@ -781,6 +994,18 @@ fn open_resolved_query<'a>(
 struct VecRowSink {
     columns: Vec<ColumnInfo>,
     rows: Vec<Row>,
+}
+
+struct DiscardRowSink;
+
+impl RowSink for DiscardRowSink {
+    fn start(&mut self, _columns: &[ColumnInfo]) -> Result<()> {
+        Ok(())
+    }
+
+    fn push(&mut self, _rows: Vec<Row>) -> Result<ControlFlow<()>> {
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 impl RowSink for VecRowSink {

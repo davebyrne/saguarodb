@@ -38,6 +38,14 @@ pub trait PlanExecutor {
 
 Default `next_batch` calls `next` in a loop. Operators should release page pins and owned resources in `close` and `Drop`.
 
+### Opt-in execution instrumentation
+
+`QueryEngine::analyze_query(ctx, plan) -> Result<ExplainAnalysis>` is the analysis-only SELECT driver. It resolves uncorrelated subqueries, builds the deterministic `PlanNodeLayout`, constructs an instrumented operator tree, and drains it through the normal `OpenQuery` fetch/close lifecycle into a discard sink. The statement execution clock uses monotonic `Instant` and covers subquery resolution, executor construction, open, drain, and close. The returned report contains cumulative per-node metrics and overall execution time; it never materializes result rows. SQL exposure is a later integration step.
+
+Each visible physical node is wrapped by `InstrumentedExecutor` only on this opt-in path. Ordinary `execute`, streaming, and `open_query` construction pass no profile state and allocate no wrappers, clocks, collectors, or metric synchronization. A successful `open` begins one loop; a failed open does not. `open`, `next`, `next_batch`, and `close` call durations contribute to inclusive node time. Rows count successful `Some(row)` results or the rows returned by a batch-native `next_batch`. Startup time runs through the first completed fetch call, or equals total time when a loop closes without fetching. A wrapper merges loop-local counters into the shared collector once at close, or on drop when an opened loop was not closed, so the mutex is never acquired per row. Counter and duration overflow saturate and cannot change query correctness.
+
+The profiled builder validates the complete plan/layout shape before constructing operators, including stored Apply subplans that an empty outer input might never execute. Apply and Lateral Apply then retain the fixed layout subtree for their subplan template. Every dynamically rebuilt inner executor reuses that subtree and shared collector, aggregating physical executions under the template IDs; a memo hit does not fabricate a loop. Parent timings include time spent driving children, so node times must not be summed. The analyzed formatter reports per-loop averages while cumulative values remain in `ExplainAnalysis`.
+
 ### Streaming SELECT output
 
 `QueryEngine::execute_query_streamed` is the streaming counterpart of the SELECT

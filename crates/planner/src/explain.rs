@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::time::Duration;
 
 use crate::ApplyKind;
 use crate::JoinType;
@@ -16,11 +18,42 @@ pub struct PlanNodeLayout {
     children: Vec<PlanNodeLayout>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeExecutionMetrics {
+    pub loops: u64,
+    pub rows: u64,
+    pub startup: Duration,
+    pub total: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitPlanAnalysis {
+    pub ordinal: usize,
+    pub parent: Option<usize>,
+    pub plan: PhysicalPlan,
+    pub layout: PlanNodeLayout,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExplainAnalysis {
+    pub nodes: BTreeMap<PlanNodeId, NodeExecutionMetrics>,
+    pub init_plans: Vec<InitPlanAnalysis>,
+    pub execution_time: Duration,
+}
+
 impl PlanNodeLayout {
     /// Builds a zero-based, pre-order layout for `plan`.
     pub fn new(plan: &PhysicalPlan) -> Self {
         let mut next = 0;
-        build_layout(plan, &mut next)
+        Self::new_with_next(plan, &mut next)
+    }
+
+    /// Builds a pre-order layout from a caller-owned next-ID counter.
+    ///
+    /// Sharing the counter across a main plan and init plans gives every node
+    /// a distinct ID without exposing mutable layout state.
+    pub fn new_with_next(plan: &PhysicalPlan, next: &mut usize) -> Self {
+        build_layout(plan, next)
     }
 
     pub fn id(&self) -> PlanNodeId {
@@ -56,6 +89,7 @@ fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Aggregate { source, .. } => vec![source],
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. }
         | PhysicalPlan::SetOp { left, right, .. } => vec![left, right],
         PhysicalPlan::Apply { input, subplan, .. } => vec![input, subplan],
         PhysicalPlan::CreateSchema { .. }
@@ -84,7 +118,49 @@ fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
 pub fn format_explain(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> String {
     let mut output = String::new();
     let layout = PlanNodeLayout::new(plan);
-    format_node(plan, &layout, 0, catalog, &mut output);
+    format_node(plan, &layout, 0, catalog, None, &mut output);
+    output
+}
+
+pub fn format_explain_analyze(
+    plan: &PhysicalPlan,
+    catalog: &dyn catalog::CatalogManager,
+    analysis: &ExplainAnalysis,
+) -> String {
+    let mut output = String::new();
+    let layout = PlanNodeLayout::new(plan);
+    format_node(
+        plan,
+        &layout,
+        0,
+        catalog,
+        Some(&analysis.nodes),
+        &mut output,
+    );
+    if !analysis.init_plans.is_empty() {
+        output.push_str("Init Plans:\n");
+        let mut init_plans = analysis.init_plans.iter().collect::<Vec<_>>();
+        init_plans.sort_by_key(|init| init.ordinal);
+        for init in init_plans {
+            output.push_str(&format!("  InitPlan {}", init.ordinal));
+            if let Some(parent) = init.parent {
+                output.push_str(&format!(" parent={parent}"));
+            }
+            output.push('\n');
+            format_node(
+                &init.plan,
+                &init.layout,
+                2,
+                catalog,
+                Some(&analysis.nodes),
+                &mut output,
+            );
+        }
+    }
+    output.push_str(&format!(
+        "Execution Time: {:.3} ms\n",
+        analysis.execution_time.as_secs_f64() * 1_000.0
+    ));
     output
 }
 
@@ -113,6 +189,7 @@ fn format_node(
     layout: &PlanNodeLayout,
     indent: usize,
     catalog: &dyn catalog::CatalogManager,
+    metrics: Option<&BTreeMap<PlanNodeId, NodeExecutionMetrics>>,
     output: &mut String,
 ) {
     let prefix = format!("{}[node={}] ", "  ".repeat(indent), layout.id().0);
@@ -123,15 +200,31 @@ fn format_node(
     } else {
         String::new()
     };
+    let actual_suffix = metrics.map_or_else(String::new, |nodes| {
+        let Some(node) = nodes.get(&layout.id()).filter(|node| node.loops > 0) else {
+            return " (never executed)".to_string();
+        };
+        let rows = if node.rows % node.loops == 0 {
+            (node.rows / node.loops).to_string()
+        } else {
+            format!("{:.2}", node.rows as f64 / node.loops as f64)
+        };
+        format!(
+            " (actual time={:.3}..{:.3} rows={rows} loops={})",
+            node.startup.as_secs_f64() * 1_000.0 / node.loops as f64,
+            node.total.as_secs_f64() * 1_000.0 / node.loops as f64,
+            node.loops
+        )
+    });
     match plan {
         PhysicalPlan::CreateSchema { name, .. } => {
-            output.push_str(&format!("{prefix}CreateSchema {name}\n"));
+            output.push_str(&format!("{prefix}CreateSchema {name}{actual_suffix}\n"));
         }
         PhysicalPlan::DropSchema { name, .. } => {
-            output.push_str(&format!("{prefix}DropSchema {name}\n"));
+            output.push_str(&format!("{prefix}DropSchema {name}{actual_suffix}\n"));
         }
         PhysicalPlan::CreateTable { name, .. } => {
-            output.push_str(&format!("{prefix}CreateTable {name}\n"));
+            output.push_str(&format!("{prefix}CreateTable {name}{actual_suffix}\n"));
         }
         PhysicalPlan::DropTable {
             targets, if_exists, ..
@@ -142,13 +235,15 @@ fn format_node(
                 .map(|target| target.name.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            output.push_str(&format!("{prefix}DropTable tables={names}{conditional}\n"));
+            output.push_str(&format!(
+                "{prefix}DropTable tables={names}{conditional}{actual_suffix}\n"
+            ));
         }
         PhysicalPlan::AlterTableAddColumn {
             table_name, column, ..
         } => {
             output.push_str(&format!(
-                "{prefix}AlterTableAddColumn {table_name}.{}\n",
+                "{prefix}AlterTableAddColumn {table_name}.{}{actual_suffix}\n",
                 column.name
             ));
         }
@@ -156,7 +251,7 @@ fn format_node(
             table_name, column, ..
         } => {
             output.push_str(&format!(
-                "{prefix}AlterTableDropColumn {table_name}.{column}\n"
+                "{prefix}AlterTableDropColumn {table_name}.{column}{actual_suffix}\n"
             ));
         }
         PhysicalPlan::AlterTableRenameColumn {
@@ -166,7 +261,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}AlterTableRenameColumn {table_name}.{old_name} to {new_name}\n"
+                "{prefix}AlterTableRenameColumn {table_name}.{old_name} to {new_name}{actual_suffix}\n"
             ));
         }
         PhysicalPlan::AlterTableRenameTable {
@@ -175,7 +270,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}AlterTableRenameTable {table_name} to {new_name}\n"
+                "{prefix}AlterTableRenameTable {table_name} to {new_name}{actual_suffix}\n"
             ));
         }
         PhysicalPlan::AlterTableAlterColumnType {
@@ -185,7 +280,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}AlterTableAlterColumnType {table_name}.{column} to {pg_type:?}\n"
+                "{prefix}AlterTableAlterColumnType {table_name}.{column} to {pg_type:?}{actual_suffix}\n"
             ));
         }
         PhysicalPlan::CreateIndex {
@@ -195,56 +290,69 @@ fn format_node(
             ..
         } => {
             let kind = if *unique { "Unique" } else { "" };
-            output.push_str(&format!("{prefix}Create{kind}Index {name} on {table}\n"));
+            output.push_str(&format!(
+                "{prefix}Create{kind}Index {name} on {table}{actual_suffix}\n"
+            ));
         }
         PhysicalPlan::DropIndex { index } => {
-            output.push_str(&format!("{prefix}DropIndex index={index}\n"));
+            output.push_str(&format!("{prefix}DropIndex index={index}{actual_suffix}\n"));
         }
         PhysicalPlan::CreateSequence { name, .. } => {
-            output.push_str(&format!("{prefix}CreateSequence {name}\n"));
+            output.push_str(&format!("{prefix}CreateSequence {name}{actual_suffix}\n"));
         }
         PhysicalPlan::DropSequence {
             name, if_exists, ..
         } => {
             output.push_str(&format!(
-                "{prefix}DropSequence {name} if_exists={if_exists}\n"
+                "{prefix}DropSequence {name} if_exists={if_exists}{actual_suffix}\n"
             ));
         }
         PhysicalPlan::CreateView { name, .. } => {
-            output.push_str(&format!("{prefix}CreateView {name}\n"));
+            output.push_str(&format!("{prefix}CreateView {name}{actual_suffix}\n"));
         }
         PhysicalPlan::DropView {
             name, if_exists, ..
         } => {
-            output.push_str(&format!("{prefix}DropView {name} if_exists={if_exists}\n"));
+            output.push_str(&format!(
+                "{prefix}DropView {name} if_exists={if_exists}{actual_suffix}\n"
+            ));
         }
         PhysicalPlan::Insert { table, source, .. } => {
-            output.push_str(&format!("{prefix}Insert table={table}{rows_suffix}\n"));
+            output.push_str(&format!(
+                "{prefix}Insert table={table}{rows_suffix}{actual_suffix}\n"
+            ));
             format_node(
                 source,
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Update { table, source, .. } => {
-            output.push_str(&format!("{prefix}Update table={table}{rows_suffix}\n"));
+            output.push_str(&format!(
+                "{prefix}Update table={table}{rows_suffix}{actual_suffix}\n"
+            ));
             format_node(
                 source,
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Delete { table, source, .. } => {
-            output.push_str(&format!("{prefix}Delete table={table}{rows_suffix}\n"));
+            output.push_str(&format!(
+                "{prefix}Delete table={table}{rows_suffix}{actual_suffix}\n"
+            ));
             format_node(
                 source,
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -254,14 +362,14 @@ fn format_node(
             filter,
         } => {
             output.push_str(&format!(
-                "{prefix}SeqScan table={} filter={}{rows_suffix}\n",
+                "{prefix}SeqScan table={} filter={}{rows_suffix}{actual_suffix}\n",
                 table_label(*table, table_name),
                 if filter.is_some() { "yes" } else { "none" }
             ));
         }
         PhysicalPlan::SystemScan { view, filter, .. } => {
             output.push_str(&format!(
-                "{prefix}SystemScan view={} filter={}{rows_suffix}\n",
+                "{prefix}SystemScan view={} filter={}{rows_suffix}{actual_suffix}\n",
                 view.qualified_name(),
                 if filter.is_some() { "yes" } else { "none" }
             ));
@@ -275,7 +383,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}IndexScan table={} index={} range={} filter={}{rows_suffix}\n",
+                "{prefix}IndexScan table={} index={} range={} filter={}{rows_suffix}{actual_suffix}\n",
                 table_label(*table, table_name),
                 index,
                 fmt_key_range(range),
@@ -290,7 +398,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}NestedLoopJoin type={join_type:?} condition={}{rows_suffix}\n",
+                "{prefix}NestedLoopJoin type={join_type:?} condition={}{rows_suffix}{actual_suffix}\n",
                 if condition.is_some() { "yes" } else { "none" }
             ));
             format_node(
@@ -298,6 +406,7 @@ fn format_node(
                 layout.child(0).expect("left layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
             format_node(
@@ -305,6 +414,7 @@ fn format_node(
                 layout.child(1).expect("right layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -323,7 +433,7 @@ fn format_node(
             };
             let build = if *build_left { "left" } else { "right" };
             output.push_str(&format!(
-                "{prefix}{label} keys={} build={build}{rows_suffix}\n",
+                "{prefix}{label} keys={} build={build}{rows_suffix}{actual_suffix}\n",
                 left_keys.len()
             ));
             format_node(
@@ -331,6 +441,7 @@ fn format_node(
                 layout.child(0).expect("left layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
             format_node(
@@ -338,6 +449,7 @@ fn format_node(
                 layout.child(1).expect("right layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -350,12 +462,26 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}MergeJoin type={join_type:?} keys={} residual={}{rows_suffix}\n",
+                "{prefix}MergeJoin type={join_type:?} keys={} residual={}{rows_suffix}{actual_suffix}\n",
                 left_keys.len(),
                 if residual.is_some() { "yes" } else { "none" }
             ));
-            format_node(left, indent + 1, catalog, output);
-            format_node(right, indent + 1, catalog, output);
+            format_node(
+                left,
+                layout.child(0).expect("left layout"),
+                indent + 1,
+                catalog,
+                metrics,
+                output,
+            );
+            format_node(
+                right,
+                layout.child(1).expect("right layout"),
+                indent + 1,
+                catalog,
+                metrics,
+                output,
+            );
         }
         PhysicalPlan::Apply {
             input,
@@ -377,7 +503,7 @@ fn format_node(
                 } => "Lateral Left",
             };
             output.push_str(&format!(
-                "{prefix}Apply ({kind}) correlations={}{rows_suffix}\n",
+                "{prefix}Apply ({kind}) correlations={}{rows_suffix}{actual_suffix}\n",
                 correlations.len()
             ));
             format_node(
@@ -385,6 +511,7 @@ fn format_node(
                 layout.child(0).expect("input layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
             format_node(
@@ -392,16 +519,18 @@ fn format_node(
                 layout.child(1).expect("subplan layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Filter { source, .. } => {
-            output.push_str(&format!("{prefix}Filter{rows_suffix}\n"));
+            output.push_str(&format!("{prefix}Filter{rows_suffix}{actual_suffix}\n"));
             format_node(
                 source,
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -411,7 +540,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}Projection exprs={}{rows_suffix}\n",
+                "{prefix}Projection exprs={}{rows_suffix}{actual_suffix}\n",
                 expressions.len()
             ));
             format_node(
@@ -419,12 +548,13 @@ fn format_node(
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Sort { source, order_by } => {
             output.push_str(&format!(
-                "{prefix}Sort keys={}{rows_suffix}\n",
+                "{prefix}Sort keys={}{rows_suffix}{actual_suffix}\n",
                 order_by.len()
             ));
             format_node(
@@ -432,12 +562,13 @@ fn format_node(
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Distinct { source, on_keys } => {
             output.push_str(&format!(
-                "{prefix}Distinct keys={}{rows_suffix}\n",
+                "{prefix}Distinct keys={}{rows_suffix}{actual_suffix}\n",
                 on_keys.len()
             ));
             format_node(
@@ -445,6 +576,7 @@ fn format_node(
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -454,7 +586,7 @@ fn format_node(
             offset,
         } => {
             output.push_str(&format!(
-                "{prefix}Limit count={count} offset={}{rows_suffix}\n",
+                "{prefix}Limit count={count} offset={}{rows_suffix}{actual_suffix}\n",
                 offset
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string())
@@ -464,6 +596,7 @@ fn format_node(
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
@@ -474,7 +607,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{prefix}Aggregate groups={} aggregates={}{rows_suffix}\n",
+                "{prefix}Aggregate groups={} aggregates={}{rows_suffix}{actual_suffix}\n",
                 group_by.len(),
                 aggregates.len()
             ));
@@ -483,17 +616,20 @@ fn format_node(
                 layout.child(0).expect("source layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!(
-                "{prefix}Values rows={}{rows_suffix}\n",
+                "{prefix}Values rows={}{rows_suffix}{actual_suffix}\n",
                 rows.len()
             ));
         }
         PhysicalPlan::TableFunction { name, .. } => {
-            output.push_str(&format!("{prefix}TableFunction name={name}\n"));
+            output.push_str(&format!(
+                "{prefix}TableFunction name={name}{actual_suffix}\n"
+            ));
         }
         PhysicalPlan::SetOp {
             op,
@@ -501,12 +637,15 @@ fn format_node(
             left,
             right,
         } => {
-            output.push_str(&format!("{prefix}SetOp op={op:?} all={all}{rows_suffix}\n"));
+            output.push_str(&format!(
+                "{prefix}SetOp op={op:?} all={all}{rows_suffix}{actual_suffix}\n"
+            ));
             format_node(
                 left,
                 layout.child(0).expect("left layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
             format_node(
@@ -514,6 +653,7 @@ fn format_node(
                 layout.child(1).expect("right layout"),
                 indent + 1,
                 catalog,
+                metrics,
                 output,
             );
         }

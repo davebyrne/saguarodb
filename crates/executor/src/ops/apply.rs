@@ -10,8 +10,10 @@ use planner::{ApplyKind, BoundExpr, PhysicalPlan, rewrite_plan_exprs};
 use spill::{Reservation, RetainedSize, SpillContext, SpillTape, SpillTapeReader};
 
 use crate::expr::{compare_values, eval_expr};
+use crate::instrumentation::DynamicProfile;
 use crate::query::{
-    ExecutionContext, PlanExecutor, build_executor, check_canceled, close_after, open_executor,
+    ExecutionContext, PlanExecutor, build_executor, build_executor_with_validated_profile,
+    check_canceled, close_after, open_executor,
 };
 
 /// One memoized subplan result, keyed by the correlation-value tuple. The
@@ -165,6 +167,7 @@ pub struct ApplyOp<'a> {
     /// re-executes for every outer row (`docs/specs/subqueries.md` §2).
     memo: Option<ApplyMemo>,
     spill_ctx: SpillContext,
+    profile: Option<DynamicProfile>,
 }
 
 impl<'a> ApplyOp<'a> {
@@ -174,6 +177,7 @@ impl<'a> ApplyOp<'a> {
         subplan: PhysicalPlan,
         correlations: Vec<BoundExpr>,
         kind: ApplyKind,
+        profile: Option<DynamicProfile>,
     ) -> Self {
         let appended = ColumnInfo {
             name: "?column?".to_string(),
@@ -205,6 +209,7 @@ impl<'a> ApplyOp<'a> {
             output_schema,
             memo,
             spill_ctx,
+            profile,
         }
     }
 
@@ -212,7 +217,15 @@ impl<'a> ApplyOp<'a> {
     /// build the inner executor.
     fn build_inner(&self, key: &[Value]) -> Result<Box<dyn PlanExecutor + 'a>> {
         let substituted = substitute_template(&self.subplan, key)?;
-        build_executor(self.ctx, &substituted)
+        match &self.profile {
+            Some(profile) => build_executor_with_validated_profile(
+                self.ctx,
+                &substituted,
+                &profile.layout,
+                &profile.collector,
+            ),
+            None => build_executor(self.ctx, &substituted),
+        }
     }
 
     /// Compute (or recall) the subplan result for one correlation-value tuple.
@@ -381,6 +394,7 @@ pub struct LateralApplyOp<'a> {
     current_reader: Option<SpillTapeReader<Row>>,
     current_owned_tape: Option<Arc<Mutex<SpillTape<Row>>>>,
     current_matched: bool,
+    profile: Option<DynamicProfile>,
 }
 
 impl<'a> LateralApplyOp<'a> {
@@ -393,6 +407,7 @@ impl<'a> LateralApplyOp<'a> {
         left_join: bool,
         condition: Option<BoundExpr>,
         inner_schema: Vec<ColumnInfo>,
+        profile: Option<DynamicProfile>,
     ) -> Self {
         let mut output_schema = input.output_schema().to_vec();
         let inner_width = inner_schema.len();
@@ -418,6 +433,7 @@ impl<'a> LateralApplyOp<'a> {
             current_reader: None,
             current_owned_tape: None,
             current_matched: false,
+            profile,
         }
     }
 
@@ -429,7 +445,16 @@ impl<'a> LateralApplyOp<'a> {
         let registry = &self.ctx.statement.runtime_value_sets;
         let watermark = registry.watermark();
         let substituted = substitute_template(&self.subplan, &key)?;
-        let mut inner = match build_executor(self.ctx, &substituted) {
+        let inner = match &self.profile {
+            Some(profile) => build_executor_with_validated_profile(
+                self.ctx,
+                &substituted,
+                &profile.layout,
+                &profile.collector,
+            ),
+            None => build_executor(self.ctx, &substituted),
+        };
+        let mut inner = match inner {
             Ok(inner) => inner,
             Err(err) => {
                 registry.remove_since(watermark);

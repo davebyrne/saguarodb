@@ -21,7 +21,10 @@ pub use bound::{
     CorrelatedColumn, DropTableTarget, OutputColumn,
 };
 pub use estimate::estimated_rows;
-pub use explain::{PlanNodeId, PlanNodeLayout, format_explain};
+pub use explain::{
+    ExplainAnalysis, InitPlanAnalysis, NodeExecutionMetrics, PlanNodeId, PlanNodeLayout,
+    format_explain, format_explain_analyze,
+};
 pub use expr::{
     AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinSide,
     JoinType, UnaryOp,
@@ -2368,6 +2371,95 @@ mod tests {
         assert!(text.starts_with("[node=0] Apply"));
         assert!(text.contains("  [node=1] SeqScan table=t1(1)"));
         assert!(text.contains("  [node=2] SeqScan table=t2(2)"));
+    }
+
+    #[test]
+    fn explain_analyze_formats_fixed_averages_and_never_executed_nodes() {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let catalog = MemoryCatalog::empty();
+        let plan = PhysicalPlan::Projection {
+            source: Box::new(explain_test_scan(1)),
+            expressions: Vec::new(),
+            output_schema: Vec::new(),
+        };
+        let analysis = ExplainAnalysis {
+            nodes: BTreeMap::from([(
+                PlanNodeId(0),
+                NodeExecutionMetrics {
+                    loops: 2,
+                    rows: 3,
+                    startup: Duration::from_micros(8),
+                    total: Duration::from_micros(18),
+                },
+            )]),
+            init_plans: Vec::new(),
+            execution_time: Duration::from_micros(14),
+        };
+
+        assert_eq!(
+            format_explain_analyze(&plan, &catalog, &analysis),
+            "[node=0] Projection exprs=0 (rows=1000) \
+             (actual time=0.004..0.009 rows=1.50 loops=2)\n  \
+             [node=1] SeqScan table=t1(1) filter=none (rows=1000) \
+             (never executed)\nExecution Time: 0.014 ms\n"
+        );
+    }
+
+    #[test]
+    fn explain_analyze_init_plan_layouts_use_the_shared_id_space() {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let catalog = MemoryCatalog::empty();
+        let plan = explain_test_scan(1);
+        let init_plan = PhysicalPlan::Values {
+            rows: vec![Vec::new()],
+            output_schema: Vec::new(),
+        };
+        let mut next = 0;
+        let main_layout = PlanNodeLayout::new_with_next(&plan, &mut next);
+        let init_layout = PlanNodeLayout::new_with_next(&init_plan, &mut next);
+        assert_eq!(main_layout.id(), PlanNodeId(0));
+        assert_eq!(init_layout.id(), PlanNodeId(1));
+        let analysis = ExplainAnalysis {
+            nodes: BTreeMap::from([
+                (
+                    PlanNodeId(0),
+                    NodeExecutionMetrics {
+                        loops: 1,
+                        rows: 0,
+                        startup: Duration::from_micros(1),
+                        total: Duration::from_micros(2),
+                    },
+                ),
+                (
+                    PlanNodeId(1),
+                    NodeExecutionMetrics {
+                        loops: 1,
+                        rows: 1,
+                        startup: Duration::from_micros(3),
+                        total: Duration::from_micros(4),
+                    },
+                ),
+            ]),
+            init_plans: vec![InitPlanAnalysis {
+                ordinal: 1,
+                parent: None,
+                plan: init_plan,
+                layout: init_layout,
+            }],
+            execution_time: Duration::from_micros(5),
+        };
+
+        let text = format_explain_analyze(&plan, &catalog, &analysis);
+        assert!(text.contains("[node=0] SeqScan"));
+        assert!(text.contains("    [node=1] Values"));
+        assert!(text.contains(
+            "[node=1] Values rows=1 (rows=1) \
+                               (actual time=0.003..0.004 rows=1 loops=1)"
+        ));
     }
 
     #[test]
