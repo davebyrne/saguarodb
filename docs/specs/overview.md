@@ -1,6 +1,6 @@
 # SaguaroDB Overview Specification
 
-**Date:** 2026-07-04
+**Date:** 2026-07-12
 **Status:** Living system contract
 
 The user catalog is schema-aware. `public` exists by default; `CREATE SCHEMA` and
@@ -60,6 +60,7 @@ saguarodb/
 │   ├── parser/             (wrapper around sqlparser-rs, produces internal AST)
 │   ├── planner/            (rule-based query planner, produces execution plans)
 │   ├── executor/           (query execution engine, evaluates plans against storage)
+│   ├── spill/              (query-local memory budgets, spill tapes, external sorting)
 │   ├── storage/            (storage engine trait + page-backed table implementation)
 │   ├── control/            (control record — checkpoint commit point)
 │   ├── buffer/             (buffer pool — in-memory page cache)
@@ -72,20 +73,27 @@ saguarodb/
 ### Dependency Flow
 
 ```
-server → protocol, parser, planner, executor, control, storage, buffer, wal, catalog, compress, common
+server → protocol, parser, planner, executor, control, storage, buffer, wal, catalog, compress, spill, common
 protocol → common
 parser → common
 planner → parser, catalog, common
-executor → planner, storage, catalog, common
+executor → planner, storage, catalog, spill, common
 storage → buffer, wal, compress, common
 control → common
 buffer → common
 wal → common
 catalog → common
 compress → common
+spill → common, tempfile
 ```
 
-No circular dependencies. `common` and `compress` are leaf crates (`compress` also depends only on `common`). `server` is the root. `compress` is consumed by `storage` (at-rest page compression, WAL full-page-image compression, and TOAST value payload compression/decompression) and `server` (constructs and shares the `CompressionRegistry`/`DictStore`); `wal` does not depend on `compress` (`docs/specs/compression.md`, `docs/specs/crates/compress.md`).
+No circular dependencies. `common` is the shared-type leaf. `compress` depends
+only on `common` plus codec support, and `spill` depends only on `common` and
+`tempfile`. `server` is the root. `compress` is consumed by `storage` (at-rest
+page compression, WAL full-page-image compression, and TOAST value payload
+compression/decompression) and `server` (constructs and shares the
+`CompressionRegistry`/`DictStore`); `wal` does not depend on `compress`
+(`docs/specs/compression.md`, `docs/specs/crates/compress.md`).
 
 ### Cargo Package and Crate Naming
 
@@ -235,6 +243,9 @@ pub struct ParsedColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub max_length: Option<u32>,
+    pub default: Option<ParsedDefault>,
+    pub pg_type: Option<PgType>,
 }
 
 /// Catalog column — stored in the catalog with assigned IDs.
@@ -244,6 +255,9 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub max_length: Option<u32>,
+    pub default: Option<ColumnDefault>,
+    pub pg_type: Option<PgType>,
 }
 
 /// Column metadata for result sets and plan output schemas.
@@ -311,21 +325,30 @@ pub enum SqlState {
     InvalidColumnReference,     // 42P10
     WrongObjectType,            // 42809
     DuplicateTable,             // 42P07
+    DuplicateCursor,            // 42P03
     DatatypeMismatch,           // 42804
     DivisionByZero,             // 22012
     InvalidParameterValue,      // 22023
     NumericValueOutOfRange,     // 22003
     StringDataRightTruncation,  // 22001
+    InvalidTextRepresentation,  // 22P02
+    BadCopyFileFormat,          // 22P04
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
     CheckViolation,             // 23514
+    CardinalityViolation,       // 21000
     DependentObjectsStillExist,  // 2BP01
     ObjectNotInPrerequisiteState, // 55000
+    ObjectInUse,                // 55006
+    InvalidCursorName,          // 34000
     QueryCanceled,              // 57014
     FeatureNotSupported,        // 0A000
     InFailedSqlTransaction,     // 25P02
+    NoActiveSqlTransaction,     // 25P01
+    InvalidSavepointSpecification, // 3B001
     ProgramLimitExceeded,       // 54000
     SerializationFailure,       // 40001
+    DeadlockDetected,           // 40P01
     IoError,                    // 58030
     InternalError,              // XX000
     // ... extensible
@@ -605,7 +628,10 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Server `AuthenticationOk`: tag `R`, length `8`, auth code `0`.
 - Server `ParameterStatus`: tag `S`, `key\0value\0`; startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
 - Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). Standalone statements run in autocommit and report `I`; inside a `BEGIN`/`COMMIT` block the byte is `T`, or `E` once a statement in the block has failed.
-- Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
+- Server `RowDescription`: tag `T`, field count, then for each column `name\0`,
+  `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, the declared
+  type modifier (or `-1`), and the selected per-field format code (`0` text,
+  `1` binary). Simple query always selects text; extended Bind may select binary.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
 - Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE VIEW`, `DROP VIEW`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `ALTER TABLE`, `EXPLAIN`, `DECLARE CURSOR`, `FETCH n`, `CLOSE CURSOR`, `SET`, `SHOW`, `RESET`, `DISCARD ALL`, `VACUUM`, `ANALYZE`, `TRUNCATE TABLE`, or `COPY n`.
 - Server `ErrorResponse`: tag `E`, fields `S` severity, `C` SQLSTATE, `M` message, then final `\0`.
@@ -640,6 +666,9 @@ pub enum ExecutionResult {
     ModifiedReturning { command: String, count: u64, columns: Vec<ColumnInfo>, rows: Vec<Row> },
     /// EXPLAIN result — the formatted plan without executing it
     Explanation { text: String },
+    /// Bound COPY jobs; the server drives the wire sub-protocol and transfer.
+    BeginCopyIn(CopyJob),
+    BeginCopyOut(CopyJob),
 }
 ```
 
@@ -715,14 +744,19 @@ pub enum Statement {
     Update {
         table: String,
         assignments: Vec<Assignment>,
+        from: Vec<FromItem>,
         filter: Option<Expr>,
         returning: Option<Vec<SelectItem>>,  // UPDATE ... RETURNING <items>
     },
     Delete {
         table: String,
+        using: Vec<FromItem>,
         filter: Option<Expr>,
         returning: Option<Vec<SelectItem>>,  // DELETE ... RETURNING <items>
     },
+    DeclareCursor { name: String, query: Query },
+    FetchCursor { name: String, count: FetchCount },
+    CloseCursor { name: String },
     Explain(Box<Statement>),
     // Transaction control (docs/specs/mvcc.md §10 G) and savepoints
     // (docs/specs/savepoints.md); executed by the server, not bound/planned.
@@ -850,7 +884,12 @@ pub enum FromItem {
     Table { schema: Option<String>, name: String, alias: Option<String> },
     // A derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required;
     // column_aliases optionally renames the subquery's output columns.
-    Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
+    Derived {
+        subquery: Box<Query>,
+        alias: String,
+        column_aliases: Vec<String>,
+        lateral: bool,
+    },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -1969,7 +2008,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their schema/table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (seeded from `clog.dat` and folded forward with later `Commit`/`Abort`, or rebuilt from retained WAL when no snapshot exists) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their schema/table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -2090,7 +2129,7 @@ The WAL is the source of durability between checkpoints:
 - The buffer pool holds modified pages in memory until the next checkpoint flushes them to the heap.
 - Each heap page is recoverable from the last checkpoint plus the redo records after it.
 
-This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full-page images) restores every heap page to its post-boundary on-disk state, and the CLOG (rebuilt from `Commit`/`Abort`) decides which versions are visible.**
+This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full-page images) restores every heap page to its post-boundary on-disk state, and the CLOG (seeded from `clog.dat` and folded forward, with retained-WAL rebuild as the no-snapshot fallback) decides which versions are visible.**
 
 ### Write Protocol
 
@@ -2170,7 +2209,7 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 ### Crash Recovery (REDO)
 
-The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/index/sequence/storage IDs or carried rewrite storage IDs so orphan page files, relation-generation files, or catalog IDs are not reused.
+The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, seeded from `clog.dat` and folded forward with later `Commit`/`Abort` records (or rebuilt from retained WAL when the snapshot is absent), then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/index/sequence/storage IDs or carried rewrite storage IDs so orphan page files, relation-generation files, or catalog IDs are not reused.
 
 **Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
@@ -2208,11 +2247,29 @@ impl PageBackedStorageEngine {
 
 **Recovery procedure** (driven by the server startup sequence):
 
-1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
-2. Initialize storage in recovery mode and the catalog; install table, index, and sequence schemas from the catalog snapshot.
-3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
-4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — committed table/index/sequence/view DDL, committed table metadata ALTER records, committed `UpdateTableSchema`, and committed `TruncateTable` relation swaps through catalog plus `RecoveryOperations`; allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateView` / `CreateIndex` / `CreateSequence` / `CreateDictionary` / `TruncateTable` IDs and skipped `UpdateTableSchema` rewrite storage IDs; and unconditional sequence value records through `RecoveryOperations`. `AlterTablePrimaryKey` installs metadata during replay and records the table for a deferred identity-tree rebuild after replay and crashed-writer abort resolution. The CLOG (rebuilt from `Commit`/`Abort`) decides tuple visibility; aborted/in-flight versions are invisible.
-5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
+1. Construct the buffer pool and immediately enable eviction-flush-on-steal
+   (`buffer.enable_stealing()`), before loading the control record, so redo may
+   spill and is not bounded by the pool.
+2. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If
+   none: fresh database. WAL open has already seeded the CLOG from `clog.dat`
+   when present and folded later transaction outcomes on top.
+3. Initialize storage in recovery mode and the catalog; install table, index,
+   and sequence schemas from the catalog snapshot, then seed and validate the
+   dictionary resolver.
+4. Redo-all: replay every record with `LSN > checkpoint_lsn`
+   (`WalManager::replay_from`): physical-redo records via `apply_physical_redo`
+   (PageLSN-gated; torn/missing pages are zeroed so a
+   `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike,
+   regardless of transaction outcome — committed table/index/sequence/view DDL,
+   committed table metadata ALTER records, committed `UpdateTableSchema`, and
+   committed `TruncateTable` relation swaps through catalog plus
+   `RecoveryOperations`; allocator-only reservation for skipped
+   aborted/in-flight object/rewrite IDs; and unconditional sequence value
+   records. `AlterTablePrimaryKey` defers the identity-tree rebuild until after
+   replay and crashed-writer abort resolution. The seeded/folded CLOG decides
+   tuple visibility; when `clog.dat` is absent it is rebuilt from retained WAL.
+5. If records were replayed: checkpoint to persist the redone state and advance
+   the boundary.
 6. Attempt relation-generation cleanup while no user readers exist.
 7. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
@@ -2503,23 +2560,36 @@ The `server` crate is the binary entry point.
 
 ### Startup Sequence
 
-1. Load configuration (data directory, port, buffer pool size)
-2. Initialize the control store (`FileControlStore`) and heap page store (`HeapPageStore` over `data/heap`)
-3. Initialize WAL — open or create `data/wal.dat`
-4. Initialize buffer pool with configured frames, the `WalFlushPolicy`, and the heap page store
-5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if absent)
-6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
-7. Initialize catalog from the control catalog bytes (or empty); install table, index, and sequence schemas into storage from the catalog snapshot
-8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
-9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, committed table/index/sequence/view DDL, committed table metadata ALTER records, committed `UpdateTableSchema`, and committed relation-swap truncate records through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateView` / `CreateIndex` / `CreateSequence` / `CreateDictionary` / `TruncateTable` IDs and skipped `UpdateTableSchema` rewrite storage IDs, and unconditional sequence value records through `RecoveryOperations`; primary-key ALTERs defer the derived identity-tree rebuild until after replay and crashed-writer abort resolution — the CLOG decides tuple visibility; no WAL appended in recovery mode
-10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water).
-11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
-12. Attempt relation-generation cleanup while no user readers exist.
-13. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
-13. Construct `QueryService` from `components`
-14. Start Tokio runtime, bind TCP listener (default port 5433)
+1. Load configuration and construct the shared compression registry, dictionary
+   store, control store, and heap page store. Create `<data-dir>/tmp` and verify
+   that an anonymous spill file can be created there.
+2. Open `data/wal.dat`; WAL open loads `clog.dat` when present and folds later
+   transaction outcomes on top.
+3. Construct the buffer pool and immediately enable eviction-flush-on-steal,
+   before loading the control record.
+4. Load the control record (`control.load()`): the redo boundary
+   `checkpoint_lsn` and catalog bytes (none if absent).
+5. Initialize the catalog and storage engine in **recovery mode**, then install
+   table, index, and sequence schemas from the catalog snapshot.
+6. Load/register durable dictionaries, burn orphan dictionary ids, and validate
+   every currently referenced dictionary before redo.
+7. Redo-all for records with `LSN > checkpoint_lsn`: apply physical records
+   under PageLSN gating regardless of transaction outcome; apply committed
+   logical catalog records; reserve IDs from skipped aborted/in-flight logical
+   records; and replay sequence values unconditionally. The seeded/folded CLOG
+   decides visibility, and recovery appends no WAL.
+8. Resolve crashed in-flight writers as aborted and perform deferred primary-key
+   identity-tree rebuilds.
+9. Build `ServerComponents`, including configuration (from which query contexts
+   derive `<data-dir>/tmp`), lock/SSI/session registries, checkpoint state, and
+   the transaction-id allocator high-water recovered from all retained WAL
+   records.
+10. If redo changed state, run a checkpoint; then attempt relation-generation
+    cleanup while no user readers exist.
+11. Switch storage to **normal mode**, construct `QueryService`, start Tokio, and
+    bind the listener.
 
-Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
+Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 11 transitions to normal operation where `StorageEngine` methods append WAL records.
 
 The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
 

@@ -1,6 +1,6 @@
 # `storage` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-12
 **Status:** Living crate contract
 
 `SchemaOperations` includes namespace creation and deletion. These operations
@@ -17,6 +17,8 @@ catalog records.
 - `common`
 - `buffer`
 - `wal`
+- `compress` — at-rest page envelopes, WAL full-page-image compression, TOAST
+  payload compression, and dictionary resolution
 
 `storage` must not depend on `planner`.
 
@@ -217,8 +219,9 @@ results are unchanged from the pre-MVCC engine.
   parent tuple bytes that own hidden chunk rows are not discarded outside the
   server-owned TOAST cleanup sequence.
 - **Index backfill; DML locates the visible version; HOT broken-chain guard.**
-  `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
-  the chain view is stable) with the GC horizon threaded in. The new secondary
+  `create_index(ctx, schema, gc_horizon)` backfills while the server holds the
+  target table's `Share` lock (excluding DML writers while allowing readers),
+  with the GC horizon threaded in. The new secondary
   index generation is not published in storage until its empty tree is created
   and backfill succeeds; relation snapshots captured during the build treat the
   catalog-visible index as unavailable and executor fallback must use a table

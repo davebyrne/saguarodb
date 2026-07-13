@@ -1,6 +1,6 @@
 # `wal` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-12
 **Status:** Living crate contract
 
 ## Purpose
@@ -290,7 +290,10 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
 
 - Append and replay records in LSN order.
 - Flush advances durable LSN.
-- Recovery rebuilds the CLOG from `Commit`/`Abort` records and `replay_from` yields every record (redo-all); visibility is decided by the CLOG, not a replay filter.
+- Recovery seeds the CLOG from `clog.dat` and folds post-snapshot
+  `Commit`/`Abort` records, rebuilding it from retained WAL only when the
+  snapshot is absent. `replay_from` yields every redo record (redo-all), and
+  visibility is decided by the CLOG rather than a replay filter.
 - Decoupled truncation: `persist_clog` records an un-vacuumed aborted transaction, then unconditional `truncate_before` drops its `Abort` record — yet after reopen the snapshot keeps it `Aborted` (invisible), and repeated checkpoint+recovery cycles (with the recovery floor establisher) never resurrect it.
 - Vacuum floor (F4c): after `set_vacuum_floor(B)`, the next `persist_clog` drops a reclaimed aborted transaction `< B` from the snapshot (it reads implicit-committed) — while an aborted transaction `>= B`, or one with no vacuum floor advanced, keeps its explicit `Aborted` entry; with no durable CLOG snapshot the floor falls back to its conservative value at reopen.
 - Durable CLOG snapshot: `persist_clog` writes `clog.dat`; reopen seeds the CLOG and both floors from it and folds only the post-`clog_lsn` `Commit`/`Abort` records; an absent snapshot rebuilds from the WAL; a corrupt snapshot (CRC/version/structure) fails open. The snapshot envelope round-trips and rejects tamper/version/length/unsorted/overlapping payloads.

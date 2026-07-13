@@ -1,6 +1,6 @@
 # `server` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-12
 **Status:** Living crate contract
 
 The server turns the session `search_path` GUC into schema ids against the catalog
@@ -28,12 +28,17 @@ transactions and savepoints.
 - `control`
 - `catalog`
 - `compress` — constructs the shared `CompressionRegistry` and `DictStore` at startup and injects them into `storage`/the heap page store (`docs/specs/compression.md` §5a/§7)
+- `spill` — supplies the session `work_mem` budget and `<data-dir>/tmp` spill
+  configuration captured by each opened query
 
 No library crate depends on `server`.
 
 ## Modules
 
-`app` (component bundle + `AppState`), `cancel` (`BackendKey { process_id, secret_key }` and the process-wide `CancelRegistry`), `checkpoint`, `config`, `connection`, `query`, `recovery`, `shutdown`, and `tls` (`build_acceptor`).
+`app` (component bundle + `AppState`), `cancel` (`BackendKey { process_id,
+secret_key }` and the process-wide `CancelRegistry`), `checkpoint`, `config`,
+`connection`, `lock_manager`, `query`, `recovery`, `registry`,
+`session_registry`, `shutdown`, `ssi_manager`, and `tls` (`build_acceptor`).
 
 ## Configuration
 
@@ -46,6 +51,7 @@ pub struct Config {
     pub checkpoint_wal_bytes: u64,
     pub auto_vacuum_dead_rows: u64,
     pub shutdown_timeout_ms: u64,
+    pub deadlock_timeout_ms: u64,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
 }
@@ -62,6 +68,7 @@ Defaults:
 - `checkpoint_wal_bytes = 64 * 1024 * 1024`
 - `auto_vacuum_dead_rows = 10000`
 - `shutdown_timeout_ms = 30000`
+- `deadlock_timeout_ms = 1000`
 - `tls_cert_file = None`
 - `tls_key_file = None`
 
@@ -75,7 +82,10 @@ Binary CLI flags:
 - `--auto-analyze-changed-rows <N>` sets `Config.auto_analyze_changed_rows`; default `10000`. When at least this many committed changed rows (`INSERT`/`UPDATE`/`DELETE`/`COPY FROM`, counted on durable commit only) have accumulated since the last auto-analyze, the next checkpoint re-collects statistics for every user table under its exclusive guard with the built-in default statistics target, as one committed maintenance transaction whose `UpdateTableStatistics` records precede the checkpoint's WAL flush (so the manifest carries the fresh statistics and truncating the records is safe), then resets the accumulator (`docs/specs/statistics.md` §10). A manual full `ANALYZE` (no table) also resets it. `0` disables auto-analyze; like `--auto-vacuum-dead-rows`, `0` is accepted.
 - `--auto-vacuum-dead-rows <N>` sets `Config.auto_vacuum_dead_rows`; default `10000`. When at least this many committed dead versions have accumulated since the last auto-prune, the next checkpoint folds a VACUUM pass over every user table into itself (Milestone F4b, `mvcc.md` §9). `0` disables auto-prune (space is then bounded only by explicit `VACUUM`); unlike the other numeric flags, `0` is accepted here.
 - `--shutdown-timeout-ms <MS>` sets `Config.shutdown_timeout_ms`; default `30000`.
-- `--deadlock-timeout-ms <MS>` sets `Config.deadlock_timeout_ms`; default `1000`. This is how long a writer blocked on an in-progress row-lock holder waits before the deadlock detector checks the wait-for graph. The value must be positive and nonzero.
+- `--deadlock-timeout-ms <MS>` sets `Config.deadlock_timeout_ms`; default `1000`.
+  This is how long a transaction blocked on a row, table, or sequence lock waits
+  before the shared deadlock detector checks the wait-for graph. The value must
+  be positive and nonzero.
 - `--tls-cert-file <PATH>` sets `Config.tls_cert_file`; PEM certificate chain. Optional; defaults to disabled.
 - `--tls-key-file <PATH>` sets `Config.tls_key_file`; PEM private key. Optional; defaults to disabled.
 - `--help` prints usage and exits with code `0`.
@@ -449,9 +459,10 @@ once per VACUUM pass and only advances as snapshots are released; `QueryService:
 captures it **after** acquiring `Share` on every target, so no target writer can
 advance it, and accounts for every reader advertised at that instant (Milestone
 F4a). The CLOG that records settled transaction outcomes
-lives in the WAL manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
-`docs/specs/crates/wal.md`), separate from this registry of still-running
-transactions.
+lives in the WAL manager (`Clog`, seeded from `clog.dat` and folded forward
+with later `Commit`/`Abort` records, or rebuilt from retained WAL when no
+snapshot exists; see `docs/specs/crates/wal.md`), separate from this registry
+of still-running transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the
@@ -688,7 +699,10 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 
 - Startup with no control record creates empty catalog and empty storage.
 - Startup with a control record loads the redo boundary and catalog.
-- Recovery redoes every record after the control record's checkpoint LSN regardless of transaction outcome, and the CLOG (rebuilt from `Commit`/`Abort` records) decides visibility; a transaction in-flight at crash is recovered as aborted.
+- Recovery redoes every record after the control record's checkpoint LSN
+  regardless of transaction outcome, and the CLOG seeded/folded at WAL open
+  decides visibility; without `clog.dat`, retained WAL is the reconstruction
+  fallback. A transaction in-flight at crash is recovered as aborted.
 - Failed write rolls back buffer pages and does not append commit.
 - Successful write appends commit, flushes WAL, commits buffer before returning.
 - Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.

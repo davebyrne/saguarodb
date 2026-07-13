@@ -43,9 +43,10 @@ trait seams.
   unnamed `CHECK` constraints, sequence functions, PostgreSQL-compatible system
   information functions, and catalog/probe functions used by common clients.
 - Multi-statement transactions, autocommit, transaction-scoped and
-  session-scoped isolation settings, savepoints, and `DISCARD ALL`.
-- MVCC with lock-free readers, concurrent writers, Read Committed, Repeatable
-  Read, and Serializable Snapshot Isolation.
+  session-scoped isolation settings, savepoints, forward-only read-only SQL
+  cursors, `statement_timeout`, `work_mem`, and `DISCARD ALL`.
+- MVCC tuple visibility without row locks, concurrent writers, Read Committed,
+  Repeatable Read, and Serializable Snapshot Isolation.
 - Garbage collection via `VACUUM [table]`, coordinated TOAST cleanup, and
   checkpoint auto-pruning (`--auto-vacuum-dead-rows`).
 - Optimizer statistics via `ANALYZE [table]` / `VACUUM ANALYZE` (sampled row
@@ -68,12 +69,12 @@ trait seams.
   checkpoints, WAL truncation, and crash recovery.
 
 SaguaroDB deliberately does not implement authentication, replication, a custom
-wire protocol, mutual TLS/client-certificate authentication, transactional DDL,
-or time-travel queries. Important follow-on areas include a fuller
-cost-based optimizer (join reordering, multi-column index ranges), recursive
-queries, window functions, row-locking SELECTs, advanced index options
-(partial/expression/concurrent/include indexes), and more complete sequence
-and constraint DDL.
+wire protocol, mutual TLS/client-certificate authentication, or time-travel
+queries. Important follow-on areas include a fuller cost-based optimizer (join
+reordering, multi-column index ranges), recursive queries, window functions,
+row-locking SELECTs, advanced index options
+(partial/expression/concurrent/include indexes), and more complete sequence and
+constraint DDL.
 
 ## Quick Start
 
@@ -182,14 +183,16 @@ map, and reclaimed later by VACUUM.
   `ROLLBACK TO SAVEPOINT` create nested subtransactions. Rolling back to a
   savepoint marks that subtransaction's row versions aborted while preserving the
   outer transaction.
-- **Concurrency.** Readers are lock-free and never block. Writers run
-  concurrently, coordinated by row locks plus per-index and per-heap structural
-  latches; a writer blocked on a row waits and then invokes deadlock detection
-  after `--deadlock-timeout-ms`. Conflicts can return deadlock error `40P01`,
-  unique violation `23505`, or serialization error `40001`, depending on the
-  committed state and isolation level. Checkpoint, DDL, and maintenance commands
-  briefly take an exclusive guard that drains in-flight writers while readers
-  continue.
+- **Concurrency.** MVCC tuple reads take no row locks and do not conflict with
+  ordinary DML writers. SQL statements also take transaction- or statement-owned
+  table locks, so a reader can wait behind an `AccessExclusive` operation such as
+  `TRUNCATE` or table-rewrite DDL. Writers run concurrently, coordinated by table
+  and row locks plus per-index and per-heap structural latches; a writer blocked
+  on a lock invokes deadlock detection after `--deadlock-timeout-ms`. Conflicts
+  can return deadlock error `40P01`, unique violation `23505`, or serialization
+  error `40001`, depending on the committed state and isolation level. Writes,
+  DDL, and WAL-writing maintenance share the checkpoint-participant guard; only
+  checkpoint takes it exclusively and drains page/WAL writers.
 - **Garbage collection.** Dead row versions are reclaimed by `VACUUM [table]` and
   by automatic pruning at checkpoint (`--auto-vacuum-dead-rows`). For tables with
   TOAST storage, the server coordinates parent-row pruning and hidden TOAST-chunk
@@ -227,14 +230,18 @@ psql / client -> | server            |
                               +-----+----------+
 ```
 
+The executor also uses the one-way `spill` crate for per-operator `work_mem`
+accounting, rewindable temporary tapes, and external sorting under
+`<data-dir>/tmp`.
+
 Crate dependency flow:
 
 ```text
 server
   -> protocol, parser, planner, executor, control, storage, buffer, wal,
-     catalog, compress, common
+     catalog, compress, spill, common
 
-executor -> planner, storage, catalog, common
+executor -> planner, storage, catalog, spill, common
 planner  -> parser, catalog, common
 storage  -> buffer, wal, compress, common
 control  -> common
@@ -244,8 +251,11 @@ buffer   -> common
 wal      -> common
 catalog  -> common
 compress -> common
+spill    -> common
 
-common and compress are leaf crates.
+`common` is the leaf crate for shared database types. `compress` depends only on
+`common` plus codec support, and `spill` depends only on `common` plus
+`tempfile`.
 No library crate depends on server.
 ```
 
@@ -254,6 +264,7 @@ Workspace layout:
 ```text
 crates/
   common/    shared IDs, values, rows, errors, contexts, traits
+  spill/     query-local memory accounting, spill tapes, external sorting
   compress/  compression codecs, page envelopes, TOAST helpers, dictionaries
   parser/    SQL text to SaguaroDB AST
   catalog/   table metadata, stable IDs, schema snapshots
@@ -270,11 +281,12 @@ crates/
 ## Query Path
 
 Most SQL flows through the same parse, bind, plan, and execute pipeline. Read
-statements take an MVCC snapshot and run lock-free; data-changing statements run
-under a shared writer guard and receive a transaction ID plus a snapshot for
-visibility, WAL, row locks, and conflict detection. DDL, checkpoint, `VACUUM`,
-`TRUNCATE`, and table-rewrite maintenance take an exclusive guard that drains
-in-flight writers.
+statements take an MVCC snapshot and `AccessShare` table locks but no row locks;
+data-changing statements run under a shared writer guard and receive a
+transaction ID plus a snapshot for visibility, WAL, table/row locks, and
+conflict detection. DDL and maintenance also use the shared writer guard plus
+relation-specific locks and the catalog publication gate. Checkpoint alone takes
+the exclusive checkpoint guard and drains page/WAL writers.
 
 ```text
 client query
@@ -289,10 +301,11 @@ QueryService
     |
     +--> classify statement
     |       |
-    |       +-- SELECT / EXPLAIN: MVCC snapshot, no writer guard
-    |       +-- DML / COPY FROM:  shared writer guard + txn_id + snapshot
+    |       +-- SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks
+    |       +-- DML / COPY FROM:  shared writer guard + txn_id + table locks + snapshot
     |       +-- DDL / maintenance:
-    |                            exclusive guard (drains writers)
+    |                            shared writer guard + object locks/catalog gate
+    |       +-- checkpoint:      exclusive checkpoint guard (drains writers)
     |       +-- transaction, savepoint, SET/SHOW/RESET, DISCARD:
     |                            handled by server session state
     |
@@ -320,10 +333,11 @@ generations until snapshots drain, but heap/index page bytes are not undone.
 
 ## Data Files
 
-The data directory contains one write-ahead-log file, the control record,
-dictionary files, and physical heap/index relation files. `manifest.dat` is the
-control record: the redo boundary (`checkpoint_lsn`), the live table ids, and
-the serialized catalog, written atomically as a single CRC-checked envelope.
+The data directory contains the write-ahead log, durable CLOG snapshot, control
+record, dictionary files, ephemeral query-spill directory, and physical
+heap/index relation files. `manifest.dat` is the control record: the redo
+boundary (`checkpoint_lsn`), the live table ids, and the serialized catalog,
+written atomically as a single CRC-checked envelope.
 
 Each live table generation has a `storage_id`. The row heap is stored at
 `<storage_id>.heap`, the reserved storage-identity B-tree is stored at
@@ -336,8 +350,10 @@ generations with the same heap/index file pattern.
 ```text
 data/
   wal.dat
+  clog.dat
   manifest.dat
   manifest.dat.tmp
+  tmp/                       ephemeral query spill files
   dicts/
     <dict-id>.dict
   heap/
@@ -409,6 +425,8 @@ checkpoint
     |
     +-- fsync data directory
     |
+    +-- persist clog.dat through checkpoint_lsn (atomic write + fsync)
+    |
     +-- append WAL Checkpoint metadata record and fsync
     |
     +-- truncate WAL records before checkpoint_lsn
@@ -417,23 +435,27 @@ checkpoint
 ```
 
 The control record is the commit point: it is written only after the heap and
-index pages it describes are durable, and the WAL prefix is truncated only after
-the control record is durable. If the server crashes mid-checkpoint, recovery
-falls back to the previous redo boundary, where this cycle's full-page images
-repair any torn page writes.
+index pages it describes are durable. Before the WAL prefix is truncated, the
+server also persists `clog.dat` through the new boundary so every transaction
+outcome removed from WAL remains durable. If the server crashes mid-checkpoint,
+recovery falls back to the previous redo boundary, where this cycle's full-page
+images repair any torn page writes.
 
 ## Recovery
 
-Startup reads the control record for the redo boundary and catalog, validates
+Startup opens the WAL and its durable `clog.dat` snapshot, enables buffer
+stealing, reads the control record for the redo boundary and catalog, validates
 the dictionary store, then replays WAL records after `checkpoint_lsn` onto heap
-and index pages (redo-all). Replay rebuilds the commit-status map (CLOG) from
-`Commit`/`Abort` records, including subtransaction commit records, so MVCC and
-savepoint visibility are correct after restart.
+and index pages (redo-all). The CLOG is seeded from `clog.dat` and folded forward
+with later `Commit`/`Abort` records, including subtransaction commit records; if
+the snapshot is absent, it is rebuilt from retained WAL records.
 
 ```text
 server startup
     |
     +-- open control store, dictionary store, heap page store, and data/wal.dat
+    |
+    +-- enable buffer stealing; load clog.dat when present
     |
     +-- read manifest.dat
     |       |
@@ -443,8 +465,8 @@ server startup
     +-- install table, hidden TOAST, secondary-index, and sequence schemas
     |       into storage
     |
-    +-- replay WAL records with LSN > checkpoint_lsn (redo-all) and rebuild
-    |       the commit-status map (CLOG) from Commit/Abort records for visibility
+    +-- replay WAL records with LSN > checkpoint_lsn (redo-all); use the CLOG
+    |       seeded/folded at WAL open for transaction visibility
     |       page-LSN gating makes redo idempotent; torn or missing pages are
     |       zeroed so a FullPageImage / FullPageImageCompressed / HeapInit
     |       re-establishes them
