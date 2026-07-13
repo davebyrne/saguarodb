@@ -567,12 +567,12 @@ fn format_node(
             ));
             format_node(
                 source,
-                layout.child(0).expect("source layout"),
+                layout_child(layout, 0)?,
                 indent + 1,
                 catalog,
                 metrics,
                 output,
-            );
+            )?;
         }
         PhysicalPlan::Sort { source, order_by } => {
             output.push_str(&format!(

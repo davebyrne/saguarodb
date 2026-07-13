@@ -2291,7 +2291,13 @@ impl StorageEngine for PageBackedStorageEngine {
                     return Ok(LockRowResult::Deleted);
                 }
                 LatestRowVersion::WouldBlock(_) => {
-                    unreachable!("in-progress versions are handled by the inner wait loop")
+                    return restore_tuple_changes_after_error(
+                        ctx,
+                        changes,
+                        storage_internal(
+                            "in-progress row version escaped the tuple-lock wait loop",
+                        ),
+                    );
                 }
             }
         }
@@ -2406,9 +2412,9 @@ impl StorageEngine for PageBackedStorageEngine {
                 StorageEngine::delete_locked(self, ctx, relations, table, &target)
             }
             LockRowResult::Locked(_) | LockRowResult::Deleted => Err(concurrent_update_error()),
-            LockRowResult::Skipped => {
-                unreachable!("blocking tuple-lock acquisition cannot skip a row")
-            }
+            LockRowResult::Skipped => Err(storage_internal(
+                "blocking delete tuple-lock acquisition skipped a row",
+            )),
         }
     }
 
@@ -2470,9 +2476,9 @@ impl StorageEngine for PageBackedStorageEngine {
                 StorageEngine::update_locked(self, ctx, relations, table, &target, row)
             }
             LockRowResult::Locked(_) | LockRowResult::Deleted => Err(concurrent_update_error()),
-            LockRowResult::Skipped => {
-                unreachable!("blocking tuple-lock acquisition cannot skip a row")
-            }
+            LockRowResult::Skipped => Err(storage_internal(
+                "blocking update tuple-lock acquisition skipped a row",
+            )),
         }
     }
 

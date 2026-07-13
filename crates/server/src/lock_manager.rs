@@ -268,8 +268,8 @@ impl LockManager {
     }
 
     fn create_guard(self: &Arc<Self>, owner: LockOwner) -> Result<ObjectLockGuard> {
-        self.register_owner(owner)?;
         let guard_id = next_id(&self.next_guard_id, "object lock guard")?;
+        self.register_owner(owner)?;
         Ok(ObjectLockGuard::new(Arc::clone(self), owner, guard_id))
     }
 
@@ -593,6 +593,19 @@ impl LockManager {
                 "object lock snapshot is stale and cannot restore released grants",
             ));
         }
+        let mut next_generation = state.next_tuple_grant_generation;
+        let mut restored = Vec::with_capacity(snapshot.grants.len());
+        for (resource, mode) in &snapshot.grants {
+            let generation = if matches!(mode, ObjectLockMode::Tuple(_)) {
+                next_generation = next_generation
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::internal("tuple grant generation exhausted"))?;
+                Some(next_generation)
+            } else {
+                None
+            };
+            restored.push((resource.clone(), *mode, generation));
+        }
         for owners in state.grants.values_mut() {
             owners.remove(&owner);
         }
@@ -600,21 +613,17 @@ impl LockManager {
         state
             .tuple_grant_generations
             .retain(|(_, grant_owner), _| *grant_owner != owner);
-        for (resource, mode) in &snapshot.grants {
+        state.next_tuple_grant_generation = next_generation;
+        for (resource, mode, generation) in restored {
             state
                 .grants
                 .entry(resource.clone())
                 .or_default()
-                .insert(owner, *mode);
-            if matches!(mode, ObjectLockMode::Tuple(_)) {
-                state.next_tuple_grant_generation = state
-                    .next_tuple_grant_generation
-                    .checked_add(1)
-                    .ok_or_else(|| DbError::internal("tuple grant generation exhausted"))?;
-                let generation = state.next_tuple_grant_generation;
+                .insert(owner, mode);
+            if let Some(generation) = generation {
                 state
                     .tuple_grant_generations
-                    .insert((resource.clone(), owner), generation);
+                    .insert((resource, owner), generation);
             }
         }
         state.waits_for.remove(&owner);

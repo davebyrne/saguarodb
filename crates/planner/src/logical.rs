@@ -658,7 +658,11 @@ fn plan_select_body(
             Some(BoundDistinct::On(on)) => Some(on.clone()),
         };
         plan = if let Some(lock) = row_lock {
-            debug_assert!(distinct_keys.is_none());
+            if distinct_keys.is_some() {
+                return Err(DbError::internal(
+                    "locking SELECT reached planning with DISTINCT",
+                ));
+            }
             LogicalPlan::LockRows {
                 source: Box::new(plan),
                 table: lock.table,
