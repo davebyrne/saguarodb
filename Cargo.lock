@@ -996,8 +996,8 @@ name = "saguarodb-server"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
- "libc",
  "rcgen",
+ "rustix",
  "rustls-pemfile",
  "saguarodb-buffer",
  "saguarodb-catalog",
@@ -1029,8 +1029,8 @@ name = "saguarodb-storage"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
- "libc",
  "parking_lot",
+ "rustix",
  "saguarodb-buffer",
  "saguarodb-common",
  "saguarodb-compress",

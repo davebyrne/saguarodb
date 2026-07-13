@@ -21,7 +21,6 @@ use support::{Connection, TestServer};
 #[cfg(target_os = "linux")]
 fn filesystem_supports_hole_punch(dir: &std::path::Path) -> bool {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
 
     let path = dir.join("hole-punch-probe.tmp");
@@ -31,15 +30,14 @@ fn filesystem_supports_hole_punch(dir: &std::path::Path) -> bool {
     file.sync_all().unwrap();
     let before = file.metadata().unwrap().blocks() * 512;
 
-    let rc = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            0,
-            block as libc::off_t,
-        )
-    };
-    let reclaimed = rc == 0 && {
+    let punched = rustix::fs::fallocate(
+        &file,
+        rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE,
+        0,
+        block,
+    )
+    .is_ok();
+    let reclaimed = punched && {
         let after = file.metadata().unwrap().blocks() * 512;
         after < before
     };

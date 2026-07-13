@@ -196,30 +196,24 @@ impl HeapPageStore {
     /// read back — the envelope is length-delimited.
     #[cfg(target_os = "linux")]
     fn punch_hole(&self, file: &File, offset: u64, len: u64) {
-        use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
         if self.punch_unsupported.load(Ordering::Relaxed) {
             return;
         }
-        let rc = unsafe {
-            libc::fallocate(
-                file.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset as libc::off_t,
-                len as libc::off_t,
-            )
-        };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if matches!(
-                err.raw_os_error(),
-                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
-            ) {
-                self.punch_unsupported.store(true, Ordering::Relaxed);
-            }
-            // Any punch failure is tolerated: the slot keeps stale trailing
-            // bytes, which the length-delimited envelope decode never reads.
+        let result = rustix::fs::fallocate(
+            file,
+            rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE,
+            offset,
+            len,
+        );
+        if matches!(
+            result,
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::INVAL)
+        ) {
+            self.punch_unsupported.store(true, Ordering::Relaxed);
         }
+        // Any punch failure is tolerated: the slot keeps stale trailing
+        // bytes, which the length-delimited envelope decode never reads.
     }
 
     #[cfg(not(target_os = "linux"))]
