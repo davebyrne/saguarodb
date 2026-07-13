@@ -1616,6 +1616,136 @@ async fn rollback_to_savepoint_undoes_inner_work() {
     );
 }
 
+/// A relation lock first acquired after a savepoint is released by `ROLLBACK TO`,
+/// and an already-queued conflicting waiter is woken without waiting for top-level
+/// transaction completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_to_savepoint_releases_later_relation_lock_and_wakes_waiter() {
+    let server = TestServer::start().await.unwrap();
+    let mut owner = Connection::connect(&server).await.unwrap();
+    owner
+        .ok("create table savepoint_late_lock (id integer primary key)")
+        .await;
+
+    owner.ok("begin").await;
+    owner.ok("savepoint s").await;
+    owner.ok("select * from savepoint_late_lock").await;
+
+    let mut waiter = Connection::connect(&server).await.unwrap();
+    let waiter =
+        tokio::spawn(async move { waiter.query("truncate table savepoint_late_lock").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "TRUNCATE must wait for AccessShare");
+
+    owner.ok("rollback to savepoint s").await;
+    tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("ROLLBACK TO should wake the relation-lock waiter")
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    owner.ok("rollback").await;
+}
+
+/// Grants held when the savepoint was established survive rollback to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_to_savepoint_preserves_earlier_relation_lock() {
+    let server = TestServer::start().await.unwrap();
+    let mut owner = Connection::connect(&server).await.unwrap();
+    owner
+        .ok("create table savepoint_early_lock (id integer primary key)")
+        .await;
+
+    owner.ok("begin").await;
+    owner.ok("select * from savepoint_early_lock").await;
+    owner.ok("savepoint s").await;
+    owner.ok("rollback to savepoint s").await;
+
+    let mut waiter = Connection::connect(&server).await.unwrap();
+    let waiter =
+        tokio::spawn(async move { waiter.query("truncate table savepoint_early_lock").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the pre-savepoint AccessShare grant must remain held"
+    );
+    owner.ok("commit").await;
+    tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("top-level COMMIT should wake the waiter")
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+}
+
+/// Rolling back a post-savepoint lock upgrade restores the earlier weaker mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_to_savepoint_downgrades_relation_lock_upgrade() {
+    let server = TestServer::start().await.unwrap();
+    let mut owner = Connection::connect(&server).await.unwrap();
+    owner
+        .ok("create table savepoint_lock_upgrade (id integer primary key)")
+        .await;
+    owner
+        .ok("insert into savepoint_lock_upgrade values (1)")
+        .await;
+
+    owner.ok("begin").await;
+    owner.ok("select * from savepoint_lock_upgrade").await;
+    owner.ok("savepoint s").await;
+    owner.ok("truncate savepoint_lock_upgrade").await;
+    owner.ok("rollback to savepoint s").await;
+
+    let mut reader = Connection::connect(&server).await.unwrap();
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        reader.query("select * from savepoint_lock_upgrade"),
+    )
+    .await
+    .expect("AccessExclusive must be downgraded to the saved AccessShare mode")
+    .unwrap();
+    assert_eq!(read.rows(), vec![vec![Some("1".to_string())]]);
+    owner.ok("rollback").await;
+}
+
+/// `RELEASE` merges later grants into the parent, including grants acquired in a
+/// nested level that was released before the outer savepoint was rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_retains_locks_but_rollback_of_outer_releases_nested_grants() {
+    let server = TestServer::start().await.unwrap();
+    let mut owner = Connection::connect(&server).await.unwrap();
+    owner
+        .ok("create table savepoint_release_lock (id integer primary key)")
+        .await;
+
+    owner.ok("begin").await;
+    owner.ok("savepoint outer").await;
+    owner.ok("savepoint inner").await;
+    owner.ok("select * from savepoint_release_lock").await;
+    owner.ok("release savepoint inner").await;
+
+    let mut waiter = Connection::connect(&server).await.unwrap();
+    let waiter =
+        tokio::spawn(async move { waiter.query("truncate table savepoint_release_lock").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "RELEASE must retain grants acquired under the released level"
+    );
+
+    owner.ok("rollback to savepoint outer").await;
+    tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("rolling back the outer level should release the nested grant")
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    owner.ok("rollback").await;
+}
+
 /// `RELEASE SAVEPOINT` keeps the subtransaction's work; it commits with the parent
 /// and is visible to a later transaction.
 #[tokio::test]

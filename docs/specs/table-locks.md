@@ -100,9 +100,10 @@ the schema lock without changing name-lock semantics.
 There are two owner kinds:
 
 - A top-level transaction id owns every lock acquired by an explicit
-  transaction. Locks survive statement completion, errors, `RELEASE SAVEPOINT`,
-  and `ROLLBACK TO SAVEPOINT`, and release only at top-level COMMIT/ROLLBACK or
-  disconnect cleanup.
+  transaction. Locks survive statement completion, errors, and `RELEASE
+  SAVEPOINT`. `ROLLBACK TO SAVEPOINT` restores the captured grant set, releasing
+  later acquisitions and downgrading later upgrades; the remaining grants release
+  at top-level COMMIT/ROLLBACK or disconnect cleanup.
 - A generated statement-owner id owns locks for an autocommit or read-only
   statement that has no registered transaction id. Its RAII guard releases all
   locks when the statement/stream/portal operation finishes.
@@ -124,9 +125,11 @@ granted `Share` locks through physical pruning. It performs no further row waits
 transactional writes and releases the grants at statement end. This preserves one
 graph identity without exposing target tables between durable cleanup and pruning.
 
-Subxids never own table locks independently. A savepoint statement uses the
-top-level transaction owner so deadlock edges and lifetime remain transaction
-scoped.
+Subxids never own object locks independently. A savepoint captures the top-level
+transaction owner's complete grant set. `ROLLBACK TO` atomically restores that
+set, releasing grants first acquired after the savepoint and downgrading later
+upgrades; `RELEASE` keeps later grants. The owner identity remains transaction
+scoped, so row/relation deadlock edges do not split across subxids.
 
 Before an explicit transaction acquires its first table or sequence lock—even
 for a read—it acquires and retains the shared checkpoint-participant guard through
@@ -184,7 +187,8 @@ Read and Serializable; only the MVCC snapshot is retained by those isolation
 levels. After binding/revalidation, a statement acquires all relation locks and
 only then captures the current relation generations used by execution. An
 explicit transaction retains the locks for every relation it has actually
-referenced, so recapturing generations cannot change those relations behind the
+referenced unless `ROLLBACK TO` restores a snapshot predating that reference, so
+recapturing generations cannot change currently locked relations behind the
 transaction. This separation also means a transaction that previously referenced
 only an unrelated table does not pin stale generations for every table.
 
@@ -267,8 +271,9 @@ only data-path operation that waits for the exclusive checkpoint guard.
   storage-concurrency project may weaken this.
 - Schema-scoped catalog-name resources protect CREATE and relation-name conflicts.
   Transactional DDL retains those locks through top-level commit or rollback;
-  the catalog publication gate is used for atomic overlay publication and short
-  revalidation/mutation critical sections.
+  `ROLLBACK TO` restores the savepoint's earlier grant set. The catalog publication
+  gate is used for atomic overlay publication and short revalidation/mutation
+  critical sections.
 - DROP SEQUENCE and owned-sequence cascades take `SequenceExclusive`; sequence
   calls/defaults take `SequenceAccess` for their statement/transaction lifetime.
 
@@ -294,11 +299,12 @@ held. This prevents bind-before-lock from observing uncommitted storage ids.
 
 ## 8. Transactional TRUNCATE
 
-`TRUNCATE [TABLE] <name> [, ...]` is allowed in a healthy explicit transaction
-when no savepoint is currently open. It takes `AccessExclusive` on all targets and
-retains those locks through transaction end. The restriction applies only to
-TRUNCATE; VACUUM and other maintenance commands retain their documented
-transaction-block restrictions.
+`TRUNCATE [TABLE] <name> [, ...]` is allowed in a healthy explicit transaction,
+including beneath savepoints. It takes `AccessExclusive` on all targets. Top-level
+completion retains those locks through transaction end; `ROLLBACK TO` restores the
+captured grant set together with the catalog and storage generation before-images.
+VACUUM and other maintenance commands retain their documented transaction-block
+restrictions.
 
 Before swapping storage, reject `TRUNCATE` with `SqlState::ObjectInUse` (`55006`)
 if the same session has a SQL cursor, suspended extended-protocol portal, or other
@@ -348,10 +354,10 @@ rules. Recovery applies committed `TruncateTable` records and later physical COP
 DML redo in WAL order. In-flight/aborted truncate records are skipped for catalog
 publication while their replacement storage ids remain reserved.
 
-`ROLLBACK TO SAVEPOINT` support for a TRUNCATE performed inside a savepoint is out
-of scope for this milestone because catalog/generation undo is initially top-level.
-Attempting it with an open savepoint returns `FeatureNotSupported` and poisons the
-block like other statement errors.
+For TRUNCATE beneath a savepoint, `ROLLBACK TO` restores the prior catalog overlay,
+storage generations, and lock modes as one rollback operation. A table whose
+`AccessExclusive` grant was first acquired after the savepoint is released; an
+earlier weaker grant is restored to its captured mode.
 
 ## 9. Acceptance criteria
 

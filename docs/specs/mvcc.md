@@ -1146,7 +1146,7 @@ in-progress conflicts — see §7.3 and `docs/specs/deadlock.md`.)
 
 Read Committed (per-statement snapshot) vs Repeatable Read (per-transaction
 snapshot); `'E'` failed-transaction handling; serialization-failure surfacing;
-savepoints via sub-transaction xids (optional, deferred).
+savepoints via sub-transaction xids (implemented; `docs/specs/savepoints.md`).
 
 - **G1 — transaction-scoped isolation SQL.** *(implemented.)*
   `BEGIN [TRANSACTION] ISOLATION LEVEL <level>`,

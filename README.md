@@ -187,8 +187,10 @@ map, and reclaimed later by VACUUM.
   dependency cycles with serialization error `40001`.
 - **Savepoints.** `SAVEPOINT`, `RELEASE SAVEPOINT`, and
   `ROLLBACK TO SAVEPOINT` create nested subtransactions. Rolling back to a
-  savepoint marks that subtransaction's row versions aborted while preserving the
-  outer transaction.
+  savepoint marks that subtransaction's row versions aborted, releases object
+  locks acquired since the savepoint, restores upgraded locks to their earlier
+  modes, and preserves the outer transaction. Releasing a savepoint keeps its
+  changes and locks merged into the parent.
 - **Concurrency.** MVCC tuple reads take no row locks and do not conflict with
   ordinary DML writers. SQL statements also take transaction- or statement-owned
   table locks, so a reader can wait behind an `AccessExclusive` operation such as

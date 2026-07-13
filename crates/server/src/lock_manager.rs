@@ -1109,6 +1109,54 @@ mod tests {
     }
 
     #[test]
+    fn owner_snapshot_restore_releases_tuple_grant_and_wakes_waiter() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        registry.register(2);
+        let mut first = manager.transaction_owner(1).unwrap();
+        let second = manager.transaction_owner(2).unwrap();
+        let empty = first.snapshot();
+        let cancel = Arc::new(QueryCancel::new());
+        manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+
+        let waiting_manager = Arc::clone(&manager);
+        let waiting_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let result = waiting_manager.acquire_tuple(
+                2,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &waiting_cancel,
+            );
+            tx.send(result.map(|_| ())).unwrap();
+            drop(second);
+        });
+        wait_until_queued(
+            &manager,
+            LockOwner::Transaction(2),
+            LockResource::Tuple {
+                table: 1,
+                key: tuple_tag(7).key,
+            },
+        );
+
+        first.restore(&empty).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert!(first.snapshot().grants.is_empty());
+        thread.join().unwrap();
+    }
+
+    #[test]
     fn tuple_receipts_cannot_be_restored_by_another_owner() {
         let (manager, registry) = manager(20);
         registry.register(1);

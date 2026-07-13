@@ -508,11 +508,13 @@ hidden TOAST, and secondary-index schemas in a transaction-local catalog overlay
 public catalog maps remain unchanged. The read-only overlay stores only replacement
 schemas and falls back to the live catalog for unrelated objects, so later statements
 do not clone the full catalog and can resolve unrelated committed DDL. Owner binding
-resolves overlay entries before the committed catalog. Top-level commit publishes the complete overlay under the
-server catalog gate and one catalog write lock; rollback discards it. Allocated ids
-remain burned. Repeated truncates replace the overlay entry with the newest schema
-while storage retains first-before-images. Savepoint-local overlay rollback is out
-of scope, so TRUNCATE is rejected while a savepoint is open.
+resolves overlay entries before the committed catalog. Top-level commit publishes
+the complete overlay under the server catalog gate and one catalog write lock;
+rollback discards it. Allocated ids remain burned. Repeated truncates replace the
+overlay entry with the newest schema while storage retains first-before-images.
+Each savepoint captures the overlay journal position; `ROLLBACK TO` restores that
+position together with storage generation before-images, so TRUNCATE is supported
+beneath savepoints without publishing intermediate catalog state.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE`
 execution. `rename_table`, `add_table_column`, `drop_table_column`, and

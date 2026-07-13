@@ -28,7 +28,9 @@ use storage::RelationSnapshot;
 use tokio::sync::mpsc;
 
 use crate::app::ServerComponents;
-use crate::lock_manager::{ObjectLockGuard, ObjectLockRequest, RelationLockMode, SequenceLockMode};
+use crate::lock_manager::{
+    ObjectLockGuard, ObjectLockRequest, OwnerGrantSnapshot, RelationLockMode, SequenceLockMode,
+};
 use crate::registry::AdvertisedSnapshot;
 use crate::session_registry::SessionRegistry;
 
@@ -700,8 +702,9 @@ pub struct Transaction {
     /// A deadlock victim is physically aborted immediately but remains as a failed
     /// protocol shell until COMMIT/ROLLBACK consumes the transaction block.
     physically_aborted: bool,
-    /// One top-level-xid owner token for every table/sequence lock retained by the
-    /// transaction. Subtransactions share this owner and never release its grants.
+    /// One top-level-xid owner token for every table/sequence/tuple lock retained by
+    /// the transaction. Subtransactions share this owner; savepoint rollback restores
+    /// its captured grant set while release keeps later grants.
     object_locks: Option<ObjectLockGuard>,
     /// The SHARED checkpoint-participant guard, acquired before the first retained
     /// object lock and held until COMMIT/ROLLBACK. It is shared with writers; only
@@ -783,6 +786,7 @@ struct SavepointLevel {
     catalog_overlay: CatalogOverlaySavepoint,
     storage: storage::StorageSavepoint,
     work_mem_override: Option<WorkMemOverride>,
+    object_locks: Option<OwnerGrantSnapshot>,
 }
 
 impl Transaction {

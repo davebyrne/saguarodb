@@ -423,8 +423,9 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   state, append their
   logical WAL records, and are
   transaction-scoped through the catalog/storage journals inside a block.
-  Retained object locks release only after commit or rollback, so other sessions
-  never observe provisional state.
+  Retained object locks release after top-level commit/rollback, or return to a
+  captured earlier grant set on `ROLLBACK TO SAVEPOINT`, in step with the catalog
+  and storage journals so other sessions never observe provisional state.
 - Statements flagged `mutates_sequences` are routed to the write path even when
   they are syntactically `SELECT`; binding collects their sequence ids and the
   xid owner takes `SequenceAccess` before snapshot/execution. DML defaults do the

@@ -90,8 +90,13 @@ A write statement stamps the current writing xid as the tuple's `xmin`
 
 Each savepoint level also snapshots transaction-local catalog state. This
 includes the general transactional catalog overlay and the current TRUNCATE
-generation map. `ROLLBACK TO` restores those snapshots before re-establishing
-the level; `RELEASE` discards the snapshot while retaining the current changes.
+generation map. It also snapshots the top-level transaction owner's object-lock
+grants. `ROLLBACK TO` restores those snapshots before re-establishing the level:
+grants first acquired after the savepoint are released and post-savepoint upgrades
+are downgraded to their captured modes. `RELEASE` discards the snapshots while
+retaining the current changes and grants. Locks captured by a savepoint survive a
+rollback to that level and remain held through top-level completion unless an
+older savepoint snapshot is later restored.
 Allocator high-water reservations are deliberately not rewound, so rolled-back
 DDL leaves harmless id gaps rather than permitting durable identity reuse. WAL
 and heap row effects continue to use the subxid/CLOG mechanism below.
@@ -103,8 +108,9 @@ set until the top settles.
 
 ### Operations on the stack and CLOG
 
-- **`SAVEPOINT s`**: allocate `subxid`, register it active, add it to the live-set,
-  push `(s, subxid)`.
+- **`SAVEPOINT s`**: snapshot the transaction owner's current object-lock grants,
+  allocate `subxid`, register it active, add it to the live-set, and push
+  `(s, subxid)`.
 - **`RELEASE SAVEPOINT s`**: a **pure in-memory stack merge** — pop the nearest
   level named `s` (and any levels above it) into their parent. The popped subxids
   are **not** marked in the CLOG and **not** deregistered: they stay in the active
@@ -118,8 +124,10 @@ set until the top settles.
 - **`ROLLBACK TO SAVEPOINT s`**: find the nearest level named `s`; mark its subxid
   and every subxid above it **`Aborted`** in the CLOG, deregister them and remove
   them from the live-set, pop the levels above `s`, and replace `s`'s subxid with a
-  **fresh** subxid (PG keeps `s` active for continued work). Clears the failed
-  state if set.
+  **fresh** subxid (PG keeps `s` active for continued work). Restore the captured
+  object-lock grant set, releasing later acquisitions and downgrading later
+  upgrades; queued waiters are notified by the ordinary lock-manager restore.
+  Clears the failed state if set.
 - **Top-level `COMMIT`**: `T` and every live-set subxid (open or released — i.e.
   all non-rolled-back) commit durably together (§5). The in-memory CLOG statuses
   for the whole family are set `Committed` first, then `{T}` ∪ all live-set
@@ -219,8 +227,8 @@ ordinary xids.
 
 ## 8. Server transaction lifecycle & protocol
 
-- `Transaction` gains the savepoint stack. A new `StatementClass::Savepoint(...)`
-  is routed through the transaction-control lifecycle (not bound/planned), like
+- `Transaction` owns the savepoint stack. `StatementClass::Savepoint(...)` routes
+  through the transaction-control lifecycle (not bound/planned), like
   `BEGIN`/`COMMIT`/`ROLLBACK`.
 - The failed-state gate permits `ROLLBACK TO SAVEPOINT` (recovery) in addition to
   `COMMIT`/`ROLLBACK`; all other statements still return `25P02`.
@@ -228,47 +236,49 @@ ordinary xids.
 
 ## 9. Crate responsibilities
 
-- `common`: the two new SQLSTATEs; the live-(sub)xid set on the visibility inputs;
-  and generalizing the scalar `== current_txn` self-check to "∈ live-set" in **all
+- `common`: the savepoint SQLSTATEs; the live-(sub)xid set on visibility inputs;
+  and the "∈ live-set" self-check in **all
   three** of `is_visible`/`txn_effect_visible` (own-write), `write_conflict`, and
   `classify_unique_conflict` (own row-lock) — so a transaction never spuriously
   conflicts with its own earlier subtransaction.
 - `parser`: `Statement::Savepoint`/`ReleaseSavepoint`/`RollbackToSavepoint`
-  (sqlparser 0.56 already parses all three; today they are rejected).
+  conversion from sqlparser's corresponding statements.
 - `wal`: subxid-aware top-level `Commit` record (carrying the committed subxid
   set) + recovery rebuild + truncation-floor handling.
-- `server`: `Transaction` savepoint stack + live-set; `SAVEPOINT`/`RELEASE`
+- `server`: the `Transaction` savepoint stack + live-set; `SAVEPOINT`/`RELEASE`
   (in-memory merge) / `ROLLBACK TO` handlers; failed-state recovery; active-registry
-  subxid tracking (released subxids stay registered until the top commits) plus a
-  new `ActiveTxnRegistry::deregister_all(&[TxnId])` for the atomic family-deregister
+  subxid tracking (released subxids stay registered until the top commits) plus
+  `ActiveTxnRegistry::deregister_all(&[TxnId])` for atomic family deregistration
   at top-level COMMIT/ROLLBACK; `StatementClass::Savepoint` routing; command tags;
   threading the live-set into every statement's `StatementContext`.
-- `storage`: pass the live-set through to the conflict classifiers; the `xmax`
+- `storage`: passes the live-set through to the conflict classifiers; the `xmax`
   stale-lock (aborted-subxid) case already works via CLOG status.
+- `server::lock_manager`: savepoint grant snapshots use the top-level owner and
+  restore the complete object-lock grant set atomically, including tuple-grant
+  generation bookkeeping and waiter notification.
 
-## 10. Implementation milestones
+## 10. Implemented behavior
 
-One cohesive feature, staged as reviewed commits that land together before merge:
+The implementation includes parser and statement routing, eager subxid allocation,
+the transaction stack and live-set, failed-state recovery, cross-transaction
+visibility through active-registry `xip`, subxid-aware commit/abort WAL and crash
+recovery, truncation-floor safety, transaction-local catalog and storage rollback,
+recognized transactional GUC restoration, and object-lock grant restoration.
 
-- **M1** — parser + `StatementClass` + `Transaction` savepoint stack + eager subxid
-  allocation + `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` + CLOG settle + own-transaction
-  visibility (live-set) + failed-state recovery. Single-connection-correct.
-- **M2** — cross-transaction visibility: subxids in the active registry / snapshot
-  `xip`; concurrency tests.
-- **M3** — WAL/recovery durability: subxid-aware commit record, recovery rebuild,
-  truncation/floor; crash-recovery tests.
+## 11. Test coverage
 
-## 11. Testing
-
-- **common** unit tests: visibility with subxids (own live / own rolled-back /
+- **common** unit tests cover visibility with subxids (own live / own rolled-back /
   other in-progress / other settled released vs rolled-back).
-- **wal/recovery** tests: a transaction that releases one savepoint and rolls back
-  another, then commits, survives a crash — released rows kept, rolled-back rows
-  hidden; truncation/floor never resurrects a rolled-back subxid.
-- **server concurrency** tests: a second transaction sees a committed
+- **wal/recovery** tests cover a transaction that releases one savepoint and rolls
+  back another, then commits, survives a crash — released rows kept, rolled-back
+  rows hidden; truncation/floor never resurrects a rolled-back subxid.
+- **server concurrency** tests verify a second transaction sees a committed
   transaction's released rows and never its rolled-back rows.
-- **server integration** (simple query, via psql or the harness): the full SQL
-  surface — nested savepoints, same-name re-establishment, `RELEASE`, `ROLLBACK
-  TO`, `ROLLBACK TO` recovering a failed (`25P02`) transaction, and the error
+- **server integration** covers the full simple-query SQL surface — nested
+  savepoints, same-name re-establishment, `RELEASE`, `ROLLBACK TO`, recovery of a
+  failed (`25P02`) transaction, and the error
   paths (`25P01` outside a block, `3B001` unknown savepoint, extended-protocol
-  rejection).
+  rejection) — plus catalog/storage/GUC rollback and relation-lock acquisition,
+  upgrade, release, nested-level, and waiter-wakeup behavior.
+- **server lock-manager** unit tests cover tuple-grant generation restoration and
+  waiter wakeup through the same owner-snapshot path.

@@ -38,7 +38,9 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
   hash-join build side. Join order remains the written left-to-right order.
 - Transaction-owned table locks coordinate reads, writes, DDL, and maintenance by
   logical `TableId`, share the row-lock deadlock graph, and provide transactional
-  multi-table TRUNCATE; see `docs/specs/table-locks.md`.
+  multi-table TRUNCATE. Savepoints snapshot the owner's grants so `ROLLBACK TO`
+  releases later acquisitions and reverses later upgrades; see
+  `docs/specs/table-locks.md`.
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
 - Async networking (Tokio) with blocking thread pool for query execution
@@ -1555,7 +1557,8 @@ under `ServerComponents.relation_publish_gate`; relation-swap publication and
 rollback take the gate's write side. Repeatable Read and Serializable retain
 only their first MVCC snapshot. Their relation-generation snapshot is recaptured
 per statement after locking. Because explicit transactions retain table locks
-for every relation actually referenced, a recapture cannot change a referenced
+for every relation actually referenced unless a later `ROLLBACK TO` restores an
+earlier lock snapshot, a recapture cannot change a currently locked referenced
 relation behind the transaction, while unrelated tables are not eagerly pinned.
 A session conflicting with transactional TRUNCATE waits before relation capture
 and therefore sees the committed replacement or restored original, never the
@@ -2700,8 +2703,8 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 
 - **Read-only statements** (`SELECT`, plain EXPLAIN, and analyzed EXPLAIN without sequence mutation): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward. Analyzed EXPLAIN with `nextval`/`setval` follows the write lifecycle instead; plain EXPLAIN never evaluates them.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): bind to discover relations, allocate/register the autocommit xid (or use the explicit transaction's top xid), acquire the shared writer guard, then acquire xid-owned table locks and revalidate before snapshot capture. Targets use `RowExclusive`; read sources use `AccessShare`. Row and table waits share the same graph node and deadlock manager.
-- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): transaction-scoped. Explicit transactions retain their catalog overlay and schema/name/table/sequence locks through commit or rollback; autocommit uses the same lifecycle for one statement. Catalog changes become globally visible only after the transaction's commit record is durable. The publication gate makes the combined catalog snapshot visible atomically; object modes scope data/lifetime access.
-- **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE and ALTER take `AccessExclusive`. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback.
+- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): transaction-scoped. Explicit transactions retain their catalog overlay and schema/name/table/sequence locks through commit or rollback; `ROLLBACK TO` instead restores both the overlay and the lock-grant snapshot captured at that savepoint. Autocommit uses the same lifecycle for one statement. Catalog changes become globally visible only after the transaction's commit record is durable. The publication gate makes the combined catalog snapshot visible atomically; object modes scope data/lifetime access.
+- **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE and ALTER take `AccessExclusive`. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback, while `ROLLBACK TO` restores both to the savepoint snapshot.
 - Shared writer guards are held for the operation lifetime. Actual checkpoint alone takes the exclusive guard and drains all page/WAL writers. `WalFlushPolicy` admits any WAL-durable page; uncommitted/aborted pages may reach the heap but remain hidden by CLOG.
 
 The concrete `ConcurrencyController` is an `RwLock`: all page/WAL writers take it shared and `begin_checkpoint()` takes it exclusively. Foreground waits use cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no controller guard. Table locks coordinate relation access and the catalog publication gate serializes catalog undo.

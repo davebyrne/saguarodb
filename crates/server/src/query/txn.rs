@@ -251,6 +251,7 @@ impl QueryService {
                     Ok(savepoint) => savepoint,
                     Err(err) => return (Some(txn), default_isolation, Err(err)),
                 };
+                let object_locks = txn.object_locks.as_ref().map(|locks| locks.snapshot());
                 let subxid = self.register_active_subxid(txn.txn_id);
                 txn.live_subxids.push(subxid);
                 txn.savepoints.push(SavepointLevel {
@@ -263,6 +264,7 @@ impl QueryService {
                     catalog_overlay,
                     storage,
                     work_mem_override: txn.work_mem_override,
+                    object_locks,
                 });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
             }
@@ -307,6 +309,7 @@ impl QueryService {
                         let catalog_overlay = txn.savepoints[idx].catalog_overlay.clone();
                         let storage = txn.savepoints[idx].storage.clone();
                         let work_mem_override = txn.savepoints[idx].work_mem_override;
+                        let object_locks = txn.savepoints[idx].object_locks.clone();
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -353,6 +356,21 @@ impl QueryService {
                         txn.truncate_updates = truncate_updates.clone();
                         txn.relation_generation_changed = relation_generation_changed;
                         txn.work_mem_override = work_mem_override;
+                        let restore_result = match (&object_locks, txn.object_locks.as_mut()) {
+                            (Some(snapshot), Some(locks)) => locks.restore(snapshot),
+                            (None, Some(_)) => {
+                                txn.object_locks = None;
+                                Ok(())
+                            }
+                            (None, None) => Ok(()),
+                            (Some(_), None) => Err(DbError::internal(
+                                "transaction lock owner disappeared during savepoint rollback",
+                            )),
+                        };
+                        if let Err(err) = restore_result {
+                            txn.failed = true;
+                            return (Some(txn), default_isolation, Err(err));
+                        }
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -367,6 +385,7 @@ impl QueryService {
                             catalog_overlay,
                             storage,
                             work_mem_override,
+                            object_locks,
                         });
                         // ROLLBACK TO recovers a failed ('E') block to this savepoint.
                         txn.failed = false;
@@ -556,8 +575,10 @@ impl QueryService {
 
     /// Establish the universal explicit-transaction lock order: retain the shared
     /// checkpoint-participant guard before creating the transaction's single
-    /// top-level object-lock owner. The same owner is reused by every statement and
-    /// released only with the top-level transaction.
+    /// top-level object-lock owner. The same owner is reused by every statement. It
+    /// normally releases with the top-level transaction; rollback to a savepoint
+    /// captured before owner creation releases it early, and a later statement may
+    /// create a fresh guard for the same top-level xid.
     pub(super) fn ensure_transaction_lock_owner<'a>(
         &self,
         txn: &'a mut Transaction,
