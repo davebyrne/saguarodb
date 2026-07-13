@@ -190,6 +190,35 @@ impl DictStore {
     }
 }
 
+fn dict_field<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    path: &Path,
+    field: &str,
+) -> Result<[u8; N]> {
+    let end = offset.checked_add(N).ok_or_else(|| {
+        corrupt(format!(
+            "dict file {} {field} offset overflows",
+            path.display()
+        ))
+    })?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| {
+            corrupt(format!(
+                "dict file {} has a truncated {field}",
+                path.display()
+            ))
+        })?
+        .try_into()
+        .map_err(|_| {
+            corrupt(format!(
+                "dict file {} has a malformed {field}",
+                path.display()
+            ))
+        })
+}
+
 fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     if bytes.len() < DICT_HEADER_LEN || bytes[..4] != DICT_MAGIC {
         return Err(corrupt(format!("bad dictionary file {}", path.display())));
@@ -200,12 +229,15 @@ fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
             path.display()
         )));
     }
-    let dict_id = u32::from_le_bytes(bytes[5..9].try_into().expect("4 bytes"));
-    let table_id = u32::from_le_bytes(bytes[9..13].try_into().expect("4 bytes"));
-    let len = u32::from_le_bytes(bytes[13..17].try_into().expect("4 bytes")) as usize;
-    let stored_crc = u32::from_le_bytes(bytes[17..21].try_into().expect("4 bytes"));
+    let dict_id = u32::from_le_bytes(dict_field(bytes, 5, path, "dictionary id")?);
+    let table_id = u32::from_le_bytes(dict_field(bytes, 9, path, "table id")?);
+    let len = u32::from_le_bytes(dict_field(bytes, 13, path, "payload length")?) as usize;
+    let stored_crc = u32::from_le_bytes(dict_field(bytes, 17, path, "CRC")?);
+    let payload_end = DICT_HEADER_LEN
+        .checked_add(len)
+        .ok_or_else(|| corrupt(format!("dict file {} length overflows", path.display())))?;
     let payload = bytes
-        .get(DICT_HEADER_LEN..DICT_HEADER_LEN + len)
+        .get(DICT_HEADER_LEN..payload_end)
         .ok_or_else(|| corrupt(format!("dict file {} truncated", path.display())))?;
     if crc32fast::hash(payload) != stored_crc {
         return Err(corrupt(format!(

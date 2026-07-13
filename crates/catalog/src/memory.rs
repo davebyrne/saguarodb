@@ -2136,6 +2136,30 @@ struct BuildSchemaInput {
     checks: Vec<String>,
 }
 
+fn user_column_id(index: usize, relation_kind: &str) -> Result<ColumnId> {
+    ColumnId::try_from(index).map_err(|_| {
+        DbError::plan(
+            SqlState::ProgramLimitExceeded,
+            format!(
+                "{relation_kind} has too many columns; at most {} columns are supported",
+                usize::from(ColumnId::MAX) + 1
+            ),
+        )
+    })
+}
+
+fn validate_user_check_count(count: usize) -> Result<()> {
+    if count > usize::from(MAX_COMPOUND_OID_SUB_ID) {
+        return Err(DbError::plan(
+            SqlState::ProgramLimitExceeded,
+            format!(
+                "table has too many CHECK constraints; at most {MAX_COMPOUND_OID_SUB_ID} are supported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<TableSchema> {
     let BuildSchemaInput {
         table_id,
@@ -2149,6 +2173,8 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         checks,
     } = input;
 
+    validate_user_check_count(checks.len())?;
+
     let mut seen_names = HashSet::new();
     let mut column_ids_by_name = HashMap::new();
     let mut assigned_columns = Vec::with_capacity(columns.len());
@@ -2161,9 +2187,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
             ));
         }
 
-        let column_id: ColumnId = index
-            .try_into()
-            .map_err(|_| DbError::internal("catalog column id overflow"))?;
+        let column_id = user_column_id(index, "table")?;
         column_ids_by_name.insert(column.name.clone(), column_id);
         let default = convert_column_default(snapshot, schema_id, column.default)?;
         if matches!(default, Some(ColumnDefault::Nextval(_)))
@@ -2283,11 +2307,7 @@ fn validate_add_table_column(
     }
 
     reject_relation_wide_view_dependency(snapshot, schema.id, "add column")?;
-    let column_id: ColumnId = schema
-        .columns
-        .len()
-        .try_into()
-        .map_err(|_| DbError::internal("catalog column id overflow"))?;
+    let column_id = user_column_id(schema.columns.len(), "table")?;
     let default = convert_column_default(snapshot, schema.schema_id, column.default.clone())?;
     if matches!(default, Some(ColumnDefault::Nextval(_))) && column.data_type != DataType::Integer {
         return Err(DbError::plan(
@@ -2446,9 +2466,7 @@ fn build_view_schema(
                 format!("duplicate view column {}", column.name),
             ));
         }
-        let column_id: ColumnId = index
-            .try_into()
-            .map_err(|_| DbError::internal("catalog view column id overflow"))?;
+        let column_id = user_column_id(index, "view")?;
         assigned_columns.push(ColumnDef {
             id: column_id,
             name: column.name,
@@ -4394,4 +4412,27 @@ fn reject_duplicate_primary_key_constraint_index(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn user_column_limit_reports_program_limit_exceeded() {
+        assert_eq!(
+            user_column_id(usize::from(ColumnId::MAX), "table").unwrap(),
+            ColumnId::MAX
+        );
+        let error = user_column_id(usize::from(ColumnId::MAX) + 1, "view").unwrap_err();
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+    }
+
+    #[test]
+    fn user_check_limit_reports_program_limit_exceeded() {
+        validate_user_check_count(usize::from(MAX_COMPOUND_OID_SUB_ID)).unwrap();
+        let error =
+            validate_user_check_count(usize::from(MAX_COMPOUND_OID_SUB_ID) + 1).unwrap_err();
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+    }
 }

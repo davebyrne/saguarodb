@@ -68,10 +68,25 @@ impl IndexValue for RowLocation {
         if bytes.len() != LOCATION_LEN {
             return Err(corrupt("index leaf value is not a row location"));
         }
+        let file_id = bytes
+            .get(0..4)
+            .ok_or_else(|| corrupt("index row-location file id is truncated"))?
+            .try_into()
+            .map_err(|_| corrupt("index row-location file id has the wrong width"))?;
+        let page_num = bytes
+            .get(4..8)
+            .ok_or_else(|| corrupt("index row-location page number is truncated"))?
+            .try_into()
+            .map_err(|_| corrupt("index row-location page number has the wrong width"))?;
+        let slot_num = bytes
+            .get(8..10)
+            .ok_or_else(|| corrupt("index row-location slot number is truncated"))?
+            .try_into()
+            .map_err(|_| corrupt("index row-location slot number has the wrong width"))?;
         Ok(RowLocation {
-            file_id: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
-            page_num: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
-            slot_num: u16::from_le_bytes(bytes[8..10].try_into().expect("2 bytes")),
+            file_id: u32::from_le_bytes(file_id),
+            page_num: u32::from_le_bytes(page_num),
+            slot_num: u16::from_le_bytes(slot_num),
         })
     }
 }
@@ -1071,7 +1086,10 @@ fn decode_child(bytes: &[u8]) -> Result<PageNum> {
     if bytes.len() != CHILD_LEN {
         return Err(corrupt("index internal value is not a child pointer"));
     }
-    Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+    let bytes = bytes
+        .try_into()
+        .map_err(|_| corrupt("index child pointer has the wrong width"))?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn range_start_key(range: &KeyRange) -> Option<Key> {

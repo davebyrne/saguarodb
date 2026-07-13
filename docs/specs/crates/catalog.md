@@ -199,7 +199,11 @@ primary-key-index virtual OIDs reject installed object IDs above that payload
 range instead of truncating them. Derived constraint/default OIDs split the
 payload into a table-id portion and a local-object-id portion; catalog validation
 rejects objects outside that deterministic injective range rather than hashing
-or masking IDs into colliding OIDs.
+or masking IDs into colliding OIDs. System-catalog row construction uses the
+fallible `try_check_constraint_oid` helper for enumerated CHECK constraints; it
+validates the `usize`-to-`u16` conversion, the primary-key-reserved sub-ID, and
+the table-ID range before constructing an OID, returning `InternalError` for
+invalid catalog metadata instead of truncating, aliasing, or panicking.
 
 OID-like catalog columns use existing integer semantic types with PostgreSQL
 `oid` wire presentation. `name`/`char` values still use text semantics; vector
@@ -535,7 +539,13 @@ owned-sequence-default columns.
 - Duplicate primary-key column names return `SqlState::SyntaxError`.
 - Composite (multi-column) primary keys are supported — every named column must exist, in declared order, and uniqueness is enforced over the whole tuple at the storage layer.
 - Primary key columns are implicitly non-null.
-- `ColumnId`s are assigned in declared column order starting at zero.
+- `ColumnId`s are assigned in declared column order starting at zero. Tables and
+  views support at most 65,536 output columns; CREATE/ADD operations beyond that
+  `u16` ID space return `SqlState::ProgramLimitExceeded` (`54000`).
+- A table supports at most 4,095 stored CHECK constraints, because compound
+  virtual OID sub-ID zero is reserved for its primary-key constraint. CREATE
+  beyond that limit returns `SqlState::ProgramLimitExceeded` (`54000`). Invalid
+  persisted snapshots continue to return `InternalError` as catalog corruption.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
 - A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. User-written `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`, but cannot reference a sequence marked `owned`. Internal `ParsedDefault::OwnedNextval(name)` is accepted only for an owned sequence created by `SERIAL` desugaring. A remaining `ParsedDefault::Serial` marker is an internal error because execution must replace it before calling the catalog. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time. A constant default must be a **finite** number: a non-finite `DOUBLE PRECISION`/`REAL` constant (e.g. `DEFAULT 1e400`, which parses to Infinity) is rejected with `SqlState::NumericValueOutOfRange`, because the JSON catalog/WAL encodings cannot round-trip NaN/±Infinity — an accepted one would make the next startup unable to load the catalog.
 - Empty catalogs start with `next_table_id = 1` and `next_storage_id = 1`;
@@ -647,7 +657,12 @@ Recovery apply methods must update catalog state consistently with storage state
 
 - Name map and ID map are consistent, for tables, indexes, and sequences.
 - IDs are never reused after drop.
-- Table, index, sequence, column, and dictionary ID assignment is overflow-guarded: rather than wrap or reuse, an exhausted ID space returns `SqlState::InternalError`/`DbError::internal`.
+- Table, index, sequence, and dictionary ID assignment is overflow-guarded:
+  rather than wrap or reuse, an exhausted allocator returns
+  `SqlState::InternalError`/`DbError::internal`. User-requested table/view column
+  assignment beyond the `ColumnId` space instead returns
+  `SqlState::ProgramLimitExceeded`; an out-of-range column ID in a persisted
+  snapshot remains `InternalError` corruption.
 - Storage-id assignment is overflow-guarded and rejects ids in the file-kind
   high-bit range. Freshly allocated table, TOAST, and secondary-index physical
   objects have distinct raw storage ids; legacy loaded catalogs may retain a raw

@@ -32,6 +32,17 @@ fn corrupt(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 
+fn fixed_width<const N: usize>(bytes: &[u8], offset: usize, field: &str) -> Result<[u8; N]> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| corrupt(format!("compressed page {field} offset overflows")))?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| corrupt(format!("compressed page {field} is truncated")))?
+        .try_into()
+        .map_err(|_| corrupt(format!("compressed page {field} has the wrong width")))
+}
+
 fn validate_envelope_codec(codec: u8) -> Result<()> {
     if codec != CODEC_ZSTD && codec != CODEC_ZSTD_DICT {
         return Err(corrupt(format!("unknown envelope codec {codec}")));
@@ -98,9 +109,9 @@ pub fn decode_envelope(slot: &[u8]) -> Result<Envelope<'_>> {
     }
     let codec = slot[7];
     validate_envelope_codec(codec)?;
-    let dict_id = u32::from_le_bytes(slot[8..12].try_into().expect("4 bytes"));
-    let payload_len = u16::from_le_bytes(slot[12..14].try_into().expect("2 bytes")) as usize;
-    let stored_crc = u32::from_le_bytes(slot[14..18].try_into().expect("4 bytes"));
+    let dict_id = u32::from_le_bytes(fixed_width(slot, 8, "dictionary id")?);
+    let payload_len = u16::from_le_bytes(fixed_width(slot, 12, "payload length")?) as usize;
+    let stored_crc = u32::from_le_bytes(fixed_width(slot, 14, "CRC")?);
     let end = ENVELOPE_HEADER_LEN
         .checked_add(payload_len)
         .ok_or_else(|| corrupt("envelope payload length overflow"))?;

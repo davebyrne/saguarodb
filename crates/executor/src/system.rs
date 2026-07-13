@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use catalog::{
     CatalogManager, INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemView,
-    attrdef_oid, check_constraint_oid, index_oid, primary_key_constraint_oid, schema_oid,
-    sequence_oid, synthetic_primary_key_oid, table_oid,
+    attrdef_oid, index_oid, primary_key_constraint_oid, schema_oid, sequence_oid,
+    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
     ColumnDef, ColumnDefault, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32,
@@ -543,9 +543,8 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             }));
         }
         for (index, check) in table.checks.iter().enumerate() {
-            let check_index: u16 = index.try_into().unwrap_or(u16::MAX);
             rows.push(pg_constraint_row(ConstraintRow {
-                oid: check_constraint_oid(table.id, check_index),
+                oid: try_check_constraint_oid(table.id, index)?,
                 name: check_constraint_name(&table, index),
                 kind: "c",
                 table_oid: table_oid(table.id),
@@ -632,10 +631,9 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             ));
         }
         for (index, _) in table.checks.iter().enumerate() {
-            let check_index: u16 = index.try_into().unwrap_or(u16::MAX);
             rows.push(pg_depend_row(
                 SystemView::PgConstraint.relation_oid(),
-                check_constraint_oid(table.id, check_index),
+                try_check_constraint_oid(table.id, index)?,
                 0,
                 SystemView::PgClass.relation_oid(),
                 table_oid(table.id),

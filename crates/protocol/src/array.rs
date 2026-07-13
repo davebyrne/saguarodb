@@ -182,9 +182,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn i32(&mut self) -> Result<i32> {
-        Ok(i32::from_be_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
+        let bytes = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| array_error("binary array fixed-width field has the wrong length"))?;
+        Ok(i32::from_be_bytes(bytes))
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {

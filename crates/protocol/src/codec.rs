@@ -776,7 +776,9 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 bytes[0], bytes[1], bytes[2], bytes[3],
             ])))),
             8 => {
-                let array: [u8; 8] = bytes.try_into().expect("length checked");
+                let array: [u8; 8] = bytes.try_into().map_err(|_| {
+                    protocol_error("binary integer parameter must be exactly 8 bytes")
+                })?;
                 Ok(Value::Integer(i64::from_be_bytes(array)))
             }
             _ => Err(protocol_error(

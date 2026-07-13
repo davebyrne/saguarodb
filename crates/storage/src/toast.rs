@@ -160,10 +160,16 @@ pub(crate) fn chunk_row(value_id: u64, seq: usize, data: &[u8]) -> Result<Row> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize, what: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| toast_corruption(format!("{what} offset overflows")))?;
     let raw = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or_else(|| toast_corruption(format!("{what} is truncated")))?;
-    Ok(u32::from_le_bytes(raw.try_into().expect("4 bytes")))
+    let raw = raw
+        .try_into()
+        .map_err(|_| toast_corruption(format!("{what} has an invalid fixed width")))?;
+    Ok(u32::from_le_bytes(raw))
 }
 
 pub(crate) fn toast_corruption(message: impl Into<String>) -> DbError {

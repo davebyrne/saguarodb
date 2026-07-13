@@ -11,6 +11,7 @@ pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
     attrdef_oid, check_constraint_oid, index_oid, is_system_schema, primary_key_constraint_oid,
     resolve_system_view, schema_oid, sequence_oid, synthetic_primary_key_oid, table_oid,
+    try_check_constraint_oid,
 };
 pub use truncate_overlay::TruncateCatalogOverlay;
 

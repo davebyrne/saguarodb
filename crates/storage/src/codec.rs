@@ -112,11 +112,12 @@ impl ToastPointer {
                 bytes.len()
             )));
         }
+        let mut offset = 0;
         let pointer = Self {
-            value_id: u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")),
-            raw_len: u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")),
-            stored_len: u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes")),
-            codec: bytes[16],
+            value_id: u64::from_le_bytes(read_array(bytes, &mut offset)?),
+            raw_len: u32::from_le_bytes(read_array(bytes, &mut offset)?),
+            stored_len: u32::from_le_bytes(read_array(bytes, &mut offset)?),
+            codec: read_exact(bytes, &mut offset, 1)?[0],
         };
         validate_toast_pointer_value_id(pointer.value_id)?;
         validate_decoded_varlena_u32_len(pointer.raw_len, "toast pointer raw length")?;
@@ -210,9 +211,9 @@ fn put_interval(bytes: &mut Vec<u8>, value: &common::Interval) {
 
 /// Decode an `INTERVAL` written by [`put_interval`].
 fn read_interval(bytes: &[u8], offset: &mut usize) -> Result<common::Interval> {
-    let months = i32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
-    let days = i32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
-    let micros = i64::from_le_bytes(read_exact(bytes, offset, 8)?.try_into().expect("8 bytes"));
+    let months = i32::from_le_bytes(read_array(bytes, offset)?);
+    let days = i32::from_le_bytes(read_array(bytes, offset)?);
+    let micros = i64::from_le_bytes(read_array(bytes, offset)?);
     Ok(common::Interval::new(months, days, micros))
 }
 
@@ -225,9 +226,8 @@ fn put_numeric(bytes: &mut Vec<u8>, value: &Decimal) {
 
 /// Decode a `NUMERIC` value written by [`put_numeric`].
 fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
-    let mantissa =
-        i128::from_le_bytes(read_exact(bytes, offset, 16)?.try_into().expect("16 bytes"));
-    let scale = u32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
+    let mantissa = i128::from_le_bytes(read_array(bytes, offset)?);
+    let scale = u32::from_le_bytes(read_array(bytes, offset)?);
     Decimal::try_from_i128_with_scale(mantissa, scale)
         .map_err(|_| corrupt_row("invalid numeric value"))
 }
@@ -336,11 +336,7 @@ pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     let mut dimensions = Vec::with_capacity(ndim);
     for _ in 0..ndim {
         let len = read_u32(bytes, &mut offset)?;
-        let lower_bound = i32::from_le_bytes(
-            read_exact(bytes, &mut offset, 4)?
-                .try_into()
-                .expect("4 bytes"),
-        );
+        let lower_bound = i32::from_le_bytes(read_array(bytes, &mut offset)?);
         dimensions.push(ArrayDimension::new(len, lower_bound));
     }
     if cardinality == 0 && ndim != 0 {
@@ -513,13 +509,9 @@ fn decode_array_element(bytes: &[u8], offset: &mut usize, data_type: &DataType) 
         DataType::TimestampTz => Value::TimestampTz(read_i64(bytes, offset)?),
         DataType::Interval => Value::Interval(read_interval(bytes, offset)?),
         DataType::Bytea => Value::Bytes(read_array_bytes(bytes, offset)?.to_vec()),
-        DataType::Uuid => Value::Uuid(read_exact(bytes, offset, 16)?.try_into().expect("16 bytes")),
-        DataType::Double => Value::Float(
-            f64::from_le_bytes(read_exact(bytes, offset, 8)?.try_into().expect("8 bytes")).into(),
-        ),
-        DataType::Real => Value::Real(
-            f32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes")).into(),
-        ),
+        DataType::Uuid => Value::Uuid(read_array(bytes, offset)?),
+        DataType::Double => Value::Float(f64::from_le_bytes(read_array(bytes, offset)?).into()),
+        DataType::Real => Value::Real(f32::from_le_bytes(read_array(bytes, offset)?).into()),
         DataType::Numeric { .. } => Value::Numeric(read_numeric(bytes, offset)?),
         DataType::Array(_) => return Err(corrupt_row("nested array element type is invalid")),
     })
@@ -540,9 +532,7 @@ fn read_array_bytes<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8]>
 }
 
 fn read_i64(bytes: &[u8], offset: &mut usize) -> Result<i64> {
-    Ok(i64::from_le_bytes(
-        read_exact(bytes, offset, 8)?.try_into().expect("8 bytes"),
-    ))
+    Ok(i64::from_le_bytes(read_array(bytes, offset)?))
 }
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
@@ -652,26 +642,15 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
 /// no-trailing-bytes check.
 pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
     let mut offset = 0;
-    let count = u16::from_le_bytes(
-        read_exact(bytes, &mut offset, 2)?
-            .try_into()
-            .expect("read_exact returns 2 bytes"),
-    );
+    let count = u16::from_le_bytes(read_array(bytes, &mut offset)?);
     let mut values = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let tag = read_exact(bytes, &mut offset, 1)?[0];
         let value = match tag {
             KEY_TAG_NULL => Value::Null,
-            KEY_TAG_INTEGER => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::Integer(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
-            }
+            KEY_TAG_INTEGER => Value::Integer(i64::from_le_bytes(read_array(bytes, &mut offset)?)),
             KEY_TAG_TEXT => {
-                let len = u32::from_le_bytes(
-                    read_exact(bytes, &mut offset, 4)?
-                        .try_into()
-                        .expect("4 bytes"),
-                ) as usize;
+                let len = u32::from_le_bytes(read_array(bytes, &mut offset)?) as usize;
                 let raw = read_exact(bytes, &mut offset, len)?;
                 Value::Text(
                     String::from_utf8(raw.to_vec())
@@ -683,44 +662,25 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 1 => Value::Boolean(true),
                 _ => return Err(corrupt_row("key boolean is not 0 or 1")),
             },
-            KEY_TAG_DATE => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::Date(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
-            }
+            KEY_TAG_DATE => Value::Date(i64::from_le_bytes(read_array(bytes, &mut offset)?)),
             KEY_TAG_TIMESTAMP => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::Timestamp(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+                Value::Timestamp(i64::from_le_bytes(read_array(bytes, &mut offset)?))
             }
-            KEY_TAG_TIME => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::Time(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
-            }
+            KEY_TAG_TIME => Value::Time(i64::from_le_bytes(read_array(bytes, &mut offset)?)),
             KEY_TAG_TIMESTAMPTZ => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::TimestampTz(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+                Value::TimestampTz(i64::from_le_bytes(read_array(bytes, &mut offset)?))
             }
             KEY_TAG_INTERVAL => Value::Interval(read_interval(bytes, &mut offset)?),
             KEY_TAG_BYTEA => {
-                let len = u32::from_le_bytes(
-                    read_exact(bytes, &mut offset, 4)?
-                        .try_into()
-                        .expect("4 bytes"),
-                ) as usize;
+                let len = u32::from_le_bytes(read_array(bytes, &mut offset)?) as usize;
                 Value::Bytes(read_exact(bytes, &mut offset, len)?.to_vec())
             }
-            KEY_TAG_UUID => {
-                let raw = read_exact(bytes, &mut offset, 16)?;
-                Value::Uuid(raw.try_into().expect("16 bytes"))
-            }
+            KEY_TAG_UUID => Value::Uuid(read_array(bytes, &mut offset)?),
             KEY_TAG_DOUBLE => {
-                let raw = read_exact(bytes, &mut offset, 8)?;
-                Value::Float(f64::from_le_bytes(raw.try_into().expect("8 bytes")).into())
+                Value::Float(f64::from_le_bytes(read_array(bytes, &mut offset)?).into())
             }
             KEY_TAG_NUMERIC => Value::Numeric(read_numeric(bytes, &mut offset)?),
-            KEY_TAG_REAL => {
-                let raw = read_exact(bytes, &mut offset, 4)?;
-                Value::Real(f32::from_le_bytes(raw.try_into().expect("4 bytes")).into())
-            }
+            KEY_TAG_REAL => Value::Real(f32::from_le_bytes(read_array(bytes, &mut offset)?).into()),
             KEY_TAG_ARRAY => {
                 let len = read_u32(bytes, &mut offset)? as usize;
                 Value::Array(decode_array_payload(read_exact(bytes, &mut offset, len)?)?)
@@ -1068,10 +1028,7 @@ pub(crate) fn decode_physical_row(
                 )?);
                 continue;
             }
-            DataType::Uuid => {
-                let raw = read_exact(bytes, &mut offset, 16)?;
-                Value::Uuid(raw.try_into().expect("16 bytes"))
-            }
+            DataType::Uuid => Value::Uuid(read_array(bytes, &mut offset)?),
             DataType::Array(_) => {
                 values.push(decode_varlena_physical(
                     bytes,
@@ -1466,11 +1423,12 @@ fn read_mvcc_header(header: &[u8]) -> Result<MvccHeader> {
     if header.len() != V2_MVCC_HEADER_LEN {
         return Err(corrupt_row("row v2 header has the wrong length"));
     }
-    let infomask = u16::from_le_bytes(header[0..2].try_into().expect("2 bytes"));
-    let xmin = u64::from_le_bytes(header[2..10].try_into().expect("8 bytes"));
-    let xmax = u64::from_le_bytes(header[10..18].try_into().expect("8 bytes"));
-    let page = u32::from_le_bytes(header[18..22].try_into().expect("4 bytes"));
-    let slot = u16::from_le_bytes(header[22..24].try_into().expect("2 bytes"));
+    let mut offset = 0;
+    let infomask = u16::from_le_bytes(read_array(header, &mut offset)?);
+    let xmin = u64::from_le_bytes(read_array(header, &mut offset)?);
+    let xmax = u64::from_le_bytes(read_array(header, &mut offset)?);
+    let page = u32::from_le_bytes(read_array(header, &mut offset)?);
+    let slot = u16::from_le_bytes(read_array(header, &mut offset)?);
     Ok(MvccHeader {
         xmin,
         xmax,
@@ -1543,10 +1501,16 @@ fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a
     Ok(raw)
 }
 
+fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N]> {
+    read_exact(bytes, offset, N)?.try_into().map_err(|_| {
+        corrupt_row(format!(
+            "fixed-width decoder expected {N} bytes after bounds validation"
+        ))
+    })
+}
+
 fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"),
-    ))
+    Ok(u32::from_le_bytes(read_array(bytes, offset)?))
 }
 
 fn corrupt_row(message: impl Into<String>) -> common::DbError {

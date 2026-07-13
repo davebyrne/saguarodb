@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use catalog::{
     CatalogManager, CatalogOverlay, CatalogOverlaySavepoint, MemoryCatalog, TruncateCatalogOverlay,
-    check_constraint_oid, index_oid, primary_key_constraint_oid, resolve_system_view, sequence_oid,
-    synthetic_primary_key_oid, table_oid,
+    index_oid, primary_key_constraint_oid, resolve_system_view, sequence_oid,
+    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
     CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
@@ -511,8 +511,7 @@ impl QueryCatalogIntrospection {
                 )));
             }
             for (index, check) in table.checks.iter().enumerate() {
-                let check_index: u16 = index.try_into().unwrap_or(u16::MAX);
-                if check_constraint_oid(table.id, check_index) == constraint_oid {
+                if try_check_constraint_oid(table.id, index)? == constraint_oid {
                     return Ok(Some(format!("CHECK ({check})")));
                 }
             }

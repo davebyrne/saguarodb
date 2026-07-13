@@ -175,7 +175,13 @@ impl HeapPageStore {
         };
         match self.compression.decompress_page(&buf, PAGE_SIZE) {
             Ok(Some(image)) => {
-                let bytes: [u8; PAGE_SIZE] = image.try_into().expect("length checked by registry");
+                let actual_len = image.len();
+                let bytes: [u8; PAGE_SIZE] = image.try_into().map_err(|_| {
+                    DbError::storage(
+                        common::SqlState::InternalError,
+                        format!("decompressed page has {actual_len} bytes, expected {PAGE_SIZE}"),
+                    )
+                })?;
                 Ok(Some(PageData(bytes)))
             }
             Ok(None) => Ok(Some(PageData(buf))),

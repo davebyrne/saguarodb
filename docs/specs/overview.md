@@ -2401,6 +2401,13 @@ cross-links, and duplicate storage-id rules while preserving the legacy raw
 table/index collision allowed by file-kind bits. Older view dependencies with no
 `all_columns` field and no columns retain `all_columns = true` compatibility.
 
+User table/view column assignment is limited to the 65,536 values in the
+`ColumnId` space, and stored CHECK lists are limited to the 4,095 compound
+virtual-OID sub-IDs available after reserving the primary-key constraint slot;
+user DDL exceeding either limit returns `ProgramLimitExceeded` (`54000`).
+System-catalog CHECK OID construction is fallible and propagates invalid catalog
+indices as `InternalError` rather than truncating them into colliding OIDs.
+
 The catalog is the authority for name-to-ID resolution. Table IDs, catalog-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for storage's per-table identity index). User tables, user views, user-visible indexes, public sequences, and primary-key auto-names share the public relation-name namespace exposed through `pg_class`/`to_regclass`; duplicate names across those kinds are rejected. Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable relation/index IDs plus schema-version-local column IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
 The catalog crate also owns a static virtual system-view registry for the

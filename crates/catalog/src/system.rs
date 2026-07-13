@@ -1,4 +1,4 @@
-use common::{ColumnDef, DataType, PgType};
+use common::{ColumnDef, DataType, DbError, PgType, Result};
 
 pub const PG_CATALOG_SCHEMA_OID: i64 = 11;
 pub const PUBLIC_SCHEMA_OID: i64 = 2200;
@@ -499,6 +499,31 @@ pub fn check_constraint_oid(table_id: u32, check_index: u16) -> i64 {
     CONSTRAINT_OID_TAG | compound_oid_payload(table_id, check_index.saturating_add(1))
 }
 
+/// Construct a CHECK-constraint OID from an enumerated catalog position.
+///
+/// Unlike [`check_constraint_oid`], this entry point accepts the `usize` produced
+/// by `enumerate` and reports malformed catalog metadata instead of truncating the
+/// index or reaching the compound-OID assertions. Sub-ID zero is reserved for the
+/// primary-key constraint, so the greatest valid CHECK index is one less than the
+/// compound sub-ID limit.
+pub fn try_check_constraint_oid(table_id: u32, check_index: usize) -> Result<i64> {
+    if table_id > MAX_COMPOUND_OID_TABLE_ID {
+        return Err(DbError::internal(format!(
+            "catalog table id {table_id} exceeds compound virtual OID table-id limit {MAX_COMPOUND_OID_TABLE_ID}"
+        )));
+    }
+    let check_index = u16::try_from(check_index).map_err(|_| {
+        DbError::internal("catalog CHECK constraint index exceeds the u16 encoding limit")
+    })?;
+    if check_index >= MAX_COMPOUND_OID_SUB_ID {
+        return Err(DbError::internal(format!(
+            "catalog CHECK constraint index {check_index} exceeds compound virtual OID index limit {}",
+            MAX_COMPOUND_OID_SUB_ID - 1
+        )));
+    }
+    Ok(check_constraint_oid(table_id, check_index))
+}
+
 pub fn attrdef_oid(table_id: u32, column_id: u16) -> i64 {
     ATTRDEF_OID_TAG | compound_oid_payload(table_id, column_id)
 }
@@ -692,5 +717,28 @@ mod tests {
                 .is_err()
         );
         assert!(std::panic::catch_unwind(|| attrdef_oid(1, MAX_COMPOUND_OID_SUB_ID + 1)).is_err());
+    }
+
+    #[test]
+    fn fallible_check_oid_rejects_every_unencodable_index() {
+        let greatest_index = usize::from(MAX_COMPOUND_OID_SUB_ID - 1);
+        assert_eq!(
+            try_check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID, greatest_index).unwrap(),
+            check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID, MAX_COMPOUND_OID_SUB_ID - 1)
+        );
+
+        let reserved_sub_id = try_check_constraint_oid(
+            MAX_COMPOUND_OID_TABLE_ID,
+            usize::from(MAX_COMPOUND_OID_SUB_ID),
+        )
+        .unwrap_err();
+        assert_eq!(reserved_sub_id.code, common::SqlState::InternalError);
+
+        let conversion_overflow = try_check_constraint_oid(1, usize::MAX).unwrap_err();
+        assert_eq!(conversion_overflow.code, common::SqlState::InternalError);
+
+        let table_overflow =
+            try_check_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1, 0).unwrap_err();
+        assert_eq!(table_overflow.code, common::SqlState::InternalError);
     }
 }
