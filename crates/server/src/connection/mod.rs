@@ -829,8 +829,9 @@ where
     S: AsyncWrite + Unpin,
 {
     for message in messages {
+        let bytes = codec.encode(message)?;
         socket
-            .write_all(&codec.encode(message))
+            .write_all(&bytes)
             .await
             .map_err(|err| DbError::io(format!("failed to write socket response: {err}")))?;
     }

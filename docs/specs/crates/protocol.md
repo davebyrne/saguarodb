@@ -87,7 +87,7 @@ messages (prepared statements, portals, Describe/Execute/Sync) is owned by
 ```rust
 pub trait ProtocolCodec: Send {
     fn decode(&mut self, buf: &[u8]) -> Result<Vec<ClientMessage>>;
-    fn encode(&self, msg: &ServerMessage) -> Vec<u8>;
+    fn encode(&self, msg: &ServerMessage) -> Result<Vec<u8>>;
 }
 
 pub struct PostgresCodec { /* buffered PostgreSQL v3 simple-query codec */ }
@@ -98,6 +98,10 @@ impl PostgresCodec {
 ```
 
 `decode` is stateful and may return zero, one, or many messages. It buffers incomplete input internally. Any startup-style or tagged frame whose declared length exceeds `MAX_FRAME_LEN` (1 MiB) is rejected with a `SyntaxError` rather than buffered, bounding memory use. Per-message decoders enforce full consumption: extended messages reject trailing bytes, and `Query` rejects any payload after its nul terminator.
+
+`encode` rejects message bodies or protocol count fields that do not fit their
+PostgreSQL wire integers with `ProgramLimitExceeded`; it never panics on a
+message supplied by its caller.
 
 ## Connection State API
 

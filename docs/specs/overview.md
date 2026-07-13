@@ -533,8 +533,8 @@ pub trait ProtocolCodec: Send {
     /// Feed incoming bytes, return decoded messages (may return 0 or more).
     fn decode(&mut self, buf: &[u8]) -> Result<Vec<ClientMessage>>;
 
-    /// Encode a server message into bytes for transmission.
-    fn encode(&self, msg: &ServerMessage) -> Vec<u8>;
+    /// Encode a server message into bytes for transmission, rejecting wire-field overflows.
+    fn encode(&self, msg: &ServerMessage) -> Result<Vec<u8>>;
 }
 
 /// Connection state machine — tracks where we are in the protocol lifecycle.

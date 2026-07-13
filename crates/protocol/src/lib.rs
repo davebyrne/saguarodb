@@ -122,13 +122,19 @@ mod tests {
         let messages = codec.decode(&ssl_request_bytes()).unwrap();
 
         assert_eq!(messages, vec![ClientMessage::SslRequest]);
-        assert_eq!(codec.encode(&ServerMessage::SslRejected), b"N".to_vec());
+        assert_eq!(
+            codec.encode(&ServerMessage::SslRejected).unwrap(),
+            b"N".to_vec()
+        );
     }
 
     #[test]
     fn encodes_ssl_accepted_as_single_s_byte() {
         let codec = PostgresCodec::new();
-        assert_eq!(codec.encode(&ServerMessage::SslAccepted), b"S".to_vec());
+        assert_eq!(
+            codec.encode(&ServerMessage::SslAccepted).unwrap(),
+            b"S".to_vec()
+        );
     }
 
     #[test]
@@ -164,10 +170,12 @@ mod tests {
     #[test]
     fn encodes_backend_key_data() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::BackendKeyData {
-            process_id: 7,
-            secret_key: 99,
-        });
+        let bytes = codec
+            .encode(&ServerMessage::BackendKeyData {
+                process_id: 7,
+                secret_key: 99,
+            })
+            .unwrap();
         assert_eq!(bytes[0], b'K');
         assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()), 12);
         let mut offset = 5;
@@ -354,28 +362,33 @@ mod tests {
     fn encodes_extended_completion_messages_as_empty_tagged_frames() {
         let codec = PostgresCodec::new();
         assert_eq!(
-            codec.encode(&ServerMessage::ParseComplete),
+            codec.encode(&ServerMessage::ParseComplete).unwrap(),
             vec![b'1', 0, 0, 0, 4]
         );
         assert_eq!(
-            codec.encode(&ServerMessage::BindComplete),
+            codec.encode(&ServerMessage::BindComplete).unwrap(),
             vec![b'2', 0, 0, 0, 4]
         );
         assert_eq!(
-            codec.encode(&ServerMessage::CloseComplete),
+            codec.encode(&ServerMessage::CloseComplete).unwrap(),
             vec![b'3', 0, 0, 0, 4]
         );
         assert_eq!(
-            codec.encode(&ServerMessage::PortalSuspended),
+            codec.encode(&ServerMessage::PortalSuspended).unwrap(),
             vec![b's', 0, 0, 0, 4]
         );
-        assert_eq!(codec.encode(&ServerMessage::NoData), vec![b'n', 0, 0, 0, 4]);
+        assert_eq!(
+            codec.encode(&ServerMessage::NoData).unwrap(),
+            vec![b'n', 0, 0, 0, 4]
+        );
     }
 
     #[test]
     fn encodes_parameter_description_with_type_oids() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::ParameterDescription(vec![20, 25]));
+        let bytes = codec
+            .encode(&ServerMessage::ParameterDescription(vec![20, 25]))
+            .unwrap();
 
         assert_eq!(bytes[0], b't');
         assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()), 14);
@@ -505,7 +518,9 @@ mod tests {
     #[test]
     fn data_row_encodes_null_field_as_negative_length() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::DataRow(vec![Some(b"7".to_vec()), None]));
+        let bytes = codec
+            .encode(&ServerMessage::DataRow(vec![Some(b"7".to_vec()), None]))
+            .unwrap();
 
         assert!(
             bytes
@@ -515,10 +530,35 @@ mod tests {
     }
 
     #[test]
+    fn data_row_rejects_column_count_that_does_not_fit_wire_field() {
+        let codec = PostgresCodec::new();
+        let err = codec
+            .encode(&ServerMessage::DataRow(vec![None; 32_768]))
+            .unwrap_err();
+
+        assert_eq!(err.code, common::SqlState::ProgramLimitExceeded);
+        assert_eq!(err.message, "too many data row columns");
+    }
+
+    #[test]
+    fn row_description_rejects_column_count_that_does_not_fit_wire_field() {
+        let codec = PostgresCodec::new();
+        let err = codec
+            .encode(&ServerMessage::RowDescription {
+                columns: vec![column("c", DataType::Integer); 32_768],
+                formats: Vec::new(),
+            })
+            .unwrap_err();
+
+        assert_eq!(err.code, common::SqlState::ProgramLimitExceeded);
+        assert_eq!(err.message, "too many row description columns");
+    }
+
+    #[test]
     fn ready_for_query_encodes_supplied_status_byte() {
         let codec = PostgresCodec::new();
         for status in [b'I', b'T', b'E'] {
-            let bytes = codec.encode(&ServerMessage::ReadyForQuery(status));
+            let bytes = codec.encode(&ServerMessage::ReadyForQuery(status)).unwrap();
             assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, status]);
         }
     }
@@ -610,14 +650,16 @@ mod tests {
     #[test]
     fn row_description_encodes_v1_type_oids_sizes_and_text_format() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::RowDescription {
-            columns: vec![
-                column("id", DataType::Integer),
-                column("name", DataType::Text),
-                column("active", DataType::Boolean),
-            ],
-            formats: Vec::new(),
-        });
+        let bytes = codec
+            .encode(&ServerMessage::RowDescription {
+                columns: vec![
+                    column("id", DataType::Integer),
+                    column("name", DataType::Text),
+                    column("active", DataType::Boolean),
+                ],
+                formats: Vec::new(),
+            })
+            .unwrap();
 
         assert_eq!(bytes[0], b'T');
         assert_eq!(
@@ -649,26 +691,28 @@ mod tests {
             column_id: None,
             pg_type: Some(pg_type),
         };
-        let bytes = codec.encode(&ServerMessage::RowDescription {
-            columns: vec![
-                labeled("small", DataType::Integer, PgType::Int2),
-                labeled("n", DataType::Integer, PgType::Int4),
-                labeled("obj", DataType::Integer, PgType::Oid),
-                labeled("code", DataType::Text, PgType::Varchar(Some(10))),
-                labeled(
-                    "amt",
-                    DataType::Numeric {
-                        precision: Some(10),
-                        scale: 2,
-                    },
-                    PgType::Numeric {
-                        precision: Some(10),
-                        scale: 2,
-                    },
-                ),
-            ],
-            formats: Vec::new(),
-        });
+        let bytes = codec
+            .encode(&ServerMessage::RowDescription {
+                columns: vec![
+                    labeled("small", DataType::Integer, PgType::Int2),
+                    labeled("n", DataType::Integer, PgType::Int4),
+                    labeled("obj", DataType::Integer, PgType::Oid),
+                    labeled("code", DataType::Text, PgType::Varchar(Some(10))),
+                    labeled(
+                        "amt",
+                        DataType::Numeric {
+                            precision: Some(10),
+                            scale: 2,
+                        },
+                        PgType::Numeric {
+                            precision: Some(10),
+                            scale: 2,
+                        },
+                    ),
+                ],
+                formats: Vec::new(),
+            })
+            .unwrap();
 
         let mut offset = 5;
         assert_eq!(read_i16(&bytes, &mut offset), 5);
@@ -752,11 +796,13 @@ mod tests {
     #[test]
     fn error_response_encodes_sqlstate_severity_and_message_fields() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::ErrorResponse {
-            severity: "ERROR".to_string(),
-            code: "42P01".to_string(),
-            message: "table not found".to_string(),
-        });
+        let bytes = codec
+            .encode(&ServerMessage::ErrorResponse {
+                severity: "ERROR".to_string(),
+                code: "42P01".to_string(),
+                message: "table not found".to_string(),
+            })
+            .unwrap();
 
         assert_eq!(bytes[0], b'E');
         assert_eq!(
@@ -849,7 +895,7 @@ mod tests {
                 b'H',
             ),
         ] {
-            let bytes = codec.encode(&message);
+            let bytes = codec.encode(&message).unwrap();
             assert_eq!(bytes[0], tag);
             let mut offset = 1;
             let length = read_i32(&bytes, &mut offset);
@@ -870,12 +916,14 @@ mod tests {
         expected.extend_from_slice(&8i32.to_be_bytes()); // length = 4 + 4-byte payload
         expected.extend_from_slice(b"a,b\n");
         assert_eq!(
-            codec.encode(&ServerMessage::CopyData(b"a,b\n".to_vec())),
+            codec
+                .encode(&ServerMessage::CopyData(b"a,b\n".to_vec()))
+                .unwrap(),
             expected
         );
 
         assert_eq!(
-            codec.encode(&ServerMessage::CopyDone),
+            codec.encode(&ServerMessage::CopyDone).unwrap(),
             vec![b'c', 0, 0, 0, 4]
         );
     }

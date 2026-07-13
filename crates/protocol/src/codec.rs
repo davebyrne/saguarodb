@@ -11,7 +11,7 @@ const MAX_FRAME_LEN: usize = 1024 * 1024;
 
 pub trait ProtocolCodec: Send {
     fn decode(&mut self, buf: &[u8]) -> Result<Vec<ClientMessage>>;
-    fn encode(&self, msg: &ServerMessage) -> Vec<u8>;
+    fn encode(&self, msg: &ServerMessage) -> Result<Vec<u8>>;
 }
 
 pub struct PostgresCodec {
@@ -180,10 +180,10 @@ impl ProtocolCodec for PostgresCodec {
         Ok(messages)
     }
 
-    fn encode(&self, msg: &ServerMessage) -> Vec<u8> {
+    fn encode(&self, msg: &ServerMessage) -> Result<Vec<u8>> {
         match msg {
-            ServerMessage::SslAccepted => b"S".to_vec(),
-            ServerMessage::SslRejected => b"N".to_vec(),
+            ServerMessage::SslAccepted => Ok(b"S".to_vec()),
+            ServerMessage::SslRejected => Ok(b"N".to_vec()),
             ServerMessage::AuthenticationOk => {
                 let mut body = Vec::new();
                 put_i32(&mut body, 0);
@@ -209,7 +209,7 @@ impl ProtocolCodec for PostgresCodec {
                 let mut body = Vec::new();
                 put_i16(
                     &mut body,
-                    checked_i16(columns.len(), "too many row description columns"),
+                    checked_i16(columns.len(), "too many row description columns")?,
                 );
                 for (index, column) in columns.iter().enumerate() {
                     let format = formats.get(index).copied().unwrap_or(0);
@@ -221,14 +221,14 @@ impl ProtocolCodec for PostgresCodec {
                 let mut body = Vec::new();
                 put_i16(
                     &mut body,
-                    checked_i16(values.len(), "too many data row columns"),
+                    checked_i16(values.len(), "too many data row columns")?,
                 );
                 for value in values {
                     match value {
                         Some(bytes) => {
                             put_i32(
                                 &mut body,
-                                checked_i32(bytes.len(), "data row value too large"),
+                                checked_i32(bytes.len(), "data row value too large")?,
                             );
                             body.extend_from_slice(bytes);
                         }
@@ -250,7 +250,7 @@ impl ProtocolCodec for PostgresCodec {
                 let mut body = Vec::new();
                 put_i16(
                     &mut body,
-                    checked_i16(type_oids.len(), "too many parameter descriptions"),
+                    checked_i16(type_oids.len(), "too many parameter descriptions")?,
                 );
                 for oid in type_oids {
                     put_i32(&mut body, *oid);
@@ -261,11 +261,15 @@ impl ProtocolCodec for PostgresCodec {
             ServerMessage::CopyInResponse {
                 overall_format,
                 column_formats,
-            } => encode_server_message(b'G', encode_copy_response(*overall_format, column_formats)),
+            } => {
+                encode_server_message(b'G', encode_copy_response(*overall_format, column_formats)?)
+            }
             ServerMessage::CopyOutResponse {
                 overall_format,
                 column_formats,
-            } => encode_server_message(b'H', encode_copy_response(*overall_format, column_formats)),
+            } => {
+                encode_server_message(b'H', encode_copy_response(*overall_format, column_formats)?)
+            }
             ServerMessage::CopyData(bytes) => encode_server_message(b'd', bytes.clone()),
             ServerMessage::CopyDone => encode_server_message(b'c', Vec::new()),
             ServerMessage::ErrorResponse {
@@ -463,30 +467,34 @@ fn decode_nul_terminated_text<'a>(bytes: &'a [u8], error: &'static str) -> Resul
     }
 }
 
-fn encode_server_message(tag: u8, body: Vec<u8>) -> Vec<u8> {
+fn encode_server_message(tag: u8, body: Vec<u8>) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(body.len() + 5);
     bytes.push(tag);
+    let frame_len = body
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| encoding_error("server message too large"))?;
     put_i32(
         &mut bytes,
-        checked_i32(body.len() + 4, "server message too large"),
+        checked_i32(frame_len, "server message too large")?,
     );
     bytes.extend_from_slice(&body);
-    bytes
+    Ok(bytes)
 }
 
 /// Body shared by `CopyInResponse`/`CopyOutResponse`: `int8 overall_format`,
 /// `int16 column_count`, then one `int16 format_code` per column.
-fn encode_copy_response(overall_format: i8, column_formats: &[i16]) -> Vec<u8> {
+fn encode_copy_response(overall_format: i8, column_formats: &[i16]) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(3 + column_formats.len() * 2);
     body.push(overall_format as u8);
     put_i16(
         &mut body,
-        checked_i16(column_formats.len(), "too many copy columns"),
+        checked_i16(column_formats.len(), "too many copy columns")?,
     );
     for format in column_formats {
         put_i16(&mut body, *format);
     }
-    body
+    Ok(body)
 }
 
 fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo, format: i16) {
@@ -957,12 +965,16 @@ fn read_i32(bytes: &[u8]) -> Result<i32> {
     Ok(i32::from_be_bytes(bytes))
 }
 
-fn checked_i16(value: usize, message: &'static str) -> i16 {
-    i16::try_from(value).expect(message)
+fn checked_i16(value: usize, message: &'static str) -> Result<i16> {
+    i16::try_from(value).map_err(|_| encoding_error(message))
 }
 
-fn checked_i32(value: usize, message: &'static str) -> i32 {
-    i32::try_from(value).expect(message)
+fn checked_i32(value: usize, message: &'static str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| encoding_error(message))
+}
+
+fn encoding_error(message: impl Into<String>) -> DbError {
+    DbError::protocol(SqlState::ProgramLimitExceeded, message)
 }
 
 fn protocol_error(message: impl Into<String>) -> DbError {
