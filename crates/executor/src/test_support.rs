@@ -169,6 +169,7 @@ impl ExecutorHarness {
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         self.engine.analyze_query(&ctx, &physical)
     }

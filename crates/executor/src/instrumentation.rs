@@ -381,6 +381,7 @@ mod tests {
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let plan = PhysicalPlan::Values {
             rows: vec![vec![]],
@@ -408,6 +409,7 @@ mod tests {
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let leaf = PhysicalPlan::Values {
             rows: vec![vec![]],
@@ -445,6 +447,7 @@ mod tests {
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let empty_input = PhysicalPlan::Values {
             rows: Vec::new(),
