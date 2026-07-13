@@ -21,9 +21,21 @@ precedence.
   convention guide.
 - If code and specs disagree, stop and surface the mismatch before changing
   behavior. Do not silently update code or specs to paper over the conflict.
-- Update the relevant spec in the same change when intentionally changing a
-  public contract, SQL behavior, durable format, startup option, or crate
-  responsibility.
+- **Documentation upkeep is part of every change, not a follow-up.** In the
+  same change that alters behavior, update EVERY document that states the old
+  behavior — the crate specs, `docs/specs/overview.md`, feature specs,
+  `README.md`, and this file where they restate the SQL subset, startup
+  options, defaults, feature lists, or planner/executor behavior. A change is
+  not done while any document still describes the previous behavior.
+- When a change ships something previously described as missing, sweep for
+  stale forward-looking text: grep `README.md` and `docs/specs/` for the
+  feature's key terms and fix every "not supported", "future work",
+  "follow-on", "non-goal", "deferred", or limitation mention the change makes
+  untrue. Feature and limitation lists rot silently; sweeping them is part of
+  the job, not optional polish.
+- A fact stated in more than one document (e.g. an eligibility rule repeated
+  by a feature spec) must be updated in all copies in the same change — grep
+  for the old wording to find them.
 
 ## Repository Workflow
 
@@ -131,6 +143,10 @@ cargo test --workspace
 - If a verification command cannot run, record the exact command and reason.
 - Do not claim a fix is complete until relevant verification has run or the
   limitation is explicitly documented.
+- Before handing off, verify no documentation went stale: grep `README.md`,
+  `docs/specs/`, and this file for the changed behavior's key terms and for
+  the old behavior's wording, and fix what the change made untrue (see
+  "Authoritative Documentation").
 
 ## Running The Server
 
