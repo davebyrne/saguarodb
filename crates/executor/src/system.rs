@@ -30,7 +30,7 @@ pub(crate) fn rows_for(
         SystemView::PgAttribute => pg_attribute_rows(catalog),
         SystemView::PgType => Ok(pg_type_rows()),
         SystemView::PgIndex => pg_index_rows(catalog),
-        SystemView::PgProc => Ok(pg_proc_rows()),
+        SystemView::PgProc => pg_proc_rows(),
         SystemView::PgConstraint => pg_constraint_rows(catalog),
         SystemView::PgAttrdef => pg_attrdef_rows(catalog),
         SystemView::PgDepend => pg_depend_rows(catalog),
@@ -76,7 +76,7 @@ fn pg_namespace_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             ]));
         }
     }
-    rows.sort_by_key(|row| integer_at(row, 0));
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
 }
 
@@ -127,7 +127,7 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         rows.push(pg_class_view_row(*view));
     }
 
-    rows.sort_by_key(|row| integer_at(row, 0));
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
 }
 
@@ -322,7 +322,9 @@ fn pg_attribute_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             rows.push(pg_attribute_row(view.relation_oid(), &column));
         }
     }
-    rows.sort_by_key(|row| (integer_at(row, 0), integer_at(row, 5)));
+    sort_rows_by_key(&mut rows, |row| {
+        Ok((integer_at(row, 0)?, integer_at(row, 5)?))
+    })?;
     Ok(rows)
 }
 
@@ -427,7 +429,7 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         }
     }
 
-    rows.sort_by_key(|row| integer_at(row, 0));
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
 }
 
@@ -462,10 +464,10 @@ fn pg_index_row(
     ])
 }
 
-fn pg_proc_rows() -> Vec<Row> {
+fn pg_proc_rows() -> Result<Vec<Row>> {
     let mut rows: Vec<_> = pg_proc_catalog_entries().iter().map(pg_proc_row).collect();
-    rows.sort_by_key(|row| integer_at(row, 0));
-    rows
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
+    Ok(rows)
 }
 
 fn pg_proc_row(entry: &PgProcCatalogEntry) -> Row {
@@ -553,7 +555,7 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             }));
         }
     }
-    rows.sort_by_key(|row| integer_at(row, 0));
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
 }
 
@@ -608,7 +610,7 @@ fn pg_attrdef_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             ]));
         }
     }
-    rows.sort_by_key(|row| integer_at(row, 0));
+    sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
 }
 
@@ -682,7 +684,13 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             }
         }
     }
-    rows.sort_by_key(|row| (integer_at(row, 0), integer_at(row, 1), integer_at(row, 4)));
+    sort_rows_by_key(&mut rows, |row| {
+        Ok((
+            integer_at(row, 0)?,
+            integer_at(row, 1)?,
+            integer_at(row, 4)?,
+        ))
+    })?;
     Ok(rows)
 }
 
@@ -996,7 +1004,9 @@ fn information_schema_tables_rows(
             "NO",
         ));
     }
-    rows.sort_by_key(|row| (text_at(row, 1).to_string(), text_at(row, 2).to_string()));
+    sort_rows_by_key(&mut rows, |row| {
+        Ok((text_at(row, 1)?.to_string(), text_at(row, 2)?.to_string()))
+    })?;
     Ok(rows)
 }
 
@@ -1073,13 +1083,13 @@ fn information_schema_columns_rows(
             )?);
         }
     }
-    rows.sort_by_key(|row| {
-        (
-            text_at(row, 1).to_string(),
-            text_at(row, 2).to_string(),
-            integer_at(row, 4),
-        )
-    });
+    sort_rows_by_key(&mut rows, |row| {
+        Ok((
+            text_at(row, 1)?.to_string(),
+            text_at(row, 2)?.to_string(),
+            integer_at(row, 4)?,
+        ))
+    })?;
     Ok(rows)
 }
 
@@ -1198,17 +1208,40 @@ fn timestamp_tz(value: Option<i64>) -> Value {
     value.map(Value::TimestampTz).unwrap_or(Value::Null)
 }
 
-fn integer_at(row: &Row, index: usize) -> i64 {
-    match &row.values[index] {
-        Value::Integer(value) => *value,
-        other => panic!("expected integer at slot {index}, got {other:?}"),
+fn sort_rows_by_key<K: Ord>(
+    rows: &mut Vec<Row>,
+    mut key: impl FnMut(&Row) -> Result<K>,
+) -> Result<()> {
+    let mut keyed = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        keyed.push((key(&row)?, row));
+    }
+    keyed.sort_by(|(left, _), (right, _)| left.cmp(right));
+    rows.extend(keyed.into_iter().map(|(_, row)| row));
+    Ok(())
+}
+
+fn integer_at(row: &Row, index: usize) -> Result<i64> {
+    match row.values.get(index) {
+        Some(Value::Integer(value)) => Ok(*value),
+        Some(other) => Err(common::DbError::internal(format!(
+            "expected integer at system row slot {index}, got {other:?}"
+        ))),
+        None => Err(common::DbError::internal(format!(
+            "system row is missing integer slot {index}"
+        ))),
     }
 }
 
-fn text_at(row: &Row, index: usize) -> &str {
-    match &row.values[index] {
-        Value::Text(value) => value,
-        other => panic!("expected text at slot {index}, got {other:?}"),
+fn text_at(row: &Row, index: usize) -> Result<&str> {
+    match row.values.get(index) {
+        Some(Value::Text(value)) => Ok(value),
+        Some(other) => Err(common::DbError::internal(format!(
+            "expected text at system row slot {index}, got {other:?}"
+        ))),
+        None => Err(common::DbError::internal(format!(
+            "system row is missing text slot {index}"
+        ))),
     }
 }
 
@@ -1503,7 +1536,9 @@ fn datetime_precision(pg_type: &PgType) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::non_empty_array_text;
+    use common::{Row, SqlState, Value};
+
+    use super::{integer_at, non_empty_array_text, sort_rows_by_key, text_at};
 
     fn array_text(elements: &[&str]) -> Option<String> {
         non_empty_array_text(elements.iter().map(|element| element.to_string()))
@@ -1531,5 +1566,33 @@ mod tests {
         );
         // No elements: SQL NULL, not an empty array literal.
         assert_eq!(array_text(&[]), None);
+    }
+
+    #[test]
+    fn system_row_accessors_return_internal_errors_for_malformed_rows() {
+        let wrong_type = Row {
+            values: vec![Value::Text("not an integer".to_string())],
+        };
+        assert!(matches!(
+            integer_at(&wrong_type, 0),
+            Err(err) if err.code == SqlState::InternalError
+        ));
+
+        let missing_slot = Row { values: vec![] };
+        assert!(matches!(
+            text_at(&missing_slot, 0),
+            Err(err) if err.code == SqlState::InternalError
+        ));
+    }
+
+    #[test]
+    fn fallible_system_row_sort_propagates_key_errors() {
+        let mut rows = vec![Row {
+            values: vec![Value::Text("not an integer".to_string())],
+        }];
+        assert!(matches!(
+            sort_rows_by_key(&mut rows, |row| integer_at(row, 0)),
+            Err(err) if err.code == SqlState::InternalError
+        ));
     }
 }

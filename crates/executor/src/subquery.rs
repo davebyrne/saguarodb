@@ -384,11 +384,34 @@ fn subquery_column_type(query: &BoundQuery) -> Result<DataType> {
 
 /// Extract the single value from a one-column subquery row.
 fn single_value(row: Row) -> Result<Value> {
-    let mut values = row.values;
-    if values.len() != 1 {
-        return Err(DbError::internal(
+    let mut values = row.values.into_iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => Ok(value),
+        _ => Err(DbError::internal(
             "subquery used as a value produced a row with the wrong number of columns",
-        ));
+        )),
     }
-    Ok(values.pop().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{Row, SqlState, Value};
+
+    use super::single_value;
+
+    #[test]
+    fn single_value_rejects_malformed_row_width_without_panicking() {
+        for values in [vec![], vec![Value::Integer(1), Value::Integer(2)]] {
+            assert!(matches!(
+                single_value(Row { values }),
+                Err(err) if err.code == SqlState::InternalError
+            ));
+        }
+        assert_eq!(
+            single_value(Row {
+                values: vec![Value::Integer(1)],
+            }),
+            Ok(Value::Integer(1))
+        );
+    }
 }

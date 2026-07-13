@@ -408,9 +408,11 @@ fn read_accounted<T: SpillRecord>(
 
 fn rewind_data(file: &mut File) -> Result<()> {
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-    let mut header = [0; 8];
-    file.read_exact(&mut header).map_err(io_error)?;
-    if &header[..4] != MAGIC || u32::from_le_bytes(header[4..].try_into().unwrap()) != VERSION {
+    let mut magic = [0; 4];
+    let mut version = [0; 4];
+    file.read_exact(&mut magic).map_err(io_error)?;
+    file.read_exact(&mut version).map_err(io_error)?;
+    if &magic != MAGIC || u32::from_le_bytes(version) != VERSION {
         return Err(io_error("invalid spill file header"));
     }
     Ok(())
@@ -908,12 +910,20 @@ where
                 _ => false,
             };
             if take_left {
-                let emitted = l.take().unwrap();
+                let Some(emitted) = l.take() else {
+                    return Err(DbError::internal(
+                        "external sort merge selected an exhausted left run",
+                    ));
+                };
                 write_record(&mut output, &emitted.value, &self.ctx)?;
                 drop(emitted);
                 l = read_accounted(&mut left.file, &self.ctx)?;
             } else {
-                let emitted = r.take().unwrap();
+                let Some(emitted) = r.take() else {
+                    return Err(DbError::internal(
+                        "external sort merge selected an exhausted right run",
+                    ));
+                };
                 write_record(&mut output, &emitted.value, &self.ctx)?;
                 drop(emitted);
                 r = read_accounted(&mut right.file, &self.ctx)?;

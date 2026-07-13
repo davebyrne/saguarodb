@@ -100,12 +100,14 @@ impl ObjectLockMode {
         }
     }
 
-    fn strongest(self, other: Self) -> Self {
+    fn strongest(self, other: Self) -> Result<Self> {
         match (self, other) {
-            (Self::Catalog(left), Self::Catalog(right)) => Self::Catalog(left.max(right)),
-            (Self::Relation(left), Self::Relation(right)) => Self::Relation(left.max(right)),
-            (Self::Sequence(left), Self::Sequence(right)) => Self::Sequence(left.max(right)),
-            _ => panic!("lock mode does not match resource type"),
+            (Self::Catalog(left), Self::Catalog(right)) => Ok(Self::Catalog(left.max(right))),
+            (Self::Relation(left), Self::Relation(right)) => Ok(Self::Relation(left.max(right))),
+            (Self::Sequence(left), Self::Sequence(right)) => Ok(Self::Sequence(left.max(right))),
+            _ => Err(DbError::internal(
+                "object lock modes have different resource types",
+            )),
         }
     }
 }
@@ -309,11 +311,26 @@ impl LockManager {
             );
             if blockers.is_empty() {
                 remove_request(&mut state, request.resource.clone(), request_id);
-                let grants = state.grants.entry(request.resource.clone()).or_default();
-                grants
-                    .entry(owner)
-                    .and_modify(|held| *held = held.strongest(request.mode))
-                    .or_insert(request.mode);
+                let mode = match state
+                    .grants
+                    .get(&request.resource)
+                    .and_then(|grants| grants.get(&owner))
+                {
+                    Some(held) => match held.strongest(request.mode) {
+                        Ok(mode) => mode,
+                        Err(err) => {
+                            state.waits_for.remove(&owner);
+                            self.cond.notify_all();
+                            return Err(err);
+                        }
+                    },
+                    None => request.mode,
+                };
+                state
+                    .grants
+                    .entry(request.resource.clone())
+                    .or_default()
+                    .insert(owner, mode);
                 state.waits_for.remove(&owner);
                 self.cond.notify_all();
                 return Ok(());
@@ -548,10 +565,15 @@ fn normalize_requests(requests: &[ObjectLockRequest]) -> Result<Vec<ObjectLockRe
     let mut normalized = BTreeMap::<LockResource, ObjectLockMode>::new();
     for request in requests {
         validate_request(request)?;
-        normalized
-            .entry(request.resource.clone())
-            .and_modify(|mode| *mode = mode.strongest(request.mode))
-            .or_insert(request.mode);
+        match normalized.entry(request.resource.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(request.mode);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let mode = entry.get().strongest(request.mode)?;
+                entry.insert(mode);
+            }
+        }
     }
     Ok(normalized
         .into_iter()
@@ -707,6 +729,24 @@ mod tests {
                 ObjectLockRequest::sequence(2, SequenceLockMode::Exclusive),
             ]
         );
+    }
+
+    #[test]
+    fn mismatched_lock_mode_families_return_internal_errors() {
+        assert!(matches!(
+            ObjectLockMode::Catalog(CatalogLockMode::Access)
+                .strongest(ObjectLockMode::Relation(RelationLockMode::AccessShare)),
+            Err(err) if err.code == SqlState::InternalError
+        ));
+
+        let malformed = ObjectLockRequest {
+            resource: LockResource::Table(1),
+            mode: ObjectLockMode::Sequence(SequenceLockMode::Access),
+        };
+        assert!(matches!(
+            normalize_requests(&[malformed]),
+            Err(err) if err.code == SqlState::InternalError
+        ));
     }
 
     #[test]
