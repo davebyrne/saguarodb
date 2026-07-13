@@ -337,15 +337,14 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
   `Integer` semantic type while recording PostgreSQL `oid` wire presentation
   (`PgType::Oid`) for columns and casts. Other qualified custom type names remain
   unsupported.
-- `CREATE SEQUENCE name [INCREMENT [BY] n] [START [WITH] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [CACHE n] [[NO] CYCLE]`. Options may be written in any order and are normalized into `SequenceOptions`; duplicate options are rejected. `CACHE` must be positive and is accepted as parser input but ignored downstream. `TEMP`/`TEMPORARY`, `IF NOT EXISTS`, `AS <type>`, qualified or quoted names, and `OWNED BY` are rejected as unsupported.
+- `CREATE SEQUENCE name [INCREMENT [BY] n] [START [WITH] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [CACHE n] [[NO] CYCLE]`. Options may be written in any order and are normalized into `SequenceOptions`; duplicate options are rejected. `CACHE` must be positive and is accepted as parser input but ignored downstream. One- and two-part unquoted names are supported; `TEMP`/`TEMPORARY`, `IF NOT EXISTS`, `AS <type>`, quoted names, and `OWNED BY` are rejected as unsupported.
 - `DROP SEQUENCE [IF EXISTS] name`.
-- Relation names in `FROM` accept unquoted one- or two-part names, supporting
-  `public.<table>`, `pg_catalog.<view>`, and `information_schema.<view>` as parser
-  output. Three-or-more-part names and quoted identifiers are rejected. CREATE and
-  DROP object paths remain single-part only. DML/COPY targets fold `public.<name>`
-  to `<name>`, reject `pg_catalog.<name>` and `information_schema.<name>` as
-  read-only (`FeatureNotSupported`), and reject any other schema with
-  `InvalidSchemaName`.
+- Relation and user-object targets accept unquoted one- or two-part names and
+  preserve them as `QualifiedName`; three-or-more-part and quoted identifiers
+  are rejected. `pg_catalog` and `information_schema` relations are available
+  only through their virtual read-only views. The binder resolves unqualified
+  user objects through `BindOptions.search_path` and rejects writes to system
+  schemas.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
 - `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT`, `VALUES`, and set-operation bodies are supported, and an optional `WITH` clause on the wrapper.

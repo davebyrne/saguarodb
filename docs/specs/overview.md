@@ -26,10 +26,13 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Schema-evolution DDL also supports `ALTER TABLE [ONLY] <table> ALTER [COLUMN]
   <column> TYPE <type>` and `... SET DATA TYPE <type>`. It performs an explicit-cast
   full heap/index rewrite transactionally; `USING` expressions are unsupported.
-- `VACUUM ANALYZE` and `VACUUM ANALYZE <table>` are compatibility spellings of
-  the corresponding VACUUM commands. The reclamation pass still runs; `ANALYZE`
-  itself is discarded because the rule-based planner has no statistics catalog.
-- Rule-based query planner (no cost-based optimization)
+- Optimizer statistics through `ANALYZE [table]` and `VACUUM ANALYZE [table]`:
+  collection is sampled, durable in catalog snapshots and WAL, exposed through
+  `pg_class`/`pg_stats`, and refreshed automatically at checkpoints when the
+  configured changed-row threshold is reached (`docs/specs/statistics.md`).
+- A predominantly rule-based planner with statistics-driven cardinality
+  estimates and first cost-based choices: sequential versus index scan and the
+  hash-join build side. Join order remains the written left-to-right order.
 - Transaction-owned table locks coordinate reads, writes, DDL, and maintenance by
   logical `TableId`, share the row-lock deadlock graph, and provide transactional
   multi-table TRUNCATE; see `docs/specs/table-locks.md`.
@@ -113,6 +116,9 @@ Internal Rust code should use paths like `common::Result` and `storage::StorageE
 
 ```rust
 pub type TableId = u32;
+pub type SchemaId = u32;
+pub const PUBLIC_SCHEMA_ID: SchemaId = 1;
+pub const FIRST_USER_SCHEMA_ID: SchemaId = 2;
 pub type ColumnId = u16;
 pub type IndexId = u32;
 pub type SequenceId = u32;
@@ -372,6 +378,7 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    pub statement_timestamp_micros: i64,
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
     pub cancel: Arc<QueryCancel>,
     pub live_txns: Arc<[u64]>,
@@ -382,6 +389,7 @@ pub struct StatementContext {
     pub session_info: Arc<SessionInfo>,
     pub system_state: Arc<dyn SystemStateProvider>,
     pub catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    pub runtime_value_sets: Arc<RuntimeValueSetRegistry>,
 }
 ```
 
@@ -694,12 +702,18 @@ The `parser` crate wraps `sqlparser-rs` (PostgreSQL dialect) and translates its 
 
 ### Internal AST Types
 
-The AST uses strings for identifiers — name resolution to IDs happens in the planner.
+The AST uses `QualifiedName` for user objects and strings for individual
+identifier components; name resolution to schema/object IDs happens in the
+planner.
+The enum below is an abridged shape summary; the exact field-level parser
+contract is `docs/specs/crates/parser.md` and `crates/parser/src/ast.rs`.
 
 ```rust
 pub enum Statement {
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
     CreateTable {
-        name: String,
+        name: QualifiedName,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
@@ -708,33 +722,34 @@ pub enum Statement {
         toast: ToastOptionPatch,
         checks: Vec<String>,
     },
-    DropTable { names: Vec<String>, if_exists: bool },
+    DropTable { names: Vec<QualifiedName>, if_exists: bool },
     AlterTableAddColumn {
-        table: String,
+        table: QualifiedName,
         if_not_exists: bool,
         column: ParsedColumnDef,
     },
     AlterTableDropColumn {
-        table: String,
+        table: QualifiedName,
         if_exists: bool,
         column: String,
     },
-    AlterTableRenameColumn { table: String, old_name: String, new_name: String },
-    AlterTableRenameTable { table: String, new_name: String },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
-    DropIndex { name: String },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
+    AlterTableRenameColumn { table: QualifiedName, old_name: String, new_name: String },
+    AlterTableRenameTable { table: QualifiedName, new_name: String },
+    AlterTableAlterColumnType { table: QualifiedName, column: String, data_type: DataType, pg_type: PgType },
+    CreateIndex { name: QualifiedName, table: QualifiedName, columns: Vec<String>, unique: bool },
+    DropIndex { name: QualifiedName },
+    CreateSequence { name: QualifiedName, options: SequenceOptions },
+    DropSequence { name: QualifiedName, if_exists: bool },
     CreateView {
-        name: String,
+        name: QualifiedName,
         or_replace: bool,
         columns: Vec<String>,
         query: Query,
         definition: String,
     },
-    DropView { name: String, if_exists: bool },
+    DropView { name: QualifiedName, if_exists: bool },
     Insert {
-        table: String,
+        table: QualifiedName,
         columns: Vec<String>,
         source: InsertSource,
         on_conflict: Option<OnConflict>,     // INSERT ... ON CONFLICT ... (upsert)
@@ -742,14 +757,14 @@ pub enum Statement {
     },
     Query(Query),
     Update {
-        table: String,
+        table: QualifiedName,
         assignments: Vec<Assignment>,
         from: Vec<FromItem>,
         filter: Option<Expr>,
         returning: Option<Vec<SelectItem>>,  // UPDATE ... RETURNING <items>
     },
     Delete {
-        table: String,
+        table: QualifiedName,
         using: Vec<FromItem>,
         filter: Option<Expr>,
         returning: Option<Vec<SelectItem>>,  // DELETE ... RETURNING <items>
@@ -772,27 +787,28 @@ pub enum Statement {
     ResetVariable { name: Option<String> },                          // RESET <guc> / RESET ALL
     ShowVariable { name: Option<String> },                           // SHOW <guc> / SHOW ALL
     DiscardAll,                                                      // DISCARD ALL
-    Vacuum { table: Option<String> },             // VACUUM [table] — maintenance, not bound/planned
-    Truncate { tables: Vec<String> },             // TRUNCATE [TABLE] <name> [, ...] — maintenance, not bound/planned
+    Vacuum { table: Option<QualifiedName>, analyze: bool }, // VACUUM [ANALYZE] [table]
+    Analyze { table: Option<QualifiedName> },      // ANALYZE [table]
+    Truncate { tables: Vec<QualifiedName> },       // TRUNCATE [TABLE] <name> [, ...]
     AlterTableSetCompression {                    // ALTER TABLE <table> SET (compression = ...)
-        table: String,
+        table: QualifiedName,
         compression: CompressionSetting,
     },
     AlterTableSetOptions {                        // ALTER TABLE <table> SET (toast..., ...)
-        table: String,
+        table: QualifiedName,
         options: TableOptionPatch,
     },
     AlterTableAddPrimaryKey {
-        table: String,
+        table: QualifiedName,
         columns: Vec<String>,
         constraint_name: Option<String>,
     },
     AlterTableDropPrimaryKey {
-        table: String,
+        table: QualifiedName,
         constraint_name: Option<String>,
     },
     Copy {                                        // COPY <table> [(cols)] FROM STDIN | TO STDOUT
-        table: String,                            // (docs/specs/copy.md)
+        table: QualifiedName,                     // (docs/specs/copy.md)
         columns: Vec<String>,
         direction: CopyDirection,
         options: CopyOptions,
@@ -997,7 +1013,10 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan>;
 pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Result<PhysicalPlan>;
 ```
 
-All three phases are separate modules within the `planner` crate. All three are implemented — the physical planner is trivial (rule-based), but the boundary is real. A future cost-based optimizer replaces only `physical_plan` without touching binding or logical planning.
+All three phases are separate modules within the `planner` crate. The physical
+planner is predominantly rule-based but already consults catalog statistics for
+cardinality estimates and its first cost decisions. A fuller optimizer can
+extend or replace that phase without changing binding or logical planning.
 
 ### Phase 1: Binder
 
@@ -1013,7 +1032,8 @@ The binder:
 
 ```rust
 pub struct DropTableTarget {
-    pub name: String,
+    pub name: QualifiedName,
+    pub search_path: Vec<SchemaId>,
     pub table: Option<TableId>,
 }
 
@@ -1021,7 +1041,10 @@ pub struct DropTableTarget {
 /// execution-time DDL cases; all types are checked and all column references are
 /// assigned physical slot positions.
 pub enum BoundStatement {
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -1032,27 +1055,32 @@ pub enum BoundStatement {
         checks: Vec<String>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
+    CreateSequence { schema: SchemaId, name: String, options: SequenceOptions },
+    DropSequence { name: String, search_path: Vec<SchemaId>, sequence: Option<SequenceId>, if_exists: bool },
     Insert {
         table: TableId,
         columns: Vec<ColumnId>,
         source: BoundInsertSource,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
+        check_exprs: Vec<BoundExpr>,
     },
     Query(BoundQuery),
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: BoundSelect,
+        joined_source: bool,
         returning: Option<BoundReturning>,
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,
         source: BoundSelect,
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
     Explain(Box<BoundStatement>),
@@ -1302,11 +1330,16 @@ Every `BoundExpr` variant carries its resolved output type and nullability. Bind
 ### Phase 2: Logical Planner
 
 Translates a `BoundStatement` into a `LogicalPlan` — relational algebra describing *what* to compute. No access method decisions.
+The synopsis below shows the main shapes; `crates/planner/src/logical.rs` is the
+exact field-level contract.
 
 ```rust
 pub enum LogicalPlan {
     // DDL — passes through to physical plan unchanged
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -1317,10 +1350,10 @@ pub enum LogicalPlan {
         checks: Vec<String>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
+    CreateSequence { schema: SchemaId, name: String, options: SequenceOptions },
+    DropSequence { name: String, search_path: Vec<SchemaId>, sequence: Option<SequenceId>, if_exists: bool },
 
     // DML
     Insert {
@@ -1329,16 +1362,21 @@ pub enum LogicalPlan {
         source: Box<LogicalPlan>,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
+        check_exprs: Vec<BoundExpr>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<LogicalPlan>,
+        joined_source: bool,
         returning: Option<BoundReturning>,
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,
         source: Box<LogicalPlan>,
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
 
@@ -1381,6 +1419,8 @@ pub enum AggregateFunc {
     VarPop,     // VAR_POP (divisor n)
     BoolAnd,    // BOOL_AND — true when every non-NULL input is true
     BoolOr,     // BOOL_OR — true when any non-NULL input is true
+    ArrayAgg,   // ARRAY_AGG(value) — array of input values, including NULLs
+    StringAgg,  // STRING_AGG(text, delimiter) — concatenated non-NULL values
 }
 
 pub struct BoundOrderByItem {
@@ -1390,7 +1430,7 @@ pub struct BoundOrderByItem {
 }
 ```
 
-Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, the statistical aggregates `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP` and `VARIANCE`/`VAR_SAMP`/`VAR_POP`, and `BOOL_AND`/`BOOL_OR` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls into `AggregateExpr` values and rewrites expressions above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values, so aggregate slot `i` is read as `LocalRef { slot: group_by.len() + i, ... }`. `AggregateCall` must not reach executor scalar evaluation.
+Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, the statistical aggregates `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP` and `VARIANCE`/`VAR_SAMP`/`VAR_POP`, `BOOL_AND`/`BOOL_OR`, `ARRAY_AGG`, and `STRING_AGG` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls into `AggregateExpr` values and rewrites expressions above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values, so aggregate slot `i` is read as `LocalRef { slot: group_by.len() + i, ... }`. `AggregateCall` must not reach executor scalar evaluation.
 
 Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM` and `AVG` accept either numeric type and return it (`AVG(integer)` uses integer division truncated toward zero; `AVG(double precision)` is true division), rejecting non-numeric arguments with `SqlState::DatatypeMismatch`; `MIN` and `MAX` return the argument type and are nullable; `STDDEV`/`VARIANCE` (and their `_SAMP`/`_POP` forms) take a numeric argument and return `DOUBLE PRECISION`; `BOOL_AND`/`BOOL_OR` take a boolean argument and return `BOOLEAN`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for the rest (sample variance/stddev also return `NULL` for a single value).
 
@@ -1398,12 +1438,19 @@ Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries
 
 ### Phase 3: Physical Planner
 
-Translates a `LogicalPlan` into a `PhysicalPlan` — chooses access methods and join algorithms. The physical planner is trivial (rule-based), but the boundary is real from day one.
+Translates a `LogicalPlan` into a `PhysicalPlan` and chooses access methods and
+join algorithms. Most choices are rule-based; analyzed table statistics feed
+cardinality estimates, sequential-versus-index scan cost comparison, and
+hash-join build-side selection (`docs/specs/statistics.md`).
 
 ```rust
+// Structural synopsis. See crates/planner/src/physical.rs for the exact fields.
 pub enum PhysicalPlan {
     // DDL
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
     CreateTable {
+        schema: SchemaId,
         name: String,
         if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
@@ -1414,10 +1461,10 @@ pub enum PhysicalPlan {
         checks: Vec<String>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
+    CreateSequence { schema: SchemaId, name: String, options: SequenceOptions },
+    DropSequence { name: String, search_path: Vec<SchemaId>, sequence: Option<SequenceId>, if_exists: bool },
 
     // DML
     Insert {
@@ -1426,16 +1473,21 @@ pub enum PhysicalPlan {
         source: Box<PhysicalPlan>,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
+        check_exprs: Vec<BoundExpr>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<PhysicalPlan>,
+        joined_source: bool,
         returning: Option<BoundReturning>,
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,
         source: Box<PhysicalPlan>,
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
 
@@ -1450,12 +1502,16 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Option<BoundExpr>,
         join_type: JoinType,
+        identity_from: Option<JoinSide>,
     },
     HashJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
+        join_type: JoinType,
+        identity_from: Option<JoinSide>,
+        build_left: bool,
     },
     MergeJoin {
         left: Box<PhysicalPlan>,
@@ -1512,25 +1568,28 @@ not considered for storage index selection and carries the view plus full output
 schema so execution and EXPLAIN/debug output do not need to re-resolve the
 registry entry.
 
-The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a future cost-based optimizer replaces only `physical_plan`, choosing among multiple physical alternatives per logical operator. The binder and logical planner are unchanged.
+The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) keeps
+statistics estimation and physical choice isolated from binding and logical
+semantics. A fuller cost search can extend this phase without changing the
+binder or logical planner.
 
 ### Planner Rules (Applied in Order)
 
 1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of the table's declared primary key, emit `IndexScan` with `PRIMARY_KEY_INDEX_ID`. If it has an equality or range comparison on the leading column of a catalog index, emit `IndexScan` with that catalog index. Both forms carry a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, the original predicate in `full_filter`, and any residual predicate in `filter`.
 2. **Index choice:** When several indexed leading columns are constrained, prefer an equality over a range, primary-key identity access over catalog indexes, then the lower index id.
-3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
-4. **Join ordering:** Process joins left to right as written. Eligible inner/semi/anti equi joins use `HashJoin`. A left/right/full join with at least one extractable cross-side equality and no DML identity source uses `MergeJoin`, with remaining `ON` conjuncts evaluated internally as residuals. Cross, non-equi, and DML-identity outer joins use `NestedLoopJoin`. Merge join owns spillable internal sorts but publishes no ordering property.
-5. **Projection pushdown:** Optional. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
+3. **Statistics cost check:** With statistics, compare sequential and eligible
+   index scan costs; without statistics, preserve the rule-based index choice.
+4. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
+5. **Join ordering:** Process joins left to right as written. Eligible inner/semi/anti equi joins use `HashJoin`. A left/right/full join with at least one extractable cross-side equality and no DML identity source uses `MergeJoin`, with remaining `ON` conjuncts evaluated internally as residuals. Cross, non-equi, and DML-identity outer joins use `NestedLoopJoin`. Merge join owns spillable internal sorts but publishes no ordering property. For a fully analyzed plain inner join, build the hash table on the smaller estimated side.
+6. **Projection pushdown:** Not implemented; logical projection maps directly to physical projection.
 
 ### EXPLAIN
 
-`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement, acquires its ordinary object-lifetime locks, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
+`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement, acquires its ordinary object-lifetime locks, plans the inner bound statement only, and calls planner-owned `format_explain(plan, catalog)`. Relational nodes include a statistics-backed or fallback `rows=N` estimate. The server returns `ExecutionResult::Explanation`; `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly.
 
 ### Planner Non-Goals
 
-- Cost-based optimization
-- Join reordering
-- Merge joins
+- Full cost-based optimization and join reordering
 - Query plan caching
 
 ## 6. Query Executor
@@ -2591,7 +2650,7 @@ The `server` crate is the binary entry point.
 
 Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 11 transitions to normal operation where `StorageEngine` methods append WAL records.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
+The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--auto-analyze-changed-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. The two automatic-maintenance thresholds accept `0` to disable their respective checkpoint pass; all other numeric flags must be positive and `--port` is limited to `1..=65535`. TLS is off unless both certificate and key paths are supplied. Invalid input prints usage to stderr and exits with code `2`.
 
 `statement_timeout` is session configuration rather than a startup flag. Its
 canonical value is an integer number of milliseconds (`0` disables it), while
@@ -2658,6 +2717,7 @@ pub struct Config {
     pub checkpoint_every_n_commits: u64, // default: 100
     pub checkpoint_wal_bytes: u64,    // default: 64 * 1024 * 1024
     pub auto_vacuum_dead_rows: u64,   // default: 10000 (0 disables auto-prune)
+    pub auto_analyze_changed_rows: u64, // default: 10000 (0 disables auto-analyze)
     pub shutdown_timeout_ms: u64,     // default: 30000
     pub deadlock_timeout_ms: u64,     // default: 1000
     pub tls_cert_file: Option<PathBuf>, // default: None (PEM cert chain)
@@ -2671,7 +2731,9 @@ Loaded from command-line args only. There is no environment-variable or config-f
 
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
-- **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among primary-key identity access and catalog indexes, preferring primary-key identity access when available; a cost model would replace that heuristic.
+- **Full Cost-Based Optimizer:** The current hybrid planner has cardinality
+  estimation plus cost-based scan and hash-build-side choices. Join reordering,
+  alternative join enumeration, and a general cost search remain future work.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.
 - **Additional Data Types:** `DataType` and `Value` enums are extensible. Row serialization format supports new types via the null bitmap + column data pattern.

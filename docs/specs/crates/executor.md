@@ -115,9 +115,11 @@ Production execution uses an explicit context:
 ```rust
 pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
+    pub relations: Arc<dyn RelationSnapshot>,
     pub catalog: Arc<dyn CatalogManager>,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
+    pub gc_horizon: u64,
     pub cancel: &'a QueryCancel,
     pub spill: spill::SpillConfig,
 }
@@ -294,7 +296,13 @@ Uncorrelated subqueries are resolved to constants by a one-time pre-pass over th
   preserves the existing three-valued behavior, including the project's empty
   set behavior. Scalar subqueries pull at most two rows and `EXISTS` at most one.
 
-Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and executed once; the pass recurses so nested subqueries are resolved bottom-up. Because the subqueries are uncorrelated, a single execution under the statement snapshot is correct; correlated subqueries are not yet supported.
+Each uncorrelated subquery's bound SELECT is planned (`logical_plan` +
+`physical_plan`) and executed once; the pass recurses so nested subqueries are
+resolved bottom-up. Correlated scalar, `[NOT] EXISTS`, and `[NOT] IN` subqueries
+in `WHERE`, `HAVING`, and projection positions are hoisted into `Apply` nodes and
+executed per distinct correlation key (unless volatile), using spill-backed
+memoized results. The remaining position and decorrelation limits are specified
+in `docs/specs/subqueries.md`.
 
 ## DML Execution
 

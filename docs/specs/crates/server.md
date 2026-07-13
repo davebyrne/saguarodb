@@ -50,6 +50,7 @@ pub struct Config {
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
     pub auto_vacuum_dead_rows: u64,
+    pub auto_analyze_changed_rows: u64,
     pub shutdown_timeout_ms: u64,
     pub deadlock_timeout_ms: u64,
     pub tls_cert_file: Option<PathBuf>,
@@ -67,6 +68,7 @@ Defaults:
 - `checkpoint_every_n_commits = 100`
 - `checkpoint_wal_bytes = 64 * 1024 * 1024`
 - `auto_vacuum_dead_rows = 10000`
+- `auto_analyze_changed_rows = 10000`
 - `shutdown_timeout_ms = 30000`
 - `deadlock_timeout_ms = 1000`
 - `tls_cert_file = None`
@@ -90,7 +92,7 @@ Binary CLI flags:
 - `--tls-key-file <PATH>` sets `Config.tls_key_file`; PEM private key. Optional; defaults to disabled.
 - `--help` prints usage and exits with code `0`.
 
-The binary parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; all other numeric flags must be positive nonzero integers. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`. TLS is enabled only when both `--tls-cert-file` and `--tls-key-file` are supplied; supplying exactly one is an error that prints usage to stderr and exits with code `2`.
+The binary parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; both automatic-maintenance thresholds accept `0` to disable their pass, and every other numeric flag must be positive and nonzero. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`. TLS is enabled only when both `--tls-cert-file` and `--tls-key-file` are supplied; supplying exactly one is an error that prints usage to stderr and exits with code `2`.
 
 ## Startup Sequence
 

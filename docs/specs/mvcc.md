@@ -1469,7 +1469,8 @@ savepoints via sub-transaction xids (optional, deferred).
   catalog overlay, savepoint journaling, transactional relation-generation
   lifecycle, and durable-commit publication (`docs/specs/crates/catalog.md`,
   `docs/specs/table-locks.md`).
-- **Serializable (SSI)** — layer predicate/SIREAD tracking on snapshot isolation.
+- ~~**Serializable (SSI)**~~ — **implemented** with transaction/relation/tuple
+  SIREAD tracking and dangerous-structure detection (`docs/specs/ssi.md`).
 - ~~**Savepoints / sub-transactions**~~ — **implemented** via sub-transaction
   xids + CLOG, no undo (`docs/specs/savepoints.md`).
 - **Time-travel / as-of** — would motivate adding commit timestamps (Decision 1

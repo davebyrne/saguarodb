@@ -19,7 +19,9 @@ against that path rather than the caller's current path.
 2. Logical plan: describe what to compute.
 3. Physical plan: choose access methods and algorithms.
 
-Physical planning is rule-based and naive, but the phase boundary is real.
+Physical planning is predominantly rule-based, with statistics-backed
+cardinality estimates and cost comparisons for scan selection and hash-join
+build-side choice. Join order remains left-to-right as written.
 
 ## Depends On
 
@@ -682,19 +684,26 @@ usable (e.g. `id = 3 + 4` folds to `id = 7`).
 
 ## Physical Plan
 
+The following is a structural synopsis of the relational variants, not a
+field-for-field duplicate of the public enum. The exact field contract lives in
+`crates/planner/src/physical.rs`; DDL/DML fields additionally follow the bound
+contracts above.
+
 ```rust
 pub enum PhysicalPlan {
-    CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
+    CreateSchema { name: String, if_not_exists: bool },
+    DropSchema { name: String, if_exists: bool },
+    CreateTable { schema: SchemaId, name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
     AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
     AlterTableRenameTable { table: TableId, table_name: String, new_name: String },
     AlterTableAlterColumnType { table: TableId, table_name: String, column: String, data_type: DataType, pg_type: PgType },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    CreateSequence { name: String, options: SequenceOptions },
-    DropSequence { name: String, if_exists: bool },
+    CreateSequence { schema: SchemaId, name: String, options: SequenceOptions },
+    DropSequence { name: String, search_path: Vec<SchemaId>, sequence: Option<SequenceId>, if_exists: bool },
     CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
@@ -708,12 +717,16 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Option<BoundExpr>,
         join_type: JoinType,
+        identity_from: Option<JoinSide>,
     },
     HashJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
+        join_type: JoinType,
+        identity_from: Option<JoinSide>,
+        build_left: bool,
     },
     MergeJoin {
         left: Box<PhysicalPlan>, right: Box<PhysicalPlan>,

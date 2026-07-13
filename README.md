@@ -21,10 +21,11 @@ trait seams.
   suspension for extended-query `max_rows`.
 - Optional TLS/SSL server connections when both a PEM certificate chain and
   private key are configured.
-- DDL and maintenance for `CREATE`/`DROP TABLE`, `CREATE`/`DROP VIEW`,
+- DDL and maintenance for `CREATE`/`DROP SCHEMA`, `CREATE`/`DROP TABLE`, `CREATE`/`DROP VIEW`,
   `CREATE`/`DROP SEQUENCE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `TRUNCATE`,
   `VACUUM`, table compression/TOAST option changes, primary-key add/drop, and
-  schema evolution for add/drop/rename columns and table renames.
+  schema evolution for add/drop/rename/type-change columns and table renames.
+  One- and two-part user object names resolve through the session `search_path`.
 - DML for `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE` (including
   `UPDATE ... FROM`), `DELETE` (including `DELETE ... USING`), `RETURNING`,
   primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and
@@ -35,10 +36,13 @@ trait seams.
   `OFFSET`, scalar / `[NOT] IN` / `[NOT] EXISTS` subqueries — correlated in
   `WHERE`, the select list, and `HAVING`, with equality shapes decorrelated to
   hash semi/anti joins — and `LATERAL` derived tables
-  (`docs/specs/subqueries.md`).
+  (`docs/specs/subqueries.md`). `unnest(array)` and integer
+  `generate_series(...)` are implicitly lateral table functions.
 - Data types include integer widths and serial families, boolean, text and
   bounded character types, date/time/timestamp/timestamptz/interval, bytea,
-  uuid, floating point, numeric, and null values.
+  uuid, floating point, numeric, rectangular arrays, and null values. Arrays
+  support constructors, casts, comparisons, subscripts, `op ANY(array)`, text
+  and binary protocol formats, COPY fields, and `array_agg`.
 - Column defaults, `nextval` defaults, non-constant expression defaults,
   unnamed `CHECK` constraints, sequence functions, PostgreSQL-compatible system
   information functions, and catalog/probe functions used by common clients.

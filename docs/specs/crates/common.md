@@ -9,13 +9,13 @@
 
 ## Owns
 
-- Stable identifiers: `TableId`, `ColumnId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
+- Stable identifiers: `SchemaId`, `TableId`, `ColumnId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
 - The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
   parameter path and the `COPY` import path so both share one accept-set; each
   caller maps `None` to its own SQLSTATE.
-- Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`,
+- Schema description types: `QualifiedName`, `NamespaceSchema`, `DataType`, `ParsedColumnDef`, `ColumnDef`,
   `ColumnInfo`, `TableSchema`, `IndexSchema`, `ViewColumn`,
   `ViewDependency`, `ViewSchema`, `SequenceOptions`, and `SequenceSchema`.
 - Relation-generation catalog handoff types: `TruncateTablePlan` and
@@ -57,6 +57,9 @@
 
 ```rust
 pub type TableId = u32;
+pub type SchemaId = u32;
+pub const PUBLIC_SCHEMA_ID: SchemaId = 1;
+pub const FIRST_USER_SCHEMA_ID: SchemaId = 2;
 pub type ColumnId = u16;
 pub type IndexId = u32;
 pub type SequenceId = u32;
@@ -597,6 +600,7 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    pub statement_timestamp_micros: i64,
     pub gc_horizon: u64,
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
     pub cancel: Arc<QueryCancel>,
@@ -607,6 +611,7 @@ pub struct StatementContext {
     pub session_info: Arc<SessionInfo>,
     pub system_state: Arc<dyn SystemStateProvider>,
     pub catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    pub runtime_value_sets: Arc<RuntimeValueSetRegistry>,
 }
 ```
 
