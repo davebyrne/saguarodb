@@ -350,6 +350,13 @@ fn value_width(value: &Value) -> u64 {
         Value::Numeric(_) | Value::Interval(_) | Value::Uuid(_) => 16,
         Value::Text(text) => text.len() as u64,
         Value::Bytes(bytes) => bytes.len() as u64,
+        // Approximate: one byte of per-element overhead (so NULL-dense arrays
+        // still have width proportional to their cardinality and cannot evade
+        // the cap) plus the scalar element widths. Large arrays exceed
+        // WIDE_VALUE_THRESHOLD and are width-capped like TEXT/BYTEA.
+        Value::Array(array) => {
+            array.elements().len() as u64 + array.elements().iter().map(value_width).sum::<u64>()
+        }
     }
 }
 
@@ -827,6 +834,31 @@ mod tests {
         ];
         let stats = column_statistics(&sample_of(values), 0, 3, 10);
         assert_eq!(stats.avg_width, 3);
+    }
+
+    #[test]
+    fn null_dense_arrays_are_width_capped() {
+        // A NULL element still costs one byte of width, so '{NULL,NULL,...}'
+        // with thousands of elements is reduced to SampledValue::Wide instead
+        // of being retained fully materialized (and can never reach MCVs or
+        // histogram bounds).
+        use common::{ArrayDimension, SqlArray};
+        let wide_array = Value::Array(
+            SqlArray::new(
+                common::DataType::Double,
+                vec![ArrayDimension::new(2000, 1)],
+                vec![Value::Null; 2000],
+            )
+            .unwrap(),
+        );
+        assert!(value_width(&wide_array) > WIDE_VALUE_THRESHOLD);
+        let sample = sample_of(vec![wide_array.clone(), wide_array, Value::Null]);
+        let stats = column_statistics(&sample, 0, 3, 10);
+        assert!(
+            stats.most_common.is_empty(),
+            "a wide array is not retained, so it cannot become an MCV"
+        );
+        assert!(stats.avg_width as u64 >= 2000);
     }
 
     #[test]

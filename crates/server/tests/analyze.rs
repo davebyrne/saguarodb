@@ -529,3 +529,39 @@ async fn copy_from_rows_count_toward_auto_analyze() {
     conn.ok("commit").await;
     assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 3);
 }
+
+#[tokio::test]
+async fn analyze_excludes_non_finite_arrays_and_survives_restart() {
+    // Regression for the SQL-arrays integration: a repeated ARRAY[1e400]
+    // (containing Infinity) must be excluded from MCVs/histograms — a
+    // non-finite value inside an array would otherwise serialize as JSON
+    // `null` in the manifest/WAL statistics payloads and brick the next
+    // startup, exactly like the scalar case.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table arr (id integer primary key, vals double precision[])")
+            .await;
+        conn.ok(
+            "insert into arr values (1, ARRAY[1e400]), (2, ARRAY[1e400]), (3, ARRAY[1.5, 2.5])",
+        )
+        .await;
+        let response = conn.query_raw("analyze arr").await.unwrap();
+        assert_eq!(command_tags(&response).unwrap(), vec!["ANALYZE"]);
+
+        let stats = table_statistics(&server, "arr").expect("statistics");
+        assert_eq!(stats.row_count, 3);
+        let vals = &stats.columns[&1];
+        assert!(
+            vals.most_common.is_empty(),
+            "the only repeated value contains Infinity and must be excluded"
+        );
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // The manifest carries the statistics and the database still opens.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let stats = table_statistics(&server, "arr").expect("statistics after restart");
+    assert_eq!(stats.row_count, 3);
+}

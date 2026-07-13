@@ -85,6 +85,9 @@ pub fn value_is_finite(value: &Value) -> bool {
     match value {
         Value::Float(double) => double.get().is_finite(),
         Value::Real(real) => real.get().is_finite(),
+        // Array elements are scalars (arrays cannot nest), so one level of
+        // recursion covers every float they can carry.
+        Value::Array(array) => array.elements().iter().all(value_is_finite),
         _ => true,
     }
 }
@@ -128,6 +131,30 @@ mod tests {
     #[test]
     fn finite_statistics_are_finite() {
         assert!(finite_statistics().is_finite());
+    }
+
+    #[test]
+    fn arrays_are_checked_element_wise() {
+        use crate::array::{ArrayDimension, SqlArray};
+        use crate::schema::DataType;
+        let finite = Value::Array(
+            SqlArray::new(
+                DataType::Double,
+                vec![ArrayDimension::new(1, 1)],
+                vec![Value::Float(OrderedF64::new(1.5))],
+            )
+            .unwrap(),
+        );
+        assert!(value_is_finite(&finite));
+        let poisoned = Value::Array(
+            SqlArray::new(
+                DataType::Double,
+                vec![ArrayDimension::new(1, 1)],
+                vec![Value::Float(OrderedF64::new(f64::INFINITY))],
+            )
+            .unwrap(),
+        );
+        assert!(!value_is_finite(&poisoned));
     }
 
     #[test]
