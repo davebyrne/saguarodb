@@ -21,7 +21,7 @@ pub use bound::{
     CorrelatedColumn, DropTableTarget, OutputColumn,
 };
 pub use estimate::estimated_rows;
-pub use explain::format_explain;
+pub use explain::{PlanNodeId, PlanNodeLayout, format_explain};
 pub use expr::{
     AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinSide,
     JoinType, UnaryOp,
@@ -2287,6 +2287,87 @@ mod tests {
 
         assert!(text.contains("IndexScan"));
         assert!(text.contains("users"));
+    }
+
+    fn explain_test_scan(table: u32) -> PhysicalPlan {
+        PhysicalPlan::SeqScan {
+            table,
+            table_name: format!("t{table}"),
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn explain_ids_follow_unary_preorder_and_are_repeatable() {
+        let catalog = MemoryCatalog::empty();
+        let plan = PhysicalPlan::Projection {
+            source: Box::new(PhysicalPlan::Filter {
+                source: Box::new(explain_test_scan(1)),
+                predicate: BoundExpr::Literal {
+                    value: Value::Boolean(true),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            expressions: Vec::new(),
+            output_schema: Vec::new(),
+        };
+
+        let expected = "[node=0] Projection exprs=0 (rows=1000)\n  \
+                        [node=1] Filter (rows=1000)\n    \
+                        [node=2] SeqScan table=t1(1) filter=none (rows=1000)\n";
+        assert_eq!(format_explain(&plan, &catalog), expected);
+        assert_eq!(format_explain(&plan, &catalog), expected);
+
+        let scan_only = format_explain(&explain_test_scan(1), &catalog);
+        assert!(scan_only.starts_with("[node=0] SeqScan table=t1(1)"));
+        assert!(expected.contains("[node=2] SeqScan table=t1(1)"));
+    }
+
+    #[test]
+    fn explain_ids_visit_binary_children_left_then_right() {
+        let catalog = MemoryCatalog::empty();
+        let join = PhysicalPlan::NestedLoopJoin {
+            left: Box::new(explain_test_scan(1)),
+            right: Box::new(explain_test_scan(2)),
+            condition: None,
+            join_type: JoinType::Cross,
+            identity_from: None,
+        };
+        let set_op = PhysicalPlan::SetOp {
+            op: SetOp::Union,
+            all: true,
+            left: Box::new(explain_test_scan(3)),
+            right: Box::new(explain_test_scan(4)),
+        };
+
+        let join_text = format_explain(&join, &catalog);
+        assert!(join_text.starts_with("[node=0] NestedLoopJoin"));
+        assert!(join_text.contains("  [node=1] SeqScan table=t1(1)"));
+        assert!(join_text.contains("  [node=2] SeqScan table=t2(2)"));
+
+        let set_text = format_explain(&set_op, &catalog);
+        assert!(set_text.starts_with("[node=0] SetOp"));
+        assert!(set_text.contains("  [node=1] SeqScan table=t3(3)"));
+        assert!(set_text.contains("  [node=2] SeqScan table=t4(4)"));
+    }
+
+    #[test]
+    fn explain_ids_visit_apply_input_before_subplan() {
+        let catalog = MemoryCatalog::empty();
+        let plan = PhysicalPlan::Apply {
+            input: Box::new(explain_test_scan(1)),
+            subplan: Box::new(explain_test_scan(2)),
+            correlations: Vec::new(),
+            kind: ApplyKind::Scalar {
+                data_type: DataType::Integer,
+            },
+        };
+
+        let text = format_explain(&plan, &catalog);
+        assert!(text.starts_with("[node=0] Apply"));
+        assert!(text.contains("  [node=1] SeqScan table=t1(1)"));
+        assert!(text.contains("  [node=2] SeqScan table=t2(2)"));
     }
 
     #[test]

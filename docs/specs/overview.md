@@ -1585,7 +1585,7 @@ binder or logical planner.
 
 ### EXPLAIN
 
-`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement, acquires its ordinary object-lifetime locks, plans the inner bound statement only, and calls planner-owned `format_explain(plan, catalog)`. Relational nodes include a statistics-backed or fallback `rows=N` estimate. The server returns `ExecutionResult::Explanation`; `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly.
+`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement, acquires its ordinary object-lifetime locks, plans the inner bound statement only, and calls planner-owned `format_explain(plan, catalog)`. Relational nodes include a statistics-backed or fallback `rows=N` estimate. Each line begins with an execution-local `[node=N]` identifier assigned in deterministic pre-order (root, unary child, binary left then right, Apply input then subplan), followed by the operator type, table/index involved, predicates, and row estimate. IDs are stable only for an unchanged physical tree and are neither durable nor catalog identifiers. The server returns `ExecutionResult::Explanation`; `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly.
 
 ### Planner Non-Goals
 

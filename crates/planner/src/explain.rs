@@ -5,9 +5,86 @@ use crate::JoinType;
 use crate::PhysicalPlan;
 use common::{Key, KeyRange};
 
+/// An execution-local identifier assigned to one node in a physical plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanNodeId(pub usize);
+
+/// The immutable child shape and deterministic identifiers for a physical plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanNodeLayout {
+    id: PlanNodeId,
+    children: Vec<PlanNodeLayout>,
+}
+
+impl PlanNodeLayout {
+    /// Builds a zero-based, pre-order layout for `plan`.
+    pub fn new(plan: &PhysicalPlan) -> Self {
+        let mut next = 0;
+        build_layout(plan, &mut next)
+    }
+
+    pub fn id(&self) -> PlanNodeId {
+        self.id
+    }
+
+    pub fn child(&self, index: usize) -> Option<&PlanNodeLayout> {
+        self.children.get(index)
+    }
+}
+
+fn build_layout(plan: &PhysicalPlan, next: &mut usize) -> PlanNodeLayout {
+    let id = PlanNodeId(*next);
+    *next += 1;
+    let children = physical_plan_children(plan)
+        .into_iter()
+        .map(|child| build_layout(child, next))
+        .collect();
+    PlanNodeLayout { id, children }
+}
+
+/// Returns physical children in the canonical EXPLAIN/execution order.
+fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
+    match plan {
+        PhysicalPlan::Insert { source, .. }
+        | PhysicalPlan::Update { source, .. }
+        | PhysicalPlan::Delete { source, .. }
+        | PhysicalPlan::Filter { source, .. }
+        | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Distinct { source, .. }
+        | PhysicalPlan::Limit { source, .. }
+        | PhysicalPlan::Aggregate { source, .. } => vec![source],
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::SetOp { left, right, .. } => vec![left, right],
+        PhysicalPlan::Apply { input, subplan, .. } => vec![input, subplan],
+        PhysicalPlan::CreateSchema { .. }
+        | PhysicalPlan::DropSchema { .. }
+        | PhysicalPlan::CreateTable { .. }
+        | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
+        | PhysicalPlan::AlterTableAlterColumnType { .. }
+        | PhysicalPlan::CreateIndex { .. }
+        | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
+        | PhysicalPlan::SeqScan { .. }
+        | PhysicalPlan::SystemScan { .. }
+        | PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::Values { .. }
+        | PhysicalPlan::TableFunction { .. } => Vec::new(),
+    }
+}
+
 pub fn format_explain(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> String {
     let mut output = String::new();
-    format_node(plan, 0, catalog, &mut output);
+    let layout = PlanNodeLayout::new(plan);
+    format_node(plan, &layout, 0, catalog, &mut output);
     output
 }
 
@@ -33,11 +110,12 @@ fn carries_row_estimate(plan: &PhysicalPlan) -> bool {
 
 fn format_node(
     plan: &PhysicalPlan,
+    layout: &PlanNodeLayout,
     indent: usize,
     catalog: &dyn catalog::CatalogManager,
     output: &mut String,
 ) {
-    let padding = "  ".repeat(indent);
+    let prefix = format!("{}[node={}] ", "  ".repeat(indent), layout.id().0);
     // Estimated output rows (docs/specs/statistics.md §9.1), appended to
     // every data-producing node line.
     let rows_suffix = if carries_row_estimate(plan) {
@@ -47,13 +125,13 @@ fn format_node(
     };
     match plan {
         PhysicalPlan::CreateSchema { name, .. } => {
-            output.push_str(&format!("{padding}CreateSchema {name}\n"));
+            output.push_str(&format!("{prefix}CreateSchema {name}\n"));
         }
         PhysicalPlan::DropSchema { name, .. } => {
-            output.push_str(&format!("{padding}DropSchema {name}\n"));
+            output.push_str(&format!("{prefix}DropSchema {name}\n"));
         }
         PhysicalPlan::CreateTable { name, .. } => {
-            output.push_str(&format!("{padding}CreateTable {name}\n"));
+            output.push_str(&format!("{prefix}CreateTable {name}\n"));
         }
         PhysicalPlan::DropTable {
             targets, if_exists, ..
@@ -64,13 +142,13 @@ fn format_node(
                 .map(|target| target.name.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            output.push_str(&format!("{padding}DropTable tables={names}{conditional}\n"));
+            output.push_str(&format!("{prefix}DropTable tables={names}{conditional}\n"));
         }
         PhysicalPlan::AlterTableAddColumn {
             table_name, column, ..
         } => {
             output.push_str(&format!(
-                "{padding}AlterTableAddColumn {table_name}.{}\n",
+                "{prefix}AlterTableAddColumn {table_name}.{}\n",
                 column.name
             ));
         }
@@ -78,7 +156,7 @@ fn format_node(
             table_name, column, ..
         } => {
             output.push_str(&format!(
-                "{padding}AlterTableDropColumn {table_name}.{column}\n"
+                "{prefix}AlterTableDropColumn {table_name}.{column}\n"
             ));
         }
         PhysicalPlan::AlterTableRenameColumn {
@@ -88,7 +166,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}AlterTableRenameColumn {table_name}.{old_name} to {new_name}\n"
+                "{prefix}AlterTableRenameColumn {table_name}.{old_name} to {new_name}\n"
             ));
         }
         PhysicalPlan::AlterTableRenameTable {
@@ -97,7 +175,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}AlterTableRenameTable {table_name} to {new_name}\n"
+                "{prefix}AlterTableRenameTable {table_name} to {new_name}\n"
             ));
         }
         PhysicalPlan::AlterTableAlterColumnType {
@@ -107,7 +185,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}AlterTableAlterColumnType {table_name}.{column} to {pg_type:?}\n"
+                "{prefix}AlterTableAlterColumnType {table_name}.{column} to {pg_type:?}\n"
             ));
         }
         PhysicalPlan::CreateIndex {
@@ -117,40 +195,58 @@ fn format_node(
             ..
         } => {
             let kind = if *unique { "Unique" } else { "" };
-            output.push_str(&format!("{padding}Create{kind}Index {name} on {table}\n"));
+            output.push_str(&format!("{prefix}Create{kind}Index {name} on {table}\n"));
         }
         PhysicalPlan::DropIndex { index } => {
-            output.push_str(&format!("{padding}DropIndex index={index}\n"));
+            output.push_str(&format!("{prefix}DropIndex index={index}\n"));
         }
         PhysicalPlan::CreateSequence { name, .. } => {
-            output.push_str(&format!("{padding}CreateSequence {name}\n"));
+            output.push_str(&format!("{prefix}CreateSequence {name}\n"));
         }
         PhysicalPlan::DropSequence {
             name, if_exists, ..
         } => {
             output.push_str(&format!(
-                "{padding}DropSequence {name} if_exists={if_exists}\n"
+                "{prefix}DropSequence {name} if_exists={if_exists}\n"
             ));
         }
         PhysicalPlan::CreateView { name, .. } => {
-            output.push_str(&format!("{padding}CreateView {name}\n"));
+            output.push_str(&format!("{prefix}CreateView {name}\n"));
         }
         PhysicalPlan::DropView {
             name, if_exists, ..
         } => {
-            output.push_str(&format!("{padding}DropView {name} if_exists={if_exists}\n"));
+            output.push_str(&format!("{prefix}DropView {name} if_exists={if_exists}\n"));
         }
         PhysicalPlan::Insert { table, source, .. } => {
-            output.push_str(&format!("{padding}Insert table={table}{rows_suffix}\n"));
-            format_node(source, indent + 1, catalog, output);
+            output.push_str(&format!("{prefix}Insert table={table}{rows_suffix}\n"));
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Update { table, source, .. } => {
-            output.push_str(&format!("{padding}Update table={table}{rows_suffix}\n"));
-            format_node(source, indent + 1, catalog, output);
+            output.push_str(&format!("{prefix}Update table={table}{rows_suffix}\n"));
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Delete { table, source, .. } => {
-            output.push_str(&format!("{padding}Delete table={table}{rows_suffix}\n"));
-            format_node(source, indent + 1, catalog, output);
+            output.push_str(&format!("{prefix}Delete table={table}{rows_suffix}\n"));
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::SeqScan {
             table,
@@ -158,14 +254,14 @@ fn format_node(
             filter,
         } => {
             output.push_str(&format!(
-                "{padding}SeqScan table={} filter={}{rows_suffix}\n",
+                "{prefix}SeqScan table={} filter={}{rows_suffix}\n",
                 table_label(*table, table_name),
                 if filter.is_some() { "yes" } else { "none" }
             ));
         }
         PhysicalPlan::SystemScan { view, filter, .. } => {
             output.push_str(&format!(
-                "{padding}SystemScan view={} filter={}{rows_suffix}\n",
+                "{prefix}SystemScan view={} filter={}{rows_suffix}\n",
                 view.qualified_name(),
                 if filter.is_some() { "yes" } else { "none" }
             ));
@@ -179,7 +275,7 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}IndexScan table={} index={} range={} filter={}{rows_suffix}\n",
+                "{prefix}IndexScan table={} index={} range={} filter={}{rows_suffix}\n",
                 table_label(*table, table_name),
                 index,
                 fmt_key_range(range),
@@ -194,11 +290,23 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}NestedLoopJoin type={join_type:?} condition={}{rows_suffix}\n",
+                "{prefix}NestedLoopJoin type={join_type:?} condition={}{rows_suffix}\n",
                 if condition.is_some() { "yes" } else { "none" }
             ));
-            format_node(left, indent + 1, catalog, output);
-            format_node(right, indent + 1, catalog, output);
+            format_node(
+                left,
+                layout.child(0).expect("left layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
+            format_node(
+                right,
+                layout.child(1).expect("right layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::HashJoin {
             left,
@@ -215,11 +323,23 @@ fn format_node(
             };
             let build = if *build_left { "left" } else { "right" };
             output.push_str(&format!(
-                "{padding}{label} keys={} build={build}{rows_suffix}\n",
+                "{prefix}{label} keys={} build={build}{rows_suffix}\n",
                 left_keys.len()
             ));
-            format_node(left, indent + 1, catalog, output);
-            format_node(right, indent + 1, catalog, output);
+            format_node(
+                left,
+                layout.child(0).expect("left layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
+            format_node(
+                right,
+                layout.child(1).expect("right layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::MergeJoin {
             left,
@@ -257,15 +377,33 @@ fn format_node(
                 } => "Lateral Left",
             };
             output.push_str(&format!(
-                "{padding}Apply ({kind}) correlations={}{rows_suffix}\n",
+                "{prefix}Apply ({kind}) correlations={}{rows_suffix}\n",
                 correlations.len()
             ));
-            format_node(input, indent + 1, catalog, output);
-            format_node(subplan, indent + 1, catalog, output);
+            format_node(
+                input,
+                layout.child(0).expect("input layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
+            format_node(
+                subplan,
+                layout.child(1).expect("subplan layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Filter { source, .. } => {
-            output.push_str(&format!("{padding}Filter{rows_suffix}\n"));
-            format_node(source, indent + 1, catalog, output);
+            output.push_str(&format!("{prefix}Filter{rows_suffix}\n"));
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Projection {
             source,
@@ -273,24 +411,42 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}Projection exprs={}{rows_suffix}\n",
+                "{prefix}Projection exprs={}{rows_suffix}\n",
                 expressions.len()
             ));
-            format_node(source, indent + 1, catalog, output);
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Sort { source, order_by } => {
             output.push_str(&format!(
-                "{padding}Sort keys={}{rows_suffix}\n",
+                "{prefix}Sort keys={}{rows_suffix}\n",
                 order_by.len()
             ));
-            format_node(source, indent + 1, catalog, output);
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Distinct { source, on_keys } => {
             output.push_str(&format!(
-                "{padding}Distinct keys={}{rows_suffix}\n",
+                "{prefix}Distinct keys={}{rows_suffix}\n",
                 on_keys.len()
             ));
-            format_node(source, indent + 1, catalog, output);
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Limit {
             source,
@@ -298,12 +454,18 @@ fn format_node(
             offset,
         } => {
             output.push_str(&format!(
-                "{padding}Limit count={count} offset={}{rows_suffix}\n",
+                "{prefix}Limit count={count} offset={}{rows_suffix}\n",
                 offset
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string())
             ));
-            format_node(source, indent + 1, catalog, output);
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Aggregate {
             source,
@@ -312,20 +474,26 @@ fn format_node(
             ..
         } => {
             output.push_str(&format!(
-                "{padding}Aggregate groups={} aggregates={}{rows_suffix}\n",
+                "{prefix}Aggregate groups={} aggregates={}{rows_suffix}\n",
                 group_by.len(),
                 aggregates.len()
             ));
-            format_node(source, indent + 1, catalog, output);
+            format_node(
+                source,
+                layout.child(0).expect("source layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!(
-                "{padding}Values rows={}{rows_suffix}\n",
+                "{prefix}Values rows={}{rows_suffix}\n",
                 rows.len()
             ));
         }
         PhysicalPlan::TableFunction { name, .. } => {
-            output.push_str(&format!("{padding}TableFunction name={name}\n"));
+            output.push_str(&format!("{prefix}TableFunction name={name}\n"));
         }
         PhysicalPlan::SetOp {
             op,
@@ -333,11 +501,21 @@ fn format_node(
             left,
             right,
         } => {
-            output.push_str(&format!(
-                "{padding}SetOp op={op:?} all={all}{rows_suffix}\n"
-            ));
-            format_node(left, indent + 1, catalog, output);
-            format_node(right, indent + 1, catalog, output);
+            output.push_str(&format!("{prefix}SetOp op={op:?} all={all}{rows_suffix}\n"));
+            format_node(
+                left,
+                layout.child(0).expect("left layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
+            format_node(
+                right,
+                layout.child(1).expect("right layout"),
+                indent + 1,
+                catalog,
+                output,
+            );
         }
     }
 }
