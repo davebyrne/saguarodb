@@ -21,16 +21,18 @@ are keyed by `SchemaId`; catalog-name resources are keyed by `(SchemaId,
 normalized_name)`, allowing same-name creators to serialize before an object id
 exists. Catalog locks have `Access` and `Exclusive` modes: access locks coexist,
 while exclusive conflicts with both. Multi-resource requests use the global
-order schema → catalog name → table → sequence, with ids/names sorted within a
-resource kind.
+order schema → catalog name → table → tuple → sequence, with ids/names/keys
+sorted within a resource kind. Tuple locks are acquired dynamically during row
+execution rather than as part of the pre-execution object-request batch.
 
 ## 2. Lock modes
 
-The first implementation has four modes, ordered from weakest to strongest:
+The relation lock manager has five modes, ordered from weakest to strongest:
 
 ```rust
 pub enum RelationLockMode {
     AccessShare,
+    RowShare,
     RowExclusive,
     Share,
     AccessExclusive,
@@ -39,18 +41,22 @@ pub enum RelationLockMode {
 
 The symmetric compatibility matrix is:
 
-| Held/requested | AccessShare | RowExclusive | Share | AccessExclusive |
-|---|---:|---:|---:|---:|
-| AccessShare | yes | yes | yes | no |
-| RowExclusive | yes | yes | no | no |
-| Share | yes | no | no | no |
-| AccessExclusive | no | no | no | no |
+| Held/requested | AccessShare | RowShare | RowExclusive | Share | AccessExclusive |
+|---|---:|---:|---:|---:|---:|
+| AccessShare | yes | yes | yes | yes | no |
+| RowShare | yes | yes | yes | yes | no |
+| RowExclusive | yes | yes | yes | no | no |
+| Share | yes | yes | no | no | no |
+| AccessExclusive | no | no | no | no | no |
 
 Mappings:
 
 - `AccessShare`: `SELECT`, `COPY TO`, and every user table read through a view,
   subquery, CTE, join, cursor, or suspended portal. A view reference also locks
   the view's logical relation id so replace/drop cannot change its definition.
+- `RowShare`: reserved for a transaction that will lock selected tuples. The SQL
+  locking clauses are not exposed yet, but the distinct mode prevents that
+  future behavior from being conflated with a plain snapshot read.
 - `RowExclusive`: `INSERT`, `UPDATE`, `DELETE`, and `COPY FROM`; a modifying
   statement takes this mode on its target and `AccessShare` on read-only source
   tables.
@@ -78,8 +84,8 @@ sequence DDL no longer uses the global exclusive guard:
 
 Sequence locks use the same owner, queue, cancellation, and deadlock graph as
 the other object locks. The complete resource ordering is schemas by `SchemaId`,
-catalog names by `(SchemaId, normalized_name)`, tables by `TableId`, then
-sequences by `SequenceId`. Binding collects referenced
+catalog names by `(SchemaId, normalized_name)`, tables by `TableId`, tuple tags by
+`(TableId, Key)`, then sequences by `SequenceId`. Binding collects referenced
 sequence ids as well as table ids before acquisition. This prevents a bound
 sequence call from racing removal and lets table/sequence cycles be detected.
 
@@ -137,10 +143,11 @@ deadlock detection.
 
 ## 4. Multi-table order, snapshots, and revalidation
 
-A caller normalizes a request to one strongest mode per resource, sorts tables
-then sequences as specified above, and acquires in that order. Stable ordering
-avoids avoidable cycles; upgrades and mixed row/object waits still require
-deadlock detection.
+A caller normalizes pre-execution object requests to one strongest mode per
+resource and acquires schema, catalog-name, table, then sequence requests in stable
+order. Tuple tags are data-dependent and acquired later during execution; their
+position in `LockResource` supplies deterministic snapshots but cannot prevent
+row/object cycles, which remain the deadlock detector's responsibility.
 
 Binding/name lookup runs under the shared catalog publication gate and releases it
 before waiting for locks. After acquiring all discovered object locks, an
@@ -233,7 +240,8 @@ partial subxid abort notify all waiters; every waiter always rechecks compatibil
 Lock ordering is:
 
 1. A shared writer guard, when the operation writes data, catalog, or WAL.
-2. Schema, catalog-name, table, then sequence locks, in their stable resource order.
+2. Schema, catalog-name, table, then sequence locks, in their stable pre-execution
+   order; data-dependent tuple locks are acquired during row execution.
 3. The catalog publication gate, when catalog mutation/undo requires it.
 4. Existing per-file structural latch.
 5. Buffer frame latch.

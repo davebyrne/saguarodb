@@ -163,7 +163,7 @@ physical_plan(logical, catalog)
 engine.execute(execution_context, physical)
 ```
 
-The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `StatementContext` carries the server-allocated transaction id, snapshot, lock/SSI/cancel handles, the concrete storage engine as `Arc<dyn SequenceManager>`, and the connection-owned session sequence state for `currval`. The `QueryEngine` receives that context and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
+The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `StatementContext` carries the server-allocated transaction id, snapshot, conflict-wait/tuple-lock/SSI/cancel handles, the concrete storage engine as `Arc<dyn SequenceManager>`, and the connection-owned session sequence state for `currval`. The tuple-lock handle is the same `LockManager` used for catalog-object and direct xid waits, so future row-lock queues cannot hide mixed deadlocks. The `QueryEngine` receives that context and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
 
 Every statement initially binds under the shared catalog publication gate far
 enough to discover logical object ids, releases that gate, acquires its object

@@ -456,6 +456,7 @@ impl QueryService {
             }
         };
         let ctx = StatementContext::with_snapshot(txn_id, snapshot)
+            .with_tuple_lock_manager(components.lock_manager.clone())
             .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
         let seed = match analyze_seed() {
             Ok(seed) => seed,

@@ -410,6 +410,7 @@ impl QueryService {
     ) -> Result<ToastAlterPostCommit> {
         let components = &self.components;
         let ctx = StatementContext::new(txn_id)
+            .with_tuple_lock_manager(components.lock_manager.clone())
             .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
 
         let mut toast = schema.toast.apply_patch(&options.toast);
@@ -853,6 +854,7 @@ fn maintenance_statement_context(
 ) -> StatementContext {
     StatementContext::new(txn_id)
         .with_gc_horizon(gc_horizon)
+        .with_tuple_lock_manager(service.components.lock_manager.clone())
         .with_conflict_waiter(service.components.lock_manager.clone(), cancel)
 }
 

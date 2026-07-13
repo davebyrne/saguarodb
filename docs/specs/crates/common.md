@@ -504,6 +504,7 @@ pub enum SqlState {
     DependentObjectsStillExist,
     ObjectNotInPrerequisiteState,
     ObjectInUse,
+    LockNotAvailable,
     InvalidCursorName,
     QueryCanceled,
     FeatureNotSupported,
@@ -532,6 +533,8 @@ strings, and `SqlState::from_code` is the reverse parser for known codes.
 `DuplicateCursor` maps to `42P03` for a duplicate SQL cursor declaration.
 `InvalidCursorName` maps to `34000` for `FETCH`/`CLOSE` of a cursor that is not
 open in the current session.
+`LockNotAvailable` maps to `55P03` when a `NOWAIT` tuple request cannot be
+granted immediately.
 
 `SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
 table's `CHECK` constraint — the constraint expression evaluated to `false` for
@@ -609,6 +612,7 @@ pub struct StatementContext {
     pub statement_timestamp_micros: i64,
     pub gc_horizon: u64,
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
+    pub tuple_locks: Arc<dyn TupleLockManager>,
     pub cancel: Arc<QueryCancel>,
     pub live_txns: Arc<[TxnId]>,
     pub ssi_tracker: Arc<dyn SsiTracker>,
@@ -620,6 +624,13 @@ pub struct StatementContext {
     pub runtime_value_sets: Arc<RuntimeValueSetRegistry>,
 }
 ```
+
+`TupleLockManager` uses `TupleLockTag { table, key }` and the ordered
+`KeyShare`/`Share`/`NoKeyUpdate`/`Update` strengths. Acquisitions accept blocking,
+`NOWAIT`, or `SKIP LOCKED` policy and return reversible grant receipts so a
+partially followed row can undo only the grants acquired for that attempt. The
+default context implementation errors loudly; server transaction contexts install
+the unified lock manager.
 
 `QueryCancel` stores the first `CancelReason` (`UserRequest` or
 `StatementTimeout`) atomically until the connection resets it for the next

@@ -90,6 +90,8 @@ pub enum SqlState {
     /// `55006`: the requested operation conflicts with another object owned by
     /// the same session, such as TRUNCATE against a parked cursor.
     ObjectInUse,
+    /// `55P03`: a requested lock cannot be acquired immediately under `NOWAIT`.
+    LockNotAvailable,
     /// `34000`: `FETCH`/`CLOSE` named a cursor that is not open in the session.
     InvalidCursorName,
     QueryCanceled,
@@ -155,6 +157,7 @@ impl SqlState {
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::ObjectInUse => "55006",
+            SqlState::LockNotAvailable => "55P03",
             SqlState::InvalidCursorName => "34000",
             SqlState::QueryCanceled => "57014",
             SqlState::FeatureNotSupported => "0A000",
@@ -200,6 +203,7 @@ impl SqlState {
             "2BP01" => SqlState::DependentObjectsStillExist,
             "55000" => SqlState::ObjectNotInPrerequisiteState,
             "55006" => SqlState::ObjectInUse,
+            "55P03" => SqlState::LockNotAvailable,
             "34000" => SqlState::InvalidCursorName,
             "57014" => SqlState::QueryCanceled,
             "0A000" => SqlState::FeatureNotSupported,
@@ -296,6 +300,7 @@ mod tests {
             SqlState::CardinalityViolation,
             SqlState::DependentObjectsStillExist,
             SqlState::ObjectNotInPrerequisiteState,
+            SqlState::LockNotAvailable,
             SqlState::InvalidCursorName,
             SqlState::QueryCanceled,
             SqlState::FeatureNotSupported,

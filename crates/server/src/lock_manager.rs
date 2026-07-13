@@ -10,7 +10,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use common::{
-    ConflictWaiter, DbError, QueryCancel, Result, SchemaId, SequenceId, SqlState, TableId, TxnId,
+    ConflictWaiter, DbError, Key, QueryCancel, Result, SchemaId, SequenceId, SqlState, TableId,
+    TupleLockAcquire, TupleLockGrantChange, TupleLockManager, TupleLockMode, TupleLockTag,
+    TupleLockWaitPolicy, TxnId,
 };
 
 use crate::registry::ActiveTxnRegistry;
@@ -43,12 +45,17 @@ pub enum LockResource {
         name: NormalizedCatalogName,
     },
     Table(TableId),
+    Tuple {
+        table: TableId,
+        key: Key,
+    },
     Sequence(SequenceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelationLockMode {
     AccessShare,
+    RowShare,
     RowExclusive,
     Share,
     AccessExclusive,
@@ -71,6 +78,7 @@ pub enum ObjectLockMode {
     Catalog(CatalogLockMode),
     Relation(RelationLockMode),
     Sequence(SequenceLockMode),
+    Tuple(TupleLockMode),
 }
 
 impl ObjectLockMode {
@@ -81,6 +89,7 @@ impl ObjectLockMode {
             }
             (Self::Catalog(_), Self::Catalog(_)) => false,
             (Self::Relation(left), Self::Relation(right)) => relation_compatible(left, right),
+            (Self::Tuple(left), Self::Tuple(right)) => tuple_compatible(left, right),
             (
                 Self::Sequence(SequenceLockMode::Access),
                 Self::Sequence(SequenceLockMode::Access),
@@ -96,6 +105,7 @@ impl ObjectLockMode {
             (Self::Catalog(held), Self::Catalog(requested)) => held >= requested,
             (Self::Relation(held), Self::Relation(requested)) => held >= requested,
             (Self::Sequence(held), Self::Sequence(requested)) => held >= requested,
+            (Self::Tuple(held), Self::Tuple(requested)) => held >= requested,
             _ => false,
         }
     }
@@ -105,6 +115,7 @@ impl ObjectLockMode {
             (Self::Catalog(left), Self::Catalog(right)) => Ok(Self::Catalog(left.max(right))),
             (Self::Relation(left), Self::Relation(right)) => Ok(Self::Relation(left.max(right))),
             (Self::Sequence(left), Self::Sequence(right)) => Ok(Self::Sequence(left.max(right))),
+            (Self::Tuple(left), Self::Tuple(right)) => Ok(Self::Tuple(left.max(right))),
             _ => Err(DbError::internal(
                 "object lock modes have different resource types",
             )),
@@ -113,12 +124,23 @@ impl ObjectLockMode {
 }
 
 fn relation_compatible(left: RelationLockMode, right: RelationLockMode) -> bool {
-    use RelationLockMode::{AccessExclusive, AccessShare, RowExclusive, Share};
+    use RelationLockMode::{AccessExclusive, AccessShare, RowExclusive, RowShare, Share};
     match left {
         AccessShare => right != AccessExclusive,
-        RowExclusive => matches!(right, AccessShare | RowExclusive),
-        Share => right == AccessShare,
+        RowShare => right != AccessExclusive,
+        RowExclusive => matches!(right, AccessShare | RowShare | RowExclusive),
+        Share => matches!(right, AccessShare | RowShare),
         AccessExclusive => false,
+    }
+}
+
+fn tuple_compatible(left: TupleLockMode, right: TupleLockMode) -> bool {
+    use TupleLockMode::{KeyShare, NoKeyUpdate, Share, Update};
+    match left {
+        KeyShare => right != Update,
+        Share => matches!(right, KeyShare | Share),
+        NoKeyUpdate => right == KeyShare,
+        Update => false,
     }
 }
 
@@ -176,12 +198,35 @@ struct QueuedRequest {
     mode: ObjectLockMode,
 }
 
+enum AcquireOne {
+    Acquired {
+        previous: Option<ObjectLockMode>,
+        previous_generation: Option<u64>,
+        granted: ObjectLockMode,
+        granted_generation: Option<u64>,
+    },
+    Skipped,
+}
+
+#[derive(Debug)]
+struct TupleGrantReceipt {
+    manager_id: u64,
+    owner: TxnId,
+    tag: TupleLockTag,
+    previous: Option<TupleLockMode>,
+    previous_generation: Option<u64>,
+    granted: TupleLockMode,
+    granted_generation: u64,
+}
+
 #[derive(Debug, Default)]
 struct LockState {
     active_owners: BTreeSet<LockOwner>,
     waits_for: HashMap<LockOwner, BTreeSet<LockOwner>>,
     grants: BTreeMap<LockResource, BTreeMap<LockOwner, ObjectLockMode>>,
     queues: BTreeMap<LockResource, VecDeque<QueuedRequest>>,
+    tuple_grant_generations: BTreeMap<(LockResource, LockOwner), u64>,
+    next_tuple_grant_generation: u64,
 }
 
 #[derive(Debug)]
@@ -257,7 +302,7 @@ impl LockManager {
         cancel: &QueryCancel,
     ) -> Result<()> {
         for request in normalize_requests(requests)? {
-            self.acquire_one(owner, request, cancel)?;
+            let _ = self.acquire_one(owner, request, TupleLockWaitPolicy::Block, cancel)?;
         }
         Ok(())
     }
@@ -266,17 +311,34 @@ impl LockManager {
         &self,
         owner: LockOwner,
         request: ObjectLockRequest,
+        wait_policy: TupleLockWaitPolicy,
         cancel: &QueryCancel,
-    ) -> Result<()> {
+    ) -> Result<AcquireOne> {
         validate_request(&request)?;
         let mut state = self.lock();
-        if state
+        if !state.active_owners.contains(&owner) {
+            return Err(DbError::internal(format!(
+                "lock owner {owner:?} has no lifetime guard"
+            )));
+        }
+        let previous = state
             .grants
             .get(&request.resource)
             .and_then(|grants| grants.get(&owner))
-            .is_some_and(|held| held.covers(request.mode))
+            .copied();
+        let previous_generation = state
+            .tuple_grant_generations
+            .get(&(request.resource.clone(), owner))
+            .copied();
+        if let Some(held) = previous
+            && held.covers(request.mode)
         {
-            return Ok(());
+            return Ok(AcquireOne::Acquired {
+                previous: Some(held),
+                previous_generation,
+                granted: held,
+                granted_generation: previous_generation,
+            });
         }
 
         let request_id = next_id(&self.next_request_id, "object lock request")?;
@@ -309,11 +371,7 @@ impl LockManager {
             );
             if blockers.is_empty() {
                 remove_request(&mut state, request.resource.clone(), request_id);
-                let mode = match state
-                    .grants
-                    .get(&request.resource)
-                    .and_then(|grants| grants.get(&owner))
-                {
+                let granted = match previous {
                     Some(held) => match held.strongest(request.mode) {
                         Ok(mode) => mode,
                         Err(err) => {
@@ -324,14 +382,58 @@ impl LockManager {
                     },
                     None => request.mode,
                 };
+                let granted_generation = if matches!(request.mode, ObjectLockMode::Tuple(_)) {
+                    let next_generation = state
+                        .next_tuple_grant_generation
+                        .checked_add(1)
+                        .ok_or_else(|| DbError::internal("tuple grant generation exhausted"));
+                    let generation = match next_generation {
+                        Ok(generation) => generation,
+                        Err(err) => {
+                            state.waits_for.remove(&owner);
+                            self.cond.notify_all();
+                            return Err(err);
+                        }
+                    };
+                    state.next_tuple_grant_generation = generation;
+                    state
+                        .tuple_grant_generations
+                        .insert((request.resource.clone(), owner), generation);
+                    Some(generation)
+                } else {
+                    None
+                };
                 state
                     .grants
                     .entry(request.resource.clone())
                     .or_default()
-                    .insert(owner, mode);
+                    .insert(owner, granted);
                 state.waits_for.remove(&owner);
                 self.cond.notify_all();
-                return Ok(());
+                return Ok(AcquireOne::Acquired {
+                    previous,
+                    previous_generation,
+                    granted,
+                    granted_generation,
+                });
+            }
+            match wait_policy {
+                TupleLockWaitPolicy::NoWait => {
+                    remove_request(&mut state, request.resource.clone(), request_id);
+                    state.waits_for.remove(&owner);
+                    self.cond.notify_all();
+                    return Err(DbError::execute(
+                        SqlState::LockNotAvailable,
+                        "could not obtain tuple lock on row",
+                    ));
+                }
+                TupleLockWaitPolicy::SkipLocked => {
+                    remove_request(&mut state, request.resource.clone(), request_id);
+                    state.waits_for.remove(&owner);
+                    self.cond.notify_all();
+                    return Ok(AcquireOne::Skipped);
+                }
+                TupleLockWaitPolicy::Block => {}
             }
             state.waits_for.insert(owner, blockers);
 
@@ -353,6 +455,98 @@ impl LockManager {
                 }
             }
         }
+    }
+
+    fn restore_tuple_changes(
+        &self,
+        owner: LockOwner,
+        changes: Vec<TupleLockGrantChange>,
+    ) -> Result<()> {
+        let mut state = self.lock();
+        if !state.active_owners.contains(&owner) {
+            return Err(DbError::internal(format!(
+                "lock owner {owner:?} has no lifetime guard"
+            )));
+        }
+        let owner_xid = match owner {
+            LockOwner::Transaction(xid) => xid,
+            LockOwner::Statement(_) => {
+                return Err(DbError::internal(
+                    "statement owners cannot restore tuple lock grants",
+                ));
+            }
+        };
+        let mut simulated = BTreeMap::<LockResource, (Option<ObjectLockMode>, Option<u64>)>::new();
+        for change in changes.iter().rev() {
+            let receipt = change
+                .manager_payload::<TupleGrantReceipt>()
+                .ok_or_else(|| DbError::internal("invalid tuple lock receipt payload"))?;
+            if receipt.manager_id != self.id || receipt.owner != owner_xid {
+                return Err(DbError::internal(
+                    "tuple lock receipt belongs to a different manager or owner",
+                ));
+            }
+            let resource = LockResource::Tuple {
+                table: receipt.tag.table,
+                key: receipt.tag.key.clone(),
+            };
+            let current = simulated.entry(resource).or_insert_with_key(|resource| {
+                (
+                    state
+                        .grants
+                        .get(resource)
+                        .and_then(|owners| owners.get(&owner))
+                        .copied(),
+                    state
+                        .tuple_grant_generations
+                        .get(&(resource.clone(), owner))
+                        .copied(),
+                )
+            });
+            if *current
+                != (
+                    Some(ObjectLockMode::Tuple(receipt.granted)),
+                    Some(receipt.granted_generation),
+                )
+            {
+                return Err(DbError::internal(
+                    "tuple lock grant changed before acquisition rollback",
+                ));
+            }
+            *current = (
+                receipt.previous.map(ObjectLockMode::Tuple),
+                receipt.previous_generation,
+            );
+        }
+        for (resource, (restored, restored_generation)) in simulated {
+            match restored {
+                Some(mode) => {
+                    state
+                        .grants
+                        .entry(resource.clone())
+                        .or_default()
+                        .insert(owner, mode);
+                    state.tuple_grant_generations.insert(
+                        (resource, owner),
+                        restored_generation.ok_or_else(|| {
+                            DbError::internal("restored tuple grant has no generation")
+                        })?,
+                    );
+                }
+                None => {
+                    if let Some(owners) = state.grants.get_mut(&resource) {
+                        owners.remove(&owner);
+                        if owners.is_empty() {
+                            state.grants.remove(&resource);
+                        }
+                    }
+                    state.tuple_grant_generations.remove(&(resource, owner));
+                }
+            }
+        }
+        state.waits_for.remove(&owner);
+        self.cond.notify_all();
+        Ok(())
     }
 
     fn owner_snapshot(&self, owner: LockOwner, guard_id: u64) -> OwnerGrantSnapshot {
@@ -403,12 +597,25 @@ impl LockManager {
             owners.remove(&owner);
         }
         state.grants.retain(|_, owners| !owners.is_empty());
+        state
+            .tuple_grant_generations
+            .retain(|(_, grant_owner), _| *grant_owner != owner);
         for (resource, mode) in &snapshot.grants {
             state
                 .grants
                 .entry(resource.clone())
                 .or_default()
                 .insert(owner, *mode);
+            if matches!(mode, ObjectLockMode::Tuple(_)) {
+                state.next_tuple_grant_generation = state
+                    .next_tuple_grant_generation
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::internal("tuple grant generation exhausted"))?;
+                let generation = state.next_tuple_grant_generation;
+                state
+                    .tuple_grant_generations
+                    .insert((resource.clone(), owner), generation);
+            }
         }
         state.waits_for.remove(&owner);
         self.cond.notify_all();
@@ -422,6 +629,9 @@ impl LockManager {
             owners.remove(&owner);
         }
         state.grants.retain(|_, owners| !owners.is_empty());
+        state
+            .tuple_grant_generations
+            .retain(|(_, grant_owner), _| *grant_owner != owner);
         for queue in state.queues.values_mut() {
             queue.retain(|request| request.owner != owner);
         }
@@ -542,6 +752,81 @@ impl ConflictWaiter for LockManager {
     }
 }
 
+impl TupleLockManager for LockManager {
+    fn acquire_tuple(
+        &self,
+        xid: TxnId,
+        tag: &TupleLockTag,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+        cancel: &QueryCancel,
+    ) -> Result<TupleLockAcquire> {
+        if !self.registry.is_active(xid) {
+            return Err(DbError::internal(format!(
+                "tuple lock xid {xid} is not active"
+            )));
+        }
+        let owner = LockOwner::Transaction(self.registry.top_of(xid));
+        let resource = LockResource::Tuple {
+            table: tag.table,
+            key: tag.key.clone(),
+        };
+        match self.acquire_one(
+            owner,
+            ObjectLockRequest {
+                resource,
+                mode: ObjectLockMode::Tuple(mode),
+            },
+            wait_policy,
+            cancel,
+        )? {
+            AcquireOne::Acquired {
+                previous,
+                previous_generation,
+                granted,
+                granted_generation,
+            } => {
+                let previous = match previous {
+                    Some(ObjectLockMode::Tuple(mode)) => Some(mode),
+                    Some(_) => {
+                        return Err(DbError::internal(
+                            "tuple resource carried a non-tuple previous mode",
+                        ));
+                    }
+                    None => None,
+                };
+                let granted = match granted {
+                    ObjectLockMode::Tuple(mode) => mode,
+                    _ => {
+                        return Err(DbError::internal(
+                            "tuple resource carried a non-tuple granted mode",
+                        ));
+                    }
+                };
+                let granted_generation = granted_generation
+                    .ok_or_else(|| DbError::internal("tuple grant has no generation"))?;
+                Ok(TupleLockAcquire::Acquired(
+                    TupleLockGrantChange::manager_receipt(TupleGrantReceipt {
+                        manager_id: self.id,
+                        owner: self.registry.top_of(xid),
+                        tag: tag.clone(),
+                        previous,
+                        previous_generation,
+                        granted,
+                        granted_generation,
+                    }),
+                ))
+            }
+            AcquireOne::Skipped => Ok(TupleLockAcquire::Skipped),
+        }
+    }
+
+    fn restore_tuple_grants(&self, xid: TxnId, changes: Vec<TupleLockGrantChange>) -> Result<()> {
+        let owner = LockOwner::Transaction(self.registry.top_of(xid));
+        self.restore_tuple_changes(owner, changes)
+    }
+}
+
 fn next_id(counter: &AtomicU64, kind: &str) -> Result<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -554,6 +839,7 @@ fn validate_request(request: &ObjectLockRequest) -> Result<()> {
         (LockResource::Schema(_), ObjectLockMode::Catalog(_))
             | (LockResource::CatalogName { .. }, ObjectLockMode::Catalog(_))
             | (LockResource::Table(_), ObjectLockMode::Relation(_))
+            | (LockResource::Tuple { .. }, ObjectLockMode::Tuple(_))
             | (LockResource::Sequence(_), ObjectLockMode::Sequence(_))
     );
     if valid {
@@ -688,13 +974,14 @@ mod tests {
 
     #[test]
     fn relation_compatibility_matrix_matches_contract() {
-        use RelationLockMode::{AccessExclusive, AccessShare, RowExclusive, Share};
-        let modes = [AccessShare, RowExclusive, Share, AccessExclusive];
+        use RelationLockMode::{AccessExclusive, AccessShare, RowExclusive, RowShare, Share};
+        let modes = [AccessShare, RowShare, RowExclusive, Share, AccessExclusive];
         let expected = [
-            [true, true, true, false],
-            [true, true, false, false],
-            [true, false, false, false],
-            [false, false, false, false],
+            [true, true, true, true, false],
+            [true, true, true, true, false],
+            [true, true, true, false, false],
+            [true, true, false, false, false],
+            [false, false, false, false, false],
         ];
         for (left_index, left) in modes.into_iter().enumerate() {
             for (right_index, right) in modes.into_iter().enumerate() {
@@ -704,6 +991,197 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tuple_compatibility_matrix_matches_contract() {
+        use TupleLockMode::{KeyShare, NoKeyUpdate, Share, Update};
+        let modes = [KeyShare, Share, NoKeyUpdate, Update];
+        let expected = [
+            [true, true, true, false],
+            [true, true, false, false],
+            [true, false, false, false],
+            [false, false, false, false],
+        ];
+        for (left_index, left) in modes.into_iter().enumerate() {
+            for (right_index, right) in modes.into_iter().enumerate() {
+                assert_eq!(
+                    tuple_compatible(left, right),
+                    expected[left_index][right_index]
+                );
+            }
+        }
+    }
+
+    fn tuple_tag(value: i64) -> TupleLockTag {
+        TupleLockTag {
+            table: 1,
+            key: Key(vec![common::Value::Integer(value)]),
+        }
+    }
+
+    #[test]
+    fn tuple_nowait_and_skip_locked_do_not_queue() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        registry.register(2);
+        let _first = manager.transaction_owner(1).unwrap();
+        let _second = manager.transaction_owner(2).unwrap();
+        let cancel = QueryCancel::new();
+        manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+
+        let err = manager
+            .acquire_tuple(
+                2,
+                &tuple_tag(7),
+                TupleLockMode::KeyShare,
+                TupleLockWaitPolicy::NoWait,
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::LockNotAvailable);
+        assert!(matches!(
+            manager
+                .acquire_tuple(
+                    2,
+                    &tuple_tag(7),
+                    TupleLockMode::KeyShare,
+                    TupleLockWaitPolicy::SkipLocked,
+                    &cancel,
+                )
+                .unwrap(),
+            TupleLockAcquire::Skipped
+        ));
+        assert!(manager.lock().queues.is_empty());
+    }
+
+    #[test]
+    fn tuple_grant_receipts_restore_upgrades_and_new_grants() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        let guard = manager.transaction_owner(1).unwrap();
+        let cancel = QueryCancel::new();
+        let first = manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::KeyShare,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+        let upgrade = manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+        let first = match first {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => panic!("blocking acquisition skipped"),
+        };
+        let upgrade = match upgrade {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => panic!("blocking acquisition skipped"),
+        };
+
+        manager.restore_tuple_grants(1, vec![upgrade]).unwrap();
+        assert_eq!(
+            guard.snapshot().grants.get(&LockResource::Tuple {
+                table: 1,
+                key: tuple_tag(7).key,
+            }),
+            Some(&ObjectLockMode::Tuple(TupleLockMode::KeyShare))
+        );
+        manager.restore_tuple_grants(1, vec![first]).unwrap();
+        assert!(guard.snapshot().grants.is_empty());
+    }
+
+    #[test]
+    fn tuple_receipts_cannot_be_restored_by_another_owner() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        registry.register(2);
+        let _first = manager.transaction_owner(1).unwrap();
+        let second = manager.transaction_owner(2).unwrap();
+        let cancel = QueryCancel::new();
+        let receipt = match manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::KeyShare,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap()
+        {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => panic!("blocking acquisition skipped"),
+        };
+
+        assert!(manager.restore_tuple_grants(2, vec![receipt]).is_err());
+        assert!(second.snapshot().grants.is_empty());
+    }
+
+    #[test]
+    fn stale_receipt_batch_does_not_partially_restore_grants() {
+        let (manager, registry) = manager(20);
+        registry.register(1);
+        let guard = manager.transaction_owner(1).unwrap();
+        let cancel = QueryCancel::new();
+        let empty = guard.snapshot();
+        let stale = match manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap()
+        {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => panic!("blocking acquisition skipped"),
+        };
+        let mut guard = guard;
+        guard.restore(&empty).unwrap();
+        manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(7),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap();
+        let valid = match manager
+            .acquire_tuple(
+                1,
+                &tuple_tag(8),
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &cancel,
+            )
+            .unwrap()
+        {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => panic!("blocking acquisition skipped"),
+        };
+        let before = guard.snapshot().grants;
+
+        assert!(manager.restore_tuple_grants(1, vec![stale, valid]).is_err());
+        assert_eq!(guard.snapshot().grants, before);
     }
 
     #[test]

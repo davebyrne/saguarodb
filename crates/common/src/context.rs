@@ -6,6 +6,10 @@ use crate::cancel::QueryCancel;
 use crate::datetime::now_micros;
 use crate::error::{DbError, Result};
 use crate::ids::{SequenceId, TableId, TxnId};
+use crate::locking::{
+    TupleLockAcquire, TupleLockGrantChange, TupleLockManager, TupleLockMode, TupleLockTag,
+    TupleLockWaitPolicy,
+};
 use crate::mvcc::{IsolationLevel, Snapshot};
 use crate::row::Key;
 use crate::value::Value;
@@ -93,6 +97,30 @@ impl ConflictWaiter for NoConflictWaiter {
         Err(DbError::internal(format!(
             "no conflict waiter configured: a write path reached a row-lock conflict \
              (waiter={waiter}, blocker={blocker}) without a lock manager"
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct NoTupleLockManager;
+
+impl TupleLockManager for NoTupleLockManager {
+    fn acquire_tuple(
+        &self,
+        xid: TxnId,
+        tag: &TupleLockTag,
+        mode: TupleLockMode,
+        _wait_policy: TupleLockWaitPolicy,
+        _cancel: &QueryCancel,
+    ) -> Result<TupleLockAcquire> {
+        Err(DbError::internal(format!(
+            "no tuple lock manager configured: xid {xid} requested {mode:?} on {tag:?}"
+        )))
+    }
+
+    fn restore_tuple_grants(&self, xid: TxnId, _changes: Vec<TupleLockGrantChange>) -> Result<()> {
+        Err(DbError::internal(format!(
+            "no tuple lock manager configured: xid {xid} attempted to restore tuple grants"
         )))
     }
 }
@@ -407,6 +435,9 @@ pub struct StatementContext {
     /// (`NoConflictWaiter`) errors if ever asked to wait; the server installs the
     /// real lock manager on write-capable contexts.
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
+    /// Transaction-owned tuple locks. The default errors loudly if a locking path
+    /// is reached without the server lock manager installed.
+    pub tuple_locks: Arc<dyn TupleLockManager>,
     /// Per-statement cancellation state shared with the connection. Threaded to
     /// storage conflict waits so user requests and statement timeouts can interrupt
     /// a blocked writer (`docs/specs/deadlock.md` §5).
@@ -465,6 +496,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
+            tuple_locks: Arc::new(NoTupleLockManager),
             cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
@@ -489,6 +521,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
+            tuple_locks: Arc::new(NoTupleLockManager),
             cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
@@ -515,6 +548,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
+            tuple_locks: Arc::new(NoTupleLockManager),
             cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
@@ -561,6 +595,12 @@ impl StatementContext {
     ) -> Self {
         self.conflict_waiter = conflict_waiter;
         self.cancel = cancel;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tuple_lock_manager(mut self, tuple_locks: Arc<dyn TupleLockManager>) -> Self {
+        self.tuple_locks = tuple_locks;
         self
     }
 
@@ -641,6 +681,7 @@ impl Eq for StatementContext {}
 #[cfg(test)]
 mod tests {
     use super::{IsolationLevel, QueryCancel, Snapshot, StatementContext};
+    use crate::{Key, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, Value};
 
     #[test]
     fn default_conflict_waiter_errors_rather_than_spinning() {
@@ -653,6 +694,25 @@ mod tests {
             .wait_for(7, 8, &QueryCancel::new())
             .expect_err("default waiter must error, not return Ok");
         assert!(err.message.contains("no conflict waiter configured"));
+    }
+
+    #[test]
+    fn default_tuple_lock_manager_errors_loudly() {
+        let ctx = StatementContext::new(7);
+        let err = ctx
+            .tuple_locks
+            .acquire_tuple(
+                7,
+                &TupleLockTag {
+                    table: 1,
+                    key: Key(vec![Value::Integer(1)]),
+                },
+                TupleLockMode::Update,
+                TupleLockWaitPolicy::Block,
+                &QueryCancel::new(),
+            )
+            .expect_err("default tuple lock manager must error");
+        assert!(err.message.contains("no tuple lock manager configured"));
     }
 
     #[test]

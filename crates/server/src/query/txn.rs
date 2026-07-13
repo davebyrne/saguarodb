@@ -1177,6 +1177,7 @@ impl QueryService {
                 .with_session_info(runtime.session_info)
                 .with_system_state(runtime.system_state)
                 .with_catalog_introspection(runtime.catalog_introspection)
+                .with_tuple_lock_manager(self.components.lock_manager.clone())
                 // Install the lock manager (so an in-progress row-lock conflict blocks
                 // instead of failing fast) and the connection's cancel flag (so a
                 // blocked writer is interruptible) — `docs/specs/deadlock.md`.

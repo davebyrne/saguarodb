@@ -25,6 +25,7 @@ pub mod flush;
 pub mod functions;
 pub mod ids;
 pub mod interval;
+pub mod locking;
 pub mod mvcc;
 pub mod numeric;
 pub mod pg_type;
@@ -68,6 +69,10 @@ pub use ids::{
     TableId, TxnId,
 };
 pub use interval::Interval;
+pub use locking::{
+    TupleLockAcquire, TupleLockGrantChange, TupleLockManager, TupleLockMode, TupleLockTag,
+    TupleLockWaitPolicy,
+};
 pub use mvcc::{
     IsolationLevel, Snapshot, TxnStatus, TxnStatusView, UniqueConflict, WriteConflict,
     XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,

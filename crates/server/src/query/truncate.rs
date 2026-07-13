@@ -125,6 +125,7 @@ impl QueryService {
                 updates.push(update);
             }
             let ctx = StatementContext::new(txn_id)
+                .with_tuple_lock_manager(components.lock_manager.clone())
                 .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
             for (plan, update) in plans.iter().zip(&updates) {
                 if let Err(err) = components
@@ -254,10 +255,12 @@ impl QueryService {
             plans.push(plan);
             updates.push(update);
         }
-        let ctx = StatementContext::new(txn.writing_xid()).with_conflict_waiter(
-            self.components.lock_manager.clone(),
-            Arc::new(QueryCancel::new()),
-        );
+        let ctx = StatementContext::new(txn.writing_xid())
+            .with_tuple_lock_manager(self.components.lock_manager.clone())
+            .with_conflict_waiter(
+                self.components.lock_manager.clone(),
+                Arc::new(QueryCancel::new()),
+            );
         // Preparation appends WAL and registers replacement files in storage's
         // transaction rollback state. From this point onward even a failed
         // statement must take the write-abort path.

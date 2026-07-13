@@ -248,6 +248,7 @@ impl QueryService {
         };
         drop(catalog_read);
         let ctx = StatementContext::new(txn_id)
+            .with_tuple_lock_manager(components.lock_manager.clone())
             .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
         let mut cleaned_toast = Vec::with_capacity(tables.len());
         for schema in &tables {
@@ -486,10 +487,19 @@ fn delete_toast_values_pending_parent_vacuum(
     let txn_id = components
         .active_txns
         .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
-    let ctx = StatementContext::new(txn_id).with_conflict_waiter(
-        components.lock_manager.clone(),
-        Arc::new(QueryCancel::new()),
-    );
+    let _object_guard = match components.lock_manager.transaction_owner(txn_id) {
+        Ok(guard) => guard,
+        Err(err) => {
+            rollback_maintenance_txn_or_die(components, txn_id);
+            return Err(err);
+        }
+    };
+    let ctx = StatementContext::new(txn_id)
+        .with_tuple_lock_manager(components.lock_manager.clone())
+        .with_conflict_waiter(
+            components.lock_manager.clone(),
+            Arc::new(QueryCancel::new()),
+        );
 
     let deleted = match components
         .storage
