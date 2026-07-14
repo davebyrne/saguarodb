@@ -77,12 +77,18 @@ pub enum SqlState {
     /// expression evaluated to `false` for the proposed row (a `NULL`/unknown
     /// result passes, matching PostgreSQL).
     CheckViolation,
+    /// `23503`: a write violates a foreign-key constraint.
+    ForeignKeyViolation,
     /// `21000`: a subquery used as an expression returned more than one row where
     /// at most one was expected (a scalar subquery).
     CardinalityViolation,
     /// `2BP01`: an object cannot be dropped because another object depends on it,
     /// e.g. a column default still references a sequence.
     DependentObjectsStillExist,
+    /// `42830`: referenced columns lack an eligible declared key constraint.
+    InvalidForeignKey,
+    /// `42710`: a named constraint or other object already exists.
+    DuplicateObject,
     /// `55000`: the object is not in the prerequisite state for the requested
     /// operation, e.g. `currval` before this session has called `nextval`/`setval`
     /// for that sequence.
@@ -153,8 +159,11 @@ impl SqlState {
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",
+            SqlState::ForeignKeyViolation => "23503",
             SqlState::CardinalityViolation => "21000",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidForeignKey => "42830",
+            SqlState::DuplicateObject => "42710",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::ObjectInUse => "55006",
             SqlState::LockNotAvailable => "55P03",
@@ -199,8 +208,11 @@ impl SqlState {
             "23502" => SqlState::NotNullViolation,
             "23505" => SqlState::UniqueViolation,
             "23514" => SqlState::CheckViolation,
+            "23503" => SqlState::ForeignKeyViolation,
             "21000" => SqlState::CardinalityViolation,
             "2BP01" => SqlState::DependentObjectsStillExist,
+            "42830" => SqlState::InvalidForeignKey,
+            "42710" => SqlState::DuplicateObject,
             "55000" => SqlState::ObjectNotInPrerequisiteState,
             "55006" => SqlState::ObjectInUse,
             "55P03" => SqlState::LockNotAvailable,
@@ -297,8 +309,11 @@ mod tests {
             SqlState::NotNullViolation,
             SqlState::UniqueViolation,
             SqlState::CheckViolation,
+            SqlState::ForeignKeyViolation,
             SqlState::CardinalityViolation,
             SqlState::DependentObjectsStillExist,
+            SqlState::InvalidForeignKey,
+            SqlState::DuplicateObject,
             SqlState::ObjectNotInPrerequisiteState,
             SqlState::LockNotAvailable,
             SqlState::InvalidCursorName,

@@ -1457,6 +1457,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
 
         let row = crate::query::build_insert_row(
@@ -1515,6 +1517,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
 
         let row = crate::query::build_insert_row(&statement, &schema, &[], vec![], &[]).unwrap();

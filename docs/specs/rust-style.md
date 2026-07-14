@@ -169,6 +169,10 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 ## SQL Semantics in Rust Code
 
 - Do not implement implicit casts. Type mismatches return `SqlState::DatatypeMismatch`.
+- Foreign-key compatibility is declared-type identity: corresponding columns
+  have equal `DataType`, concrete `ColumnDef::wire_type()`, and length/type
+  modifier metadata. This is the deliberate case where persisted PostgreSQL
+  type identity participates in semantic validation.
 - `NULL` may be accepted where the target column or expression is nullable.
 - SQL three-valued logic belongs in executor expression evaluation, not in `Value` ordering.
 - `Value::Ord` is storage key ordering only, derived from `common::Value`'s declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid < Array`, with natural ordering inside each variant. `SqlArray` orders by element type, row-major elements, cardinality, and dimensional metadata.

@@ -83,6 +83,12 @@ pub struct CatalogSnapshot {
 physical relation-generation ids used by storage file-id derivation; the logical
 table/index/view ids remain stable catalog identities.
 
+User `TableSchema` values also carry durable outgoing foreign keys and a
+per-table `next_foreign_key_id`. IDs are allocated from zero, never reused, and
+limited to `0..=4095`; `4096` is the exhausted sentinel. Constraints preserve
+the declared child/parent column order and immediate `NO ACTION`/`RESTRICT`
+actions. Hidden TOAST relations carry an empty list and allocator zero.
+
 Every persisted relation-like object carries a `schema_id`. `ViewSchema` also
 captures the schema-id search path used to bind its stored definition. Schema id
 `1` is the built-in mutable `public` namespace; user schema allocation begins at
@@ -189,6 +195,8 @@ as unsigned 32-bit values:
 - user sequences: tag `3`;
 - fallback synthetic primary-key indexes: tag `4`;
 - user schemas: tag `7`;
+- foreign-key constraints: tag `8`, with an injective compound payload over
+  `(child_table_id, foreign_key_id)`;
 - derived constraints and column defaults use separate deterministic tagged
   spaces over `(table_id, local_object_id)`;
 - core system views use stable PostgreSQL OIDs where practical, otherwise
@@ -234,6 +242,31 @@ pub trait CatalogManager: Send + Sync {
         indexes: &[IndexSchema],
     ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
+    fn attach_foreign_keys(
+        &self,
+        table: TableId,
+        foreign_keys: Vec<ResolvedForeignKey>,
+    ) -> Result<TableSchema>;
+    fn drop_foreign_key(
+        &self,
+        table: TableId,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<Option<TableSchema>>;
+    fn list_incoming_foreign_keys(
+        &self,
+        referenced_table: TableId,
+    ) -> Result<Vec<(TableSchema, ForeignKeyConstraint)>>;
+    fn resolve_foreign_key_index(
+        &self,
+        referenced_table: TableId,
+        referenced_columns: &[ColumnId],
+    ) -> Result<Option<IndexId>>;
+    fn find_foreign_key_supporting_index(
+        &self,
+        child_table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Option<IndexId>>;
     fn create_table(
         &self,
         name: String,
@@ -405,6 +438,29 @@ rejects names already held by any other public relation kind with
 with tables but are stored in separate `views_by_*` maps so storage startup
 installs only physical relations. Hidden TOAST relations are installed by ID only
 and are outside that user-visible namespace.
+
+`attach_foreign_keys` validates and publishes a resolved batch atomically,
+generating omitted names and allocating consecutive IDs under the same catalog
+write lock. Names use `<child>_<source-columns>_fkey` and then the smallest
+positive suffix avoiding table-local PK/UNIQUE/FK names. Drop preserves the ID
+allocator. Incoming lookup is ordered by child table/FK ID. Referenced-key
+resolution accepts an exact ordered primary key or exact ordered declared
+UNIQUE constraint; a standalone unique index is ineligible. Child supporting
+indexes are optional and require an exact ordered column match.
+Catalog restore preserves the greatest per-table FK allocator high-water for
+tables present in both states, just as it preserves global allocators. Table and
+declared-UNIQUE drops reject surviving incoming dependencies. Constraint-index
+creation/update consults the same table-local constraint-name namespace.
+Dense column rewrites reject an actually referenced/source column and remap FK
+column IDs above an unrelated dropped slot within the rewritten table (including
+self-references). A parent rewrite that would require renumbering an external
+child's incoming-reference metadata is rejected until the DDL publication path
+can durably carry both schemas as one atomic update.
+Changing/dropping a primary key or declared UNIQUE key likewise rejects removal
+of the last eligible target. Type rewrites validate all incoming/outgoing FK
+declared types before allocating replacement TOAST/catalog state. Recovery
+`apply_create_table` validates any embedded FK metadata in a candidate catalog
+before publication.
 
 `apply_create_table` and `apply_drop_table` are recovery-only APIs.
 `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects
@@ -619,6 +675,10 @@ requires `public` to retain its fixed id/name, schema name/id maps to be
 bidirectionally consistent with unique names and ids, and `next_schema_id` to be
 greater than every installed schema id.
 
+`TableSchema.foreign_keys` and `next_foreign_key_id` are serde-defaulted to an
+empty list and zero. Catalog v2 and legacy unversioned payloads written before
+foreign-key metadata therefore remain readable without a format-version bump.
+
 On startup:
 
 1. The control store loads the current catalog bytes from the control record.
@@ -637,6 +697,14 @@ records provide durability until the next checkpoint, and durable top-level
 commit precedes public overlay publication.
 
 `restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every table name index entry to point at an existing user-table schema with the same name and ID, every user-table schema to have a reverse name index entry, every hidden TOAST relation to be stored by ID only (not in the name index), every view name index entry to point at an existing view schema with the same name and ID, no table and view to share a relation name or relation id, nonzero table/view schema versions, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, every primary-key column ID to exist, every primary-key column to be non-null, no duplicate primary-key column, every constant column default to be finite (non-finite constants cannot round-trip the JSON encodings; unreachable from any real durable artifact for the same reason), table IDs/default-column IDs/CHECK counts to fit the virtual catalog OID encoding limits, and `next_table_id >= max(table_or_view_id) + 1`. View validation additionally requires at least one output column, dense output column IDs, unique output column names, no column defaults on view output columns, non-empty SQL definition text, no self-dependency, no duplicate dependency entries, every dependency relation to exist, no dependency on a view or hidden TOAST relation, no dependency with both `all_columns = true` and named columns, and every named dependency column to exist. TOAST policy validation requires every table's `toast.tuple_target` to be in `ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET`, `toast.min_value_size >= ToastOptions::MIN_TOAST_MIN_VALUE_SIZE`, every user table with TOAST enabled to name an existing hidden TOAST relation, every hidden TOAST relation to point back to the owning user table without recursively naming another TOAST relation, and every hidden TOAST relation to match `common::toast_schema(base, toast_id)` exactly except for its storage id (name, columns, primary key, compression disabled, no nested TOAST metadata). Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, primary-key constraint indexes to be unique and to match the table's primary-key column list, every user table with a non-empty primary key to have exactly one primary-key constraint index, and `next_index_id >= max(index_id) + 1`. Storage-id validation requires every live table and secondary index to have a nonzero storage id, no storage id to contain file-kind high bits, no duplicate storage ids among live table/TOAST relations, no duplicate storage ids among live secondary indexes, and `next_storage_id` to be greater than every live storage id (or equal to the one-past-end sentinel after exhaustion). Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. After per-kind validation succeeds, the same public relation namespace rule used by runtime DDL is enforced across user table names, user view names, user-visible index names, public sequence names, and primary-key auto-names; hidden TOAST names and their helper names remain outside that namespace. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)` or `toast.active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id` and `next_storage_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
+
+Foreign-key snapshot validation additionally requires unique IDs and
+table-local constraint names, an allocator above every live ID and no greater
+than 4096, equal non-empty ordered column lists without duplicates, existing
+user child/parent tables and columns, exact `DataType`/concrete `PgType`/length
+metadata equality (nullability may differ), and an exact declared PK/UNIQUE
+target. Hidden TOAST relations must have no FK metadata. Violations in persisted
+metadata are `InternalError` corruption.
 
 ## WAL Interaction
 

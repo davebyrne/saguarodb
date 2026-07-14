@@ -513,7 +513,10 @@ enum DecodeResult {
 mod tests {
     use crate::{WalRecord, WalRecordKind};
 
-    use super::{CRC_LEN, HEADER_LEN, TYPE_HEAP_DELETE, decode_record, encode_record};
+    use super::{
+        CRC_LEN, HEADER_LEN, TYPE_CREATE_TABLE, TYPE_HEAP_DELETE, TYPE_UPDATE_TABLE_SCHEMA,
+        decode_payload, decode_record, encode_record,
+    };
 
     #[test]
     fn round_trips_physical_redo_records() {
@@ -621,6 +624,8 @@ mod tests {
                     toast_table_id: None,
                     relation_kind: common::RelationKind::User,
                     checks: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    next_foreign_key_id: 0,
                 },
                 indexes: vec![common::IndexSchema {
                     id: 3,
@@ -907,5 +912,69 @@ mod tests {
 
         let err = decode_record(&bytes).unwrap_err();
         assert_eq!(err.kind, common::ErrorKind::Wal);
+    }
+
+    #[test]
+    fn legacy_table_schema_wal_payloads_default_foreign_key_metadata() {
+        let schema = common::TableSchema {
+            id: 1,
+            schema_id: common::PUBLIC_SCHEMA_ID,
+            storage_id: 10,
+            name: "legacy".to_string(),
+            columns: vec![common::ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: common::DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            }],
+            primary_key: Vec::new(),
+            schema_version: 1,
+            compression: common::CompressionSetting::None,
+            active_dict_id: None,
+            toast: common::ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: common::RelationKind::User,
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
+        };
+        for (type_id, kind_name, kind) in [
+            (
+                TYPE_CREATE_TABLE,
+                "CreateTable",
+                WalRecordKind::CreateTable {
+                    schema: schema.clone(),
+                },
+            ),
+            (
+                TYPE_UPDATE_TABLE_SCHEMA,
+                "UpdateTableSchema",
+                WalRecordKind::UpdateTableSchema {
+                    schema: schema.clone(),
+                    indexes: Vec::new(),
+                },
+            ),
+        ] {
+            let mut value = serde_json::to_value(kind).unwrap();
+            let schema = value
+                .get_mut(kind_name)
+                .and_then(|value| value.get_mut("schema"))
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            schema.remove("foreign_keys");
+            schema.remove("next_foreign_key_id");
+            let payload = serde_json::to_vec(&value).unwrap();
+            let decoded = decode_payload(type_id, &payload).unwrap();
+            let decoded_schema = match decoded {
+                WalRecordKind::CreateTable { schema }
+                | WalRecordKind::UpdateTableSchema { schema, .. } => schema,
+                other => panic!("unexpected decoded record: {other:?}"),
+            };
+            assert!(decoded_schema.foreign_keys.is_empty());
+            assert_eq!(decoded_schema.next_foreign_key_id, 0);
+        }
     }
 }

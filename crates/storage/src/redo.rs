@@ -126,6 +126,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         }
     }
 

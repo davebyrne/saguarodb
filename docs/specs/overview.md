@@ -2433,6 +2433,8 @@ pub struct TableSchema {
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
     pub schema_version: u64,
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+    pub next_foreign_key_id: u32,
 }
 
 pub struct ViewDependency {
@@ -2443,6 +2445,12 @@ pub struct ViewDependency {
 ```
 
 `ColumnDef`, `DataType`, `ToastOptions`, relation/index/view/sequence schemas, and their input forms are defined in `common`. Column IDs are dense row slots within a schema version; rewrite DDL may renumber them and must remap surviving index/view metadata before publication. Logical table/index IDs remain stable while `storage_id` identifies the current physical generation and changes on TRUNCATE or rewrite. Public schema changes increment `schema_version`, which prepared execution revalidates after table-lock acquisition. Tables and views share the public relation-name namespace; hidden TOAST relations are stored only by ID and are never user-resolvable. ADD/DROP column preflight is read-only and repeated after the server holds the catalog publication gate plus target `AccessExclusive`, because an earlier conditional no-op decision may race another DDL. Catalog loading validates identifiers, storage-id uniqueness, TOAST bounds/cross-links, view dependencies, and table/view namespace collisions; unchecked snapshot installation remains crate-private.
+
+Foreign keys are stored as ordered, ID-resolved per-table metadata. Their IDs
+are allocated monotonically in `0..=4095` (`4096` is the exhausted sentinel),
+and old catalog/WAL table-schema payloads default the list and allocator to
+empty/zero. SQL creation syntax and write enforcement are enabled by later
+foreign-key slices.
 
 `create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
 metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;

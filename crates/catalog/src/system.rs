@@ -17,6 +17,7 @@ const SYNTHETIC_PRIMARY_KEY_OID_TAG: i64 = 4_i64 << VIRTUAL_OID_TAG_SHIFT;
 const CONSTRAINT_OID_TAG: i64 = 5_i64 << VIRTUAL_OID_TAG_SHIFT;
 const ATTRDEF_OID_TAG: i64 = 6_i64 << VIRTUAL_OID_TAG_SHIFT;
 const USER_SCHEMA_OID_TAG: i64 = 7_i64 << VIRTUAL_OID_TAG_SHIFT;
+const FOREIGN_KEY_CONSTRAINT_OID_TAG: i64 = 8_i64 << VIRTUAL_OID_TAG_SHIFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SystemSchema {
@@ -500,6 +501,11 @@ pub fn check_constraint_oid(table_id: u32, check_index: u16) -> Result<i64> {
         .checked_add(1)
         .ok_or_else(|| DbError::internal("catalog CHECK constraint index overflow"))?;
     Ok(CONSTRAINT_OID_TAG | compound_oid_payload(table_id, sub_id)?)
+}
+
+/// Construct the stable virtual OID for a foreign-key constraint.
+pub fn foreign_key_constraint_oid(table_id: u32, foreign_key_id: u16) -> Result<i64> {
+    Ok(FOREIGN_KEY_CONSTRAINT_OID_TAG | compound_oid_payload(table_id, foreign_key_id)?)
 }
 
 /// Construct a CHECK-constraint OID from an enumerated catalog position.

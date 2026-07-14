@@ -5,6 +5,9 @@ pub type SchemaId = u32;
 pub const PUBLIC_SCHEMA_ID: SchemaId = 1;
 pub const FIRST_USER_SCHEMA_ID: SchemaId = 2;
 pub type ColumnId = u16;
+/// Per-table foreign-key identifier. Values are allocated monotonically and
+/// never reused.
+pub type ForeignKeyId = u16;
 pub type IndexId = u32;
 pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;

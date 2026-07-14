@@ -5264,6 +5264,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         }
     }
 
@@ -5382,6 +5384,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         }
     }
 
@@ -5436,6 +5440,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -5524,6 +5530,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         }
     }
 
@@ -5563,6 +5571,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -5613,6 +5623,8 @@ mod tests {
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
         base.toast.min_value_size = 128;

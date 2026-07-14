@@ -1,8 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    ColumnId, DbError, FileId, IndexId, PUBLIC_SCHEMA_ID, PgType, SchemaId, SequenceId, SqlState,
-    TableId, Value,
+    ColumnId, DbError, FileId, ForeignKeyId, IndexId, PUBLIC_SCHEMA_ID, PgType, SchemaId,
+    SequenceId, SqlState, TableId, Value,
 };
 
 pub const INITIAL_SCHEMA_VERSION: u64 = 1;
@@ -424,6 +424,25 @@ pub struct ViewColumn {
     pub pg_type: Option<PgType>,
 }
 
+/// Immediate referential action supported by foreign-key metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+}
+
+/// A resolved, durable foreign-key constraint owned by one child table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyConstraint {
+    pub id: ForeignKeyId,
+    pub name: String,
+    pub columns: Vec<ColumnId>,
+    pub referenced_table: TableId,
+    pub referenced_columns: Vec<ColumnId>,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: TableId,
@@ -464,6 +483,13 @@ pub struct TableSchema {
     /// rejects a row whose check evaluates to `false` (a `NULL` result passes).
     #[serde(default)]
     pub checks: Vec<String>,
+    /// Ordered outgoing foreign-key constraints owned by this table.
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// Monotonic per-table foreign-key id allocator. `4096` is the exhausted
+    /// sentinel; live ids are restricted to `0..=4095`.
+    #[serde(default)]
+    pub next_foreign_key_id: u32,
 }
 
 /// A durable dependency from a view to another relation. `columns` tracks specific
@@ -581,6 +607,8 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
             base_table: base.id,
         },
         checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        next_foreign_key_id: 0,
     }
 }
 

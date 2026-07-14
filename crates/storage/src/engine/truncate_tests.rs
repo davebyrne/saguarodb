@@ -323,6 +323,8 @@ fn users_schema(storage_id: FileId) -> TableSchema {
         toast,
         schema_version: common::INITIAL_SCHEMA_VERSION,
         checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        next_foreign_key_id: 0,
         toast_table_id: Some(TOAST_TABLE_ID),
         relation_kind: RelationKind::User,
     }

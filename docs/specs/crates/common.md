@@ -9,7 +9,7 @@
 
 ## Owns
 
-- Stable identifiers: `SchemaId`, `TableId`, `ColumnId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
+- Stable identifiers: `SchemaId`, `TableId`, `ColumnId`, `ForeignKeyId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
 - The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
@@ -284,6 +284,22 @@ pub struct TableSchema {
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
     pub checks: Vec<String>,  // CHECK constraint expressions, canonical SQL text
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+    pub next_foreign_key_id: u32,
+}
+
+pub type ForeignKeyId = u16;
+
+pub enum ForeignKeyAction { NoAction, Restrict }
+
+pub struct ForeignKeyConstraint {
+    pub id: ForeignKeyId,
+    pub name: String,
+    pub columns: Vec<ColumnId>,
+    pub referenced_table: TableId,
+    pub referenced_columns: Vec<ColumnId>,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
 }
 
 pub struct IndexSchema {
@@ -367,8 +383,10 @@ by the catalog instead of treating `ColumnId` as a cross-version identity.
 `ColumnInfo` describes result columns and may be derived from expressions, so
 table/column IDs are optional. `TableSchema.schema_version` and
 `ViewSchema.schema_version` start at `1` and increment on public schema metadata
-changes. The optional `pg_type` fields are presentation metadata for PostgreSQL
-protocol OIDs/typmods only; semantic type checking still uses `DataType`.
+changes. The optional `pg_type` fields normally provide PostgreSQL protocol
+OIDs/typmods while semantic type checking uses `DataType`. Foreign-key declared
+type identity is the deliberate exception: it also compares concrete
+`ColumnDef::wire_type()` and length/type-modifier metadata.
 Supported presentation-only identities include width/kind refinements
 (`int2`/`int4`/`int8`, `varchar`/`bpchar`), catalog `oid`, and catalog
 vector/array identities (`int2vector`, `oidvector`, `int2[]`/`_int2`,
@@ -505,8 +523,11 @@ pub enum SqlState {
     NotNullViolation,
     UniqueViolation,
     CheckViolation,
+    ForeignKeyViolation,
     CardinalityViolation,
     DependentObjectsStillExist,
+    InvalidForeignKey,
+    DuplicateObject,
     ObjectNotInPrerequisiteState,
     ObjectInUse,
     LockNotAvailable,
@@ -534,6 +555,9 @@ pub type Result<T> = std::result::Result<T, DbError>;
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
 `SqlState::code` is the single source of truth for PostgreSQL wire SQLSTATE
 strings, and `SqlState::from_code` is the reverse parser for known codes.
+Foreign-key metadata reserves `23503` (`ForeignKeyViolation`), `42830`
+(`InvalidForeignKey`), and `42710` (`DuplicateObject`) before SQL syntax is
+enabled.
 
 `DuplicateCursor` maps to `42P03` for a duplicate SQL cursor declaration.
 `InvalidCursorName` maps to `34000` for `FETCH`/`CLOSE` of a cursor that is not

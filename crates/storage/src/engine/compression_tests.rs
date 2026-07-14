@@ -60,6 +60,8 @@ fn users_schema_zstd() -> TableSchema {
         relation_kind: RelationKind::User,
         schema_version: common::INITIAL_SCHEMA_VERSION,
         checks: Vec::new(),
+        foreign_keys: Vec::new(),
+        next_foreign_key_id: 0,
     }
 }
 

@@ -22,18 +22,31 @@ pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definitio
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
-    attrdef_oid, check_constraint_oid, index_oid, is_system_schema, primary_key_constraint_oid,
-    resolve_system_view, schema_oid, sequence_oid, synthetic_primary_key_oid, table_oid,
-    try_check_constraint_oid,
+    attrdef_oid, check_constraint_oid, foreign_key_constraint_oid, index_oid, is_system_schema,
+    primary_key_constraint_oid, resolve_system_view, schema_oid, sequence_oid,
+    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 pub use truncate_overlay::TruncateCatalogOverlay;
 
 use common::{
-    ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, IndexConstraintKind,
-    IndexId, IndexSchema, NamespaceSchema, ParsedColumnDef, PgType, Result, SchemaId, SequenceId,
-    SequenceOptions, SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions,
-    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, ForeignKeyAction,
+    ForeignKeyConstraint, IndexConstraintKind, IndexId, IndexSchema, NamespaceSchema,
+    ParsedColumnDef, PgType, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema,
+    TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewDependency, ViewSchema,
 };
+
+/// A name-optional but otherwise fully resolved foreign-key definition passed
+/// to the catalog for atomic name/id allocation and attachment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedForeignKey {
+    pub name: Option<String>,
+    pub columns: Vec<ColumnId>,
+    pub referenced_table: TableId,
+    pub referenced_columns: Vec<ColumnId>,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableColumnAlteration {
@@ -159,6 +172,96 @@ pub trait CatalogManager: Send + Sync {
         indexes: &[IndexSchema],
     ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
+    /// Atomically attaches a batch of fully ID/column-resolved foreign keys to
+    /// one child table. IDs must continue that table's monotonic allocator.
+    fn attach_foreign_keys(
+        &self,
+        _table: TableId,
+        _foreign_keys: Vec<ResolvedForeignKey>,
+    ) -> Result<TableSchema> {
+        Err(DbError::internal(
+            "catalog does not support foreign-key mutation",
+        ))
+    }
+    /// Removes one foreign key by its table-local constraint name. A missing
+    /// name returns `None` only when `if_exists` is true.
+    fn drop_foreign_key(
+        &self,
+        _table: TableId,
+        _name: &str,
+        _if_exists: bool,
+    ) -> Result<Option<TableSchema>> {
+        Err(DbError::internal(
+            "catalog does not support foreign-key mutation",
+        ))
+    }
+    /// Lists child tables and constraints that reference `referenced_table`.
+    fn list_incoming_foreign_keys(
+        &self,
+        referenced_table: TableId,
+    ) -> Result<Vec<(TableSchema, ForeignKeyConstraint)>> {
+        let mut incoming = Vec::new();
+        for table in self.list_tables()? {
+            for foreign_key in &table.foreign_keys {
+                if foreign_key.referenced_table == referenced_table {
+                    incoming.push((table.clone(), foreign_key.clone()));
+                }
+            }
+        }
+        incoming.sort_by_key(|(table, foreign_key)| (table.id, foreign_key.id));
+        Ok(incoming)
+    }
+    /// Resolves an eligible referenced PK/UNIQUE constraint to its storage
+    /// access index. Primary keys use the reserved storage identity index id.
+    fn resolve_foreign_key_index(
+        &self,
+        referenced_table: TableId,
+        referenced_columns: &[ColumnId],
+    ) -> Result<Option<IndexId>> {
+        let Some(table) = self.get_table(referenced_table)? else {
+            return Ok(None);
+        };
+        if !referenced_columns.is_empty() && table.primary_key == referenced_columns {
+            return Ok(Some(common::PRIMARY_KEY_INDEX_ID));
+        }
+        Ok(self
+            .list_indexes_for_table(referenced_table)?
+            .into_iter()
+            .filter(|index| {
+                index.constraint == IndexConstraintKind::Unique
+                    && index.columns == referenced_columns
+            })
+            .min_by_key(|index| index.id)
+            .map(|index| index.id))
+    }
+    /// Finds an exact-column child-side access index, if one exists.
+    fn find_foreign_key_supporting_index(
+        &self,
+        child_table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Option<IndexId>> {
+        let Some(table) = self.get_table(child_table)? else {
+            return Ok(None);
+        };
+        if !columns.is_empty() && table.primary_key == columns {
+            return Ok(Some(common::PRIMARY_KEY_INDEX_ID));
+        }
+        Ok(self
+            .list_indexes_for_table(child_table)?
+            .into_iter()
+            .filter(|index| {
+                index.constraint != IndexConstraintKind::PrimaryKey && index.columns == columns
+            })
+            .min_by_key(|index| index.id)
+            .map(|index| index.id))
+    }
+    /// Generates PostgreSQL's conventional table/column-based FK name with the
+    /// smallest positive suffix needed to avoid a table-local constraint name.
+    fn generate_foreign_key_name(&self, _table: TableId, _columns: &[ColumnId]) -> Result<String> {
+        Err(DbError::internal(
+            "catalog does not support foreign-key name generation",
+        ))
+    }
     fn create_table(
         &self,
         name: String,
@@ -466,14 +569,15 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexConstraintKind,
-        IndexSchema, ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema,
-        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
-        ViewDependency, toast_schema,
+        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, ForeignKeyAction,
+        ForeignKeyConstraint, IndexConstraintKind, IndexSchema, ParsedColumnDef, PgType,
+        RelationKind, SequenceOptions, SequenceSchema, SqlState, TableSchema, ToastCompression,
+        ToastMode, ToastOptions, ViewColumn, ViewDependency, toast_schema,
     };
 
     use crate::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, check_constraint_oid,
+        deserialize_catalog, foreign_key_constraint_oid, serialize_catalog,
         system::{MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
         validate_create_table_definition,
     };
@@ -521,6 +625,56 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
+        }
+    }
+
+    fn foreign_key_catalog() -> (MemoryCatalog, u32, u32) {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "parents".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .create_index_with_constraint(
+                "parents_pkey".to_string(),
+                "parents",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "children".to_string(),
+                vec![ParsedColumnDef {
+                    name: "parent_id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                }],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        (catalog, parent.id, child.id)
+    }
+
+    fn resolved_foreign_key(name: Option<&str>, referenced_table: u32) -> ResolvedForeignKey {
+        ResolvedForeignKey {
+            name: name.map(str::to_string),
+            columns: vec![0],
+            referenced_table,
+            referenced_columns: vec![0],
+            on_update: ForeignKeyAction::NoAction,
+            on_delete: ForeignKeyAction::Restrict,
         }
     }
 
@@ -1992,6 +2146,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
@@ -2114,6 +2270,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
@@ -2173,6 +2331,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
 
         let err = catalog.apply_create_table(schema).unwrap_err();
@@ -2339,6 +2499,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2397,6 +2559,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2434,6 +2598,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2473,6 +2639,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2801,6 +2969,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
 
         catalog.apply_create_table(schema.clone()).unwrap();
@@ -3368,6 +3538,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -3419,6 +3591,8 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            next_foreign_key_id: 0,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -4130,5 +4304,446 @@ mod tests {
         );
         catalog.drop_view(view.id).unwrap();
         catalog.drop_schema(app.id).unwrap();
+    }
+
+    #[test]
+    fn foreign_keys_attach_generate_names_list_incoming_and_drop_without_reusing_ids() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        let schema = catalog
+            .attach_foreign_keys(
+                child,
+                vec![
+                    resolved_foreign_key(None, parent),
+                    resolved_foreign_key(None, parent),
+                ],
+            )
+            .unwrap();
+        assert_eq!(schema.next_foreign_key_id, 2);
+        assert_eq!(schema.foreign_keys[0].id, 0);
+        assert_eq!(schema.foreign_keys[0].name, "children_parent_id_fkey");
+        assert_eq!(schema.foreign_keys[1].id, 1);
+        assert_eq!(schema.foreign_keys[1].name, "children_parent_id_fkey1");
+        assert_eq!(
+            catalog.resolve_foreign_key_index(parent, &[0]).unwrap(),
+            Some(common::PRIMARY_KEY_INDEX_ID)
+        );
+        let incoming = catalog.list_incoming_foreign_keys(parent).unwrap();
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0].0.id, child);
+        assert_eq!(incoming[0].1.id, 0);
+
+        let dropped = catalog
+            .drop_foreign_key(child, "children_parent_id_fkey", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.next_foreign_key_id, 2);
+        assert_eq!(dropped.foreign_keys.len(), 1);
+        assert!(
+            catalog
+                .drop_foreign_key(child, "missing", true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .drop_foreign_key(child, "missing", false)
+                .unwrap_err()
+                .code,
+            SqlState::UndefinedObject
+        );
+    }
+
+    #[test]
+    fn foreign_key_attach_is_atomic_and_validates_types_columns_names_and_allocator() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        let mut invalid = resolved_foreign_key(Some("bad"), parent);
+        invalid.columns = vec![9];
+        let err = catalog
+            .attach_foreign_keys(
+                child,
+                vec![resolved_foreign_key(Some("valid"), parent), invalid],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+        let unchanged = catalog.get_table(child).unwrap().unwrap();
+        assert!(unchanged.foreign_keys.is_empty());
+        assert_eq!(unchanged.next_foreign_key_id, 0);
+
+        let mut snapshot = catalog.snapshot().unwrap();
+        snapshot
+            .tables_by_id
+            .get_mut(&child)
+            .unwrap()
+            .next_foreign_key_id = 4095;
+        let exhausted = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        let last = exhausted
+            .attach_foreign_keys(child, vec![resolved_foreign_key(Some("last"), parent)])
+            .unwrap();
+        assert_eq!(last.foreign_keys[0].id, 4095);
+        assert_eq!(last.next_foreign_key_id, 4096);
+        assert_eq!(
+            exhausted
+                .attach_foreign_keys(child, vec![resolved_foreign_key(Some("too_many"), parent)])
+                .unwrap_err()
+                .code,
+            SqlState::ProgramLimitExceeded
+        );
+    }
+
+    #[test]
+    fn foreign_key_resolution_accepts_declared_unique_only_and_finds_exact_child_index() {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "parents".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .create_index(
+                "parents_id_standalone".to_string(),
+                "parents",
+                &["id".to_string()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.resolve_foreign_key_index(parent.id, &[0]).unwrap(),
+            None
+        );
+        let unique = catalog
+            .create_index_with_constraint(
+                "parents_id_key".to_string(),
+                "parents",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.resolve_foreign_key_index(parent.id, &[0]).unwrap(),
+            Some(unique.id)
+        );
+
+        let child = catalog
+            .create_table(
+                "children".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let supporting = catalog
+            .create_index(
+                "children_id_idx".to_string(),
+                "children",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .find_foreign_key_supporting_index(child.id, &[0])
+                .unwrap(),
+            Some(supporting.id)
+        );
+        assert_eq!(
+            catalog
+                .find_foreign_key_supporting_index(child.id, &[])
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_foreign_key_snapshot_is_rejected_and_legacy_metadata_defaults_empty() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        catalog
+            .attach_foreign_keys(
+                child,
+                vec![resolved_foreign_key(Some("child_parent"), parent)],
+            )
+            .unwrap();
+        let mut malformed = catalog.snapshot().unwrap();
+        malformed
+            .tables_by_id
+            .get_mut(&child)
+            .unwrap()
+            .next_foreign_key_id = 0;
+        let err = MemoryCatalog::try_from_snapshot(malformed).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+
+        let legacy = MemoryCatalog::empty();
+        legacy
+            .create_table(
+                "legacy".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let bytes = serialize_catalog(&legacy.snapshot().unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let table = value
+            .get_mut("tables")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|tables| tables.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        table.remove("foreign_keys");
+        table.remove("next_foreign_key_id");
+        let decoded = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = MemoryCatalog::try_from_snapshot(decoded).unwrap();
+        let schema = loaded.get_table_by_name("legacy").unwrap().unwrap();
+        assert!(schema.foreign_keys.is_empty());
+        assert_eq!(schema.next_foreign_key_id, 0);
+    }
+
+    #[test]
+    fn foreign_key_oid_uses_a_dedicated_stable_namespace() {
+        let oid = foreign_key_constraint_oid(42, 7).unwrap();
+        assert_eq!(oid, foreign_key_constraint_oid(42, 7).unwrap());
+        assert_ne!(oid, check_constraint_oid(42, 7).unwrap());
+        assert_ne!(oid, crate::primary_key_constraint_oid(42).unwrap());
+        assert!(foreign_key_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1, 0).is_err());
+    }
+
+    #[test]
+    fn restore_preserves_foreign_key_allocator_high_water() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        let before = catalog.snapshot().unwrap();
+        catalog
+            .attach_foreign_keys(child, vec![resolved_foreign_key(Some("first"), parent)])
+            .unwrap();
+        catalog.drop_foreign_key(child, "first", false).unwrap();
+        catalog.restore(before).unwrap();
+        let restored = catalog.get_table(child).unwrap().unwrap();
+        assert_eq!(restored.next_foreign_key_id, 1);
+        let attached = catalog
+            .attach_foreign_keys(child, vec![resolved_foreign_key(Some("second"), parent)])
+            .unwrap();
+        assert_eq!(attached.foreign_keys[0].id, 1);
+    }
+
+    #[test]
+    fn referenced_parent_table_and_unique_constraint_index_cannot_be_dropped() {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "parents".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let unique = catalog
+            .create_index_with_constraint(
+                "parents_id_key".to_string(),
+                "parents",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "children".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![resolved_foreign_key(Some("children_parent"), parent.id)],
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.drop_index(unique.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            catalog.drop_table(parent.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert!(catalog.get_index(unique.id).unwrap().is_some());
+        assert!(catalog.get_table(parent.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn dropping_earlier_child_column_remaps_source_but_parent_renumbering_is_rejected() {
+        let catalog = MemoryCatalog::empty();
+        let two_columns = || {
+            vec![
+                ParsedColumnDef {
+                    name: "unused".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+                ParsedColumnDef {
+                    name: "key".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+            ]
+        };
+        let parent = catalog
+            .create_table(
+                "parents".to_string(),
+                two_columns(),
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .create_index_with_constraint(
+                "parents_key_key".to_string(),
+                "parents",
+                &["key".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "children".to_string(),
+                two_columns(),
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let mut definition = resolved_foreign_key(Some("children_parent"), parent.id);
+        definition.columns = vec![1];
+        definition.referenced_columns = vec![1];
+        catalog
+            .attach_foreign_keys(child.id, vec![definition])
+            .unwrap();
+
+        catalog.drop_table_column(child.id, "unused").unwrap();
+        assert_eq!(
+            catalog.get_table(child.id).unwrap().unwrap().foreign_keys[0].columns,
+            vec![0]
+        );
+        let child_before_parent_drop = catalog.get_table(child.id).unwrap().unwrap();
+        let err = catalog.drop_table_column(parent.id, "unused").unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert_eq!(
+            catalog.get_table(child.id).unwrap().unwrap(),
+            child_before_parent_drop
+        );
+    }
+
+    #[test]
+    fn declared_constraint_index_cannot_reuse_a_foreign_key_name() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        catalog
+            .attach_foreign_keys(
+                child,
+                vec![resolved_foreign_key(Some("children_parent_key"), parent)],
+            )
+            .unwrap();
+        let err = catalog
+            .create_index_with_constraint(
+                "children_parent_key".to_string(),
+                "children",
+                &["parent_id".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateObject);
+        assert!(
+            catalog
+                .get_index_by_name("children_parent_key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn referenced_primary_key_cannot_be_changed_or_dropped() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        catalog
+            .attach_foreign_keys(
+                child,
+                vec![resolved_foreign_key(Some("children_parent"), parent)],
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .set_table_primary_key(parent, Vec::new())
+                .unwrap_err()
+                .code,
+            SqlState::DependentObjectsStillExist
+        );
+        let primary_index = catalog
+            .list_indexes_for_table(parent)
+            .unwrap()
+            .into_iter()
+            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .unwrap();
+        assert_eq!(
+            catalog
+                .drop_table_primary_key_index(parent, primary_index.id)
+                .unwrap_err()
+                .code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            catalog.get_table(parent).unwrap().unwrap().primary_key,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn recovery_create_rejects_malformed_embedded_foreign_key_metadata_atomically() {
+        let catalog = MemoryCatalog::empty();
+        let mut schema = stored_id_table(99, "bad_child");
+        schema.foreign_keys.push(ForeignKeyConstraint {
+            id: 0,
+            name: "bad_child_parent_fkey".to_string(),
+            columns: vec![0],
+            referenced_table: 999,
+            referenced_columns: vec![0],
+            on_update: ForeignKeyAction::NoAction,
+            on_delete: ForeignKeyAction::NoAction,
+        });
+        schema.next_foreign_key_id = 1;
+        let before = catalog.snapshot().unwrap();
+        let err = catalog.apply_create_table(schema).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(
+            catalog.snapshot().unwrap().tables_by_id,
+            before.tables_by_id
+        );
+    }
+
+    #[test]
+    fn incompatible_foreign_key_type_alter_does_not_allocate_toast_metadata() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        catalog
+            .attach_foreign_keys(
+                child,
+                vec![resolved_foreign_key(Some("children_parent"), parent)],
+            )
+            .unwrap();
+        let before = catalog.snapshot().unwrap();
+        let err = catalog
+            .alter_table_column_type(child, "parent_id", DataType::Text, PgType::Text, None)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        let after = catalog.snapshot().unwrap();
+        assert_eq!(after.next_table_id, before.next_table_id);
+        assert_eq!(after.next_storage_id, before.next_storage_id);
+        assert_eq!(after.tables_by_id, before.tables_by_id);
     }
 }

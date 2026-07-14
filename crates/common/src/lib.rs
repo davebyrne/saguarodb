@@ -64,9 +64,9 @@ pub use functions::{
     scalar_function_arg_hint, scalar_function_arg_pg_type, scalar_function_result_pg_type,
 };
 pub use ids::{
-    BindingId, ColumnId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID, FROZEN_XID, FileId, INVALID_XID,
-    IndexId, Lsn, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId,
-    TableId, TxnId,
+    BindingId, ColumnId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID, FROZEN_XID, FileId, ForeignKeyId,
+    INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId,
+    SequenceId, TableId, TxnId,
 };
 pub use interval::Interval;
 pub use locking::{
@@ -83,11 +83,11 @@ pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
     ArrayType, ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType,
-    INITIAL_SCHEMA_VERSION, IndexConstraintKind, IndexSchema, NamespaceSchema, ParsedColumnDef,
-    ParsedDefault, QualifiedName, RelationKind, SequenceOptions, SequenceSchema, TableOptionPatch,
-    TableSchema, ToastCompression, ToastMode, ToastOptionPatch, ToastOptions,
-    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
-    needs_toast_relation, toast_relation_name, toast_schema,
+    ForeignKeyAction, ForeignKeyConstraint, INITIAL_SCHEMA_VERSION, IndexConstraintKind,
+    IndexSchema, NamespaceSchema, ParsedColumnDef, ParsedDefault, QualifiedName, RelationKind,
+    SequenceOptions, SequenceSchema, TableOptionPatch, TableSchema, ToastCompression, ToastMode,
+    ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
+    ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name, toast_schema,
 };
 pub use statistics::{ColumnStatistics, NDistinct, TableStatistics, value_is_finite};
 pub use value::{Value, parse_bool_text};
