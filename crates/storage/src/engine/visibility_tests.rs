@@ -1,17 +1,19 @@
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
     ColumnDef, CompressionSetting, DataType, INVALID_XID, IndexSchema, Key, KeyRange,
-    PageFlushInfo, RelationKind, Row, RowId, Snapshot, SqlState, StatementContext, TableSchema,
-    ToastOptions, Value,
+    PageFlushInfo, RelationKind, Row, RowId, RowIdentity, Snapshot, SqlState, StatementContext,
+    TableSchema, ToastOptions, TupleLockMode, TupleLockTag, Value,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::PageBackedStorageEngine;
 use super::conflict_wait_test_support::{aborting_blocker, committing_blocker};
 use crate::HeapPageStore;
-use crate::traits::SchemaOperations;
+use crate::traits::{DependentRowProbe, SchemaOperations, StorageEngine};
 
 struct AlwaysFlush;
 impl common::FlushPolicy for AlwaysFlush {
@@ -20,11 +22,110 @@ impl common::FlushPolicy for AlwaysFlush {
     }
 }
 
+#[derive(Debug)]
+struct CancellationWaiter;
+
+impl common::ConflictWaiter for CancellationWaiter {
+    fn wait_for(
+        &self,
+        _waiter: u64,
+        _blocker: u64,
+        cancel: &common::QueryCancel,
+    ) -> common::Result<()> {
+        cancel.check()
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingTupleLocks {
+    grants: Mutex<Vec<(u64, TupleLockTag, TupleLockMode)>>,
+}
+
+impl common::TupleLockManager for RecordingTupleLocks {
+    fn acquire_tuple(
+        &self,
+        xid: u64,
+        tag: &TupleLockTag,
+        mode: TupleLockMode,
+        _wait_policy: common::TupleLockWaitPolicy,
+        _cancel: &common::QueryCancel,
+    ) -> common::Result<common::TupleLockAcquire> {
+        self.grants.lock().unwrap().push((xid, tag.clone(), mode));
+        Ok(common::TupleLockAcquire::Acquired(
+            common::TupleLockGrantChange::manager_receipt(()),
+        ))
+    }
+
+    fn restore_tuple_grants(
+        &self,
+        _xid: u64,
+        _changes: Vec<common::TupleLockGrantChange>,
+    ) -> common::Result<()> {
+        Ok(())
+    }
+
+    fn holds_tuple(&self, xid: u64, tag: &TupleLockTag, mode: TupleLockMode) -> bool {
+        self.grants
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(owner, granted_tag, granted_mode)| {
+                *owner == xid && granted_tag == tag && *granted_mode >= mode
+            })
+    }
+}
+
+struct CallbackTupleLocks {
+    callback: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    restored: AtomicUsize,
+}
+
+impl std::fmt::Debug for CallbackTupleLocks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallbackTupleLocks")
+            .field("restored", &self.restored.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+impl common::TupleLockManager for CallbackTupleLocks {
+    fn acquire_tuple(
+        &self,
+        _xid: u64,
+        _tag: &TupleLockTag,
+        _mode: TupleLockMode,
+        _wait_policy: common::TupleLockWaitPolicy,
+        cancel: &common::QueryCancel,
+    ) -> common::Result<common::TupleLockAcquire> {
+        cancel.check()?;
+        if let Some(callback) = self.callback.lock().unwrap().take() {
+            callback();
+        }
+        Ok(common::TupleLockAcquire::Acquired(
+            common::TupleLockGrantChange::manager_receipt(()),
+        ))
+    }
+
+    fn restore_tuple_grants(
+        &self,
+        _xid: u64,
+        changes: Vec<common::TupleLockGrantChange>,
+    ) -> common::Result<()> {
+        self.restored.fetch_add(changes.len(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn holds_tuple(&self, _xid: u64, _tag: &TupleLockTag, _mode: TupleLockMode) -> bool {
+        true
+    }
+}
+
 /// A storage engine over an in-memory buffer pool and a real (file-backed) WAL,
 /// whose CLOG the tests drive via `Commit`/`Abort` records to control which
 /// `xmin`/`xmax` are committed/aborted/in-progress.
 struct Fixture {
-    engine: PageBackedStorageEngine,
+    engine: Arc<PageBackedStorageEngine>,
     wal: Arc<FileWalManager>,
     _dir: tempfile::TempDir,
 }
@@ -39,8 +140,9 @@ impl Fixture {
         let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
         buffer.enable_stealing();
         let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
-        let engine =
-            PageBackedStorageEngine::open(buffer, wal.clone(), super::StorageMode::Normal).unwrap();
+        let engine = Arc::new(
+            PageBackedStorageEngine::open(buffer, wal.clone(), super::StorageMode::Normal).unwrap(),
+        );
         Self {
             engine,
             wal,
@@ -218,6 +320,28 @@ impl Fixture {
         crate::page::set_redirect(guard.data_mut(), slot, target).unwrap();
     }
 
+    fn mark_dead(&self, page_num: u32, slot: u16) {
+        let mut guard = self
+            .engine
+            .buffer_pool
+            .write_page(TABLE_ID, page_num, 0)
+            .unwrap();
+        crate::page::mark_slots_dead(guard.data_mut(), &[slot]).unwrap();
+    }
+
+    fn set_infomask(&self, page_num: u32, slot: u16, infomask: u16) {
+        let mut guard = self
+            .engine
+            .buffer_pool
+            .write_page(TABLE_ID, page_num, 0)
+            .unwrap();
+        let bytes = crate::page::read_row(guard.data(), slot).unwrap().unwrap();
+        let (_xmin, xmax, t_ctid, _old_infomask) =
+            crate::codec::decode_mvcc_header(&bytes).unwrap();
+        let lsn = crate::page::page_lsn(guard.data());
+        crate::page::set_tuple_header(guard.data_mut(), slot, xmax, t_ctid, infomask, lsn).unwrap();
+    }
+
     /// Resolve `key` to the visible version's `(RowLocation, infomask)` via the
     /// engine's HOT-aware `locate_visible_version` (REDIRECT + bounded chain),
     /// the path UPDATE/DELETE use to target the live version.
@@ -293,6 +417,25 @@ fn ctx_h(txn_id: u64, snapshot: Snapshot, gc_horizon: u64) -> StatementContext {
     .with_gc_horizon(gc_horizon)
 }
 
+fn ctx_isolation(
+    txn_id: u64,
+    snapshot: Snapshot,
+    isolation: common::IsolationLevel,
+) -> StatementContext {
+    crate::with_test_tuple_locks(StatementContext::with_snapshot_and_isolation(
+        txn_id,
+        Arc::new(snapshot),
+        isolation,
+    ))
+}
+
+fn recording_ctx(txn_id: u64, snapshot: Snapshot) -> (StatementContext, Arc<RecordingTupleLocks>) {
+    let locks = Arc::new(RecordingTupleLocks::default());
+    let ctx = StatementContext::with_snapshot(txn_id, Arc::new(snapshot))
+        .with_tuple_lock_manager(locks.clone());
+    (ctx, locks)
+}
+
 /// A snapshot that sees every settled (committed) id below `xmax` except the
 /// listed in-progress ids, none of which are own writes.
 fn snapshot(xmax: u64, xip: Vec<u64>) -> Snapshot {
@@ -336,6 +479,13 @@ fn users_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         next_foreign_key_id: 0,
     }
+}
+
+fn composite_users_schema() -> TableSchema {
+    let mut schema = users_schema();
+    schema.primary_key = vec![0, 1];
+    schema.columns[1].nullable = false;
+    schema
 }
 
 fn name_index() -> IndexSchema {
@@ -855,6 +1005,1178 @@ fn fixture_with_unique_name_index() -> Fixture {
         .unwrap();
     fixture.commit(100);
     fixture
+}
+
+fn fixture_with_declared_unique_name() -> Fixture {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    let unique_name = IndexSchema {
+        id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
+        storage_id: 101,
+        table: TABLE_ID,
+        name: "users_name_key".to_string(),
+        columns: vec![1],
+        unique: true,
+        constraint: common::IndexConstraintKind::Unique,
+    };
+    fixture
+        .engine
+        .create_index(&setup, &unique_name, 0)
+        .unwrap();
+    fixture.commit(100);
+    fixture
+}
+
+#[test]
+fn foreign_key_referenced_probe_uses_pk_and_retains_key_share() {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    fixture.commit(100);
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "parent"))
+        .unwrap();
+    fixture.commit(10);
+
+    let (probe, locks) = recording_ctx(20, snapshot(21, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                common::PRIMARY_KEY_INDEX_ID,
+                &key(1),
+            )
+            .unwrap()
+    );
+    assert!(common::TupleLockManager::holds_tuple(
+        locks.as_ref(),
+        probe.txn_id,
+        &TupleLockTag {
+            table: TABLE_ID,
+            key: key(1),
+        },
+        TupleLockMode::KeyShare,
+    ));
+    assert!(
+        !fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                common::PRIMARY_KEY_INDEX_ID,
+                &key(2),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_referenced_probe_restores_locks_when_recheck_rejects_candidate() {
+    let fixture = fixture_with_declared_unique_name();
+    let old = fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "old"))
+        .unwrap();
+    fixture.commit(10);
+    assert!(
+        fixture
+            .engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &key(1),
+                row(1, "new"),
+            )
+            .unwrap()
+    );
+
+    // Make the copied pre-lock header look live. The lock-manager callback then
+    // settles the already-physical update before lock_row re-resolves the chain.
+    fixture.set_infomask(old.page_num, old.slot_num, common::XMAX_ABORTED);
+    let buffer_pool = fixture.engine.buffer_pool.clone();
+    let wal = fixture.wal.clone();
+    let callback = move || {
+        let mut guard = buffer_pool.write_page(TABLE_ID, old.page_num, 20).unwrap();
+        let bytes = crate::page::read_row(guard.data(), old.slot_num)
+            .unwrap()
+            .unwrap();
+        let (_xmin, xmax, t_ctid, _infomask) = crate::codec::decode_mvcc_header(&bytes).unwrap();
+        let lsn = crate::page::page_lsn(guard.data());
+        crate::page::set_tuple_header(guard.data_mut(), old.slot_num, xmax, t_ctid, 0, lsn)
+            .unwrap();
+        drop(guard);
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 20,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+    };
+    let locks = Arc::new(CallbackTupleLocks {
+        callback: Mutex::new(Some(Box::new(callback))),
+        restored: AtomicUsize::new(0),
+    });
+    let probe = StatementContext::with_snapshot(30, Arc::new(snapshot(31, vec![])))
+        .with_tuple_lock_manager(locks.clone());
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        !fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                1,
+                &Key(vec![Value::Text("old".to_string())]),
+            )
+            .unwrap()
+    );
+    assert!(locks.restored.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn foreign_key_referenced_probe_restores_intermediate_identity_lock_on_success() {
+    let fixture = fixture_with_declared_unique_name();
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "same"))
+        .unwrap();
+    fixture.commit(10);
+    let engine = Arc::clone(&fixture.engine);
+    let wal = fixture.wal.clone();
+    let callback = move || {
+        assert!(
+            engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(2, "same"),
+                )
+                .unwrap()
+        );
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 20,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+    };
+    let locks = Arc::new(CallbackTupleLocks {
+        callback: Mutex::new(Some(Box::new(callback))),
+        restored: AtomicUsize::new(0),
+    });
+    let probe = StatementContext::with_snapshot(30, Arc::new(snapshot(31, vec![])))
+        .with_tuple_lock_manager(locks.clone());
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                1,
+                &Key(vec![Value::Text("same".to_string())]),
+            )
+            .unwrap()
+    );
+    assert_eq!(locks.restored.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn foreign_key_referenced_probe_waits_for_creator_and_supports_declared_unique() {
+    let fixture = fixture_with_declared_unique_name();
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+        .unwrap();
+    let probe = committing_blocker(ctx(20, snapshot(21, vec![10])), fixture.wal.clone());
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                1,
+                &Key(vec![Value::Text("amy".to_string())]),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_creator_wait_is_cancelable() {
+    let fixture = fixture_with_declared_unique_name();
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+        .unwrap();
+    let cancel = Arc::new(common::QueryCancel::new());
+    cancel.request(common::CancelReason::UserRequest);
+    let probe =
+        ctx(20, snapshot(21, vec![10])).with_conflict_waiter(Arc::new(CancellationWaiter), cancel);
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .referenced_key_exists(
+            &probe,
+            relations.as_ref(),
+            TABLE_ID,
+            1,
+            &Key(vec![Value::Text("amy".to_string())]),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+}
+
+#[test]
+fn foreign_key_dependent_scan_polls_cancellation_without_a_transaction_wait() {
+    let fixture = fixture_with_declared_unique_name();
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+        .unwrap();
+    fixture.commit(10);
+    let cancel = Arc::new(common::QueryCancel::new());
+    cancel.request(common::CancelReason::UserRequest);
+    let probe =
+        ctx(20, snapshot(21, vec![])).with_conflict_waiter(Arc::new(CancellationWaiter), cancel);
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[1],
+                key: &Key(vec![Value::Text("missing".to_string())]),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+}
+
+#[test]
+fn foreign_key_referenced_probe_restarts_after_in_progress_delete() {
+    let committed_delete = fixture_with_declared_unique_name();
+    let row_id = committed_delete
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+        .unwrap();
+    committed_delete.commit(10);
+    committed_delete.stamp_xmax(row_id.page_num, row_id.slot_num, 11, 0);
+    let probe = committing_blocker(
+        ctx(20, snapshot(21, vec![11])),
+        committed_delete.wal.clone(),
+    );
+    let relations = committed_delete.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        !committed_delete
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                1,
+                &Key(vec![Value::Text("amy".to_string())]),
+            )
+            .unwrap()
+    );
+
+    let aborted_delete = fixture_with_declared_unique_name();
+    let row_id = aborted_delete
+        .engine
+        .insert(&ctx(30, snapshot(31, vec![])), TABLE_ID, row(1, "bob"))
+        .unwrap();
+    aborted_delete.commit(30);
+    aborted_delete.stamp_xmax(row_id.page_num, row_id.slot_num, 31, 0);
+    let probe = aborting_blocker(ctx(40, snapshot(41, vec![31])), aborted_delete.wal.clone());
+    let relations = aborted_delete.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        aborted_delete
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                1,
+                &Key(vec![Value::Text("bob".to_string())]),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_probe_rejects_post_snapshot_current_row_at_retained_isolation() {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    fixture.commit(100);
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "future"))
+        .unwrap();
+    fixture.commit(10);
+    let probe = ctx_isolation(
+        20,
+        snapshot(10, vec![]),
+        common::IsolationLevel::RepeatableRead,
+    );
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .referenced_key_exists(
+            &probe,
+            relations.as_ref(),
+            TABLE_ID,
+            common::PRIMARY_KEY_INDEX_ID,
+            &key(1),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::SerializationFailure);
+}
+
+#[test]
+fn foreign_key_dependent_probe_uses_index_or_heap_and_honors_exclusion() {
+    let (fixture, row_id) = fixture_with_one_row_and_index();
+    let probe = ctx(20, snapshot(21, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let parent_key = Key(vec![Value::Text("alive".to_string())]);
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &parent_key,
+                    supporting_index: Some(1),
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &parent_key,
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+    let excluded = RowIdentity {
+        row_id,
+        xmin: 10,
+        key: key(1),
+    };
+    assert!(
+        !fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &parent_key,
+                    supporting_index: None,
+                    excluded: Some(&excluded),
+                },
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_dependent_probe_skips_committed_dead_and_hot_predecessor_versions() {
+    let (deleted, _row_id) = fixture_with_one_row_and_index();
+    assert!(
+        deleted
+            .engine
+            .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+            .unwrap()
+    );
+    deleted.commit(20);
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = deleted.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        !deleted
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("alive".to_string())]),
+                    supporting_index: Some(1),
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+
+    let hot = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    hot.engine.create_table(&setup, &users_schema()).unwrap();
+    hot.commit(100);
+    hot.engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "old"))
+        .unwrap();
+    hot.commit(10);
+    assert!(
+        hot.engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &key(1),
+                row(1, "new"),
+            )
+            .unwrap()
+    );
+    hot.commit(20);
+    let relations = hot.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        !hot.engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("old".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+    assert!(
+        hot.engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("new".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_dependent_probe_waits_and_restarts_for_child_state() {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    fixture.commit(100);
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "child"))
+        .unwrap();
+    let probe = committing_blocker(ctx(20, snapshot(21, vec![10])), fixture.wal.clone());
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("child".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+
+    let aborted = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    aborted
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    aborted.commit(100);
+    aborted
+        .engine
+        .insert(&ctx(30, snapshot(31, vec![])), TABLE_ID, row(1, "child"))
+        .unwrap();
+    let probe = aborting_blocker(ctx(40, snapshot(41, vec![30])), aborted.wal.clone());
+    let relations = aborted.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        !aborted
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("child".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_heap_probe_does_not_wait_for_unrelated_in_progress_child() {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &users_schema())
+        .unwrap();
+    fixture.commit(100);
+    fixture
+        .engine
+        .insert(
+            &ctx(10, snapshot(11, vec![])),
+            TABLE_ID,
+            row(1, "unrelated"),
+        )
+        .unwrap();
+    fixture
+        .engine
+        .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "wanted"))
+        .unwrap();
+    fixture.commit(11);
+    let probe = ctx(20, snapshot(21, vec![10]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("wanted".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_heap_probe_rejects_corrupt_redirect_topology() {
+    let (fixture, root) = fixture_with_root();
+    let target = fixture.append_raw_tuple(root.page_num, &row(1, "redirected"), 10, INVALID_XID, 0);
+    fixture.make_redirect(root.page_num, root.slot_num, target);
+    fixture.mark_dead(root.page_num, target);
+    let probe = ctx(20, snapshot(21, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    let err = fixture
+        .engine
+        .referenced_key_exists(
+            &probe,
+            relations.as_ref(),
+            TABLE_ID,
+            common::PRIMARY_KEY_INDEX_ID,
+            &key(1),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+}
+
+#[test]
+fn foreign_key_heap_probe_rejects_cross_page_hot_link() {
+    let (fixture, root) = fixture_with_root();
+    let mut guard = fixture
+        .engine
+        .buffer_pool
+        .write_page(TABLE_ID, root.page_num, 20)
+        .unwrap();
+    let lsn = crate::page::page_lsn(guard.data());
+    crate::page::set_tuple_header(
+        guard.data_mut(),
+        root.slot_num,
+        20,
+        (root.page_num + 1, 0),
+        crate::codec::HOT_UPDATED,
+        lsn,
+    )
+    .unwrap();
+    drop(guard);
+    fixture.commit(20);
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    let err = fixture
+        .engine
+        .referenced_key_exists(
+            &probe,
+            relations.as_ref(),
+            TABLE_ID,
+            common::PRIMARY_KEY_INDEX_ID,
+            &key(1),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+}
+
+#[test]
+fn foreign_key_heap_probe_rejects_multiple_chain_member_owners() {
+    let (fan_in, root) = fixture_with_root();
+    let target = fan_in.append_raw_tuple(
+        root.page_num,
+        &row(1, "target"),
+        20,
+        INVALID_XID,
+        crate::codec::HEAP_ONLY,
+    );
+    let other = fan_in.append_raw_tuple(root.page_num, &row(2, "other"), 10, INVALID_XID, 0);
+    fan_in.chain_to(
+        root.page_num,
+        root.slot_num,
+        target,
+        20,
+        crate::codec::HOT_UPDATED,
+    );
+    fan_in.chain_to(root.page_num, other, target, 20, crate::codec::HOT_UPDATED);
+    fan_in.commit(20);
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fan_in.engine.capture_relation_snapshot().unwrap();
+    let err = fan_in
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+
+    let (overlap, root) = fixture_with_root();
+    let target = overlap.append_raw_tuple(
+        root.page_num,
+        &row(1, "target"),
+        20,
+        INVALID_XID,
+        crate::codec::HEAP_ONLY,
+    );
+    let predecessor = overlap.append_raw_tuple(root.page_num, &row(2, "other"), 10, INVALID_XID, 0);
+    overlap.make_redirect(root.page_num, root.slot_num, target);
+    overlap.chain_to(
+        root.page_num,
+        predecessor,
+        target,
+        20,
+        crate::codec::HOT_UPDATED,
+    );
+    overlap.commit(20);
+    let relations = overlap.engine.capture_relation_snapshot().unwrap();
+    let err = overlap
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+}
+
+#[test]
+fn foreign_key_probes_reject_an_orphan_or_directly_indexed_heap_only_tuple() {
+    let (fixture, root) = fixture_with_root();
+    let orphan = fixture.append_raw_tuple(
+        root.page_num,
+        &row(2, "orphan"),
+        20,
+        INVALID_XID,
+        crate::codec::HEAP_ONLY,
+    );
+    fixture.commit(20);
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(2),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    assert!(err.message.contains("not reachable"), "{}", err.message);
+
+    let location = super::RowLocation {
+        file_id: crate::heap::heap_file_id(TABLE_ID),
+        page_num: root.page_num,
+        slot_num: orphan,
+    };
+    fixture
+        .engine
+        .btree(crate::heap::primary_index_file_id(TABLE_ID))
+        .insert(21, &key(2), &location)
+        .unwrap();
+    for result in [
+        fixture.engine.referenced_key_exists(
+            &probe,
+            relations.as_ref(),
+            TABLE_ID,
+            common::PRIMARY_KEY_INDEX_ID,
+            &key(2),
+        ),
+        fixture.engine.dependent_row_exists(
+            &probe,
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(2),
+                supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                excluded: None,
+            },
+        ),
+    ] {
+        let err = result.unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("heap-only"), "{}", err.message);
+    }
+}
+
+#[test]
+fn foreign_key_indexed_probes_reject_locations_in_another_heap() {
+    let fixture = fixture_with_declared_unique_name();
+    let mut foreign = users_schema();
+    foreign.id = 2;
+    foreign.storage_id = 2;
+    foreign.name = "foreign_heap".to_string();
+    let setup = ctx(101, snapshot(102, vec![]));
+    fixture.engine.create_table(&setup, &foreign).unwrap();
+    fixture.commit(101);
+    let foreign_row = fixture
+        .engine
+        .insert(
+            &ctx(10, snapshot(11, vec![])),
+            foreign.id,
+            row(99, "foreign"),
+        )
+        .unwrap();
+    fixture.commit(10);
+    let corrupt = super::RowLocation {
+        file_id: crate::heap::heap_file_id(foreign.storage_id),
+        page_num: foreign_row.page_num,
+        slot_num: foreign_row.slot_num,
+    };
+    fixture
+        .engine
+        .btree(crate::heap::primary_index_file_id(TABLE_ID))
+        .insert(20, &key(99), &corrupt)
+        .unwrap();
+    let unique_name = IndexSchema {
+        id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
+        storage_id: 101,
+        table: TABLE_ID,
+        name: "users_name_key".to_string(),
+        columns: vec![1],
+        unique: true,
+        constraint: common::IndexConstraintKind::Unique,
+    };
+    let name_key = Key(vec![Value::Text("foreign".to_string())]);
+    fixture
+        .engine
+        .secondary_btree(&unique_name)
+        .insert(20, &name_key, &corrupt)
+        .unwrap();
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    for (index, columns, candidate) in [
+        (common::PRIMARY_KEY_INDEX_ID, vec![0], key(99)),
+        (unique_name.id, vec![1], name_key),
+    ] {
+        let err = fixture
+            .engine
+            .referenced_key_exists(&probe, relations.as_ref(), TABLE_ID, index, &candidate)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        let err = fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &columns,
+                    key: &candidate,
+                    supporting_index: Some(index),
+                    excluded: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+    }
+}
+
+#[test]
+fn foreign_key_indexed_probes_reject_live_rows_with_a_different_index_key() {
+    let fixture = fixture_with_declared_unique_name();
+    let row_id = fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "actual"))
+        .unwrap();
+    fixture.commit(10);
+    let location = super::RowLocation {
+        file_id: crate::heap::heap_file_id(TABLE_ID),
+        page_num: row_id.page_num,
+        slot_num: row_id.slot_num,
+    };
+    let wrong_pk = key(99);
+    fixture
+        .engine
+        .btree(crate::heap::primary_index_file_id(TABLE_ID))
+        .insert(20, &wrong_pk, &location)
+        .unwrap();
+    let unique_name = IndexSchema {
+        id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
+        storage_id: 101,
+        table: TABLE_ID,
+        name: "users_name_key".to_string(),
+        columns: vec![1],
+        unique: true,
+        constraint: common::IndexConstraintKind::Unique,
+    };
+    let wrong_name = Key(vec![Value::Text("wrong".to_string())]);
+    fixture
+        .engine
+        .secondary_btree(&unique_name)
+        .insert(20, &wrong_name, &location)
+        .unwrap();
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    for (index, columns, candidate) in [
+        (common::PRIMARY_KEY_INDEX_ID, vec![0], wrong_pk),
+        (unique_name.id, vec![1], wrong_name),
+    ] {
+        let err = fixture
+            .engine
+            .referenced_key_exists(&probe, relations.as_ref(), TABLE_ID, index, &candidate)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        let err = fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &columns,
+                    key: &candidate,
+                    supporting_index: Some(index),
+                    excluded: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+    }
+}
+
+#[test]
+fn foreign_key_probes_preserve_composite_column_order() {
+    let fixture = Fixture::new();
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture
+        .engine
+        .create_table(&setup, &composite_users_schema())
+        .unwrap();
+    fixture.commit(100);
+    fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+        .unwrap();
+    fixture.commit(10);
+    let probe = ctx(20, snapshot(21, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let ordered = Key(vec![Value::Integer(1), Value::Text("amy".to_string())]);
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                common::PRIMARY_KEY_INDEX_ID,
+                &ordered,
+            )
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[0, 1],
+                    key: &ordered,
+                    supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+    let reversed = Key(vec![Value::Text("amy".to_string()), Value::Integer(1)]);
+    assert!(
+        !fixture
+            .engine
+            .dependent_row_exists(
+                &probe,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[0, 1],
+                    key: &reversed,
+                    supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn foreign_key_probes_preserve_hidden_identity_across_hot_successor() {
+    let fixture = Fixture::new();
+    let mut schema = users_schema();
+    schema.primary_key.clear();
+    let unique_id = IndexSchema {
+        id: 1,
+        schema_id: common::PUBLIC_SCHEMA_ID,
+        storage_id: 101,
+        table: TABLE_ID,
+        name: "users_id_key".to_string(),
+        columns: vec![0],
+        unique: true,
+        constraint: common::IndexConstraintKind::Unique,
+    };
+    let setup = ctx(100, snapshot(101, vec![]));
+    fixture.engine.create_table(&setup, &schema).unwrap();
+    fixture.engine.create_index(&setup, &unique_id, 0).unwrap();
+    fixture.commit(100);
+    let root = fixture
+        .engine
+        .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "old"))
+        .unwrap();
+    fixture.commit(10);
+    let mut rows = fixture
+        .engine
+        .scan_range(&ctx(20, snapshot(21, vec![])), TABLE_ID, &KeyRange::All)
+        .unwrap();
+    let hidden_key = rows.next().unwrap().unwrap().key;
+    assert!(
+        fixture
+            .engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &hidden_key,
+                row(1, "new"),
+            )
+            .unwrap()
+    );
+    fixture.commit(20);
+    let root_location = super::RowLocation {
+        file_id: crate::heap::heap_file_id(schema.storage_id),
+        page_num: root.page_num,
+        slot_num: root.slot_num,
+    };
+    assert_ne!(
+        fixture.decode_physical(root_location).unwrap().infomask & crate::codec::HOT_UPDATED,
+        0
+    );
+    let probe = ctx(30, snapshot(31, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let referenced = key(1);
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &probe,
+                relations.as_ref(),
+                TABLE_ID,
+                unique_id.id,
+                &referenced,
+            )
+            .unwrap()
+    );
+    for supporting_index in [Some(unique_id.id), None] {
+        assert!(
+            fixture
+                .engine
+                .dependent_row_exists(
+                    &probe,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: TABLE_ID,
+                        columns: &[0],
+                        key: &referenced,
+                        supporting_index,
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn forced_update_entry_point_retains_update_lock_for_unchanged_pk() {
+    let (fixture, _row_id) = fixture_with_one_row_and_index();
+    let (update, locks) = recording_ctx(20, snapshot(21, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .update_requiring_update_lock(
+                &update,
+                relations.as_ref(),
+                TABLE_ID,
+                &key(1),
+                row(1, "changed"),
+            )
+            .unwrap()
+    );
+    assert!(common::TupleLockManager::holds_tuple(
+        locks.as_ref(),
+        update.txn_id,
+        &TupleLockTag {
+            table: TABLE_ID,
+            key: key(1),
+        },
+        TupleLockMode::Update,
+    ));
 }
 
 /// A duplicate unique SECONDARY-index name held by an in-progress inserter BLOCKS
@@ -1781,6 +3103,35 @@ fn redirect_resolves_to_its_normal_target() {
     fixture.make_redirect(root.page_num, root.slot_num, target);
 
     let reader = ctx(0, snapshot(40, vec![]));
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    assert!(
+        fixture
+            .engine
+            .referenced_key_exists(
+                &reader,
+                relations.as_ref(),
+                TABLE_ID,
+                common::PRIMARY_KEY_INDEX_ID,
+                &key(1),
+            )
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .engine
+            .dependent_row_exists(
+                &reader,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: TABLE_ID,
+                    columns: &[1],
+                    key: &Key(vec![Value::Text("redirected".to_string())]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap()
+    );
     // Point lookup, sequential scan, and the UPDATE/DELETE locate path all
     // follow the REDIRECT to the NORMAL target.
     assert_eq!(
@@ -2015,6 +3366,23 @@ fn cyclic_hot_chain_is_a_structured_error_not_an_infinite_loop() {
     let err = fixture
         .engine
         .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    assert!(err.message.contains("cyclic"), "{}", err.message);
+    let relations = fixture.engine.capture_relation_snapshot().unwrap();
+    let err = fixture
+        .engine
+        .dependent_row_exists(
+            &ctx(30, snapshot(40, vec![])),
+            relations.as_ref(),
+            DependentRowProbe {
+                table: TABLE_ID,
+                columns: &[0],
+                key: &key(1),
+                supporting_index: None,
+                excluded: None,
+            },
+        )
         .unwrap_err();
     assert_eq!(err.code, SqlState::InternalError);
     assert!(err.message.contains("cyclic"), "{}", err.message);

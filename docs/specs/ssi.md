@@ -10,6 +10,13 @@ machinery. It is the system-level contract for the feature; it complements
 `docs/specs/deadlock.md` (blocking writers + deadlock detection), and supersedes
 the prior decision that `SERIALIZABLE` is a bare alias for Repeatable Read.
 
+The storage layer exposes current-state parent/child referential probes and
+returns `40001` when a required current row lies outside a Serializable retained
+snapshot. The probes do not independently choose SSI predicate granularity; the
+executor enforcement layer added with DML enforcement must record the exact
+parent tuple or conservative parent/child relation SIREAD associated with the
+semantic FK check.
+
 ## 1. Purpose and scope
 
 Snapshot isolation (Repeatable Read) and Read Committed are already implemented.

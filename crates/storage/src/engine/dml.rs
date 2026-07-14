@@ -65,19 +65,6 @@ pub(super) fn restore_tuple_changes(
     ctx.tuple_locks.restore_tuple_grants(ctx.txn_id, changes)
 }
 
-pub(super) fn restore_tuple_changes_after_error<T>(
-    ctx: &StatementContext,
-    changes: Vec<TupleLockGrantChange>,
-    original: DbError,
-) -> Result<T> {
-    match restore_tuple_changes(ctx, changes) {
-        Ok(()) => Err(original),
-        Err(restore) => Err(DbError::internal(format!(
-            "tuple-lock acquisition failed ({original}); restoring its grants also failed ({restore})"
-        ))),
-    }
-}
-
 struct ToastCandidate {
     column: usize,
     raw_len: u32,

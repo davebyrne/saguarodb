@@ -10,6 +10,13 @@ Table locks add relation-scoped coordination so operations on unrelated tables
 can proceed independently and so a transaction can safely retain a TRUNCATE
 generation until COMMIT or ROLLBACK.
 
+Referential storage probes operate only after their caller has captured a
+relation snapshot under the required relation locks. The parent `KeyShare` tuple
+grant is distinct from relation locking and is retained for the transaction;
+creator/deleter waits never retain relation-internal structural or frame latches.
+Server-side acquisition of related parent/child relation locks is specified with
+FK dependency discovery rather than inferred inside storage.
+
 Table locks do not replace MVCC, page/index structural latches, row-conflict
 waiting, the checkpoint guard, or schema-generation validation. They coordinate
 which operations may use or replace a logical table and participate in the same

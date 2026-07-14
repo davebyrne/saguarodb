@@ -63,18 +63,19 @@ use crate::codec::{
 use crate::heap::{heap_file_id, primary_index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{
-    LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+    DependentRowProbe, LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations,
+    StorageEngine,
 };
 
 mod dml;
 mod index;
 mod recovery;
+mod referential;
 mod vacuum;
 mod visibility;
 
 use dml::{
     DeleteRowVersionRequest, LatestRowVersion, UpdateRowVersionRequest, restore_tuple_changes,
-    restore_tuple_changes_after_error,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2204,6 +2205,32 @@ impl StorageEngine for PageBackedStorageEngine {
         Ok(None)
     }
 
+    fn referenced_key_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        access_index: IndexId,
+        key: &Key,
+    ) -> Result<bool> {
+        self.probe_referenced_key(
+            ctx,
+            pagebacked_relations(relations)?,
+            table,
+            access_index,
+            key,
+        )
+    }
+
+    fn dependent_row_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        probe: DependentRowProbe<'_>,
+    ) -> Result<bool> {
+        self.probe_dependent_row(ctx, pagebacked_relations(relations)?, probe)
+    }
+
     fn lock_row(
         &self,
         ctx: &StatementContext,
@@ -2214,93 +2241,9 @@ impl StorageEngine for PageBackedStorageEngine {
         wait_policy: TupleLockWaitPolicy,
     ) -> Result<LockRowResult> {
         let relations = pagebacked_relations(relations)?;
-        let table_handle = self.table_handle(relations, table)?;
-        let schema = table_handle.schema.clone();
-        let mut next_tag = TupleLockTag {
-            table,
-            key: identity.key.clone(),
-        };
-        let mut held_tags = BTreeSet::new();
-        let mut changes = Vec::new();
-
-        loop {
-            if held_tags.insert(next_tag.clone()) {
-                let acquisition = ctx.tuple_locks.acquire_tuple(
-                    ctx.txn_id,
-                    &next_tag,
-                    mode,
-                    wait_policy,
-                    ctx.cancel.as_ref(),
-                );
-                match acquisition {
-                    Ok(TupleLockAcquire::Acquired(change)) => changes.push(change),
-                    Ok(TupleLockAcquire::Skipped) => {
-                        restore_tuple_changes(ctx, changes)?;
-                        return Ok(LockRowResult::Skipped);
-                    }
-                    Err(err) => return restore_tuple_changes_after_error(ctx, changes, err),
-                }
-            }
-
-            let latest = loop {
-                match self.resolve_latest_row_version(ctx, relations, &schema, identity) {
-                    Ok(LatestRowVersion::WouldBlock(blocker)) => match wait_policy {
-                        TupleLockWaitPolicy::Block => {
-                            if let Err(err) = self.wait_for_conflict(ctx, blocker) {
-                                return restore_tuple_changes_after_error(ctx, changes, err);
-                            }
-                        }
-                        TupleLockWaitPolicy::NoWait => {
-                            return restore_tuple_changes_after_error(
-                                ctx,
-                                changes,
-                                DbError::execute(
-                                    SqlState::LockNotAvailable,
-                                    "could not obtain tuple lock on row",
-                                ),
-                            );
-                        }
-                        TupleLockWaitPolicy::SkipLocked => {
-                            restore_tuple_changes(ctx, changes)?;
-                            return Ok(LockRowResult::Skipped);
-                        }
-                    },
-                    Ok(other) => break other,
-                    Err(err) => return restore_tuple_changes_after_error(ctx, changes, err),
-                }
-            };
-            match latest {
-                LatestRowVersion::Live { row, .. } => {
-                    let current_tag = TupleLockTag {
-                        table,
-                        key: row.identity().key.clone(),
-                    };
-                    if held_tags.contains(&current_tag) {
-                        return Ok(LockRowResult::Locked(LockedRow::from_lock_grant(
-                            table,
-                            ctx.txn_id,
-                            row.identity().clone(),
-                            row.row().clone(),
-                            mode,
-                        )));
-                    }
-                    next_tag = current_tag;
-                }
-                LatestRowVersion::Deleted => {
-                    restore_tuple_changes(ctx, changes)?;
-                    return Ok(LockRowResult::Deleted);
-                }
-                LatestRowVersion::WouldBlock(_) => {
-                    return restore_tuple_changes_after_error(
-                        ctx,
-                        changes,
-                        storage_internal(
-                            "in-progress row version escaped the tuple-lock wait loop",
-                        ),
-                    );
-                }
-            }
-        }
+        let (result, _retained_changes) =
+            self.lock_row_with_changes(ctx, relations, table, identity, mode, wait_policy)?;
+        Ok(result)
     }
 
     fn update_locked(
@@ -2427,59 +2370,31 @@ impl StorageEngine for PageBackedStorageEngine {
         row: Row,
     ) -> Result<bool> {
         let relations = pagebacked_relations(relations)?;
-        self.ensure_current_generation_for_write(relations, table)?;
-        let table_handle = self.table_handle(relations, table)?;
-        let schema = table_handle.schema.clone();
-        let index_fid = table_handle.primary_index_file_id;
-        let btree = self.btree(index_fid);
-        // Locate the version this statement's snapshot sees (the row the executor
-        // matched), NOT an arbitrary `search(key)` entry. The primary-key index may
-        // carry an entry per version once versioning lands (and after a
-        // delete-then-reinsert there are several entries for the key), so targeting
-        // the *visible* version is what makes the right row the one updated. If none
-        // is visible the key was already deleted or is absent, so the update affects
-        // no row — preserve the no-op semantics.
-        let visible = {
-            let rewrite_latch = self.identity_rewrite_latch(table);
-            let _rewrite_guard = rewrite_latch.read();
-            self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
-        };
-        let Some((previous_location, _infomask)) = visible else {
-            return Ok(false);
-        };
-        let (resolved, xmin, _previous_row) = self
-            .read_visible_row(ctx, relations, &schema, previous_location)?
-            .ok_or_else(|| storage_internal("visible row disappeared during update"))?;
+        let schema = self.table_handle(relations, table)?.schema.clone();
         let mode = if schema.primary_key.is_empty() || primary_key_for_row(&schema, &row)? == *key {
             TupleLockMode::NoKeyUpdate
         } else {
             TupleLockMode::Update
         };
-        let identity = common::RowIdentity {
-            row_id: RowId {
-                page_num: resolved.page_num,
-                slot_num: resolved.slot_num,
-            },
-            xmin,
-            key: key.clone(),
-        };
-        match StorageEngine::lock_row(
-            self,
+        self.update_visible_with_lock_mode(ctx, relations, table, key, row, mode)
+    }
+
+    fn update_requiring_update_lock(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool> {
+        self.update_visible_with_lock_mode(
             ctx,
-            relations,
+            pagebacked_relations(relations)?,
             table,
-            &identity,
-            mode,
-            TupleLockWaitPolicy::Block,
-        )? {
-            LockRowResult::Locked(target) if *target.identity() == identity => {
-                StorageEngine::update_locked(self, ctx, relations, table, &target, row)
-            }
-            LockRowResult::Locked(_) | LockRowResult::Deleted => Err(concurrent_update_error()),
-            LockRowResult::Skipped => Err(storage_internal(
-                "blocking update tuple-lock acquisition skipped a row",
-            )),
-        }
+            key,
+            row,
+            TupleLockMode::Update,
+        )
     }
 
     fn scan(

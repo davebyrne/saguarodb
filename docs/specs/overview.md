@@ -1786,6 +1786,24 @@ pub trait StorageEngine: Send + Sync {
         key: &Key,
     ) -> Result<Option<Row>>;
 
+    /// Current-state declared PK/UNIQUE probe; retains KeyShare when found.
+    fn referenced_key_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        access_index: IndexId,
+        key: &Key,
+    ) -> Result<bool>;
+
+    /// Current-state child lookup through an exact index or bounded heap scan.
+    fn dependent_row_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        probe: DependentRowProbe<'_>,
+    ) -> Result<bool>;
+
     /// Lock a scan-time identity and resolve its latest physical row version.
     fn lock_row(
         &self,
@@ -1825,6 +1843,16 @@ pub trait StorageEngine: Send + Sync {
 
     /// Update by storage identity key
     fn update(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool>;
+
+    /// Update while requiring Update even when the storage identity is unchanged.
+    fn update_requiring_update_lock(
         &self,
         ctx: &StatementContext,
         relations: &dyn RelationSnapshot,
@@ -1884,6 +1912,16 @@ pub trait SchemaOperations: Send + Sync {
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
 }
 ```
+
+The referential probes use current CLOG/infomask liveness rather than ordinary
+statement visibility. Matching in-progress creators/deleters are waited through
+the shared conflict/deadlock/cancellation machinery and the access path is then
+restarted with no structural or frame latch retained. Parent success rechecks
+HOT/update chains and retains `KeyShare` on the actual current identity. Child
+lookup processes exact-index candidates or bounded heap-page HOT-root batches,
+validates REDIRECT/HOT topology, and may exclude one identity for self-reference.
+Read Committed accepts settled current state; retained-snapshot isolation returns
+`40001` when a required current row is outside that snapshot.
 
 Every operation takes a `StatementContext`. It carries the `txn_id`, the MVCC `snapshot` used for visibility, the `isolation` level, and the `gc_horizon` — so each storage operation sees and stamps versions consistently without changing any call sites.
 

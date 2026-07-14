@@ -3,7 +3,7 @@ use common::{
     ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexConstraintKind, IndexId,
     IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result, Row, RowId, RowIdentity,
     SqlState, StatementContext, StoredRow, TableId, TableSchema, TupleLockAcquire,
-    TupleLockManager, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, Value,
+    TupleLockManager, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnStatus, Value,
 };
 use planner::{ExplainAnalysis, PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
@@ -11,7 +11,8 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::{
-    LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+    DependentRowProbe, LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations,
+    StorageEngine,
 };
 
 use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine, RowSink};
@@ -372,6 +373,31 @@ pub(crate) fn memory_statement_context(txn_id: u64) -> StatementContext {
     StatementContext::new(txn_id).with_tuple_lock_manager(Arc::new(PermissiveMemoryTupleLocks))
 }
 
+fn restore_memory_lock_change(
+    ctx: &StatementContext,
+    change: Option<common::TupleLockGrantChange>,
+) -> Result<()> {
+    match change {
+        Some(change) => ctx
+            .tuple_locks
+            .restore_tuple_grants(ctx.txn_id, vec![change]),
+        None => Ok(()),
+    }
+}
+
+fn restore_memory_lock_change_after_error<T>(
+    ctx: &StatementContext,
+    change: Option<common::TupleLockGrantChange>,
+    original: DbError,
+) -> Result<T> {
+    match restore_memory_lock_change(ctx, change) {
+        Ok(()) => Err(original),
+        Err(restore) => Err(DbError::internal(format!(
+            "foreign-key probe failed ({original}); restoring its tuple-lock grant also failed ({restore})"
+        ))),
+    }
+}
+
 #[derive(Default)]
 pub struct MemoryStorage {
     state: Mutex<MemoryStorageState>,
@@ -386,6 +412,9 @@ struct MemoryStorageState {
     next_key: i64,
     next_row_id: u64,
     savepoints: BTreeMap<u64, MemoryStorageSnapshot>,
+    probe_txn_statuses: BTreeMap<u64, TxnStatus>,
+    probe_deleters: BTreeMap<(TableId, Key, RowId, u64), u64>,
+    probe_pending_rows: BTreeMap<(TableId, Key), Vec<MemoryStoredRow>>,
 }
 
 #[derive(Clone)]
@@ -404,7 +433,177 @@ struct MemoryStoredRow {
     predecessors: Vec<(RowId, u64)>,
 }
 
+enum MemoryProbeCandidate<T> {
+    Missing,
+    Wait(u64),
+    Found(T),
+}
+
+enum MemoryProbeRowState {
+    Dead,
+    Wait(u64),
+    Live,
+}
+
+fn memory_probe_creator_state(
+    state: &MemoryStorageState,
+    ctx: &StatementContext,
+    xmin: u64,
+) -> TxnStatus {
+    if ctx.live_txns.contains(&xmin) {
+        TxnStatus::Committed
+    } else {
+        state
+            .probe_txn_statuses
+            .get(&xmin)
+            .copied()
+            .unwrap_or(TxnStatus::Committed)
+    }
+}
+
+fn memory_probe_row_state(
+    state: &MemoryStorageState,
+    ctx: &StatementContext,
+    table: TableId,
+    identity_key: &Key,
+    row_id: RowId,
+    xmin: u64,
+) -> MemoryProbeRowState {
+    match memory_probe_creator_state(state, ctx, xmin) {
+        TxnStatus::Aborted => return MemoryProbeRowState::Dead,
+        TxnStatus::InProgress => return MemoryProbeRowState::Wait(xmin),
+        TxnStatus::Committed => {}
+    }
+    let Some(deleter) = state
+        .probe_deleters
+        .get(&(table, identity_key.clone(), row_id, xmin))
+    else {
+        return MemoryProbeRowState::Live;
+    };
+    if ctx.live_txns.contains(deleter) {
+        return MemoryProbeRowState::Dead;
+    }
+    match state
+        .probe_txn_statuses
+        .get(deleter)
+        .copied()
+        .unwrap_or(TxnStatus::Committed)
+    {
+        TxnStatus::Aborted => MemoryProbeRowState::Live,
+        TxnStatus::InProgress => MemoryProbeRowState::Wait(*deleter),
+        TxnStatus::Committed => MemoryProbeRowState::Dead,
+    }
+}
+
+fn memory_probe_rows(state: &MemoryStorageState, table: TableId) -> Vec<(Key, MemoryStoredRow)> {
+    let mut rows = state
+        .rows
+        .get(&table)
+        .map(|rows| {
+            rows.iter()
+                .map(|(key, row)| (key.clone(), row.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    rows.extend(
+        state
+            .probe_pending_rows
+            .iter()
+            .filter(|((pending_table, _), _)| *pending_table == table)
+            .flat_map(|((_, key), rows)| rows.iter().cloned().map(|row| (key.clone(), row))),
+    );
+    rows
+}
+
+fn ensure_memory_current_visible(ctx: &StatementContext, identity: &RowIdentity) -> Result<()> {
+    if ctx.isolation == common::IsolationLevel::ReadCommitted
+        || ctx.live_txns.contains(&identity.xmin)
+        || (identity.xmin < ctx.snapshot.xmax && !ctx.snapshot.xip.contains(&identity.xmin))
+    {
+        return Ok(());
+    }
+    Err(DbError::execute(
+        SqlState::SerializationFailure,
+        "could not serialize access due to concurrent foreign key change",
+    ))
+}
+
 impl MemoryStorage {
+    fn lock_row_with_change(
+        &self,
+        ctx: &StatementContext,
+        table: TableId,
+        identity: &RowIdentity,
+        mode: TupleLockMode,
+        wait_policy: TupleLockWaitPolicy,
+    ) -> Result<(LockRowResult, Option<common::TupleLockGrantChange>)> {
+        let change = match ctx.tuple_locks.acquire_tuple(
+            ctx.txn_id,
+            &TupleLockTag {
+                table,
+                key: identity.key.clone(),
+            },
+            mode,
+            wait_policy,
+            ctx.cancel.as_ref(),
+        )? {
+            TupleLockAcquire::Acquired(change) => change,
+            TupleLockAcquire::Skipped => return Ok((LockRowResult::Skipped, None)),
+        };
+        let lookup = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))
+            .map(|state| {
+                state
+                    .rows
+                    .get(&table)
+                    .and_then(|rows| rows.get(&identity.key))
+                    .filter(|stored| {
+                        (stored.row_id == identity.row_id && stored.xmin == identity.xmin)
+                            || stored
+                                .predecessors
+                                .contains(&(identity.row_id, identity.xmin))
+                    })
+                    .map(|stored| {
+                        (
+                            RowIdentity {
+                                row_id: stored.row_id,
+                                xmin: stored.xmin,
+                                key: identity.key.clone(),
+                            },
+                            stored.row.clone(),
+                        )
+                    })
+            });
+        match lookup {
+            Ok(Some((current_identity, row))) => Ok((
+                LockRowResult::Locked(LockedRow::from_lock_grant(
+                    table,
+                    ctx.txn_id,
+                    current_identity,
+                    row,
+                    mode,
+                )),
+                Some(change),
+            )),
+            Ok(None) => {
+                ctx.tuple_locks
+                    .restore_tuple_grants(ctx.txn_id, vec![change])?;
+                Ok((LockRowResult::Deleted, None))
+            }
+            Err(err) => match ctx
+                .tuple_locks
+                .restore_tuple_grants(ctx.txn_id, vec![change])
+            {
+                Ok(()) => Err(err),
+                Err(restore) => Err(DbError::internal(format!(
+                    "row lookup failed ({err}); restoring its tuple-lock grant also failed ({restore})"
+                ))),
+            },
+        }
+    }
+
     pub fn empty() -> Self {
         Self::default()
     }
@@ -491,36 +690,112 @@ impl MemoryStorage {
         }
 
         let Some(row) = replacement else {
-            state
+            let previous = state
                 .rows
                 .get_mut(&table)
                 .expect("validated table rows")
-                .remove(&target.identity().key);
+                .remove(&target.identity().key)
+                .ok_or_else(|| DbError::internal("validated row disappeared"))?;
+            let pending_key = (table, target.identity().key.clone());
+            let deleter_key = (
+                table,
+                target.identity().key.clone(),
+                previous.row_id,
+                previous.xmin,
+            );
+            state
+                .probe_pending_rows
+                .entry(pending_key.clone())
+                .or_default()
+                .push(previous);
+            state.probe_deleters.insert(deleter_key, ctx.txn_id);
             return Ok(true);
         };
         let replacement_key =
             storage_identity_key_for_update(&schema, &target.identity().key, &row)?;
         validate_unique_indexes(&state, &schema, Some(&target.identity().key), &row)?;
         let replacement_row_id = allocate_memory_row_id(&mut state)?;
-        let rows = state.rows.get_mut(&table).expect("validated table rows");
-        if replacement_key != target.identity().key && rows.contains_key(&replacement_key) {
-            return Err(duplicate_storage_identity_error(&schema));
-        }
-        let previous = rows
-            .remove(&target.identity().key)
-            .expect("validated locked row");
+        let previous = {
+            let rows = state.rows.get_mut(&table).expect("validated table rows");
+            if replacement_key != target.identity().key && rows.contains_key(&replacement_key) {
+                return Err(duplicate_storage_identity_error(&schema));
+            }
+            rows.remove(&target.identity().key)
+                .expect("validated locked row")
+        };
+        let pending_key = (table, target.identity().key.clone());
+        let deleter_key = (
+            table,
+            target.identity().key.clone(),
+            previous.row_id,
+            previous.xmin,
+        );
+        state
+            .probe_pending_rows
+            .entry(pending_key.clone())
+            .or_default()
+            .push(previous.clone());
+        state.probe_deleters.insert(deleter_key, ctx.txn_id);
         let mut predecessors = previous.predecessors;
         predecessors.push((previous.row_id, previous.xmin));
-        rows.insert(
-            replacement_key,
-            MemoryStoredRow {
-                row_id: replacement_row_id,
-                xmin: ctx.txn_id,
-                row,
-                predecessors,
-            },
-        );
+        state
+            .rows
+            .get_mut(&table)
+            .expect("validated table rows")
+            .insert(
+                replacement_key,
+                MemoryStoredRow {
+                    row_id: replacement_row_id,
+                    xmin: ctx.txn_id,
+                    row,
+                    predecessors,
+                },
+            );
         Ok(true)
+    }
+
+    fn update_with_lock_mode(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+        mode: TupleLockMode,
+    ) -> Result<bool> {
+        let identity = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?
+            .rows
+            .get(&table)
+            .and_then(|rows| rows.get(key))
+            .map(|stored| RowIdentity {
+                row_id: stored.row_id,
+                xmin: stored.xmin,
+                key: key.clone(),
+            });
+        let Some(identity) = identity else {
+            return Ok(false);
+        };
+        match self.lock_row(
+            ctx,
+            relations,
+            table,
+            &identity,
+            mode,
+            TupleLockWaitPolicy::Block,
+        )? {
+            LockRowResult::Locked(target) if target.identity() == &identity => {
+                self.update_locked(ctx, relations, table, &target, row)
+            }
+            LockRowResult::Locked(_) | LockRowResult::Deleted => {
+                Err(memory_concurrent_update_error())
+            }
+            LockRowResult::Skipped => Err(DbError::internal(
+                "blocking test-storage update skipped a row",
+            )),
+        }
     }
 }
 
@@ -599,6 +874,205 @@ impl StorageEngine for MemoryStorage {
             .map(|stored| stored.row.clone()))
     }
 
+    fn referenced_key_exists(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        access_index: IndexId,
+        key: &Key,
+    ) -> Result<bool> {
+        loop {
+            let candidate = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| DbError::internal("storage lock poisoned"))?;
+                let schema = state
+                    .schemas
+                    .get(&table)
+                    .ok_or_else(|| undefined_table(table))?;
+                let columns = if access_index == common::PRIMARY_KEY_INDEX_ID {
+                    if schema.primary_key.is_empty() {
+                        return Err(DbError::internal(
+                            "foreign-key probe selected a missing test-storage primary key",
+                        ));
+                    }
+                    schema.primary_key.clone()
+                } else {
+                    let index = state
+                        .indexes
+                        .get(&access_index)
+                        .filter(|index| {
+                            index.table == table && index.constraint == IndexConstraintKind::Unique
+                        })
+                        .ok_or_else(|| undefined_index(access_index))?;
+                    index.columns.clone()
+                };
+                let mut candidate = MemoryProbeCandidate::Missing;
+                for (identity_key, stored) in memory_probe_rows(&state, table) {
+                    ctx.cancel.check()?;
+                    if key_for_columns(schema, &columns, &stored.row)? == *key {
+                        match memory_probe_row_state(
+                            &state,
+                            ctx,
+                            table,
+                            &identity_key,
+                            stored.row_id,
+                            stored.xmin,
+                        ) {
+                            MemoryProbeRowState::Dead => continue,
+                            MemoryProbeRowState::Wait(blocker) => {
+                                candidate = MemoryProbeCandidate::Wait(blocker);
+                                break;
+                            }
+                            MemoryProbeRowState::Live => {
+                                candidate = MemoryProbeCandidate::Found((
+                                    RowIdentity {
+                                        row_id: stored.row_id,
+                                        xmin: stored.xmin,
+                                        key: identity_key,
+                                    },
+                                    columns.clone(),
+                                    schema.clone(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+                candidate
+            };
+            let (identity, columns, schema) = match candidate {
+                MemoryProbeCandidate::Missing => return Ok(false),
+                MemoryProbeCandidate::Wait(blocker) => {
+                    ctx.conflict_waiter
+                        .wait_for(ctx.txn_id, blocker, ctx.cancel.as_ref())?;
+                    continue;
+                }
+                MemoryProbeCandidate::Found(candidate) => candidate,
+            };
+            let (lock_result, change) = self.lock_row_with_change(
+                ctx,
+                table,
+                &identity,
+                TupleLockMode::KeyShare,
+                TupleLockWaitPolicy::Block,
+            )?;
+            match lock_result {
+                LockRowResult::Locked(locked) => {
+                    let current_key = match key_for_columns(&schema, &columns, locked.row()) {
+                        Ok(current_key) => current_key,
+                        Err(err) => {
+                            return restore_memory_lock_change_after_error(ctx, change, err);
+                        }
+                    };
+                    if current_key == *key {
+                        if let Err(err) = ensure_memory_current_visible(ctx, locked.identity()) {
+                            return restore_memory_lock_change_after_error(ctx, change, err);
+                        }
+                        return Ok(true);
+                    }
+                    restore_memory_lock_change(ctx, change)?;
+                }
+                LockRowResult::Deleted => {}
+                LockRowResult::Skipped => {
+                    return Err(DbError::internal(
+                        "blocking foreign-key test-storage probe skipped a row",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn dependent_row_exists(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        probe: DependentRowProbe<'_>,
+    ) -> Result<bool> {
+        let DependentRowProbe {
+            table,
+            columns,
+            key,
+            supporting_index,
+            excluded,
+        } = probe;
+        loop {
+            let candidate = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| DbError::internal("storage lock poisoned"))?;
+                let schema = state
+                    .schemas
+                    .get(&table)
+                    .ok_or_else(|| undefined_table(table))?;
+                if let Some(index_id) = supporting_index {
+                    if index_id == common::PRIMARY_KEY_INDEX_ID {
+                        if schema.primary_key != columns {
+                            return Err(DbError::internal(
+                                "foreign-key test-storage primary index does not match child columns",
+                            ));
+                        }
+                    } else if !state
+                        .indexes
+                        .get(&index_id)
+                        .is_some_and(|index| index.table == table && index.columns == columns)
+                    {
+                        return Err(DbError::internal(
+                            "foreign-key test-storage child index metadata is inconsistent",
+                        ));
+                    }
+                }
+                let mut candidate = MemoryProbeCandidate::Missing;
+                for (identity_key, stored) in memory_probe_rows(&state, table) {
+                    ctx.cancel.check()?;
+                    let identity = RowIdentity {
+                        row_id: stored.row_id,
+                        xmin: stored.xmin,
+                        key: identity_key.clone(),
+                    };
+                    if excluded.is_some_and(|excluded| excluded == &identity)
+                        || key_for_columns(schema, columns, &stored.row)? != *key
+                    {
+                        continue;
+                    }
+                    match memory_probe_row_state(
+                        &state,
+                        ctx,
+                        table,
+                        &identity_key,
+                        stored.row_id,
+                        stored.xmin,
+                    ) {
+                        MemoryProbeRowState::Dead => {}
+                        MemoryProbeRowState::Wait(blocker) => {
+                            candidate = MemoryProbeCandidate::Wait(blocker);
+                            break;
+                        }
+                        MemoryProbeRowState::Live => {
+                            candidate = MemoryProbeCandidate::Found(identity);
+                            break;
+                        }
+                    }
+                }
+                candidate
+            };
+            match candidate {
+                MemoryProbeCandidate::Missing => return Ok(false),
+                MemoryProbeCandidate::Wait(blocker) => {
+                    ctx.conflict_waiter
+                        .wait_for(ctx.txn_id, blocker, ctx.cancel.as_ref())?;
+                }
+                MemoryProbeCandidate::Found(identity) => {
+                    ensure_memory_current_visible(ctx, &identity)?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     fn lock_row(
         &self,
         ctx: &StatementContext,
@@ -608,67 +1082,9 @@ impl StorageEngine for MemoryStorage {
         mode: TupleLockMode,
         wait_policy: TupleLockWaitPolicy,
     ) -> Result<LockRowResult> {
-        let change = match ctx.tuple_locks.acquire_tuple(
-            ctx.txn_id,
-            &TupleLockTag {
-                table,
-                key: identity.key.clone(),
-            },
-            mode,
-            wait_policy,
-            ctx.cancel.as_ref(),
-        )? {
-            TupleLockAcquire::Acquired(change) => change,
-            TupleLockAcquire::Skipped => return Ok(LockRowResult::Skipped),
-        };
-        let lookup = self
-            .state
-            .lock()
-            .map_err(|_| DbError::internal("storage lock poisoned"))
-            .map(|state| {
-                state
-                    .rows
-                    .get(&table)
-                    // Memory storage keeps only the current version. Resolve by the
-                    // stable logical key so executor tests exercise the same
-                    // scan-old/lock-latest contract as page-backed storage.
-                    .and_then(|rows| rows.get(&identity.key))
-                    .filter(|stored| {
-                        (stored.row_id == identity.row_id && stored.xmin == identity.xmin)
-                            || stored
-                                .predecessors
-                                .contains(&(identity.row_id, identity.xmin))
-                    })
-                    .map(|stored| {
-                        (
-                            RowIdentity {
-                                row_id: stored.row_id,
-                                xmin: stored.xmin,
-                                key: identity.key.clone(),
-                            },
-                            stored.row.clone(),
-                        )
-                    })
-            });
-        match lookup {
-            Ok(Some((current_identity, row))) => Ok(LockRowResult::Locked(
-                LockedRow::from_lock_grant(table, ctx.txn_id, current_identity, row, mode),
-            )),
-            Ok(None) => {
-                ctx.tuple_locks
-                    .restore_tuple_grants(ctx.txn_id, vec![change])?;
-                Ok(LockRowResult::Deleted)
-            }
-            Err(err) => match ctx
-                .tuple_locks
-                .restore_tuple_grants(ctx.txn_id, vec![change])
-            {
-                Ok(()) => Err(err),
-                Err(restore) => Err(DbError::internal(format!(
-                    "row lookup failed ({err}); restoring its tuple-lock grant also failed ({restore})"
-                ))),
-            },
-        }
+        let (result, _retained_change) =
+            self.lock_row_with_change(ctx, table, identity, mode, wait_policy)?;
+        Ok(result)
     }
 
     fn update_locked(
@@ -751,37 +1167,24 @@ impl StorageEngine for MemoryStorage {
             .cloned()
             .ok_or_else(|| undefined_table(table))?;
         let replacement_key = storage_identity_key_for_update(&schema, key, &row)?;
-        let Some(stored) = state.rows.get(&table).and_then(|rows| rows.get(key)) else {
-            return Ok(false);
-        };
-        let identity = RowIdentity {
-            row_id: stored.row_id,
-            xmin: stored.xmin,
-            key: key.clone(),
-        };
         drop(state);
         let mode = if replacement_key == *key {
             TupleLockMode::NoKeyUpdate
         } else {
             TupleLockMode::Update
         };
-        match self.lock_row(
-            ctx,
-            relations,
-            table,
-            &identity,
-            mode,
-            TupleLockWaitPolicy::Block,
-        )? {
-            LockRowResult::Locked(target) if target.identity() == &identity => {
-                self.update_locked(ctx, relations, table, &target, row)
-            }
-            LockRowResult::Locked(_) => Err(memory_concurrent_update_error()),
-            LockRowResult::Deleted => Err(memory_concurrent_update_error()),
-            LockRowResult::Skipped => {
-                unreachable!("blocking tuple-lock acquisition cannot skip a row")
-            }
-        }
+        self.update_with_lock_mode(ctx, relations, table, key, row, mode)
+    }
+
+    fn update_requiring_update_lock(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool> {
+        self.update_with_lock_mode(ctx, relations, table, key, row, TupleLockMode::Update)
     }
 
     fn scan(
@@ -905,6 +1308,8 @@ impl StorageEngine for MemoryStorage {
             state.rows = snapshot.rows;
             state.next_key = snapshot.next_key;
         }
+        state.probe_txn_statuses.insert(txn_id, TxnStatus::Aborted);
+        clear_memory_probe_deletions(&mut state, txn_id);
         Ok(())
     }
 
@@ -914,6 +1319,10 @@ impl StorageEngine for MemoryStorage {
             .lock()
             .map_err(|_| DbError::internal("storage lock poisoned"))?;
         state.savepoints.remove(&txn_id);
+        state
+            .probe_txn_statuses
+            .insert(txn_id, TxnStatus::Committed);
+        clear_memory_probe_deletions(&mut state, txn_id);
         Ok(())
     }
 }
@@ -1035,6 +1444,22 @@ fn begin_txn(state: &mut MemoryStorageState, txn_id: u64) {
             next_key: state.next_key,
         },
     );
+    state
+        .probe_txn_statuses
+        .insert(txn_id, TxnStatus::InProgress);
+}
+
+fn clear_memory_probe_deletions(state: &mut MemoryStorageState, txn_id: u64) {
+    let keys = state
+        .probe_deleters
+        .iter()
+        .filter(|(_, deleter)| **deleter == txn_id)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        state.probe_deleters.remove(&key);
+        state.probe_pending_rows.remove(&(key.0, key.1));
+    }
 }
 
 struct MemoryRowIterator {
@@ -1251,6 +1676,10 @@ fn index_key(schema: &TableSchema, index: &IndexSchema, row: &Row) -> Result<Key
     Ok(key)
 }
 
+fn key_for_columns(schema: &TableSchema, columns: &[ColumnId], row: &Row) -> Result<Key> {
+    row_key_for_columns(schema, columns, row).map(|(key, _has_null)| key)
+}
+
 fn row_key_for_columns(
     schema: &TableSchema,
     columns: &[ColumnId],
@@ -1368,6 +1797,7 @@ mod memory_storage_identity_tests {
         storage: Arc<MemoryStorage>,
         table: TableId,
         mutation: Mutex<Option<InterveningMutation>>,
+        restored: AtomicUsize,
     }
 
     impl std::fmt::Debug for InterveningTupleLocks {
@@ -1401,6 +1831,7 @@ mod memory_storage_identity_tests {
                             .update(&ctx, relations.as_ref(), self.table, &tag.key, row)?;
                     }
                 }
+                self.storage.commit_txn(99)?;
             }
             Ok(TupleLockAcquire::Acquired(
                 TupleLockGrantChange::manager_receipt(()),
@@ -1410,13 +1841,81 @@ mod memory_storage_identity_tests {
         fn restore_tuple_grants(
             &self,
             _xid: u64,
-            _changes: Vec<TupleLockGrantChange>,
+            changes: Vec<TupleLockGrantChange>,
         ) -> Result<()> {
+            self.restored.fetch_add(changes.len(), Ordering::SeqCst);
             Ok(())
         }
 
         fn holds_tuple(&self, _xid: u64, _tag: &TupleLockTag, _mode: TupleLockMode) -> bool {
             true
+        }
+    }
+
+    struct SettlingProbeWaiter {
+        storage: Arc<MemoryStorage>,
+        blocker: u64,
+        final_status: TxnStatus,
+        waits: AtomicUsize,
+    }
+
+    impl std::fmt::Debug for SettlingProbeWaiter {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SettlingProbeWaiter")
+                .field("blocker", &self.blocker)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl common::ConflictWaiter for SettlingProbeWaiter {
+        fn wait_for(&self, _waiter: u64, blocker: u64, cancel: &QueryCancel) -> Result<()> {
+            cancel.check()?;
+            if blocker != self.blocker {
+                return Err(DbError::internal("unexpected memory probe blocker"));
+            }
+            self.storage
+                .state
+                .lock()
+                .map_err(|_| DbError::internal("storage lock poisoned"))?
+                .probe_txn_statuses
+                .insert(blocker, self.final_status);
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProbeFinalization {
+        Commit,
+        Rollback,
+    }
+
+    struct FinalizingProbeWaiter {
+        storage: Arc<MemoryStorage>,
+        blocker: u64,
+        finalization: ProbeFinalization,
+    }
+
+    impl std::fmt::Debug for FinalizingProbeWaiter {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("FinalizingProbeWaiter")
+                .field("blocker", &self.blocker)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl common::ConflictWaiter for FinalizingProbeWaiter {
+        fn wait_for(&self, _waiter: u64, blocker: u64, cancel: &QueryCancel) -> Result<()> {
+            cancel.check()?;
+            if blocker != self.blocker {
+                return Err(DbError::internal("unexpected memory probe blocker"));
+            }
+            match self.finalization {
+                ProbeFinalization::Commit => self.storage.commit_txn(blocker),
+                ProbeFinalization::Rollback => self.storage.rollback_txn(blocker),
+            }
         }
     }
 
@@ -1703,6 +2202,7 @@ mod memory_storage_identity_tests {
                 storage: Arc::clone(&storage),
                 table: schema.id,
                 mutation: Mutex::new(Some(InterveningMutation::Delete)),
+                restored: AtomicUsize::new(0),
             }));
         let update_err = storage
             .update(
@@ -1737,6 +2237,7 @@ mod memory_storage_identity_tests {
                     1,
                     "intervening update",
                 )))),
+                restored: AtomicUsize::new(0),
             }));
         let delete_err = storage
             .delete(&updating, relations.as_ref(), schema.id, &key)
@@ -1747,6 +2248,558 @@ mod memory_storage_identity_tests {
                 .get(&updating, relations.as_ref(), schema.id, &key)
                 .unwrap(),
             Some(user(1, "intervening update"))
+        );
+    }
+
+    #[test]
+    fn referenced_probe_restores_rejected_intervening_update_lock() {
+        let (storage, schema, relations) = storage_with_users();
+        let storage = Arc::new(storage);
+        let index = IndexSchema {
+            id: 1,
+            schema_id: schema.schema_id,
+            storage_id: 101,
+            table: schema.id,
+            name: "users_name_key".to_string(),
+            columns: vec![1],
+            unique: true,
+            constraint: IndexConstraintKind::Unique,
+        };
+        storage
+            .create_index(&memory_statement_context(0), &index, 0)
+            .unwrap();
+        storage
+            .insert(
+                &memory_statement_context(1),
+                relations.as_ref(),
+                schema.id,
+                user(1, "old"),
+            )
+            .unwrap();
+        storage.commit_txn(1).unwrap();
+        let locks = Arc::new(InterveningTupleLocks {
+            storage: Arc::clone(&storage),
+            table: schema.id,
+            mutation: Mutex::new(Some(InterveningMutation::Update(user(1, "new")))),
+            restored: AtomicUsize::new(0),
+        });
+        let probe = memory_statement_context(2).with_tuple_lock_manager(locks.clone());
+        assert!(
+            !storage
+                .referenced_key_exists(
+                    &probe,
+                    relations.as_ref(),
+                    schema.id,
+                    index.id,
+                    &Key(vec![Value::Text("old".to_string())]),
+                )
+                .unwrap()
+        );
+        assert_eq!(locks.restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn foreign_key_probe_double_waits_cancels_and_enforces_retained_snapshot() {
+        let (storage, schema, relations) = storage_with_users();
+        let storage = Arc::new(storage);
+        storage
+            .insert(
+                &memory_statement_context(10),
+                relations.as_ref(),
+                schema.id,
+                user(1, "parent"),
+            )
+            .unwrap();
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .probe_txn_statuses
+            .insert(10, TxnStatus::InProgress);
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 10,
+            final_status: TxnStatus::Committed,
+            waits: AtomicUsize::new(0),
+        });
+        let current = StatementContext::with_snapshot(
+            20,
+            Arc::new(common::Snapshot {
+                xmin: 10,
+                xmax: 21,
+                xip: vec![10],
+            }),
+        )
+        .with_tuple_lock_manager(Arc::new(TestTupleLocks))
+        .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            storage
+                .referenced_key_exists(
+                    &current,
+                    relations.as_ref(),
+                    schema.id,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .probe_txn_statuses
+            .insert(10, TxnStatus::InProgress);
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 10,
+            final_status: TxnStatus::Committed,
+            waits: AtomicUsize::new(0),
+        });
+        let current = StatementContext::with_snapshot(
+            20,
+            Arc::new(common::Snapshot {
+                xmin: 10,
+                xmax: 21,
+                xip: vec![10],
+            }),
+        )
+        .with_tuple_lock_manager(Arc::new(TestTupleLocks))
+        .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            storage
+                .dependent_row_exists(
+                    &current,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[0],
+                        key: &Key(vec![Value::Integer(1)]),
+                        supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        let identity_key = Key(vec![Value::Integer(1)]);
+        {
+            let mut state = storage.state.lock().unwrap();
+            let stored = state
+                .rows
+                .get(&schema.id)
+                .and_then(|rows| rows.get(&identity_key))
+                .cloned()
+                .unwrap();
+            state.probe_deleters.insert(
+                (schema.id, identity_key.clone(), stored.row_id, stored.xmin),
+                50,
+            );
+            state.probe_txn_statuses.insert(50, TxnStatus::InProgress);
+        }
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 50,
+            final_status: TxnStatus::Committed,
+            waits: AtomicUsize::new(0),
+        });
+        let deleting = memory_statement_context(60)
+            .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            !storage
+                .referenced_key_exists(
+                    &deleting,
+                    relations.as_ref(),
+                    schema.id,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    &identity_key,
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .probe_txn_statuses
+            .insert(50, TxnStatus::InProgress);
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 50,
+            final_status: TxnStatus::Aborted,
+            waits: AtomicUsize::new(0),
+        });
+        let deleting = memory_statement_context(61)
+            .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            storage
+                .referenced_key_exists(
+                    &deleting,
+                    relations.as_ref(),
+                    schema.id,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    &identity_key,
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .probe_txn_statuses
+            .insert(50, TxnStatus::InProgress);
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 50,
+            final_status: TxnStatus::Committed,
+            waits: AtomicUsize::new(0),
+        });
+        let deleting = memory_statement_context(62)
+            .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            !storage
+                .dependent_row_exists(
+                    &deleting,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[0],
+                        key: &identity_key,
+                        supporting_index: None,
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        storage
+            .state
+            .lock()
+            .unwrap()
+            .probe_txn_statuses
+            .insert(50, TxnStatus::InProgress);
+        let waiter = Arc::new(SettlingProbeWaiter {
+            storage: Arc::clone(&storage),
+            blocker: 50,
+            final_status: TxnStatus::Aborted,
+            waits: AtomicUsize::new(0),
+        });
+        let deleting = memory_statement_context(63)
+            .with_conflict_waiter(waiter.clone(), Arc::new(QueryCancel::new()));
+        assert!(
+            storage
+                .dependent_row_exists(
+                    &deleting,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[0],
+                        key: &identity_key,
+                        supporting_index: None,
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(waiter.waits.load(Ordering::SeqCst), 1);
+
+        let cancel = Arc::new(QueryCancel::new());
+        cancel.request(common::CancelReason::UserRequest);
+        let canceled = memory_statement_context(30).with_conflict_waiter(waiter, cancel);
+        let err = storage
+            .dependent_row_exists(
+                &canceled,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: schema.id,
+                    columns: &[0],
+                    key: &Key(vec![Value::Integer(1)]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
+
+        let retained = StatementContext::with_snapshot_and_isolation(
+            40,
+            Arc::new(common::Snapshot {
+                xmin: 1,
+                xmax: 10,
+                xip: Vec::new(),
+            }),
+            common::IsolationLevel::RepeatableRead,
+        )
+        .with_tuple_lock_manager(Arc::new(TestTupleLocks));
+        let err = storage
+            .referenced_key_exists(
+                &retained,
+                relations.as_ref(),
+                schema.id,
+                common::PRIMARY_KEY_INDEX_ID,
+                &Key(vec![Value::Integer(1)]),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::SerializationFailure);
+        let err = storage
+            .dependent_row_exists(
+                &retained,
+                relations.as_ref(),
+                DependentRowProbe {
+                    table: schema.id,
+                    columns: &[0],
+                    key: &Key(vec![Value::Integer(1)]),
+                    supporting_index: None,
+                    excluded: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::SerializationFailure);
+    }
+
+    #[test]
+    fn foreign_key_probe_double_tracks_normal_dml_creator_and_deleter_lifecycle() {
+        let (storage, schema, relations) = storage_with_users();
+        let storage = Arc::new(storage);
+        storage
+            .insert(
+                &memory_statement_context(10),
+                relations.as_ref(),
+                schema.id,
+                user(1, "committing creator"),
+            )
+            .unwrap();
+        let probe = memory_statement_context(20).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 10,
+                finalization: ProbeFinalization::Commit,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        assert!(
+            storage
+                .referenced_key_exists(
+                    &probe,
+                    relations.as_ref(),
+                    schema.id,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+
+        storage
+            .insert(
+                &memory_statement_context(11),
+                relations.as_ref(),
+                schema.id,
+                user(2, "aborting creator"),
+            )
+            .unwrap();
+        let probe = memory_statement_context(21).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 11,
+                finalization: ProbeFinalization::Rollback,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        assert!(
+            !storage
+                .dependent_row_exists(
+                    &probe,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[0],
+                        key: &Key(vec![Value::Integer(2)]),
+                        supporting_index: Some(common::PRIMARY_KEY_INDEX_ID),
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+
+        let delete = memory_statement_context(30);
+        assert!(
+            storage
+                .delete(
+                    &delete,
+                    relations.as_ref(),
+                    schema.id,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+        let probe = memory_statement_context(31).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 30,
+                finalization: ProbeFinalization::Rollback,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        assert!(
+            storage
+                .referenced_key_exists(
+                    &probe,
+                    relations.as_ref(),
+                    schema.id,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+
+        let delete = memory_statement_context(32);
+        assert!(
+            storage
+                .delete(
+                    &delete,
+                    relations.as_ref(),
+                    schema.id,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+        let probe = memory_statement_context(33).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 32,
+                finalization: ProbeFinalization::Commit,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        assert!(
+            !storage
+                .dependent_row_exists(
+                    &probe,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[0],
+                        key: &Key(vec![Value::Integer(1)]),
+                        supporting_index: None,
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn foreign_key_probe_double_retains_transaction_start_image_across_repeated_updates() {
+        let (storage, schema, relations) = storage_with_users();
+        let storage = Arc::new(storage);
+        let index = IndexSchema {
+            id: 1,
+            schema_id: schema.schema_id,
+            storage_id: 101,
+            table: schema.id,
+            name: "users_name_key".to_string(),
+            columns: vec![1],
+            unique: true,
+            constraint: IndexConstraintKind::Unique,
+        };
+        storage
+            .create_index(&memory_statement_context(0), &index, 0)
+            .unwrap();
+        storage
+            .insert(
+                &memory_statement_context(10),
+                relations.as_ref(),
+                schema.id,
+                user(1, "original"),
+            )
+            .unwrap();
+        storage.commit_txn(10).unwrap();
+        let update = memory_statement_context(30);
+        for name in ["middle", "final"] {
+            assert!(
+                storage
+                    .update(
+                        &update,
+                        relations.as_ref(),
+                        schema.id,
+                        &Key(vec![Value::Integer(1)]),
+                        user(1, name),
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            storage
+                .dependent_row_exists(
+                    &update,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[1],
+                        key: &Key(vec![Value::Text("final".to_string())]),
+                        supporting_index: Some(index.id),
+                        excluded: None,
+                    },
+                )
+                .unwrap()
+        );
+        let probe = memory_statement_context(40).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 30,
+                finalization: ProbeFinalization::Rollback,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        let original = Key(vec![Value::Text("original".to_string())]);
+        assert!(
+            storage
+                .referenced_key_exists(&probe, relations.as_ref(), schema.id, index.id, &original,)
+                .unwrap()
+        );
+
+        let update = memory_statement_context(31);
+        for name in ["middle", "final"] {
+            assert!(
+                storage
+                    .update(
+                        &update,
+                        relations.as_ref(),
+                        schema.id,
+                        &Key(vec![Value::Integer(1)]),
+                        user(1, name),
+                    )
+                    .unwrap()
+            );
+        }
+        let probe = memory_statement_context(41).with_conflict_waiter(
+            Arc::new(FinalizingProbeWaiter {
+                storage: Arc::clone(&storage),
+                blocker: 31,
+                finalization: ProbeFinalization::Commit,
+            }),
+            Arc::new(QueryCancel::new()),
+        );
+        assert!(
+            !storage
+                .dependent_row_exists(
+                    &probe,
+                    relations.as_ref(),
+                    DependentRowProbe {
+                        table: schema.id,
+                        columns: &[1],
+                        key: &original,
+                        supporting_index: Some(index.id),
+                        excluded: None,
+                    },
+                )
+                .unwrap()
         );
     }
 

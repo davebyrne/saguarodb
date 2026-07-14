@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use common::{
-    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId,
+    ColumnId, ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId,
     RowIdentity, SchemaId, SequenceId, SequenceSchema, StatementContext, StoredRow, TableId,
     TableSchema, TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, ViewSchema,
 };
@@ -68,6 +68,15 @@ pub enum LockRowResult {
     Skipped,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DependentRowProbe<'a> {
+    pub table: TableId,
+    pub columns: &'a [ColumnId],
+    pub key: &'a Key,
+    pub supporting_index: Option<IndexId>,
+    pub excluded: Option<&'a RowIdentity>,
+}
+
 pub trait RowIterator: Send {
     fn next(&mut self) -> Result<Option<StoredRow>>;
     fn schema(&self) -> &[ColumnInfo];
@@ -107,6 +116,25 @@ pub trait StorageEngine: Send + Sync {
         table: TableId,
         key: &Key,
     ) -> Result<Option<Row>>;
+    /// Probe a declared primary-key or UNIQUE constraint for a current referenced
+    /// row and retain `KeyShare` on the row identity when found.
+    fn referenced_key_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        access_index: IndexId,
+        key: &Key,
+    ) -> Result<bool>;
+    /// Probe current child rows whose ordered `columns` equal `key`. `supporting_index`
+    /// must name an exact-column child index when present. `excluded` suppresses one
+    /// physical identity for self-referential parent mutation.
+    fn dependent_row_exists(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        probe: DependentRowProbe<'_>,
+    ) -> Result<bool>;
     fn delete(
         &self,
         ctx: &StatementContext,
@@ -155,6 +183,16 @@ pub trait StorageEngine: Send + Sync {
     /// that page's committed-dead HOT prefixes (under the heap latch) to reclaim space
     /// before falling back to a normal update. A stale/smaller horizon only prunes less.
     fn update(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool>;
+    /// Update the visible row while requiring `TupleLockMode::Update`, even when
+    /// its primary-key storage identity is unchanged.
+    fn update_requiring_update_lock(
         &self,
         ctx: &StatementContext,
         relations: &dyn RelationSnapshot,

@@ -73,6 +73,14 @@ Those prerequisites and the MVCC layer itself are now implemented.
 
 ## 3. The model: Postgres-family MVCC
 
+Foreign-key storage probes use a separate current-state liveness view rather
+than ordinary statement visibility. They wait for in-progress creators/deleters,
+restart after each wait, and retain a parent `KeyShare` tuple lock before
+reporting a referenced row present. Child-dependent probes likewise inspect
+current committed/own versions through an exact index or heap extent. At retained
+snapshot isolation, relying on a required post-snapshot current row is a `40001`
+serialization failure; Read Committed accepts the newly settled state.
+
 ### 3.1 The governing principle — where old versions physically live
 
 Every MVCC engine must answer: *when a reader's snapshot needs an old version,

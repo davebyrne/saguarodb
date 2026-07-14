@@ -28,8 +28,8 @@ pub use heap::HeapPageStore;
 pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;
 pub use traits::{
-    LockRowResult, LockedRow, RecoveryOperations, RelationSnapshot, RowIterator, SchemaOperations,
-    StorageEngine,
+    DependentRowProbe, LockRowResult, LockedRow, RecoveryOperations, RelationSnapshot, RowIterator,
+    SchemaOperations, StorageEngine,
 };
 
 #[cfg(test)]

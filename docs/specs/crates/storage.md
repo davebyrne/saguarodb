@@ -51,6 +51,8 @@ pub trait StorageEngine: Send + Sync {
     fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>>;
     fn insert(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, row: Row) -> Result<RowId>;
     fn get(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<Option<Row>>;
+    fn referenced_key_exists(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, access_index: IndexId, key: &Key) -> Result<bool>;
+    fn dependent_row_exists(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, probe: DependentRowProbe<'_>) -> Result<bool>;
     fn delete(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<bool>;
     fn lock_row(
         &self,
@@ -64,6 +66,7 @@ pub trait StorageEngine: Send + Sync {
     fn update_locked(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, target: &LockedRow, row: Row) -> Result<bool>;
     fn delete_locked(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, target: &LockedRow) -> Result<bool>;
     fn update(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key, row: Row) -> Result<bool>;
+    fn update_requiring_update_lock(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key, row: Row) -> Result<bool>;
     fn scan(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId) -> Result<Box<dyn RowIterator>>;
     fn for_each_visible_row(
         &self,
@@ -178,6 +181,32 @@ locking-SELECT `LockRows` operator and UPDATE/DELETE EvalPlanQual. Production
 UPDATE/DELETE lock and resolve a scan identity, requalify a successor through the
 executor, then call `update_locked`/`delete_locked`; the ordinary entry points
 remain for callers that explicitly require legacy first-updater-wins behavior.
+
+### Referential-integrity probes
+
+`referenced_key_exists` is a current-state (dirty), not statement-snapshot,
+lookup through a catalog-resolved declared primary-key or UNIQUE constraint
+index. It classifies physical candidates by CLOG/infomask state, waits for an
+in-progress creator or deleter without retaining a frame/structural latch,
+restarts the access-path scan, follows HOT/REDIRECT state, and rechecks the key
+after acquiring transaction-owned `TupleLockMode::KeyShare` on the actual current
+parent identity. A committed delete or referenced-key change is missing. The
+lock remains held through the normal transaction lock lifetime.
+
+`dependent_row_exists` performs the inverse current-state child lookup described
+by `DependentRowProbe`: it uses a supplied exact-column child index or a full heap
+extent scan, may exclude one exact `RowIdentity` for self-reference, skips
+aborted/dead/reclaimed versions, and waits then restarts for in-progress creators
+or deleters. Page bytes are copied/decoded before any conflict wait, so no buffer
+frame or structural latch crosses a wait. Invalid access-index metadata and
+corrupt HOT/REDIRECT state are structured storage errors.
+
+Read Committed accepts the settled current result after a wait. Repeatable Read
+and Serializable return `SerializationFailure` (`40001`) when a current row whose
+presence is required by either probe is outside the retained transaction
+snapshot. `update_requiring_update_lock` is the ordinary-update companion used
+when a referenced non-primary-key column requires `TupleLockMode::Update` even
+though the storage identity is unchanged.
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions/storage ids a statement should resolve plus the storage relation epoch observed

@@ -5,6 +5,13 @@
 
 ## 1. Overview
 
+Foreign-key current-state probes use the same `ConflictWaiter` and tuple-lock
+manager as ordinary writers. Creator/deleter waits are registered in the mixed
+wait-for graph, are cancellation-aware, and occur only after buffer-frame and
+structural latches have been released. Parent referenced-key success retains
+`KeyShare`; it participates in deadlock detection against parent `Update` locks
+like an explicit locking read.
+
 This replaces SaguaroDB's previous **fail-fast first-updater-wins** write-write
 conflict policy (`mvcc.md` §7.3) with **blocking + timeout-based deadlock
 detection**, matching PostgreSQL's row-lock behavior. A writer that encounters a
