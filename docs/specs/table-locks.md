@@ -69,7 +69,7 @@ Mappings:
   for child INSERT/COPY FROM/UPDATE, on every incoming child for DELETE, and on
   incoming children whose referenced columns overlap UPDATE assignments
   (including the update arm of an upsert).
-- `Share`: `CREATE INDEX` and the initial safe `VACUUM` integration. VACUUM may
+- `Share`: `CREATE INDEX`, FK ALTER ADD on the referenced parent, and the initial safe `VACUUM` integration. VACUUM may
   move to a weaker PostgreSQL-style mode only after storage is proven safe with
   concurrent writers.
 - `AccessExclusive`: `TRUNCATE`, `DROP TABLE`/`DROP VIEW`, CREATE OR REPLACE VIEW
@@ -277,6 +277,12 @@ only data-path operation that waits for the exclusive checkpoint guard.
   every target and `AccessShare` on incoming foreign-key children while the
   complete target set is validated.
 - ALTER/DROP take `AccessExclusive` on the affected table.
+- Standalone FK ADD takes child `AccessExclusive` plus parent `Share`; FK DROP
+  takes child `AccessExclusive` plus parent `AccessShare`. Schema and catalog-name
+  locks precede both relation requests. All of those grants belong to the one
+  maintenance xid owner so relation/name cycles remain visible to the mixed
+  deadlock detector. The publication gate is taken only after all relation waits
+  finish; prepared child/parent identities are revalidated there before mutation.
 - CREATE INDEX takes `Share`, permitting readers but blocking target writers.
 - VACUUM initially takes `Share` and retains writer-draining safety. A future
   storage-concurrency project may weaken this.

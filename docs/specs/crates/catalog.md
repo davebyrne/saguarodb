@@ -253,6 +253,11 @@ pub trait CatalogManager: Send + Sync {
         table: TableId,
         foreign_keys: Vec<ResolvedForeignKey>,
     ) -> Result<TableSchema>;
+    fn reserve_foreign_key_allocator(
+        &self,
+        table: TableId,
+        next_id: u32,
+    ) -> Result<()>;
     fn drop_foreign_key(
         &self,
         table: TableId,
@@ -453,8 +458,15 @@ allocator. Incoming lookup is ordered by child table/FK ID. Referenced-key
 resolution accepts an exact ordered primary key or exact ordered declared
 UNIQUE constraint; a standalone unique index is ineligible. Child supporting
 indexes are optional and require an exact ordered column match.
+CREATE and standalone ALTER share these mutation primitives. ALTER ADD attaches
+one proposed constraint while the server holds the publication gate, validates
+existing rows before commit, and persists the returned schema through
+`UpdateTableSchema`; ALTER DROP removes the execution-time-resolved name and
+leaves `next_foreign_key_id` unchanged.
 Catalog restore preserves the greatest per-table FK allocator high-water for
-tables present in both states, just as it preserves global allocators. Table and
+tables present in both states, just as it preserves global allocators. Recovery
+can advance that same high-water from a skipped `UpdateTableSchema` without
+installing its aborted FK metadata. Table and
 declared-UNIQUE drops reject surviving incoming dependencies. Constraint-index
 creation/update consults the same table-local constraint-name namespace.
 Dense column rewrites reject an actually referenced/source column and remap FK

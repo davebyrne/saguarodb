@@ -690,7 +690,9 @@ fn bind_inner(
         Statement::AlterTableSetCompression { .. }
         | Statement::AlterTableSetOptions { .. }
         | Statement::AlterTableAddPrimaryKey { .. }
-        | Statement::AlterTableDropPrimaryKey { .. } => Err(plan_error(
+        | Statement::AlterTableAddForeignKey { .. }
+        | Statement::AlterTableDropPrimaryKey { .. }
+        | Statement::AlterTableDropConstraint { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
             "ALTER TABLE is a maintenance command and does not bind",
         )),

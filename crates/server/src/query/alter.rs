@@ -1,20 +1,21 @@
 use std::sync::{Arc, RwLockWriteGuard, atomic::Ordering};
 
+use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
     ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema,
-    QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext, TableId,
-    TableOptionPatch, TableSchema, ToastCompression, ToastOptions, WriteGuard,
+    IsolationLevel, QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext,
+    TableId, TableOptionPatch, TableSchema, ToastCompression, ToastOptions, WriteGuard,
     needs_toast_relation, toast_schema,
 };
-use executor::ExecutionResult;
-use parser::Statement;
+use executor::{ExecutionContext, ExecutionResult, validate_existing_foreign_keys};
+use parser::{ParsedForeignKey, Statement};
 use storage::{RecoveryOperations, SchemaOperations};
 use wal::{WalRecord, WalRecordKind};
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::lock_manager::{ObjectLockGuard, ObjectLockRequest, RelationLockMode};
 
-use super::QueryService;
+use super::{PreparedRelationVersion, QueryService};
 
 /// How many heap pages to sample for dictionary training (`compression.md`
 /// §7: evenly sampled, capped — a 32 MiB corpus at 8 KiB pages).
@@ -50,6 +51,33 @@ enum PrimaryKeyAlterPostCommit {
 struct LockedMaintenanceTable<'a> {
     txn_id: u64,
     schema: TableSchema,
+    _catalog_publication: RwLockWriteGuard<'a, ()>,
+    _objects: ObjectLockGuard,
+    _writer: WriteGuard,
+}
+
+struct LockedForeignKeyTables<'a> {
+    txn_id: u64,
+    child: TableSchema,
+    parent: TableSchema,
+    _catalog_publication: RwLockWriteGuard<'a, ()>,
+    _objects: ObjectLockGuard,
+    _writer: WriteGuard,
+}
+
+#[derive(Clone)]
+enum DropConstraintKind {
+    PrimaryKey,
+    ForeignKey(common::ForeignKeyConstraint),
+    UnsupportedUnique,
+    Missing,
+}
+
+struct LockedDropConstraint<'a> {
+    txn_id: u64,
+    child: TableSchema,
+    parent: Option<TableSchema>,
+    kind: DropConstraintKind,
     _catalog_publication: RwLockWriteGuard<'a, ()>,
     _objects: ObjectLockGuard,
     _writer: WriteGuard,
@@ -130,6 +158,281 @@ impl QueryService {
             _objects: objects,
             _writer: writer,
         })
+    }
+
+    fn lock_foreign_key_tables<'a>(
+        &'a self,
+        child_name: &QualifiedName,
+        parent_name: &QualifiedName,
+        parent_mode: RelationLockMode,
+        cancel: &QueryCancel,
+        prepared_versions: Option<&[PreparedRelationVersion]>,
+    ) -> Result<LockedForeignKeyTables<'a>> {
+        let components = &self.components;
+        let (mut child, mut parent) = {
+            let _catalog_read = components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            (
+                self.require_user_table(child_name)?,
+                self.require_user_table(parent_name)?,
+            )
+        };
+        let txn_id = components
+            .active_txns
+            .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+        let writer = match components.concurrency.begin_writer_cancelable(cancel) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut objects = match components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let baseline = objects.snapshot();
+        let (catalog_publication, child, parent) = loop {
+            let requests = [
+                ObjectLockRequest::schema(
+                    child.schema_id,
+                    crate::lock_manager::CatalogLockMode::Access,
+                ),
+                ObjectLockRequest::catalog_name(child.schema_id, &child.name),
+                ObjectLockRequest::table(child.id, RelationLockMode::AccessExclusive),
+                ObjectLockRequest::schema(
+                    parent.schema_id,
+                    crate::lock_manager::CatalogLockMode::Access,
+                ),
+                ObjectLockRequest::catalog_name(parent.schema_id, &parent.name),
+                ObjectLockRequest::table(parent.id, parent_mode),
+            ];
+            if let Err(err) = objects.acquire_many(&requests, cancel) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            let catalog_publication = match components.catalog_publication_gate.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(DbError::internal("catalog publication gate poisoned"));
+                }
+            };
+            let current_child = match self.require_user_table(child_name) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let current_parent = match self.require_user_table(parent_name) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            if current_child.id == child.id && current_parent.id == parent.id {
+                if let Some(prepared_versions) = prepared_versions
+                    && let Err(err) =
+                        self.validate_prepared_schema_versions_under_gate(prepared_versions)
+                {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+                break (catalog_publication, current_child, current_parent);
+            }
+            drop(catalog_publication);
+            if let Err(err) = objects.restore(&baseline) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            child = current_child;
+            parent = current_parent;
+        };
+        Ok(LockedForeignKeyTables {
+            txn_id,
+            child,
+            parent,
+            _catalog_publication: catalog_publication,
+            _objects: objects,
+            _writer: writer,
+        })
+    }
+
+    fn lock_drop_constraint<'a>(
+        &'a self,
+        child_name: &QualifiedName,
+        constraint_name: &str,
+        cancel: &QueryCancel,
+        prepared_versions: Option<&[PreparedRelationVersion]>,
+    ) -> Result<LockedDropConstraint<'a>> {
+        let components = &self.components;
+        let (mut child, mut kind) = {
+            let _catalog_read = components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            let child = self.require_user_table(child_name)?;
+            let kind =
+                classify_drop_constraint(components.catalog.as_ref(), &child, constraint_name)?;
+            (child, kind)
+        };
+        let txn_id = components
+            .active_txns
+            .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+        let writer = match components.concurrency.begin_writer_cancelable(cancel) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut objects = match components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let baseline = objects.snapshot();
+        loop {
+            let discovered_parent = match &kind {
+                DropConstraintKind::ForeignKey(foreign_key) => {
+                    let parent = match components.catalog.get_table(foreign_key.referenced_table) {
+                        Ok(parent) => parent,
+                        Err(err) => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(err);
+                        }
+                    };
+                    match parent {
+                        Some(parent) if parent.relation_kind == RelationKind::User => Some(parent),
+                        Some(_) => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(DbError::internal(
+                                "foreign key references a non-user parent table",
+                            ));
+                        }
+                        None => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(DbError::internal(
+                                "foreign key references a missing parent table",
+                            ));
+                        }
+                    }
+                }
+                DropConstraintKind::PrimaryKey
+                | DropConstraintKind::UnsupportedUnique
+                | DropConstraintKind::Missing => None,
+            };
+            let mut requests = vec![
+                ObjectLockRequest::schema(
+                    child.schema_id,
+                    crate::lock_manager::CatalogLockMode::Access,
+                ),
+                ObjectLockRequest::catalog_name(child.schema_id, &child.name),
+                ObjectLockRequest::table(child.id, RelationLockMode::AccessExclusive),
+            ];
+            if let Some(parent) = &discovered_parent {
+                requests.push(ObjectLockRequest::schema(
+                    parent.schema_id,
+                    crate::lock_manager::CatalogLockMode::Access,
+                ));
+                requests.push(ObjectLockRequest::catalog_name(
+                    parent.schema_id,
+                    &parent.name,
+                ));
+                requests.push(ObjectLockRequest::table(
+                    parent.id,
+                    RelationLockMode::AccessShare,
+                ));
+            }
+            if let Err(err) = objects.acquire_many(&requests, cancel) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            let catalog_publication = match components.catalog_publication_gate.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(DbError::internal("catalog publication gate poisoned"));
+                }
+            };
+            let current_child = match self.require_user_table(child_name) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let current_kind = match classify_drop_constraint(
+                components.catalog.as_ref(),
+                &current_child,
+                constraint_name,
+            ) {
+                Ok(kind) => kind,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let current_parent_id = match &current_kind {
+                DropConstraintKind::ForeignKey(foreign_key) => Some(foreign_key.referenced_table),
+                DropConstraintKind::PrimaryKey
+                | DropConstraintKind::UnsupportedUnique
+                | DropConstraintKind::Missing => None,
+            };
+            let locked_parent_id = discovered_parent.as_ref().map(|parent| parent.id);
+            if current_child.id == child.id
+                && current_parent_id.is_none_or(|parent| Some(parent) == locked_parent_id)
+            {
+                if let Some(prepared_versions) = prepared_versions
+                    && let Err(err) =
+                        self.validate_prepared_schema_versions_under_gate(prepared_versions)
+                {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+                let parent = match current_parent_id {
+                    Some(parent_id) => match components.catalog.get_table(parent_id) {
+                        Ok(Some(parent)) => Some(parent),
+                        Ok(None) => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(DbError::internal(
+                                "foreign-key parent disappeared under its lock",
+                            ));
+                        }
+                        Err(err) => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(err);
+                        }
+                    },
+                    None => None,
+                };
+                return Ok(LockedDropConstraint {
+                    txn_id,
+                    child: current_child,
+                    parent,
+                    kind: current_kind,
+                    _catalog_publication: catalog_publication,
+                    _objects: objects,
+                    _writer: writer,
+                });
+            }
+            drop(catalog_publication);
+            if let Err(err) = objects.restore(&baseline) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            child = current_child;
+            kind = current_kind;
+        }
     }
 
     /// `ALTER TABLE <t> SET (compression = ...)`: immediate-commit DDL under
@@ -621,109 +924,92 @@ impl QueryService {
         })
     }
 
-    /// `ALTER TABLE <t> DROP PRIMARY KEY` or `DROP CONSTRAINT <pkey>`.
-    pub(super) fn run_alter_table_drop_primary_key(
+    pub(super) fn run_alter_table_add_foreign_key(
         &self,
         statement: Statement,
         cancel: &Arc<QueryCancel>,
+        prepared_versions: Option<&[PreparedRelationVersion]>,
     ) -> Result<ExecutionResult> {
-        let Statement::AlterTableDropPrimaryKey {
-            table,
-            constraint_name,
-        } = statement
-        else {
+        let Statement::AlterTableAddForeignKey { table, foreign_key } = statement else {
             return Err(DbError::internal(
-                "expected ALTER TABLE DROP PRIMARY KEY statement",
+                "expected ALTER TABLE ADD FOREIGN KEY statement",
             ));
         };
-
         let components = &self.components;
         {
-            let locked = self.lock_maintenance_table(&table, cancel)?;
+            let locked = self.lock_foreign_key_tables(
+                &table,
+                &foreign_key.referenced_table,
+                RelationLockMode::Share,
+                cancel,
+                prepared_versions,
+            )?;
             let txn_id = locked.txn_id;
-            let schema = locked.schema;
-            let prepared = (|| {
-                if schema.primary_key.is_empty() {
-                    return Err(DbError::plan(
-                        SqlState::ObjectNotInPrerequisiteState,
-                        format!("table {table} does not have a primary key"),
-                    ));
-                }
-                let index = primary_key_constraint_index(components.catalog.as_ref(), &schema)?;
-                if let Some(name) = &constraint_name
-                    && *name != index.name
-                {
-                    return Err(DbError::plan(
-                        SqlState::UndefinedObject,
-                        format!("constraint {name} does not exist"),
-                    ));
-                }
-                let mut new_schema = schema.clone();
-                new_schema.primary_key.clear();
-                Ok::<_, DbError>((
-                    index,
-                    new_schema,
-                    components.gc_horizon(),
-                    components.catalog.snapshot()?,
-                ))
-            })();
-            let (index, new_schema, gc_horizon, catalog_snapshot) = match prepared {
-                Ok(prepared) => prepared,
+            let catalog_before = match components.catalog.snapshot() {
+                Ok(snapshot) => snapshot,
                 Err(err) => {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
                 }
             };
-            let catalog_before = Some(catalog_snapshot);
-
             let pre_commit = (|| {
-                components
+                let resolved =
+                    resolve_alter_foreign_key(&locked.child, &locked.parent, foreign_key)?;
+                let proposed_catalog =
+                    Arc::new(MemoryCatalog::try_from_snapshot(catalog_before.clone())?);
+                let proposed = proposed_catalog
+                    .attach_foreign_keys(locked.child.id, vec![resolved.clone()])?;
+                let indexes = components.catalog.list_indexes_for_table(locked.child.id)?;
+                let gc_horizon = components.gc_horizon();
+                let captured = self.capture_consistent_snapshots_cancelable(txn_id, cancel)?;
+                let statement = StatementContext::with_snapshot_and_isolation(
+                    txn_id,
+                    captured.snapshot,
+                    IsolationLevel::ReadCommitted,
+                )
+                .with_gc_horizon(gc_horizon)
+                .with_tuple_lock_manager(components.lock_manager.clone())
+                .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
+                let execution = ExecutionContext {
+                    statement,
+                    relations: captured.relations,
+                    catalog: proposed_catalog,
+                    storage: components.storage.as_ref(),
+                    schema_ops: components.storage.as_ref(),
+                    gc_horizon,
+                    cancel: cancel.as_ref(),
+                    spill: spill::SpillConfig::new(
+                        4096_u64.saturating_mul(1024),
+                        components.config.data_dir.join("tmp"),
+                    ),
+                };
+                validate_existing_foreign_keys(&execution, proposed.clone())?;
+                let attached = components
                     .catalog
-                    .preflight_table_primary_key_change(schema.id, &new_schema.primary_key)?;
-                let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
-                components.storage.validate_table_primary_key_change(
-                    &ctx,
-                    &new_schema,
-                    gc_horizon,
-                )?;
-                components.wal.append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::AlterTablePrimaryKey {
-                        table_id: schema.id,
-                        primary_key: Vec::new(),
-                    },
-                })?;
-                components.wal.append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::DropIndex { index: index.id },
-                })?;
-                Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Drop {
-                    txn_id,
-                    schema: new_schema,
-                    index_id: index.id,
-                    gc_horizon,
-                })
-            })();
-
-            let post_commit = match pre_commit {
-                Ok(post_commit) => post_commit,
-                Err(err) => {
-                    self.rollback_pre_durable_or_die(txn_id, catalog_before);
-                    return Err(err);
+                    .attach_foreign_keys(locked.child.id, vec![resolved])?;
+                if attached != proposed {
+                    return Err(DbError::internal(
+                        "validated foreign-key schema differs from live catalog attachment",
+                    ));
                 }
-            };
+                components.storage.update_table_schema(
+                    &execution.statement,
+                    &attached,
+                    &indexes,
+                )?;
+                Ok::<_, DbError>(())
+            })();
+            if let Err(err) = pre_commit {
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+                return Err(err);
+            }
             if let Err(err) = cancel.check() {
-                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
                 return Err(err);
             }
             if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
-                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
                 return Err(err);
-            }
-            if let Err(err) = self.finish_alter_table_primary_key_after_commit(post_commit) {
-                self.fatal_after_durable_commit(err);
             }
             if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
                 self.fatal_after_durable_commit(err);
@@ -731,12 +1017,291 @@ impl QueryService {
             components.active_txns.deregister(txn_id);
             components.lock_manager.on_txn_finished();
         }
+        record_commit_and_maybe_checkpoint_after_durable_commit(components);
+        Ok(ExecutionResult::Modified {
+            command: "ALTER TABLE".to_string(),
+            count: 0,
+        })
+    }
+
+    pub(super) fn run_alter_table_drop_constraint(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+        prepared_versions: Option<&[PreparedRelationVersion]>,
+    ) -> Result<ExecutionResult> {
+        let Statement::AlterTableDropConstraint {
+            table,
+            constraint_name,
+            if_exists,
+        } = statement
+        else {
+            return Err(DbError::internal(
+                "expected ALTER TABLE DROP CONSTRAINT statement",
+            ));
+        };
+        let components = &self.components;
+        {
+            let locked =
+                self.lock_drop_constraint(&table, &constraint_name, cancel, prepared_versions)?;
+            let txn_id = locked.txn_id;
+            match &locked.kind {
+                DropConstraintKind::PrimaryKey => self.drop_primary_key_under_locks(
+                    txn_id,
+                    &locked.child,
+                    Some(&constraint_name),
+                    cancel,
+                )?,
+                DropConstraintKind::ForeignKey(foreign_key) => {
+                    let Some(parent) = &locked.parent else {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(DbError::internal(
+                            "locked foreign-key drop is missing its parent table",
+                        ));
+                    };
+                    if parent.id != foreign_key.referenced_table {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(DbError::internal(
+                            "locked foreign-key drop has an inconsistent parent table",
+                        ));
+                    }
+                    self.drop_foreign_key_under_locks(
+                        txn_id,
+                        &locked.child,
+                        &constraint_name,
+                        cancel,
+                    )?;
+                }
+                DropConstraintKind::UnsupportedUnique => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(DbError::plan(
+                        SqlState::FeatureNotSupported,
+                        format!("dropping UNIQUE constraint {constraint_name} is not supported",),
+                    ));
+                }
+                DropConstraintKind::Missing => {
+                    if !if_exists {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(DbError::plan(
+                            SqlState::UndefinedObject,
+                            format!(
+                                "constraint {constraint_name} of relation {} does not exist",
+                                locked.child.name
+                            ),
+                        ));
+                    }
+                    self.commit_empty_maintenance(txn_id, cancel)?;
+                }
+            }
+        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(components);
+        Ok(ExecutionResult::Modified {
+            command: "ALTER TABLE".to_string(),
+            count: 0,
+        })
+    }
+
+    fn drop_foreign_key_under_locks(
+        &self,
+        txn_id: u64,
+        child: &TableSchema,
+        constraint_name: &str,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<()> {
+        let components = &self.components;
+        let catalog_before = match components.catalog.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let pre_commit = (|| {
+            let dropped = components
+                .catalog
+                .drop_foreign_key(child.id, constraint_name, false)?
+                .ok_or_else(|| DbError::internal("locked foreign key disappeared before drop"))?;
+            let indexes = components.catalog.list_indexes_for_table(child.id)?;
+            let ctx = maintenance_statement_context(
+                txn_id,
+                self,
+                components.gc_horizon(),
+                cancel.clone(),
+            );
+            components
+                .storage
+                .update_table_schema(&ctx, &dropped, &indexes)
+        })();
+        if let Err(err) = pre_commit {
+            self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+            return Err(err);
+        }
+        if let Err(err) = cancel.check() {
+            self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+            return Err(err);
+        }
+        if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+            self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+            return Err(err);
+        }
+        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+            self.fatal_after_durable_commit(err);
+        }
+        components.active_txns.deregister(txn_id);
+        components.lock_manager.on_txn_finished();
+        Ok(())
+    }
+
+    fn commit_empty_maintenance(&self, txn_id: u64, cancel: &QueryCancel) -> Result<()> {
+        if let Err(err) = cancel.check() {
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
+        if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
+        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+            self.fatal_after_durable_commit(err);
+        }
+        self.components.active_txns.deregister(txn_id);
+        self.components.lock_manager.on_txn_finished();
+        Ok(())
+    }
+
+    /// `ALTER TABLE <t> DROP PRIMARY KEY` or `DROP CONSTRAINT <pkey>`.
+    pub(super) fn run_alter_table_drop_primary_key(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<ExecutionResult> {
+        self.run_alter_table_drop_primary_key_named(statement, None, cancel)
+    }
+
+    fn run_alter_table_drop_primary_key_named(
+        &self,
+        statement: Statement,
+        expected_name: Option<&str>,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<ExecutionResult> {
+        let Statement::AlterTableDropPrimaryKey { table } = statement else {
+            return Err(DbError::internal(
+                "expected ALTER TABLE DROP PRIMARY KEY statement",
+            ));
+        };
+
+        {
+            let locked = self.lock_maintenance_table(&table, cancel)?;
+            self.drop_primary_key_under_locks(
+                locked.txn_id,
+                &locked.schema,
+                expected_name,
+                cancel,
+            )?;
+        }
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
 
         Ok(ExecutionResult::Modified {
             command: "ALTER TABLE".to_string(),
             count: 0,
         })
+    }
+
+    fn drop_primary_key_under_locks(
+        &self,
+        txn_id: u64,
+        schema: &TableSchema,
+        expected_name: Option<&str>,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<()> {
+        let components = &self.components;
+        let prepared = (|| {
+            if schema.primary_key.is_empty() {
+                return Err(DbError::plan(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    format!("table {} does not have a primary key", schema.name),
+                ));
+            }
+            let index = primary_key_constraint_index(components.catalog.as_ref(), schema)?;
+            if expected_name.is_some_and(|expected_name| expected_name != index.name) {
+                return Err(DbError::plan(
+                    SqlState::UndefinedObject,
+                    format!(
+                        "constraint {} of relation {} does not exist",
+                        expected_name.unwrap_or_default(),
+                        schema.name
+                    ),
+                ));
+            }
+            let mut new_schema = schema.clone();
+            new_schema.primary_key.clear();
+            Ok::<_, DbError>((
+                index,
+                new_schema,
+                components.gc_horizon(),
+                components.catalog.snapshot()?,
+            ))
+        })();
+        let (index, new_schema, gc_horizon, catalog_snapshot) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let catalog_before = Some(catalog_snapshot);
+        let pre_commit = (|| {
+            components
+                .catalog
+                .preflight_table_primary_key_change(schema.id, &new_schema.primary_key)?;
+            let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
+            components
+                .storage
+                .validate_table_primary_key_change(&ctx, &new_schema, gc_horizon)?;
+            components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::AlterTablePrimaryKey {
+                    table_id: schema.id,
+                    primary_key: Vec::new(),
+                },
+            })?;
+            components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::DropIndex { index: index.id },
+            })?;
+            Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Drop {
+                txn_id,
+                schema: new_schema,
+                index_id: index.id,
+                gc_horizon,
+            })
+        })();
+        let post_commit = match pre_commit {
+            Ok(post_commit) => post_commit,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
+        };
+        if let Err(err) = cancel.check() {
+            self.rollback_pre_durable_or_die(txn_id, catalog_before);
+            return Err(err);
+        }
+        if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+            self.rollback_pre_durable_or_die(txn_id, catalog_before);
+            return Err(err);
+        }
+        if let Err(err) = self.finish_alter_table_primary_key_after_commit(post_commit) {
+            self.fatal_after_durable_commit(err);
+        }
+        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+            self.fatal_after_durable_commit(err);
+        }
+        components.active_txns.deregister(txn_id);
+        components.lock_manager.on_txn_finished();
+        Ok(())
     }
 
     fn require_user_table(&self, table: &QualifiedName) -> Result<TableSchema> {
@@ -861,6 +1426,87 @@ fn maintenance_statement_context(
         .with_conflict_waiter(service.components.lock_manager.clone(), cancel)
 }
 
+fn resolve_alter_foreign_key(
+    child: &TableSchema,
+    parent: &TableSchema,
+    foreign_key: ParsedForeignKey,
+) -> Result<ResolvedForeignKey> {
+    if foreign_key.columns.is_empty() {
+        return Err(DbError::plan(
+            SqlState::SyntaxError,
+            "foreign key column list must not be empty",
+        ));
+    }
+    let referenced_names = if foreign_key.referenced_columns.is_empty() {
+        if parent.primary_key.is_empty() {
+            return Err(DbError::plan(
+                SqlState::InvalidForeignKey,
+                format!("referenced table {} has no primary key", parent.name),
+            ));
+        }
+        parent
+            .primary_key
+            .iter()
+            .map(|column_id| {
+                parent
+                    .columns
+                    .iter()
+                    .find(|column| column.id == *column_id)
+                    .map(|column| column.name.clone())
+                    .ok_or_else(|| {
+                        DbError::internal("primary key references a missing parent column")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        foreign_key.referenced_columns
+    };
+    if foreign_key.columns.len() != referenced_names.len() {
+        return Err(DbError::plan(
+            SqlState::InvalidForeignKey,
+            "foreign key source and referenced column counts do not match",
+        ));
+    }
+    let columns = resolve_foreign_key_column_names(child, &foreign_key.columns)?;
+    let referenced_columns = resolve_foreign_key_column_names(parent, &referenced_names)?;
+    Ok(ResolvedForeignKey {
+        name: foreign_key.name,
+        columns,
+        referenced_table: parent.id,
+        referenced_columns,
+        on_update: foreign_key.on_update,
+        on_delete: foreign_key.on_delete,
+    })
+}
+
+fn resolve_foreign_key_column_names(
+    schema: &TableSchema,
+    names: &[String],
+) -> Result<Vec<ColumnId>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut columns = Vec::with_capacity(names.len());
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Err(DbError::plan(
+                SqlState::InvalidForeignKey,
+                format!("foreign key column {name} is specified more than once"),
+            ));
+        }
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.name == *name)
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!("column {name} of relation {} does not exist", schema.name),
+                )
+            })?;
+        columns.push(column.id);
+    }
+    Ok(columns)
+}
+
 fn primary_key_column_ids(schema: &TableSchema, columns: &[String]) -> Result<Vec<ColumnId>> {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::with_capacity(columns.len());
@@ -921,4 +1567,37 @@ fn primary_key_constraint_index(
                 schema.name
             ))
         })
+}
+
+fn classify_drop_constraint(
+    catalog: &dyn CatalogManager,
+    schema: &TableSchema,
+    constraint_name: &str,
+) -> Result<DropConstraintKind> {
+    let indexes = catalog.list_indexes_for_table(schema.id)?;
+    if !schema.primary_key.is_empty() {
+        let primary = indexes
+            .iter()
+            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "table {} has primary-key metadata but no primary-key constraint index",
+                    schema.name
+                ))
+            })?;
+        if primary.name == constraint_name {
+            return Ok(DropConstraintKind::PrimaryKey);
+        }
+    }
+    if indexes.iter().any(|index| {
+        index.constraint == IndexConstraintKind::Unique && index.name == constraint_name
+    }) {
+        return Ok(DropConstraintKind::UnsupportedUnique);
+    }
+    Ok(schema
+        .foreign_keys
+        .iter()
+        .find(|foreign_key| foreign_key.name == constraint_name)
+        .cloned()
+        .map_or(DropConstraintKind::Missing, DropConstraintKind::ForeignKey))
 }

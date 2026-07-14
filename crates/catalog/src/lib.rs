@@ -187,6 +187,14 @@ pub trait CatalogManager: Send + Sync {
             "catalog does not support foreign-key mutation",
         ))
     }
+    /// Advances one live table's foreign-key allocator to at least `next_id`
+    /// without installing a constraint. Recovery uses this for aborted or skipped
+    /// schema records so an ID exposed in WAL is never reused after restart.
+    fn reserve_foreign_key_allocator(&self, _table: TableId, _next_id: u32) -> Result<()> {
+        Err(DbError::internal(
+            "catalog does not support foreign-key allocator reservation",
+        ))
+    }
     /// Removes one foreign key by its table-local constraint name. A missing
     /// name returns `None` only when `if_exists` is true.
     fn drop_foreign_key(
@@ -4564,6 +4572,20 @@ mod tests {
             .attach_foreign_keys(child, vec![resolved_foreign_key(Some("second"), parent)])
             .unwrap();
         assert_eq!(attached.foreign_keys[0].id, 1);
+    }
+
+    #[test]
+    fn reservation_preserves_foreign_key_allocator_without_installing_metadata() {
+        let (catalog, parent, child) = foreign_key_catalog();
+        catalog.reserve_foreign_key_allocator(child, 2).unwrap();
+        let reserved = catalog.get_table(child).unwrap().unwrap();
+        assert!(reserved.foreign_keys.is_empty());
+        assert_eq!(reserved.next_foreign_key_id, 2);
+        let attached = catalog
+            .attach_foreign_keys(child, vec![resolved_foreign_key(Some("third"), parent)])
+            .unwrap();
+        assert_eq!(attached.foreign_keys[0].id, 2);
+        assert!(catalog.reserve_foreign_key_allocator(child, 4097).is_err());
     }
 
     #[test]

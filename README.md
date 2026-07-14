@@ -23,11 +23,16 @@ trait seams.
   private key are configured.
 - DDL and maintenance for `CREATE`/`DROP SCHEMA`, `CREATE`/`DROP TABLE`, `CREATE`/`DROP VIEW`,
   `CREATE`/`DROP SEQUENCE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `TRUNCATE`,
-  `VACUUM`, table compression/TOAST option changes, primary-key add/drop, and
+  `VACUUM`, table compression/TOAST option changes, primary-key add/drop,
+  standalone foreign-key add/drop, and
   schema evolution for add/drop/rename/type-change columns and table renames.
   One- and two-part user object names resolve through the session `search_path`.
   `CREATE TABLE` accepts column- and table-level foreign keys referencing declared
   primary-key/UNIQUE constraints with immediate `NO ACTION`/`RESTRICT` enforcement.
+  Existing tables may add the same constraints with `ALTER TABLE ... ADD
+  [CONSTRAINT name] FOREIGN KEY`; `DROP CONSTRAINT [IF EXISTS] name [RESTRICT]`
+  removes a foreign key or routes a primary-key constraint name to the existing
+  primary-key drop behavior.
 - DML for `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE` (including
   `UPDATE ... FROM`), `DELETE` (including `DELETE ... USING`), `RETURNING`,
   primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and

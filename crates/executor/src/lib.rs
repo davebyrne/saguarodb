@@ -29,6 +29,7 @@ pub use common::{ExecRow, RowIdentity};
 pub use expr::eval_expr;
 pub use query::{
     CopyIn, CopyOut, ExecutionContext, FetchStatus, OpenQuery, PlanExecutor, QueryEngine, RowSink,
+    validate_existing_foreign_keys,
 };
 pub use result::{CopyJob, ExecutionResult};
 

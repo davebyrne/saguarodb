@@ -104,9 +104,11 @@ pub enum Statement {
         columns: Vec<String>,
         constraint_name: Option<String>,
     },
-    // `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY` or
-    // `ALTER TABLE [ONLY] <name> DROP CONSTRAINT <name>`.
-    AlterTableDropPrimaryKey { table: String, constraint_name: Option<String> },
+    AlterTableAddForeignKey { table: QualifiedName, foreign_key: ParsedForeignKey },
+    // `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY`.
+    AlterTableDropPrimaryKey { table: QualifiedName },
+    // `ALTER TABLE [ONLY] <name> DROP CONSTRAINT [IF EXISTS] <name> [RESTRICT]`.
+    AlterTableDropConstraint { table: QualifiedName, constraint_name: String, if_exists: bool },
     // `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. Bulk transfer
     // (text/CSV, simple-query only); see `docs/specs/copy.md`. `columns` empty
     // means all columns in catalog order; `options` is the normalized result of
@@ -411,7 +413,7 @@ type)` target is supported. Text-valued `regclass` and `pg_catalog.regclass` cas
 are lowered to the catalog-backed `to_regclass` lookup; this supports parameterized
 catalog probes emitted by pgbench while retaining the normal OID-valued expression
 result.
-- `ALTER TABLE <name> SET (...)` and primary-key ALTER forms are intercepted before sqlparser because they are maintenance commands. `ALTER TABLE <name> SET (compression = 'none' | 'zstd')` returns `Statement::AlterTableSetCompression`; TOAST option lists return `Statement::AlterTableSetOptions`; primary-key ADD/DROP forms return the primary-key ALTER variants. Other supported schema-evolution forms are converted from sqlparser's `ALTER TABLE` AST: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN`, `RENAME TO`, and `ALTER [COLUMN] <column> [SET DATA] TYPE <data_type>`. The type-change form accepts optional `ONLY` and rejects `USING`. Unsupported ALTER families (`ALTER INDEX`, `ALTER SEQUENCE`, unsupported table operations) are rejected with `SqlState::FeatureNotSupported`. Malformed option lists, duplicate recognized keys, and unrecognized option keys are `SqlState::SyntaxError`; unsupported enum values are `SqlState::FeatureNotSupported`; out-of-range TOAST numeric values are `SqlState::InvalidParameterValue`.
+- `ALTER TABLE <name> SET (...)`, primary-key ALTER, foreign-key ADD, and generic named DROP forms are intercepted before sqlparser because they are maintenance commands. FK ADD uses the same ordered lists, actions, qualified names, and unsupported-option contract as CREATE. Generic `DROP CONSTRAINT [IF EXISTS] name [RESTRICT]` is preserved for execution-time PK/FK name resolution; `CASCADE` returns `0A000`. Other supported schema-evolution forms are converted from sqlparser's `ALTER TABLE` AST: `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN`, `RENAME TO`, and `ALTER [COLUMN] <column> [SET DATA] TYPE <data_type>`. The type-change form accepts optional `ONLY` and rejects `USING`. Unsupported ALTER families (`ALTER INDEX`, `ALTER SEQUENCE`, unsupported table operations) are rejected with `SqlState::FeatureNotSupported`. Malformed option lists, duplicate recognized keys, and unrecognized option keys are `SqlState::SyntaxError`; unsupported enum values are `SqlState::FeatureNotSupported`; out-of-range TOAST numeric values are `SqlState::InvalidParameterValue`.
 - `CREATE [OR REPLACE] VIEW <name> [(cols)] AS <query>` returns `Statement::CreateView` with both the parsed query and canonical SQL definition text. `DROP VIEW [IF EXISTS] <name>` returns `Statement::DropView`.
 - COPY: `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` parses to `Statement::Copy { table, columns, direction, options }` (see `docs/specs/copy.md`). The translator normalizes both the modern (`WITH (FORMAT csv, HEADER true, ...)`) and legacy (`WITH CSV HEADER ...`) option syntaxes into one `common::CopyOptions`, applying per-format defaults and PostgreSQL's "ESCAPE defaults to QUOTE" rule. The exact pgbench initialization suffix `WITH (FREEZE ON)` is accepted and discarded because SaguaroDB has no frozen-xid storage state; other `FREEZE` forms remain unsupported. It rejects, with structured errors, server-side files / `PROGRAM` and `COPY (query) TO` and `FORMAT binary` and the unsupported options (`FREEZE` except that compatibility suffix, `FORCE_*`, and `ENCODING`) as `FeatureNotSupported` (`0A000`); an unrecognized `FORMAT`, a backslash `DELIMITER`, a CR/LF delimiter or quote, and `DELIMITER`=`QUOTE` (CSV) as `SyntaxError`; `QUOTE`/`ESCAPE` with `FORMAT text` as `FeatureNotSupported`. Because sqlparser reads inline data after `FROM STDIN` and then demands a terminator, `parse_statement` first normalizes the input to be `;`-terminated (a no-op for other statements and never a second statement); copy-in data arrives over the wire, never inline.
 
@@ -454,7 +456,7 @@ Unquoted identifiers are normalized to lowercase before AST construction. Quoted
   them, and rejects a duplicate normalized target.
 - Parses `ALTER TABLE <name> SET (compression = ...)` (including mixed-case keywords and an optional trailing `;`) into `Statement::AlterTableSetCompression`.
 - Parses `ALTER TABLE <name> SET (...)` with any TOAST option into `Statement::AlterTableSetOptions`; the server executes TOAST-only option changes and rejects mixed page-compression/TOAST changes.
-- Parses `ALTER TABLE [ONLY] <name> ADD [CONSTRAINT <name>] PRIMARY KEY (cols...)`, `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY`, and `ALTER TABLE [ONLY] <name> DROP CONSTRAINT <name>` into the primary-key ALTER statement variants.
+- Parses primary-key ADD/DROP, foreign-key ADD, and generic named DROP into distinct maintenance statement variants; a named DROP is not assumed to name the primary key.
 - Parses schema-evolution `ALTER TABLE` ADD/DROP/RENAME COLUMN and RENAME TO forms.
 - Parses `ALTER TABLE [ONLY] <table> ALTER [COLUMN] <column> [SET DATA] TYPE <type>` and rejects `USING`.
 - Parses `CREATE [OR REPLACE] VIEW` and `DROP VIEW [IF EXISTS]`.

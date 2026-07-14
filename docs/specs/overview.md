@@ -26,6 +26,10 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - The `CREATE TABLE` entry above also includes column- and table-level foreign
   keys referencing declared primary-key/UNIQUE constraints with immediate
   `NO ACTION`/`RESTRICT` enforcement; see `docs/specs/foreign-keys.md`.
+- The maintenance ALTER entry also includes standalone `ADD [CONSTRAINT name]
+  FOREIGN KEY (...) REFERENCES ...` and `DROP CONSTRAINT [IF EXISTS] name
+  [RESTRICT]`. These forms validate/persist immediately and are rejected inside
+  explicit transaction blocks.
 - The `EXPLAIN` entry above is SELECT-only and includes plain `EXPLAIN`,
   `EXPLAIN ANALYZE`, and `EXPLAIN (ANALYZE [TRUE|FALSE])`; other options and
   non-SELECT inner statements are unsupported.
@@ -823,9 +827,15 @@ pub enum Statement {
         columns: Vec<String>,
         constraint_name: Option<String>,
     },
-    AlterTableDropPrimaryKey {
+    AlterTableAddForeignKey {
         table: QualifiedName,
-        constraint_name: Option<String>,
+        foreign_key: ParsedForeignKey,
+    },
+    AlterTableDropPrimaryKey { table: QualifiedName },
+    AlterTableDropConstraint {
+        table: QualifiedName,
+        constraint_name: String,
+        if_exists: bool,
     },
     Copy {                                        // COPY <table> [(cols)] FROM STDIN | TO STDOUT
         table: QualifiedName,                     // (docs/specs/copy.md)

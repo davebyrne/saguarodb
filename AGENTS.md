@@ -160,6 +160,10 @@ precedence.
   `ANALYZE` the reclamation pass is followed by a statistics-collection pass),
   the maintenance command `ANALYZE [table]` (collect optimizer statistics
   under `AccessShare` target locks; `docs/specs/statistics.md`), and
+  standalone `ALTER TABLE <child> ADD [CONSTRAINT name] FOREIGN KEY (...) REFERENCES
+  <parent> [(...)] [ON UPDATE NO ACTION | RESTRICT] [ON DELETE NO ACTION | RESTRICT]`
+  and `ALTER TABLE <child> DROP CONSTRAINT [IF EXISTS] name [RESTRICT]` (immediate
+  maintenance rejected inside a transaction block; `docs/specs/foreign-keys.md`), and
   `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (also a
   maintenance command: does not bind/plan relationally, takes the exclusive
   guard, is rejected inside a transaction block, and performs a full rewrite of

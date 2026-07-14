@@ -53,6 +53,25 @@ pub struct ExecutionContext<'a> {
     pub spill: spill::SpillConfig,
 }
 
+/// Validate all currently visible rows of `target` against its outgoing foreign
+/// keys. Standalone `ALTER TABLE ... ADD FOREIGN KEY` uses this before making
+/// the catalog/storage schema change durable, sharing the same resolved probes,
+/// lock ordering, NULL handling, and error contract as ordinary DML.
+pub fn validate_existing_foreign_keys(
+    ctx: &ExecutionContext<'_>,
+    target: TableSchema,
+) -> Result<()> {
+    let integrity = ReferentialIntegrity::new(ctx, target.clone())?;
+    let mut rows = ctx
+        .storage
+        .scan(&ctx.statement, ctx.relations.as_ref(), target.id)?;
+    while let Some(row) = rows.next()? {
+        check_canceled(ctx)?;
+        integrity.validate_outgoing(&row.row.values)?;
+    }
+    Ok(())
+}
+
 /// Abort with `QueryCanceled` if a cancellation has been requested. Called
 /// between rows in the row-producing and write loops.
 pub(crate) fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {

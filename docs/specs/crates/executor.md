@@ -423,6 +423,12 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   is synthesized. See `docs/specs/foreign-keys.md`.
 - Return `Modified { command: "CREATE TABLE", count: 0 }`.
 
+Standalone FK ADD calls the exported existing-row validator with the proposed
+catalog schema. It scans every visible child row and invokes the same
+statement-resolved outgoing enforcement service used by INSERT/COPY/UPDATE, so
+key ordering, `MATCH SIMPLE`, tuple locks, cancellation, and `23503` details do
+not diverge between ALTER validation and later DML.
+
 `DROP TABLE [IF EXISTS] <name> [, ...]`:
 
 - Resolve every target in the binder for plain `DROP TABLE`; if any name belongs

@@ -437,6 +437,9 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         }
         WalRecordKind::UpdateTableSchema { schema, indexes } => {
             reserve_storage_id(catalog, schema.storage_id, schema.id)?;
+            if catalog.get_table(schema.id)?.is_some() {
+                catalog.reserve_foreign_key_allocator(schema.id, schema.next_foreign_key_id)?;
+            }
             for index in indexes {
                 reserve_storage_id(catalog, index.storage_id, index.id)?;
             }

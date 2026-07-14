@@ -157,12 +157,12 @@ fn reject_unsupported_create_table_foreign_key_clauses(sql: &str) -> Result<()> 
         }
 
         loop {
-            if token_is_word(tokens.get(index).copied(), "match")
-                || (token_is_word(tokens.get(index).copied(), "not")
-                    && token_is_word(tokens.get(index + 1).copied(), "valid"))
-            {
+            if is_unsupported_foreign_key_characteristic(
+                tokens.get(index).copied(),
+                tokens.get(index + 1).copied(),
+            ) {
                 return feature_not_supported(
-                    "foreign-key MATCH and NOT VALID clauses are not supported",
+                    "foreign-key MATCH, constraint characteristics, and validation clauses are not supported",
                 );
             }
             if token_is_word(tokens.get(index).copied(), "on")
@@ -193,6 +193,20 @@ fn token_is_word(token: Option<&Token>, expected: &str) -> bool {
         Some(Token::Word(word))
             if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
     )
+}
+
+fn is_unsupported_foreign_key_characteristic(
+    first: Option<&Token>,
+    second: Option<&Token>,
+) -> bool {
+    token_is_word(first, "match")
+        || token_is_word(first, "deferrable")
+        || token_is_word(first, "initially")
+        || token_is_word(first, "enforced")
+        || (token_is_word(first, "not")
+            && (token_is_word(second, "valid")
+                || token_is_word(second, "deferrable")
+                || token_is_word(second, "enforced")))
 }
 
 fn normalize_extended_row_lock_mode(
@@ -1588,10 +1602,10 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
         parse_alter_qualified_name(&tokens, &mut i, "expected table name after ALTER TABLE")?;
     if !expect_word(&tokens, &mut i, "set") {
         if expect_word(&tokens, &mut i, "add") {
-            return try_parse_alter_table_add_primary_key(&tokens, i, table);
+            return try_parse_alter_table_add_constraint(&tokens, i, table);
         }
         if expect_word(&tokens, &mut i, "drop") {
-            return try_parse_alter_table_drop_primary_key(&tokens, i, table);
+            return try_parse_alter_table_drop_constraint(&tokens, i, table);
         }
         return Ok(None);
     }
@@ -1622,7 +1636,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     Err(parse_error("ALTER TABLE SET requires at least one option"))
 }
 
-fn try_parse_alter_table_add_primary_key(
+fn try_parse_alter_table_add_constraint(
     tokens: &[Token],
     i: usize,
     table: QualifiedName,
@@ -1637,11 +1651,15 @@ fn try_parse_alter_table_add_primary_key(
         }
         lookahead += 1;
     }
-    if !matches!(tokens.get(lookahead), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary"))
+    if matches!(tokens.get(lookahead), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary"))
     {
-        return Ok(None);
+        return parse_alter_table_add_primary_key(tokens, i, table);
     }
-    parse_alter_table_add_primary_key(tokens, i, table)
+    if matches!(tokens.get(lookahead), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("foreign"))
+    {
+        return parse_alter_table_add_foreign_key(tokens, i, table);
+    }
+    Ok(None)
 }
 
 fn parse_alter_table_add_primary_key(
@@ -1683,46 +1701,161 @@ fn parse_alter_table_add_primary_key(
     }))
 }
 
-fn try_parse_alter_table_drop_primary_key(
+fn parse_alter_table_add_foreign_key(
+    tokens: &[Token],
+    mut i: usize,
+    table: QualifiedName,
+) -> Result<Option<Statement>> {
+    let name = if expect_word(tokens, &mut i, "constraint") {
+        Some(parse_alter_identifier(
+            tokens,
+            &mut i,
+            "expected constraint name after ALTER TABLE ... ADD CONSTRAINT",
+        )?)
+    } else {
+        None
+    };
+    if !expect_word(tokens, &mut i, "foreign") || !expect_word(tokens, &mut i, "key") {
+        return Err(DbError::parse(
+            SqlState::FeatureNotSupported,
+            "only ALTER TABLE ... ADD PRIMARY KEY or FOREIGN KEY is supported",
+        ));
+    }
+    if !matches!(tokens.get(i), Some(Token::LParen)) {
+        return Err(parse_error(
+            "expected ( after ALTER TABLE ... ADD FOREIGN KEY",
+        ));
+    }
+    i += 1;
+    let columns = parse_identifier_list(tokens, &mut i, "foreign key")?;
+    if !matches!(tokens.get(i), Some(Token::RParen)) {
+        return Err(parse_error("expected ) after foreign key column list"));
+    }
+    i += 1;
+    if !expect_word(tokens, &mut i, "references") {
+        return Err(parse_error(
+            "expected REFERENCES after foreign key column list",
+        ));
+    }
+    let referenced_table =
+        parse_alter_qualified_name(tokens, &mut i, "expected referenced table after REFERENCES")?;
+    let referenced_columns = if matches!(tokens.get(i), Some(Token::LParen)) {
+        i += 1;
+        let columns = parse_identifier_list(tokens, &mut i, "referenced")?;
+        if !matches!(tokens.get(i), Some(Token::RParen)) {
+            return Err(parse_error("expected ) after referenced column list"));
+        }
+        i += 1;
+        columns
+    } else {
+        Vec::new()
+    };
+    let mut on_update = common::ForeignKeyAction::NoAction;
+    let mut on_delete = common::ForeignKeyAction::NoAction;
+    let mut saw_update = false;
+    let mut saw_delete = false;
+    while expect_word(tokens, &mut i, "on") {
+        let target = if expect_word(tokens, &mut i, "update") {
+            if saw_update {
+                return Err(parse_error("ON UPDATE specified more than once"));
+            }
+            saw_update = true;
+            &mut on_update
+        } else if expect_word(tokens, &mut i, "delete") {
+            if saw_delete {
+                return Err(parse_error("ON DELETE specified more than once"));
+            }
+            saw_delete = true;
+            &mut on_delete
+        } else {
+            return Err(parse_error("expected UPDATE or DELETE after ON"));
+        };
+        *target = if expect_word(tokens, &mut i, "no") {
+            if !expect_word(tokens, &mut i, "action") {
+                return Err(parse_error("expected ACTION after NO"));
+            }
+            common::ForeignKeyAction::NoAction
+        } else if expect_word(tokens, &mut i, "restrict") {
+            common::ForeignKeyAction::Restrict
+        } else {
+            return feature_not_supported(
+                "only NO ACTION and RESTRICT foreign-key actions are supported",
+            );
+        };
+    }
+    if is_unsupported_foreign_key_characteristic(tokens.get(i), tokens.get(i + 1)) {
+        return feature_not_supported(
+            "foreign-key MATCH, constraint characteristics, and validation clauses are not supported",
+        );
+    }
+    finish_alter_statement(tokens, i)?;
+    Ok(Some(Statement::AlterTableAddForeignKey {
+        table,
+        foreign_key: crate::ParsedForeignKey {
+            name,
+            columns,
+            referenced_table,
+            referenced_columns,
+            on_update,
+            on_delete,
+        },
+    }))
+}
+
+fn try_parse_alter_table_drop_constraint(
     tokens: &[Token],
     i: usize,
     table: QualifiedName,
 ) -> Result<Option<Statement>> {
     if matches!(tokens.get(i), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary") || word.value.eq_ignore_ascii_case("constraint"))
     {
-        return parse_alter_table_drop_primary_key(tokens, i, table);
+        return parse_alter_table_drop_constraint(tokens, i, table);
     }
     Ok(None)
 }
 
-fn parse_alter_table_drop_primary_key(
+fn parse_alter_table_drop_constraint(
     tokens: &[Token],
     mut i: usize,
     table: QualifiedName,
 ) -> Result<Option<Statement>> {
-    let constraint_name = if expect_word(tokens, &mut i, "primary") {
+    if expect_word(tokens, &mut i, "primary") {
         if !expect_word(tokens, &mut i, "key") {
             return Err(parse_error(
                 "expected KEY after ALTER TABLE ... DROP PRIMARY",
             ));
         }
-        None
-    } else if expect_word(tokens, &mut i, "constraint") {
-        Some(parse_alter_identifier(
-            tokens,
-            &mut i,
-            "expected constraint name after ALTER TABLE ... DROP CONSTRAINT",
-        )?)
-    } else {
+        finish_alter_statement(tokens, i)?;
+        return Ok(Some(Statement::AlterTableDropPrimaryKey { table }));
+    }
+    if !expect_word(tokens, &mut i, "constraint") {
         return Err(DbError::parse(
             SqlState::FeatureNotSupported,
-            "only ALTER TABLE ... DROP PRIMARY KEY is supported",
+            "only ALTER TABLE ... DROP PRIMARY KEY or CONSTRAINT is supported",
         ));
+    }
+    let if_exists = if expect_word(tokens, &mut i, "if") {
+        if !expect_word(tokens, &mut i, "exists") {
+            return Err(parse_error("expected EXISTS after IF"));
+        }
+        true
+    } else {
+        false
     };
+    let constraint_name = parse_alter_identifier(
+        tokens,
+        &mut i,
+        "expected constraint name after ALTER TABLE ... DROP CONSTRAINT",
+    )?;
+    if expect_word(tokens, &mut i, "cascade") {
+        return feature_not_supported("ALTER TABLE DROP CONSTRAINT CASCADE is not supported");
+    }
+    let _restrict = expect_word(tokens, &mut i, "restrict");
     finish_alter_statement(tokens, i)?;
-    Ok(Some(Statement::AlterTableDropPrimaryKey {
+    Ok(Some(Statement::AlterTableDropConstraint {
         table,
         constraint_name,
+        if_exists,
     }))
 }
 

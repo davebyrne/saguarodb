@@ -10,7 +10,7 @@ use parser::Statement;
 use storage::StorageEngine;
 use wal::{WalRecord, WalRecordKind};
 
-use super::{PreparedStatement, QueryService};
+use super::{PreparedRelationVersion, PreparedStatement, QueryService};
 use crate::app::ServerComponents;
 use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
 
@@ -54,7 +54,12 @@ impl QueryService {
             | Statement::AlterTableSetCompression { table, .. }
             | Statement::AlterTableSetOptions { table, .. }
             | Statement::AlterTableAddPrimaryKey { table, .. }
-            | Statement::AlterTableDropPrimaryKey { table, .. } => qualify(table)?,
+            | Statement::AlterTableDropPrimaryKey { table, .. }
+            | Statement::AlterTableDropConstraint { table, .. } => qualify(table)?,
+            Statement::AlterTableAddForeignKey { table, foreign_key } => {
+                qualify(table)?;
+                qualify(&mut foreign_key.referenced_table)?;
+            }
             Statement::Truncate { tables } => {
                 for table in tables {
                     qualify(table)?;
@@ -76,6 +81,17 @@ impl QueryService {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
             DbError::internal("maintenance prepared statement has no carried payload")
         })?;
+        if matches!(
+            statement,
+            Statement::AlterTableAddForeignKey { .. } | Statement::AlterTableDropConstraint { .. }
+        ) {
+            return self.run_maintenance_inner(
+                statement.clone(),
+                session.cancel(),
+                session.gucs().default_statistics_target(),
+                Some(&prepared.schema_versions),
+            );
+        }
         let mut identity_guard = self.components.lock_manager.statement_owner()?;
         let mut identity_requests = Vec::new();
         for name in maintenance_target_names(statement) {
@@ -93,10 +109,11 @@ impl QueryService {
         }
         identity_guard.acquire_many(&identity_requests, session.cancel())?;
         self.validate_prepared_schema_versions(&prepared.schema_versions)?;
-        self.run_maintenance(
+        self.run_maintenance_inner(
             statement.clone(),
             session.cancel(),
             session.gucs().default_statistics_target(),
+            None,
         )
     }
 
@@ -110,6 +127,16 @@ impl QueryService {
         statement: Statement,
         cancel: &Arc<QueryCancel>,
         statistics_target: u32,
+    ) -> Result<ExecutionResult> {
+        self.run_maintenance_inner(statement, cancel, statistics_target, None)
+    }
+
+    fn run_maintenance_inner(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+        statistics_target: u32,
+        prepared_versions: Option<&[PreparedRelationVersion]>,
     ) -> Result<ExecutionResult> {
         cancel.check()?;
         match &statement {
@@ -141,8 +168,14 @@ impl QueryService {
             Statement::AlterTableAddPrimaryKey { .. } => {
                 self.run_alter_table_add_primary_key(statement, cancel)
             }
+            Statement::AlterTableAddForeignKey { .. } => {
+                self.run_alter_table_add_foreign_key(statement, cancel, prepared_versions)
+            }
             Statement::AlterTableDropPrimaryKey { .. } => {
                 self.run_alter_table_drop_primary_key(statement, cancel)
+            }
+            Statement::AlterTableDropConstraint { .. } => {
+                self.run_alter_table_drop_constraint(statement, cancel, prepared_versions)
             }
             _ => Err(DbError::internal(
                 "run_maintenance called with a non-maintenance statement",
@@ -294,6 +327,10 @@ fn maintenance_target_names(statement: &Statement) -> Vec<&QualifiedName> {
         | Statement::AlterTableSetOptions { table, .. }
         | Statement::AlterTableAddPrimaryKey { table, .. }
         | Statement::AlterTableDropPrimaryKey { table, .. } => vec![table],
+        Statement::AlterTableDropConstraint { table, .. } => vec![table],
+        Statement::AlterTableAddForeignKey { table, foreign_key } => {
+            vec![table, &foreign_key.referenced_table]
+        }
         Statement::Truncate { tables } => tables.iter().collect(),
         _ => Vec::new(),
     }

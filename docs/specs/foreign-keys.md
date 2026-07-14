@@ -23,9 +23,13 @@ passes without a parent probe. `NO ACTION` is the default. `NO ACTION` and
 `SET NULL`, `SET DEFAULT`, explicit `MATCH`, `DEFERRABLE`, `NOT VALID`, and other
 constraint characteristics return `0A000`. No child index is created.
 
-Standalone `ALTER TABLE ... ADD FOREIGN KEY` and `DROP CONSTRAINT` are not yet
-shipped. Durable catalog mutation primitives exist for that later maintenance
-orchestration without changing the stored representation.
+Standalone `ALTER TABLE <child> ADD [CONSTRAINT name] FOREIGN KEY (...) REFERENCES
+<parent> [(...)] [ON UPDATE ...] [ON DELETE ...]` and `ALTER TABLE <child> DROP
+CONSTRAINT [IF EXISTS] name [RESTRICT]` are supported. `CASCADE` is rejected.
+Generic DROP resolves the table-local name at execution and routes the primary-key
+name through the existing primary-key maintenance path; otherwise it removes only
+the named foreign key. Both forms are standalone maintenance and return `0A000`
+inside an explicit transaction block.
 
 ## Binding and creation
 
@@ -48,6 +52,20 @@ batch is attached atomically, and `UpdateTableSchema` persists the final schema
 with the current index list. Pre-commit errors roll back the table, indexes,
 TOAST relation, owned sequences, and storage metadata through transactional DDL.
 CREATE remains transaction- and savepoint-aware.
+
+Standalone ADD resolves both relations again after taking `AccessExclusive` on
+the child and `Share` on the parent. It constructs the proposed FK-bearing schema
+under the catalog publication gate, validates every existing child row through
+the shared executor enforcement service, and persists the complete schema and
+current index list with `UpdateTableSchema`. DROP takes `AccessExclusive` on the
+child and `AccessShare` on the parent, resolves the name after locking, preserves
+the monotonic allocator, and uses the same durable schema record. Pre-commit
+validation, cancellation, WAL, or storage failures restore catalog/storage state.
+`IF EXISTS` suppresses only a genuinely absent name; a matching declared UNIQUE
+constraint is recognized and returns `0A000` because UNIQUE DROP is not supported.
+Prepared forms record both child and parent schema identities when the parent is
+known at prepare time and revalidate them only after the same maintenance xid owns
+the converged schema/name/relation lock set and the publication gate is held.
 
 ## Enforcement
 

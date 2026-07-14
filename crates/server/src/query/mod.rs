@@ -2221,7 +2221,11 @@ fn prepared_maintenance_schema_versions(
         | Statement::AlterTableSetCompression { table, .. }
         | Statement::AlterTableSetOptions { table, .. }
         | Statement::AlterTableAddPrimaryKey { table, .. }
-        | Statement::AlterTableDropPrimaryKey { table, .. } => vec![table],
+        | Statement::AlterTableDropPrimaryKey { table, .. }
+        | Statement::AlterTableDropConstraint { table, .. } => vec![table],
+        Statement::AlterTableAddForeignKey { table, foreign_key } => {
+            vec![table, &foreign_key.referenced_table]
+        }
         Statement::Truncate { tables } => tables.iter().collect(),
         _ => Vec::new(),
     };
@@ -2264,6 +2268,42 @@ fn prepared_maintenance_schema_versions(
         let identity = relation_schema_identity(catalog, table.id)?
             .ok_or_else(prepared_schema_changed_error)?;
         versions.push((table.id, identity.0, identity.1));
+    }
+    if let Statement::AlterTableDropConstraint {
+        table,
+        constraint_name,
+        ..
+    } = statement
+    {
+        let schema_name = table.schema.as_deref().ok_or_else(|| {
+            DbError::plan(
+                SqlState::UndefinedTable,
+                format!("table {table} does not exist"),
+            )
+        })?;
+        let namespace = catalog.get_schema_by_name(schema_name)?.ok_or_else(|| {
+            DbError::plan(
+                SqlState::InvalidSchemaName,
+                format!("schema {schema_name} does not exist"),
+            )
+        })?;
+        let child = catalog
+            .get_table_in_schema(namespace.id, &table.name)?
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedTable,
+                    format!("table {table} does not exist"),
+                )
+            })?;
+        if let Some(foreign_key) = child
+            .foreign_keys
+            .iter()
+            .find(|foreign_key| foreign_key.name == *constraint_name)
+        {
+            let identity = relation_schema_identity(catalog, foreign_key.referenced_table)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            versions.push((foreign_key.referenced_table, identity.0, identity.1));
+        }
     }
     versions.sort_unstable_by_key(|version| version.0);
     versions.dedup_by_key(|version| version.0);
@@ -3695,7 +3735,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::AlterTableSetCompression { .. }
         | Statement::AlterTableSetOptions { .. }
         | Statement::AlterTableAddPrimaryKey { .. }
-        | Statement::AlterTableDropPrimaryKey { .. } => Ok(StatementClass::Maintenance),
+        | Statement::AlterTableAddForeignKey { .. }
+        | Statement::AlterTableDropPrimaryKey { .. }
+        | Statement::AlterTableDropConstraint { .. } => Ok(StatementClass::Maintenance),
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
@@ -4519,6 +4561,7 @@ mod tests {
     struct FailingCommitWal {
         inner: FileWalManager,
         fail_next_commit: AtomicBool,
+        fail_next_flush: AtomicBool,
     }
 
     impl FailingCommitWal {
@@ -4526,11 +4569,16 @@ mod tests {
             Self {
                 inner: FileWalManager::open(path).unwrap(),
                 fail_next_commit: AtomicBool::new(false),
+                fail_next_flush: AtomicBool::new(false),
             }
         }
 
         fn fail_next_commit(&self) {
             self.fail_next_commit.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_flush(&self) {
+            self.fail_next_flush.store(true, Ordering::SeqCst);
         }
     }
 
@@ -4547,6 +4595,9 @@ mod tests {
         }
 
         fn flush(&self) -> Result<Lsn> {
+            if self.fail_next_flush.swap(false, Ordering::SeqCst) {
+                return Err(DbError::io("injected WAL flush failure"));
+            }
             self.inner.flush()
         }
 
@@ -8446,6 +8497,180 @@ mod tests {
                 .code,
             SqlState::FeatureNotSupported
         );
+    }
+
+    #[tokio::test]
+    async fn failed_alter_foreign_key_does_not_advance_live_allocator() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table alter_fk_parent (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create table alter_fk_child (id integer primary key, parent_id integer)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into alter_fk_child values (1, 99)")
+            .unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_sql(
+                    "alter table alter_fk_child add foreign key (parent_id) references alter_fk_parent",
+                )
+                .unwrap_err()
+                .code,
+            SqlState::ForeignKeyViolation
+        );
+        let child = app
+            .components
+            .catalog
+            .get_table_by_name("alter_fk_child")
+            .unwrap()
+            .unwrap();
+        assert!(child.foreign_keys.is_empty());
+        assert_eq!(child.next_foreign_key_id, 0);
+    }
+
+    #[test]
+    fn alter_foreign_key_wal_failures_restore_catalog_and_storage_before_unlock() {
+        let add_dir = tempfile::tempdir().unwrap();
+        let add_wal = Arc::new(FailingCommitWal::open(&add_dir.path().join("wal.dat")));
+        let app = app_with_parts(
+            add_dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            add_wal.clone(),
+            Arc::new(
+                control::FileControlStore::open(add_dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table rollback_fk_parent (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table rollback_fk_child (id integer primary key, parent_id integer)",
+            )
+            .unwrap();
+        let child_before = app
+            .components
+            .catalog
+            .get_table_by_name("rollback_fk_child")
+            .unwrap()
+            .unwrap();
+        add_wal.fail_next_commit();
+        assert!(
+            app.query_service
+                .execute_sql(
+                    "alter table rollback_fk_child add constraint rollback_fk foreign key \
+                     (parent_id) references rollback_fk_parent",
+                )
+                .is_err()
+        );
+        let child_after = app
+            .components
+            .catalog
+            .get_table_by_name("rollback_fk_child")
+            .unwrap()
+            .unwrap();
+        assert!(child_after.foreign_keys.is_empty());
+        assert_eq!(child_after.next_foreign_key_id, 1);
+        assert_eq!(child_after.schema_version, child_before.schema_version);
+        assert_eq!(
+            app.components
+                .storage
+                .capture_relation_snapshot()
+                .unwrap()
+                .table_schema_version(child_after.id),
+            Some(child_before.schema_version)
+        );
+        assert!(app.components.active_txns.active_ids().is_empty());
+        drop(app);
+        drop(add_wal);
+        let recovered = crate::recovery::open_app(Config {
+            data_dir: add_dir.path().to_path_buf(),
+            ..Config::default()
+        })
+        .unwrap();
+        let recovered_child = recovered
+            .components
+            .catalog
+            .get_table_by_name("rollback_fk_child")
+            .unwrap()
+            .unwrap();
+        assert!(recovered_child.foreign_keys.is_empty());
+        assert_eq!(recovered_child.next_foreign_key_id, 1);
+
+        let drop_dir = tempfile::tempdir().unwrap();
+        let drop_wal = Arc::new(FailingCommitWal::open(&drop_dir.path().join("wal.dat")));
+        let app = app_with_parts(
+            drop_dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            drop_wal.clone(),
+            Arc::new(
+                control::FileControlStore::open(drop_dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table rollback_drop_parent (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table rollback_drop_child (id integer primary key, parent_id integer)",
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "alter table rollback_drop_child add constraint keep_rollback_fk foreign key \
+                 (parent_id) references rollback_drop_parent",
+            )
+            .unwrap();
+        let child_before = app
+            .components
+            .catalog
+            .get_table_by_name("rollback_drop_child")
+            .unwrap()
+            .unwrap();
+        drop_wal.fail_next_flush();
+        assert!(
+            app.query_service
+                .execute_sql("alter table rollback_drop_child drop constraint keep_rollback_fk")
+                .is_err()
+        );
+        let child_after = app
+            .components
+            .catalog
+            .get_table_by_name("rollback_drop_child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_after.foreign_keys, child_before.foreign_keys);
+        assert_eq!(child_after.schema_version, child_before.schema_version);
+        assert_eq!(
+            app.components
+                .storage
+                .capture_relation_snapshot()
+                .unwrap()
+                .table_schema_version(child_after.id),
+            Some(child_before.schema_version)
+        );
+        assert!(app.components.active_txns.active_ids().is_empty());
+        drop(app);
+        drop(drop_wal);
+        let recovered = crate::recovery::open_app(Config {
+            data_dir: drop_dir.path().to_path_buf(),
+            ..Config::default()
+        })
+        .unwrap();
+        let recovered_child = recovered
+            .components
+            .catalog
+            .get_table_by_name("rollback_drop_child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_child.foreign_keys, child_before.foreign_keys);
     }
 
     #[tokio::test]

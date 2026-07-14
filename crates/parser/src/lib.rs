@@ -2637,18 +2637,65 @@ mod tests {
         );
         assert_eq!(
             parse("alter table users drop primary key").unwrap(),
-            Statement::AlterTableDropPrimaryKey {
-                table: qn("users"),
-                constraint_name: None,
-            }
+            Statement::AlterTableDropPrimaryKey { table: qn("users") }
         );
         assert_eq!(
-            parse("alter table only users drop constraint users_pkey").unwrap(),
-            Statement::AlterTableDropPrimaryKey {
+            parse("alter table only users drop constraint if exists users_pkey restrict").unwrap(),
+            Statement::AlterTableDropConstraint {
                 table: qn("users"),
-                constraint_name: Some("users_pkey".to_string()),
+                constraint_name: "users_pkey".to_string(),
+                if_exists: true,
             }
         );
+    }
+
+    #[test]
+    fn parses_alter_table_foreign_key_forms() {
+        let Statement::AlterTableAddForeignKey { table, foreign_key } = parse(
+            "alter table child add constraint child_parent_fkey foreign key (tenant, parent_id) \
+             references app.parent (tenant, id) on update restrict on delete no action",
+        )
+        .unwrap() else {
+            panic!("expected ALTER TABLE ADD FOREIGN KEY");
+        };
+        assert_eq!(table, qn("child"));
+        assert_eq!(foreign_key.name.as_deref(), Some("child_parent_fkey"));
+        assert_eq!(foreign_key.columns, vec!["tenant", "parent_id"]);
+        assert_eq!(foreign_key.referenced_table.schema.as_deref(), Some("app"));
+        assert_eq!(foreign_key.referenced_columns, vec!["tenant", "id"]);
+        assert_eq!(foreign_key.on_update, common::ForeignKeyAction::Restrict);
+        assert_eq!(foreign_key.on_delete, common::ForeignKeyAction::NoAction);
+
+        let Statement::AlterTableAddForeignKey { foreign_key, .. } =
+            parse("alter table child add foreign key (parent_id) references parent").unwrap()
+        else {
+            panic!("expected ALTER TABLE ADD FOREIGN KEY");
+        };
+        assert!(foreign_key.name.is_none());
+        assert!(foreign_key.referenced_columns.is_empty());
+
+        for sql in [
+            "alter table child add foreign key (parent_id) references parent(id) on delete cascade",
+            "alter table child add foreign key (parent_id) references parent(id) match full",
+            "alter table child add foreign key (parent_id) references parent(id) deferrable",
+            "alter table child add foreign key (parent_id) references parent(id) not valid",
+            "alter table child add foreign key (parent_id) references parent(id) not enforced",
+            "alter table child add foreign key (parent_id) references parent(id) enforced",
+            "alter table child drop constraint child_parent_fkey cascade",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap_err().code,
+                SqlState::FeatureNotSupported,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "alter table child add foreign key (parent_id) references parent(id) on update restrict on update no action",
+            "alter table child add foreign key (parent_id) references parent(id) on delete restrict on delete no action",
+        ] {
+            assert_eq!(parse(sql).unwrap_err().code, SqlState::SyntaxError, "{sql}");
+        }
     }
 
     #[test]

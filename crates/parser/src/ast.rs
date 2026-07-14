@@ -278,11 +278,20 @@ pub enum Statement {
         columns: Vec<String>,
         constraint_name: Option<String>,
     },
-    /// `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY` or
-    /// `ALTER TABLE [ONLY] <name> DROP CONSTRAINT <name>`.
+    /// `ALTER TABLE [ONLY] <name> ADD [CONSTRAINT <name>] FOREIGN KEY ...`.
+    AlterTableAddForeignKey {
+        table: QualifiedName,
+        foreign_key: ParsedForeignKey,
+    },
+    /// `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY`.
     AlterTableDropPrimaryKey {
         table: QualifiedName,
-        constraint_name: Option<String>,
+    },
+    /// `ALTER TABLE [ONLY] <name> DROP CONSTRAINT [IF EXISTS] <name> [RESTRICT]`.
+    AlterTableDropConstraint {
+        table: QualifiedName,
+        constraint_name: String,
+        if_exists: bool,
     },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
     /// non-relational bulk-transfer command (text/CSV, simple-query only). The

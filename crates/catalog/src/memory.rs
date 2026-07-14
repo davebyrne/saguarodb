@@ -540,6 +540,22 @@ impl CatalogManager for MemoryCatalog {
         Ok(schema)
     }
 
+    fn reserve_foreign_key_allocator(&self, table: TableId, next_id: u32) -> Result<()> {
+        if next_id > FOREIGN_KEY_ID_EXHAUSTED {
+            return Err(DbError::internal(format!(
+                "foreign-key allocator reservation {next_id} exceeds exhausted sentinel {FOREIGN_KEY_ID_EXHAUSTED}",
+            )));
+        }
+        let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot.tables_by_id.get_mut(&table).ok_or_else(|| {
+            DbError::internal(format!(
+                "cannot reserve foreign-key allocator for missing table id {table}",
+            ))
+        })?;
+        schema.next_foreign_key_id = schema.next_foreign_key_id.max(next_id);
+        Ok(())
+    }
+
     fn drop_foreign_key(
         &self,
         table: TableId,
