@@ -37,6 +37,7 @@ pub enum Statement {
         // merges the patch with `ToastOptions::default_new_table()`.
         toast: ToastOptionPatch,
         checks: Vec<String>,
+        foreign_keys: Vec<ParsedForeignKey>,
     },
     DropTable { names: Vec<QualifiedName>, if_exists: bool },
     // All relation/object targets use `QualifiedName`; examples abbreviated.
@@ -116,6 +117,15 @@ pub enum Statement {
         direction: CopyDirection,
         options: CopyOptions,
     },
+}
+
+pub struct ParsedForeignKey {
+    name: Option<String>,
+    columns: Vec<String>,
+    referenced_table: QualifiedName,
+    referenced_columns: Vec<String>, // empty means target PK
+    on_update: ForeignKeyAction,
+    on_delete: ForeignKeyAction,
 }
 
 pub enum FetchCount {
@@ -340,6 +350,17 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
   duplicate values are `SqlState::SyntaxError`, while a numeric value outside
   the range is `SqlState::InvalidParameterValue`. The validated value is
   discarded and has no AST, catalog, or page-layout effect.
+- Column-level `[CONSTRAINT name] REFERENCES table [(cols)]` and table-level
+  `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES table [(cols)]` append
+  `ParsedForeignKey` entries to `Statement::CreateTable.foreign_keys` in
+  declaration order. Missing actions become `NoAction`; `RESTRICT` is retained.
+  Other referential actions and constraint characteristics return `0A000`.
+  Omitted referenced columns remain empty for the binder to replace with the
+  target primary key. Named column options remain unsupported except for a
+  foreign key. Source spans restore the original order when sqlparser separates
+  column definitions from table constraints. Explicit `MATCH` and `NOT VALID`
+  are recognized before sqlparser's generic syntax failure and return `0A000`.
+  See `docs/specs/foreign-keys.md`.
 - `DROP TABLE [IF EXISTS] <name> [, ...]`. Targets retain input order and are
   lowercase-normalized; duplicate normalized names are rejected.
 - `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (SaguaroDB does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.

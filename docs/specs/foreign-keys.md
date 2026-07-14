@@ -1,0 +1,84 @@
+# Foreign Keys
+
+**Date:** 2026-07-13
+**Status:** Living feature contract
+
+## Scope
+
+SaguaroDB supports immediately enforced foreign keys declared by `CREATE TABLE`
+in column- or table-level form. Source and target lists are non-empty, ordered,
+equal-length, and contain no duplicates. Omitting the target list selects the
+referenced table's primary key. An explicit list must exactly match, in order, a
+declared primary-key or `UNIQUE` constraint. A standalone unique index is not an
+eligible referenced key. Paired columns must have identical `DataType`, concrete
+`PgType`, and declared length/type-modifier metadata; nullability may differ.
+
+An omitted name becomes `<child>_<source-columns-joined-by-underscore>_fkey`;
+collisions receive the smallest positive numeric suffix. Constraint names are
+table-local. Identifiers follow the ordinary unquoted lowercase normalization.
+
+Only implicit `MATCH SIMPLE` is supported: if any source value is `NULL`, the row
+passes without a parent probe. `NO ACTION` is the default. `NO ACTION` and
+`RESTRICT` are immediate per-row checks with identical enforcement. `CASCADE`,
+`SET NULL`, `SET DEFAULT`, explicit `MATCH`, `DEFERRABLE`, `NOT VALID`, and other
+constraint characteristics return `0A000`. No child index is created.
+
+Standalone `ALTER TABLE ... ADD FOREIGN KEY` and `DROP CONSTRAINT` are not yet
+shipped. Durable catalog mutation primitives exist for that later maintenance
+orchestration without changing the stored representation.
+
+## Binding and creation
+
+The parser stores `ParsedForeignKey` entries in declaration order, including
+interleaved column- and table-level forms. The binder
+resolves source columns against the proposed table. Existing parents become
+stable table/column IDs; self references retain proposed target names until the
+new table ID exists. Binding validates the eligible referenced constraint and
+exact declared types. Unqualified targets follow `search_path`; the proposed
+table is considered for self-reference only at its own schema position. Missing
+tables/columns return `42P01`/`42703`, incompatible
+types return `42804`, and an ineligible referenced key returns `42830`.
+
+`CREATE TABLE IF NOT EXISTS` validates FK definitions, including generated and
+explicit constraint-name collisions and allocator capacity, before deciding that
+an existing table makes the statement a no-op. Existing parents are prepared-plan
+schema identities and are held with `AccessShare` while CREATE publishes. The
+table and PK/UNIQUE indexes are installed first; then the complete resolved FK
+batch is attached atomically, and `UpdateTableSchema` persists the final schema
+with the current index list. Pre-commit errors roll back the table, indexes,
+TOAST relation, owned sequences, and storage metadata through transactional DDL.
+CREATE remains transaction- and savepoint-aware.
+
+## Enforcement
+
+The shared executor service enforces installed FKs for INSERT, UPDATE, DELETE,
+COPY FROM, and effective upsert branches. Local row constraints run before
+outgoing probes. A self-referencing resulting row may satisfy its own key. There
+is no deferred statement queue, so a forward reference to a later row in a
+multi-row statement is not specially accepted.
+
+Parent probes use current liveness, wait for in-progress creators, retain
+`KeyShare` on the actual row, and recheck update/HOT chains. Dependent probes use
+an exact existing child index or heap scan, wait/restart around in-progress child
+changes, and exclude the current identity for self-references. Read Committed
+accepts the current committed result after waiting; Repeatable Read and
+Serializable return `40001` when it lies outside their retained snapshot.
+
+Violations return `23503` with PostgreSQL-style child and parent messages.
+Related parent/child relations are discovered during lock convergence and held
+with `AccessShare`; the DML target retains `RowExclusive`. PK probes record an
+exact tuple SIREAD, secondary-UNIQUE probes a conservative parent relation
+SIREAD, and dependent scans a child relation SIREAD.
+
+## Durability and dependencies
+
+`TableSchema.foreign_keys` and `next_foreign_key_id` are durable and serde-defaulted
+for old manifests/WAL. IDs are monotonic `u16` values `0..=4095`; `4096` means
+exhausted and dropped IDs are never reused. Recovery installs the complete schema
+from committed `UpdateTableSchema`; pre-FK payloads decode with empty metadata.
+
+DROP COLUMN and non-no-op ALTER COLUMN TYPE reject source/referenced columns with
+`2BP01`. A referenced PK cannot be changed/dropped. DROP TABLE and TRUNCATE require
+every surviving incoming child in the target set; self references, cycles, and
+dependencies wholly inside the set are allowed. Component details live in the
+catalog, storage, executor, server, recovery, SSI, and table-lock specifications.

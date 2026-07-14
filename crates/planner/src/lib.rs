@@ -29,9 +29,10 @@ pub use binder::{
     bind_with_options,
 };
 pub use bound::{
-    BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
-    BoundReturning, BoundRowLock, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement,
-    BoundValues, CorrelatedColumn, DropTableTarget, OutputColumn,
+    BoundDistinct, BoundForeignKey, BoundForeignKeyTarget, BoundFrom, BoundInsertSource,
+    BoundOnConflict, BoundQuery, BoundQueryBody, BoundReturning, BoundRowLock, BoundSelect,
+    BoundSelectItem, BoundSetOp, BoundStatement, BoundValues, CorrelatedColumn, DropTableTarget,
+    OutputColumn,
 };
 pub use estimate::estimated_rows;
 pub use explain::{
@@ -2065,6 +2066,157 @@ mod tests {
         };
         assert!(!if_not_exists);
         assert_eq!(primary_key, vec!["id".to_string(), "org".to_string()]);
+    }
+
+    #[test]
+    fn binder_resolves_create_table_foreign_keys_and_threads_plans() {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "parent".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Int4),
+                }],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        create_primary_key_index(&catalog, "parent", &["id"]);
+        let statement = parse(
+            "create table child (id integer primary key, parent_id integer, \
+             constraint child_parent foreign key (parent_id) references parent)",
+        )
+        .unwrap();
+        let bound = bind(&statement, &catalog).unwrap();
+        let BoundStatement::CreateTable { foreign_keys, .. } = &bound else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(foreign_keys.len(), 1);
+        assert_eq!(foreign_keys[0].columns, vec![1]);
+        assert!(matches!(
+            &foreign_keys[0].target,
+            BoundForeignKeyTarget::Existing { table, columns }
+                if *table == parent.id && columns == &vec![0]
+        ));
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        assert!(matches!(
+            physical,
+            PhysicalPlan::CreateTable { foreign_keys, .. } if foreign_keys.len() == 1
+        ));
+    }
+
+    #[test]
+    fn binder_validates_self_and_existing_foreign_key_targets() {
+        let catalog = MemoryCatalog::empty();
+        let valid = parse(
+            "create table nodes (id integer primary key, code text unique, parent_code text, \
+             foreign key (parent_code) references nodes(code))",
+        )
+        .unwrap();
+        let BoundStatement::CreateTable { foreign_keys, .. } = bind(&valid, &catalog).unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(matches!(
+            &foreign_keys[0].target,
+            BoundForeignKeyTarget::SelfTable { columns } if columns == &vec!["code".to_string()]
+        ));
+
+        let bad_key = parse(
+            "create table nodes (id integer primary key, code text, parent_code text, \
+             foreign key (parent_code) references nodes(code))",
+        )
+        .unwrap();
+        assert_eq!(
+            bind(&bad_key, &catalog).unwrap_err().code,
+            SqlState::InvalidForeignKey
+        );
+        let missing =
+            parse("create table child (id integer primary key, p integer references missing(id))")
+                .unwrap();
+        assert_eq!(
+            bind(&missing, &catalog).unwrap_err().code,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    fn binder_resolves_unqualified_foreign_key_target_through_search_path() {
+        let catalog = MemoryCatalog::empty();
+        let first = catalog.create_schema("first".to_string()).unwrap();
+        let parent = catalog
+            .create_table_in_schema_with_options(
+                first.id,
+                "child".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Int4),
+                }],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+                ToastOptions::default_new_table(),
+                Vec::new(),
+            )
+            .unwrap();
+        catalog
+            .create_index_in_schema_with_constraint(
+                first.id,
+                "child_pkey".to_string(),
+                parent.id,
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+        let statement = parse(
+            "create table public.child \
+             (id integer primary key, p integer references child)",
+        )
+        .unwrap();
+        let BoundStatement::CreateTable { foreign_keys, .. } = bind_with_options(
+            &statement,
+            &catalog,
+            &BindOptions {
+                search_path: vec![first.id, common::PUBLIC_SCHEMA_ID],
+            },
+        )
+        .unwrap() else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(matches!(
+            foreign_keys[0].target,
+            BoundForeignKeyTarget::Existing { table, .. } if table == parent.id
+        ));
+
+        let missing_catalog = MemoryCatalog::empty();
+        let only = missing_catalog.create_schema("only".to_string()).unwrap();
+        let missing = parse(
+            "create table public.lonely \
+             (id integer primary key, p integer references lonely)",
+        )
+        .unwrap();
+        assert_eq!(
+            bind_with_options(
+                &missing,
+                &missing_catalog,
+                &BindOptions {
+                    search_path: vec![only.id],
+                },
+            )
+            .unwrap_err()
+            .code,
+            SqlState::UndefinedTable
+        );
     }
 
     #[test]

@@ -1,7 +1,19 @@
 use common::{
-    CompressionSetting, CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef,
-    PgType, QualifiedName, SequenceOptions, TableOptionPatch, ToastOptionPatch, Value,
+    CompressionSetting, CopyDirection, CopyOptions, DataType, ForeignKeyAction, IsolationLevel,
+    ParsedColumnDef, PgType, QualifiedName, SequenceOptions, TableOptionPatch, ToastOptionPatch,
+    Value,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedForeignKey {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub referenced_table: QualifiedName,
+    /// Empty means the referenced table's primary key.
+    pub referenced_columns: Vec<String>,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetScope {
@@ -40,6 +52,8 @@ pub enum Statement {
         /// against the table's columns. Empty when the table has no checks; a named
         /// check (`CONSTRAINT c CHECK (...)`) is rejected at parse time.
         checks: Vec<String>,
+        /// Column- and table-level foreign-key constraints in declaration order.
+        foreign_keys: Vec<ParsedForeignKey>,
     },
     DropTable {
         names: Vec<QualifiedName>,

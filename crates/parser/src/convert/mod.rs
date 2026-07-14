@@ -56,7 +56,6 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     if let Some(statement) = try_parse_fetch_cursor(sql)? {
         return Ok(statement);
     }
-
     // sqlparser reads inline data after `COPY ... FROM STDIN` and then requires a
     // statement terminator. We stream copy-in over the wire and never carry
     // inline data, so ensure the statement is terminated. A trailing `;` is a
@@ -72,8 +71,13 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     };
 
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, &normalized)
-        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?;
+    let mut statements = match Parser::parse_sql(&dialect, &normalized) {
+        Ok(statements) => statements,
+        Err(err) => {
+            reject_unsupported_create_table_foreign_key_clauses(sql)?;
+            return Err(parse_error(format!("failed to parse SQL: {err}")));
+        }
+    };
 
     if statements.len() != 1 {
         return Err(parse_error("expected exactly one SQL statement"));
@@ -99,6 +103,96 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
         row_lock.mode = mode;
     }
     Ok(statement)
+}
+
+/// sqlparser 0.56 rejects PostgreSQL FK `MATCH` and `NOT VALID` before producing
+/// an AST. After normal parsing has failed, recognize those clauses on a CREATE
+/// TABLE containing REFERENCES so understood unsupported FK options receive
+/// `0A000` without preempting any valid statement.
+fn reject_unsupported_create_table_foreign_key_clauses(sql: &str) -> Result<()> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?;
+    let tokens = tokens
+        .iter()
+        .take_while(|token| !matches!(token, Token::SemiColon))
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if !token_is_word(tokens.first().copied(), "create")
+        || !token_is_word(tokens.get(1).copied(), "table")
+    {
+        return Ok(());
+    }
+
+    for references_index in 2..tokens.len() {
+        if !token_is_word(tokens.get(references_index).copied(), "references") {
+            continue;
+        }
+
+        let mut index = references_index + 1;
+        if !matches!(tokens.get(index), Some(Token::Word(_))) {
+            continue;
+        }
+        index += 1;
+        while matches!(tokens.get(index), Some(Token::Period))
+            && matches!(tokens.get(index + 1), Some(Token::Word(_)))
+        {
+            index += 2;
+        }
+        if matches!(tokens.get(index), Some(Token::LParen)) {
+            let mut depth = 1_u32;
+            index += 1;
+            while index < tokens.len() && depth != 0 {
+                match tokens.get(index) {
+                    Some(Token::LParen) => depth += 1,
+                    Some(Token::RParen) => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            if depth != 0 {
+                continue;
+            }
+        }
+
+        loop {
+            if token_is_word(tokens.get(index).copied(), "match")
+                || (token_is_word(tokens.get(index).copied(), "not")
+                    && token_is_word(tokens.get(index + 1).copied(), "valid"))
+            {
+                return feature_not_supported(
+                    "foreign-key MATCH and NOT VALID clauses are not supported",
+                );
+            }
+            if token_is_word(tokens.get(index).copied(), "on")
+                && (token_is_word(tokens.get(index + 1).copied(), "update")
+                    || token_is_word(tokens.get(index + 1).copied(), "delete"))
+            {
+                index += 2;
+                if token_is_word(tokens.get(index).copied(), "no")
+                    && token_is_word(tokens.get(index + 1).copied(), "action")
+                {
+                    index += 2;
+                    continue;
+                }
+                if token_is_word(tokens.get(index).copied(), "restrict") {
+                    index += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn token_is_word(token: Option<&Token>, expected: &str) -> bool {
+    matches!(
+        token,
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
 }
 
 fn normalize_extended_row_lock_mode(

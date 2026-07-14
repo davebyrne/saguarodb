@@ -16,8 +16,8 @@ mod convert;
 
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FetchCount, FromItem,
-    FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, RowLockClause,
-    Select, SelectItem, SetOp, SetScope, Statement, UnaryOp,
+    FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, ParsedForeignKey, Query,
+    QueryBody, RowLockClause, Select, SelectItem, SetOp, SetScope, Statement, UnaryOp,
 };
 
 use common::Result;
@@ -1937,6 +1937,88 @@ mod tests {
                 vec!["a".to_string(), "b".to_string()],
             ]
         );
+    }
+
+    #[test]
+    fn parses_create_table_foreign_keys() {
+        let Statement::CreateTable { foreign_keys, .. } = parse(
+            "create table child (id integer primary key, parent_id integer \
+             constraint child_parent_fkey references app.parent (id) on update restrict, \
+             a integer, b integer, foreign key (a, b) references pairs (a, b) on delete no action, \
+             foreign key (id) references roots)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+        assert_eq!(foreign_keys.len(), 3);
+        assert_eq!(foreign_keys[0].name.as_deref(), Some("child_parent_fkey"));
+        assert_eq!(foreign_keys[0].columns, vec!["parent_id"]);
+        assert_eq!(
+            foreign_keys[0].referenced_table.schema.as_deref(),
+            Some("app")
+        );
+        assert_eq!(foreign_keys[0].referenced_table.name, "parent");
+        assert_eq!(foreign_keys[0].referenced_columns, vec!["id"]);
+        assert_eq!(
+            foreign_keys[0].on_update,
+            common::ForeignKeyAction::Restrict
+        );
+        assert_eq!(
+            foreign_keys[0].on_delete,
+            common::ForeignKeyAction::NoAction
+        );
+        assert_eq!(foreign_keys[1].columns, vec!["a", "b"]);
+        assert_eq!(foreign_keys[1].referenced_columns, vec!["a", "b"]);
+        assert!(foreign_keys[2].referenced_columns.is_empty());
+    }
+
+    #[test]
+    fn preserves_interleaved_create_table_foreign_key_order() {
+        let Statement::CreateTable { foreign_keys, .. } = parse(
+            "create table child (x integer, foreign key (x) references p1, \
+             y integer references p2, foreign key (x) references p3, \
+             z integer references p4)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+        assert_eq!(
+            foreign_keys
+                .iter()
+                .map(|foreign_key| foreign_key.referenced_table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2", "p3", "p4"]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_create_table_foreign_key_options() {
+        for sql in [
+            "create table c (p integer references p(id) on delete cascade)",
+            "create table c (p integer, foreign key (p) references p(id) deferrable)",
+            "create table c (p integer references p(id) initially deferred)",
+            "create table c (p integer references p(id) match simple)",
+            "create table c (p integer, foreign key (p) references p(id) match full)",
+            "create table c (p integer, foreign key (p) references p(id) not valid)",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "{sql}");
+        }
+
+        assert!(
+            parse(
+                "create table c (valid boolean, p integer references p(id), \
+                 check (not valid))"
+            )
+            .is_ok()
+        );
+
+        for sql in [
+            "create table c (p integer references p(id), match)",
+            "create table c (p integer references p(id), not valid)",
+        ] {
+            assert_eq!(parse(sql).unwrap_err().code, SqlState::SyntaxError, "{sql}");
+        }
     }
 
     #[test]

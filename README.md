@@ -26,6 +26,8 @@ trait seams.
   `VACUUM`, table compression/TOAST option changes, primary-key add/drop, and
   schema evolution for add/drop/rename/type-change columns and table renames.
   One- and two-part user object names resolve through the session `search_path`.
+  `CREATE TABLE` accepts column- and table-level foreign keys referencing declared
+  primary-key/UNIQUE constraints with immediate `NO ACTION`/`RESTRICT` enforcement.
 - DML for `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE` (including
   `UPDATE ... FROM`), `DELETE` (including `DELETE ... USING`), `RETURNING`,
   primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and

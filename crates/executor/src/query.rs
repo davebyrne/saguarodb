@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use catalog::{CatalogManager, TableColumnAlteration};
+use catalog::{CatalogManager, ResolvedForeignKey, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexConstraintKind, IndexId, IsolationLevel, Key, KeyRange, ParsedColumnDef,
@@ -12,8 +12,9 @@ use common::{
     TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, Value, ViewColumn,
 };
 use planner::{
-    BindOptions, BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, ExplainAnalysis,
-    PhysicalPlan, PlanNodeLayout, bind_default_expr_with_options,
+    BindOptions, BoundExpr, BoundForeignKey, BoundForeignKeyTarget, BoundOnConflict,
+    BoundReturning, DropTableTarget, ExplainAnalysis, PhysicalPlan, PlanNodeLayout,
+    bind_default_expr_with_options,
 };
 use storage::{
     LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
@@ -295,6 +296,7 @@ impl QueryEngine {
                 compression,
                 toast,
                 checks,
+                foreign_keys,
             } => execute_create_table(
                 ctx,
                 *schema,
@@ -306,6 +308,7 @@ impl QueryEngine {
                 *compression,
                 toast.clone(),
                 checks,
+                foreign_keys,
             ),
             PhysicalPlan::DropTable { targets, if_exists } => {
                 execute_drop_tables(ctx, targets, *if_exists)
@@ -2046,6 +2049,7 @@ fn execute_create_table(
     compression: CompressionSetting,
     toast: ToastOptions,
     checks: &[String],
+    foreign_keys: &[BoundForeignKey],
 ) -> Result<ExecutionResult> {
     if if_not_exists {
         catalog::validate_create_table_definition(name, columns, primary_key, unique)?;
@@ -2132,10 +2136,84 @@ fn execute_create_table(
             return Err(err);
         }
     }
+    if !foreign_keys.is_empty() {
+        let resolved = match resolve_create_table_foreign_keys(&schema, foreign_keys) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                cleanup_created_table(ctx, schema.id, &created_sequences);
+                return Err(err);
+            }
+        };
+        let attached = match ctx.catalog.attach_foreign_keys(schema.id, resolved) {
+            Ok(attached) => attached,
+            Err(err) => {
+                cleanup_created_table(ctx, schema.id, &created_sequences);
+                return Err(err);
+            }
+        };
+        let indexes = match ctx.catalog.list_indexes_for_table(schema.id) {
+            Ok(indexes) => indexes,
+            Err(err) => {
+                cleanup_created_table(ctx, schema.id, &created_sequences);
+                return Err(err);
+            }
+        };
+        if let Err(err) = ctx
+            .schema_ops
+            .update_table_schema(&ctx.statement, &attached, &indexes)
+        {
+            cleanup_created_table(ctx, schema.id, &created_sequences);
+            return Err(err);
+        }
+    }
     Ok(ExecutionResult::Modified {
         command: "CREATE TABLE".to_string(),
         count: 0,
     })
+}
+
+fn resolve_create_table_foreign_keys(
+    schema: &TableSchema,
+    foreign_keys: &[BoundForeignKey],
+) -> Result<Vec<ResolvedForeignKey>> {
+    foreign_keys
+        .iter()
+        .map(|foreign_key| {
+            let (referenced_table, referenced_columns) = match &foreign_key.target {
+                BoundForeignKeyTarget::Existing { table, columns } => (*table, columns.clone()),
+                BoundForeignKeyTarget::SelfTable { columns } => {
+                    let mut resolved = Vec::new();
+                    resolved.try_reserve(columns.len()).map_err(|_| {
+                        DbError::plan(
+                            SqlState::ProgramLimitExceeded,
+                            "too many self-referenced foreign-key columns",
+                        )
+                    })?;
+                    for name in columns {
+                        let column = schema
+                            .columns
+                            .iter()
+                            .find(|column| column.name == *name)
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "bound self-referenced column {name} is missing after CREATE TABLE"
+                                ))
+                            })?;
+                        resolved.push(column.id);
+                    }
+                    (schema.id, resolved)
+                }
+            };
+            Ok(ResolvedForeignKey {
+                name: foreign_key.name.clone(),
+                columns: foreign_key.columns.clone(),
+                referenced_table,
+                referenced_columns,
+                on_update: foreign_key.on_update,
+                on_delete: foreign_key.on_delete,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]

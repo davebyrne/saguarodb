@@ -559,8 +559,8 @@ Foreign-key metadata reserves `23503` (`ForeignKeyViolation`), `42830`
 (`InvalidForeignKey`), and `42710` (`DuplicateObject`). Executor enforcement uses
 `23503` for both a missing referenced parent and an incoming dependent row;
 catalog definition validation uses `42830`, while table-local constraint-name
-collisions use `42710`. SQL definition syntax is enabled separately from these
-durable/error contracts.
+collisions use `42710`. `CREATE TABLE` definition syntax uses these same durable
+and error contracts; see `docs/specs/foreign-keys.md`.
 
 `DuplicateCursor` maps to `42P03` for a duplicate SQL cursor declaration.
 `InvalidCursorName` maps to `34000` for `FETCH`/`CLOSE` of a cursor that is not

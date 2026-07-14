@@ -1,10 +1,12 @@
 use common::{
-    CompressionSetting, DbError, ParsedColumnDef, ParsedDefault, PgType, Result, SqlState,
-    TableOptionPatch, ToastCompression, ToastMode, ToastOptions, Value,
+    CompressionSetting, DbError, ForeignKeyAction, ParsedColumnDef, ParsedDefault, PgType, Result,
+    SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptions, Value,
 };
 use sqlparser::ast as sql;
+use sqlparser::ast::Spanned;
+use sqlparser::tokenizer::Location;
 
-use crate::{Expr, Statement, UnaryOp};
+use crate::{Expr, ParsedForeignKey, Statement, UnaryOp};
 
 use super::{
     column_char_length, compression_from_str, convert_expr, convert_pg_type, convert_query,
@@ -91,12 +93,22 @@ pub(super) fn convert_alter_table(
             let mut primary_key = Vec::new();
             let mut unique = Vec::new();
             let mut checks = Vec::new();
-            let column =
-                convert_column_def(column_def, &mut primary_key, &mut unique, &mut checks)?;
+            let mut foreign_keys = Vec::new();
+            let column = convert_column_def(
+                column_def,
+                &mut primary_key,
+                &mut unique,
+                &mut checks,
+                &mut foreign_keys,
+            )?;
             if matches!(column.default, Some(ParsedDefault::Serial)) {
                 return unsupported("ALTER TABLE ADD COLUMN SERIAL is not supported");
             }
-            if !primary_key.is_empty() || !unique.is_empty() || !checks.is_empty() {
+            if !primary_key.is_empty()
+                || !unique.is_empty()
+                || !checks.is_empty()
+                || !foreign_keys.is_empty()
+            {
                 return unsupported("ALTER TABLE ADD COLUMN constraints are not supported in v1");
             }
             Ok(Statement::AlterTableAddColumn {
@@ -395,12 +407,22 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
     let mut primary_key = Vec::new();
     let mut unique = Vec::new();
     let mut checks = Vec::new();
+    let mut foreign_keys: Vec<(Location, ParsedForeignKey)> = Vec::new();
     let columns = columns
         .into_iter()
-        .map(|column| convert_column_def(column, &mut primary_key, &mut unique, &mut checks))
+        .map(|column| {
+            convert_column_def(
+                column,
+                &mut primary_key,
+                &mut unique,
+                &mut checks,
+                &mut foreign_keys,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     for constraint in constraints {
+        let constraint_start = constraint.span().start;
         match constraint {
             sql::TableConstraint::PrimaryKey {
                 name,
@@ -455,11 +477,45 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
                 }
                 checks.push(expr.to_string());
             }
+            sql::TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                characteristics,
+            } => {
+                if characteristics.is_some() {
+                    return feature_not_supported(
+                        "foreign-key constraint characteristics are not supported",
+                    );
+                }
+                foreign_keys.push((
+                    constraint_start,
+                    ParsedForeignKey {
+                        name: name.as_ref().map(ident_name).transpose()?,
+                        columns: columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
+                        referenced_table: object_name(&foreign_table)?,
+                        referenced_columns: referred_columns
+                            .iter()
+                            .map(ident_name)
+                            .collect::<Result<Vec<_>>>()?,
+                        on_update: convert_foreign_key_action(on_update)?,
+                        on_delete: convert_foreign_key_action(on_delete)?,
+                    },
+                ));
+            }
             _ => return unsupported("unsupported table constraint"),
         }
     }
 
     let options = convert_table_options(with_options)?;
+    foreign_keys.sort_by_key(|(start, _)| *start);
+    let foreign_keys = foreign_keys
+        .into_iter()
+        .map(|(_, foreign_key)| foreign_key)
+        .collect();
 
     Ok(Statement::CreateTable {
         name: object_name(&name)?,
@@ -470,6 +526,7 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         compression: options.compression,
         toast: options.toast,
         checks,
+        foreign_keys,
     })
 }
 
@@ -658,13 +715,14 @@ fn convert_column_def(
     primary_key: &mut Vec<String>,
     unique: &mut Vec<Vec<String>>,
     checks: &mut Vec<String>,
+    foreign_keys: &mut Vec<(Location, ParsedForeignKey)>,
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
     let mut default = None;
     let serial = serial_pg_type(&column.data_type)?;
 
     for option in &column.options {
-        if option.name.is_some() {
+        if option.name.is_some() && !matches!(option.option, sql::ColumnOption::ForeignKey { .. }) {
             return unsupported("unsupported named column constraint");
         }
 
@@ -700,6 +758,33 @@ fn convert_column_def(
             // in PostgreSQL. A named form (`CONSTRAINT c CHECK ...`) sets
             // `option.name` and is already rejected above.
             sql::ColumnOption::Check(expr) => checks.push(expr.to_string()),
+            sql::ColumnOption::ForeignKey {
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                characteristics,
+            } => {
+                if characteristics.is_some() {
+                    return feature_not_supported(
+                        "foreign-key constraint characteristics are not supported",
+                    );
+                }
+                foreign_keys.push((
+                    option.option.span().start,
+                    ParsedForeignKey {
+                        name: option.name.as_ref().map(ident_name).transpose()?,
+                        columns: vec![ident_name(&column.name)?],
+                        referenced_table: object_name(foreign_table)?,
+                        referenced_columns: referred_columns
+                            .iter()
+                            .map(ident_name)
+                            .collect::<Result<Vec<_>>>()?,
+                        on_update: convert_foreign_key_action(*on_update)?,
+                        on_delete: convert_foreign_key_action(*on_delete)?,
+                    },
+                ));
+            }
             _ => return unsupported("unsupported column option"),
         }
     }
@@ -731,6 +816,14 @@ fn convert_column_def(
         default,
         pg_type: Some(pg_type),
     })
+}
+
+fn convert_foreign_key_action(action: Option<sql::ReferentialAction>) -> Result<ForeignKeyAction> {
+    match action.unwrap_or(sql::ReferentialAction::NoAction) {
+        sql::ReferentialAction::NoAction => Ok(ForeignKeyAction::NoAction),
+        sql::ReferentialAction::Restrict => Ok(ForeignKeyAction::Restrict),
+        other => feature_not_supported(format!("foreign-key action {other} is not supported")),
+    }
 }
 
 fn apply_column_char_length(pg_type: PgType, max_length: Option<u32>) -> Result<PgType> {

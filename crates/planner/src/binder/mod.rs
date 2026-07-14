@@ -6,11 +6,13 @@ use common::{
     ParsedDefault, PgType, QualifiedName, RelationKind, Result, SchemaId, SqlState, TableId,
     TableSchema, Value, ViewDependency,
 };
-use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statement};
+use parser::{
+    Expr, FromItem, FunctionArg, ParsedForeignKey, Query, QueryBody, SelectItem, Statement,
+};
 
 use crate::{
-    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
-    BoundStatement, BoundValues, CorrelatedColumn,
+    BoundDistinct, BoundExpr, BoundForeignKey, BoundForeignKeyTarget, BoundFrom, BoundOrderByItem,
+    BoundQuery, BoundQueryBody, BoundSelect, BoundStatement, BoundValues, CorrelatedColumn,
 };
 
 mod dml;
@@ -270,6 +272,7 @@ fn bind_inner(
             compression,
             toast,
             checks,
+            foreign_keys,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -280,6 +283,7 @@ fn bind_inner(
                     ));
                 }
             }
+            validate_create_foreign_key_names(&name.name, primary_key, unique, foreign_keys)?;
             for column in columns {
                 validate_default_value(catalog, &options.search_path, column)?;
             }
@@ -291,8 +295,19 @@ fn bind_inner(
             for check in checks {
                 bind_check_expr(catalog, &name.name, &check_columns, check)?;
             }
+            let schema = resolve_schema_id(catalog, name, &options.search_path)?;
+            let foreign_keys = bind_create_table_foreign_keys(
+                catalog,
+                &options.search_path,
+                schema,
+                &name.name,
+                columns,
+                primary_key,
+                unique,
+                foreign_keys,
+            )?;
             Ok(BoundStatement::CreateTable {
-                schema: resolve_schema_id(catalog, name, &options.search_path)?,
+                schema,
                 name: name.name.clone(),
                 if_not_exists: *if_not_exists,
                 columns: columns.clone(),
@@ -301,6 +316,7 @@ fn bind_inner(
                 compression: compression.unwrap_or_default(),
                 toast: common::ToastOptions::default_new_table().apply_patch(toast),
                 checks: checks.clone(),
+                foreign_keys,
             })
         }
         Statement::DropTable { names, if_exists } => {
@@ -1257,6 +1273,415 @@ pub(super) fn bind_table_checks(
         .checks
         .iter()
         .map(|text| bind_check_expr(catalog, &table.name, &table.columns, text))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_create_table_foreign_keys(
+    catalog: &dyn CatalogManager,
+    search_path: &[SchemaId],
+    table_schema: SchemaId,
+    table_name: &str,
+    columns: &[ParsedColumnDef],
+    primary_key: &[String],
+    unique: &[Vec<String>],
+    foreign_keys: &[ParsedForeignKey],
+) -> Result<Vec<BoundForeignKey>> {
+    let mut bound = Vec::new();
+    bound.try_reserve(foreign_keys.len()).map_err(|_| {
+        plan_error(
+            SqlState::ProgramLimitExceeded,
+            "too many foreign-key constraints",
+        )
+    })?;
+    for foreign_key in foreign_keys {
+        if foreign_key.columns.is_empty() {
+            return Err(plan_error(
+                SqlState::InvalidForeignKey,
+                "foreign key must contain at least one source column",
+            ));
+        }
+        let source = resolve_proposed_column_names(columns, &foreign_key.columns, "foreign key")?;
+        let parent = resolve_create_foreign_key_parent(
+            catalog,
+            search_path,
+            table_schema,
+            table_name,
+            &foreign_key.referenced_table,
+        )?;
+        let (target, target_columns) = if parent.is_none() {
+            let names =
+                referenced_column_names(&foreign_key.referenced_columns, primary_key, table_name)?;
+            validate_self_referenced_constraint(&names, primary_key, unique)?;
+            let ids = resolve_proposed_column_names(columns, &names, "referenced key")?;
+            (
+                BoundForeignKeyTarget::SelfTable {
+                    columns: names.clone(),
+                },
+                ids.into_iter()
+                    .map(|id| {
+                        columns
+                            .get(usize::from(id))
+                            .map(parsed_declared_column_type)
+                            .ok_or_else(|| DbError::internal("resolved self FK column disappeared"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            let parent = parent.ok_or_else(|| {
+                DbError::internal("foreign-key parent disappeared after self-reference check")
+            })?;
+            let names = referenced_column_names(
+                &foreign_key.referenced_columns,
+                &parent
+                    .primary_key
+                    .iter()
+                    .map(|id| {
+                        parent
+                            .columns
+                            .iter()
+                            .find(|column| column.id == *id)
+                            .map(|column| column.name.clone())
+                            .ok_or_else(|| {
+                                DbError::internal("parent primary-key column is missing")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                &parent.name,
+            )?;
+            let ids = resolve_existing_column_names(&parent, &names)?;
+            if catalog
+                .resolve_foreign_key_index(parent.id, &ids)?
+                .is_none()
+            {
+                return Err(plan_error(
+                    SqlState::InvalidForeignKey,
+                    format!(
+                        "there is no eligible unique constraint matching referenced columns on table {}",
+                        parent.name
+                    ),
+                ));
+            }
+            let target_columns = ids
+                .iter()
+                .map(|id| {
+                    parent
+                        .columns
+                        .iter()
+                        .find(|column| column.id == *id)
+                        .map(durable_declared_column_type)
+                        .ok_or_else(|| DbError::internal("resolved parent FK column disappeared"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (
+                BoundForeignKeyTarget::Existing {
+                    table: parent.id,
+                    columns: ids,
+                },
+                target_columns,
+            )
+        };
+        if source.len() != target_columns.len() {
+            return Err(plan_error(
+                SqlState::InvalidForeignKey,
+                "foreign key source and referenced column counts do not match",
+            ));
+        }
+        for (source_id, (target_type, target_pg_type, target_length, target_name)) in
+            source.iter().zip(target_columns)
+        {
+            let source_column = columns
+                .get(usize::from(*source_id))
+                .ok_or_else(|| DbError::internal("resolved source FK column disappeared"))?;
+            let source_pg_type = source_column
+                .pg_type
+                .clone()
+                .unwrap_or_else(|| PgType::from(&source_column.data_type));
+            if source_column.data_type != target_type
+                || source_pg_type != target_pg_type
+                || source_column.max_length != target_length
+            {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "foreign key columns {} and {} have incompatible declared types",
+                        source_column.name, target_name
+                    ),
+                ));
+            }
+        }
+        bound.push(BoundForeignKey {
+            name: foreign_key.name.clone(),
+            columns: source,
+            target,
+            on_update: foreign_key.on_update,
+            on_delete: foreign_key.on_delete,
+        });
+    }
+    Ok(bound)
+}
+
+fn validate_create_foreign_key_names(
+    table: &str,
+    primary_key: &[String],
+    unique: &[Vec<String>],
+    foreign_keys: &[ParsedForeignKey],
+) -> Result<()> {
+    const FOREIGN_KEY_CAPACITY: usize = 4096;
+    if foreign_keys.len() > FOREIGN_KEY_CAPACITY {
+        return Err(plan_error(
+            SqlState::ProgramLimitExceeded,
+            format!("foreign key id allocator is exhausted for table {table}"),
+        ));
+    }
+    let capacity = unique
+        .len()
+        .checked_add(foreign_keys.len())
+        .and_then(|count| count.checked_add(usize::from(!primary_key.is_empty())))
+        .ok_or_else(|| plan_error(SqlState::ProgramLimitExceeded, "too many constraints"))?;
+    let mut names = HashSet::new();
+    names
+        .try_reserve(capacity)
+        .map_err(|_| plan_error(SqlState::ProgramLimitExceeded, "too many constraint names"))?;
+    if !primary_key.is_empty() {
+        names.insert(format!("{table}_pkey"));
+    }
+    for columns in unique {
+        names.insert(format!("{table}_{}_key", columns.join("_")));
+    }
+    for foreign_key in foreign_keys {
+        if foreign_key.columns.is_empty() {
+            return Err(plan_error(
+                SqlState::InvalidForeignKey,
+                "foreign key must contain at least one source column",
+            ));
+        }
+        if let Some(name) = &foreign_key.name {
+            if !names.insert(name.clone()) {
+                return Err(plan_error(
+                    SqlState::DuplicateObject,
+                    format!("constraint {name} for table {table} already exists"),
+                ));
+            }
+            continue;
+        }
+        let base = format!("{table}_{}_fkey", foreign_key.columns.join("_"));
+        if names.insert(base.clone()) {
+            continue;
+        }
+        let mut suffix = 1_u32;
+        loop {
+            let candidate = format!("{base}{suffix}");
+            if names.insert(candidate) {
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                plan_error(
+                    SqlState::ProgramLimitExceeded,
+                    "foreign key constraint name suffix space exhausted",
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a CREATE TABLE FK parent with the proposed table inserted into the
+/// ordinary search path at its target schema. `None` denotes that self target.
+fn resolve_create_foreign_key_parent(
+    catalog: &dyn CatalogManager,
+    search_path: &[SchemaId],
+    table_schema: SchemaId,
+    table_name: &str,
+    referenced: &QualifiedName,
+) -> Result<Option<TableSchema>> {
+    if referenced.schema.is_some() {
+        let schema = resolve_schema_id(catalog, referenced, search_path)?;
+        if schema == table_schema && referenced.name == table_name {
+            return Ok(None);
+        }
+        return referenced_table_in_schema(catalog, schema, &referenced.name).map(Some);
+    }
+
+    for schema in search_path {
+        if *schema == table_schema && referenced.name == table_name {
+            return Ok(None);
+        }
+        if let Some(table) = catalog.get_table_in_schema(*schema, &referenced.name)? {
+            if table.relation_kind != RelationKind::User {
+                return Err(plan_error(
+                    SqlState::UndefinedTable,
+                    format!("table {} does not exist", referenced.name),
+                ));
+            }
+            return Ok(Some(table));
+        }
+        if catalog
+            .get_view_in_schema(*schema, &referenced.name)?
+            .is_some()
+            || catalog
+                .get_index_in_schema(*schema, &referenced.name)?
+                .is_some()
+            || catalog
+                .get_sequence_in_schema(*schema, &referenced.name)?
+                .is_some()
+        {
+            return Err(plan_error(
+                SqlState::WrongObjectType,
+                format!("relation {} is not a table", referenced.name),
+            ));
+        }
+    }
+    Err(plan_error(
+        SqlState::UndefinedTable,
+        format!("table {} does not exist", referenced.name),
+    ))
+}
+
+fn referenced_table_in_schema(
+    catalog: &dyn CatalogManager,
+    schema: SchemaId,
+    name: &str,
+) -> Result<TableSchema> {
+    if let Some(table) = catalog.get_table_in_schema(schema, name)?
+        && table.relation_kind == RelationKind::User
+    {
+        return Ok(table);
+    }
+    if catalog.get_view_in_schema(schema, name)?.is_some()
+        || catalog.get_index_in_schema(schema, name)?.is_some()
+        || catalog.get_sequence_in_schema(schema, name)?.is_some()
+    {
+        return Err(plan_error(
+            SqlState::WrongObjectType,
+            format!("relation {name} is not a table"),
+        ));
+    }
+    Err(plan_error(
+        SqlState::UndefinedTable,
+        format!("table {name} does not exist"),
+    ))
+}
+
+fn parsed_declared_column_type(
+    column: &ParsedColumnDef,
+) -> (DataType, PgType, Option<u32>, String) {
+    (
+        column.data_type.clone(),
+        column
+            .pg_type
+            .clone()
+            .unwrap_or_else(|| PgType::from(&column.data_type)),
+        column.max_length,
+        column.name.clone(),
+    )
+}
+
+fn durable_declared_column_type(column: &ColumnDef) -> (DataType, PgType, Option<u32>, String) {
+    (
+        column.data_type.clone(),
+        column.wire_type(),
+        column.max_length,
+        column.name.clone(),
+    )
+}
+
+fn referenced_column_names(
+    explicit: &[String],
+    primary_key: &[String],
+    table: &str,
+) -> Result<Vec<String>> {
+    let names = if explicit.is_empty() {
+        if primary_key.is_empty() {
+            return Err(plan_error(
+                SqlState::InvalidForeignKey,
+                format!("referenced table {table} has no primary key"),
+            ));
+        }
+        primary_key.to_vec()
+    } else {
+        explicit.to_vec()
+    };
+    let mut seen = HashSet::new();
+    if names.iter().any(|name| !seen.insert(name)) {
+        return Err(plan_error(
+            SqlState::InvalidForeignKey,
+            "foreign key contains duplicate referenced columns",
+        ));
+    }
+    Ok(names)
+}
+
+fn validate_self_referenced_constraint(
+    columns: &[String],
+    primary_key: &[String],
+    unique: &[Vec<String>],
+) -> Result<()> {
+    if columns == primary_key || unique.iter().any(|candidate| candidate == columns) {
+        return Ok(());
+    }
+    Err(plan_error(
+        SqlState::InvalidForeignKey,
+        "there is no eligible unique constraint matching self-referenced columns",
+    ))
+}
+
+fn resolve_proposed_column_names(
+    columns: &[ParsedColumnDef],
+    names: &[String],
+    kind: &str,
+) -> Result<Vec<ColumnId>> {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(plan_error(
+                SqlState::InvalidForeignKey,
+                format!("{kind} contains duplicate column {name}"),
+            ));
+        }
+        let index = columns
+            .iter()
+            .position(|column| column.name == *name)
+            .ok_or_else(|| {
+                plan_error(
+                    SqlState::UndefinedColumn,
+                    format!("column {name} does not exist"),
+                )
+            })?;
+        resolved.push(ColumnId::try_from(index).map_err(|_| {
+            plan_error(
+                SqlState::ProgramLimitExceeded,
+                "foreign-key column position exceeds the catalog limit",
+            )
+        })?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_existing_column_names(table: &TableSchema, names: &[String]) -> Result<Vec<ColumnId>> {
+    let mut seen = HashSet::new();
+    names
+        .iter()
+        .map(|name| {
+            if !seen.insert(name) {
+                return Err(plan_error(
+                    SqlState::InvalidForeignKey,
+                    format!("foreign key contains duplicate referenced column {name}"),
+                ));
+            }
+            table
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .map(|column| column.id)
+                .ok_or_else(|| {
+                    plan_error(
+                        SqlState::UndefinedColumn,
+                        format!("column {name} does not exist on table {}", table.name),
+                    )
+                })
+        })
         .collect()
 }
 

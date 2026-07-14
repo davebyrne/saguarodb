@@ -1,8 +1,8 @@
 use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    IndexId, ParsedColumnDef, QualifiedName, SchemaId, SequenceOptions, TableId, TableSchema,
-    ToastOptions, ViewDependency,
+    ForeignKeyAction, IndexId, ParsedColumnDef, QualifiedName, SchemaId, SequenceOptions, TableId,
+    TableSchema, ToastOptions, ViewDependency,
 };
 use parser::SetOp;
 
@@ -150,6 +150,26 @@ pub struct DropTableTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundForeignKeyTarget {
+    Existing {
+        table: TableId,
+        columns: Vec<ColumnId>,
+    },
+    SelfTable {
+        columns: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundForeignKey {
+    pub name: Option<String>,
+    pub columns: Vec<ColumnId>,
+    pub target: BoundForeignKeyTarget,
+    pub on_update: ForeignKeyAction,
+    pub on_delete: ForeignKeyAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
     CreateSchema {
         name: String,
@@ -177,6 +197,7 @@ pub enum BoundStatement {
         /// `CHECK` constraint expressions (canonical SQL text), validated against
         /// the table's columns at bind time and persisted with the schema.
         checks: Vec<String>,
+        foreign_keys: Vec<BoundForeignKey>,
     },
     DropTable {
         targets: Vec<DropTableTarget>,

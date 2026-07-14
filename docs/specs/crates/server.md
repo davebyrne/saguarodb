@@ -11,6 +11,12 @@ DDL and schema-qualified relation DDL use the transaction catalog overlay and
 schema/name locks, so they remain private until durable commit and roll back with
 transactions and savepoints.
 
+`CREATE TABLE` foreign-key parents participate in prepared schema identities and
+object-lock convergence. Existing parents are held with `AccessShare` through
+the CREATE statement; self references need no pre-existing relation lock. The
+transaction overlay publishes or rolls back the final FK-bearing schema together
+with its table, indexes, TOAST relation, and owned sequences.
+
 ## Purpose
 
 `server` is the binary crate. It wires all components, runs startup/recovery, owns Tokio networking, bridges protocol messages to query execution, and manages graceful shutdown.

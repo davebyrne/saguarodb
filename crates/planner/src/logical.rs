@@ -5,9 +5,9 @@ use common::{
 };
 
 use crate::{
-    AggregateExpr, ApplyKind, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource,
-    BoundOnConflict, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect,
-    BoundStatement, JoinSide, JoinType, SetOp,
+    AggregateExpr, ApplyKind, BoundDistinct, BoundExpr, BoundForeignKey, BoundFrom,
+    BoundInsertSource, BoundOnConflict, BoundOrderByItem, BoundQuery, BoundQueryBody,
+    BoundReturning, BoundSelect, BoundStatement, JoinSide, JoinType, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum LogicalPlan {
         /// `CHECK` constraint texts, persisted with the schema (see
         /// `BoundStatement::CreateTable`).
         checks: Vec<String>,
+        foreign_keys: Vec<BoundForeignKey>,
     },
     DropTable {
         targets: Vec<crate::DropTableTarget>,
@@ -252,6 +253,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             compression,
             toast,
             checks,
+            foreign_keys,
         } => Ok(LogicalPlan::CreateTable {
             schema: *schema,
             name: name.clone(),
@@ -262,6 +264,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             compression: *compression,
             toast: toast.clone(),
             checks: checks.clone(),
+            foreign_keys: foreign_keys.clone(),
         }),
         BoundStatement::DropTable { targets, if_exists } => Ok(LogicalPlan::DropTable {
             targets: targets.clone(),

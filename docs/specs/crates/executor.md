@@ -394,10 +394,13 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 `CREATE TABLE`:
 
 - Server query orchestration acquires the shared writer guard and then the
-  exclusive catalog publication gate (CREATE has no existing object lock), holding
-  the gate through Commit or rollback restore. Catalog binders/readers are blocked.
+  existing parent tables' `AccessShare` object locks for foreign keys, followed
+  by the exclusive catalog publication gate, holding the locks and gate through
+  Commit or rollback restore. A CREATE without foreign keys has no existing
+  object lock. Catalog binders/readers are blocked by the publication gate.
 - For `IF NOT EXISTS`, validate the table definition shape first (columns,
-  primary key, and unique-constraint column references). If the table already
+  primary key, unique-constraint column references, and the complete FK
+  name/allocator namespace). If the table already
   exists, return the normal command tag without creating serial sequences,
   mutating catalog/storage, or appending logical DDL WAL records.
   If a view already exists with the requested name, return
@@ -413,6 +416,11 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - Create catalog/storage metadata and append logical WAL while the publication
   gate excludes readers. On pre-commit failure restore the catalog/storage state;
   after Commit release the gate so the complete durable object becomes visible.
+- Create the PK and declared-UNIQUE indexes before resolving self-reference table
+  IDs and atomically attaching the bound foreign-key batch. Persist the resulting
+  complete schema and current index list through `update_table_schema`; failure
+  uses the same table/index/TOAST/owned-sequence cleanup path. No child-side index
+  is synthesized. See `docs/specs/foreign-keys.md`.
 - Return `Modified { command: "CREATE TABLE", count: 0 }`.
 
 `DROP TABLE [IF EXISTS] <name> [, ...]`:

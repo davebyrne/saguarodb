@@ -17,9 +17,9 @@ use common::{
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
 use planner::{
-    BindOptions, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
-    BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues,
-    bind_default_expr_with_options, bind_parameterized_with_pg_types_and_options,
+    BindOptions, BoundDistinct, BoundExpr, BoundForeignKeyTarget, BoundFrom, BoundInsertSource,
+    BoundOnConflict, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement,
+    BoundValues, bind_default_expr_with_options, bind_parameterized_with_pg_types_and_options,
     bind_with_options, collect_param_pg_types, format_explain, format_explain_analyze,
     logical_plan, mutates_sequences, physical_plan, substitute_params,
 };
@@ -2459,9 +2459,15 @@ fn collect_bound_statement_objects(
         BoundStatement::AlterTableAlterColumnType { table, .. } => {
             record_bound_relation_version(references, *table, None)?;
         }
+        BoundStatement::CreateTable { foreign_keys, .. } => {
+            for foreign_key in foreign_keys {
+                if let BoundForeignKeyTarget::Existing { table, .. } = foreign_key.target {
+                    record_bound_relation_version(references, table, None)?;
+                }
+            }
+        }
         BoundStatement::CreateSchema { .. }
         | BoundStatement::DropSchema { .. }
-        | BoundStatement::CreateTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
@@ -8502,6 +8508,46 @@ mod tests {
                 .unwrap_err()
                 .code,
             SqlState::ForeignKeyViolation
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_create_table_tracks_foreign_key_parent_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table prepared_create_parent (id integer primary key)")
+            .unwrap();
+        let parent = app
+            .components
+            .catalog
+            .get_table_by_name("prepared_create_parent")
+            .unwrap()
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "create table prepared_create_child \
+                 (id integer primary key, p integer references prepared_create_parent)",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            prepared
+                .schema_versions
+                .iter()
+                .any(|(table, _, _)| *table == parent.id)
+        );
+
+        app.query_service
+            .execute_sql("alter table prepared_create_parent rename column id to parent_id")
+            .unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_prepared(&prepared, &[])
+                .unwrap_err()
+                .code,
+            SqlState::FeatureNotSupported
         );
     }
 

@@ -124,8 +124,10 @@ precedence.
 ## SQL And Durability Rules
 
 - Preserve the supported SQL subset unless the specs are intentionally updated:
-  `CREATE TABLE` (optionally `WITH (compression = 'none' | 'zstd')`, selecting
-  per-table at-rest page compression; `docs/specs/compression.md`),
+  `CREATE TABLE` (including column- and table-level foreign keys referencing
+  declared primary-key/UNIQUE constraints with immediate `NO ACTION`/`RESTRICT`;
+  `docs/specs/foreign-keys.md`, and optionally `WITH (compression = 'none' | 'zstd')`,
+  selecting per-table at-rest page compression; `docs/specs/compression.md`),
   `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
   `INSERT ... VALUES`, `SELECT` with the supported clauses and joins (including
   subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and

@@ -8,8 +8,8 @@ use common::{
 };
 
 use crate::{
-    AggregateExpr, ApplyKind, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning,
-    JoinSide, JoinType, LogicalPlan, SetOp,
+    AggregateExpr, ApplyKind, BinOp, BoundExpr, BoundForeignKey, BoundOnConflict, BoundOrderByItem,
+    BoundReturning, JoinSide, JoinType, LogicalPlan, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +34,7 @@ pub enum PhysicalPlan {
         /// `CHECK` constraint texts, persisted with the schema (see
         /// `BoundStatement::CreateTable`).
         checks: Vec<String>,
+        foreign_keys: Vec<BoundForeignKey>,
     },
     DropTable {
         targets: Vec<crate::DropTableTarget>,
@@ -303,6 +304,7 @@ fn physical_plan_inner(
             compression,
             toast,
             checks,
+            foreign_keys,
         } => Ok(PhysicalPlan::CreateTable {
             schema: *schema,
             name: name.clone(),
@@ -313,6 +315,7 @@ fn physical_plan_inner(
             compression: *compression,
             toast: toast.clone(),
             checks: checks.clone(),
+            foreign_keys: foreign_keys.clone(),
         }),
         LogicalPlan::DropTable { targets, if_exists } => Ok(PhysicalPlan::DropTable {
             targets: targets.clone(),

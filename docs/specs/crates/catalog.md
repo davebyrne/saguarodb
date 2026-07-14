@@ -88,6 +88,12 @@ per-table `next_foreign_key_id`. IDs are allocated from zero, never reused, and
 limited to `0..=4095`; `4096` is the exhausted sentinel. Constraints preserve
 the declared child/parent column order and immediate `NO ACTION`/`RESTRICT`
 actions. Hidden TOAST relations carry an empty list and allocator zero.
+`CREATE TABLE` installs its table and declared PK/UNIQUE indexes before calling
+`attach_foreign_keys` once with the fully bound batch. The catalog allocates names
+and IDs atomically, validates the resulting complete snapshot, bumps the child
+schema version, and returns the schema persisted by `UpdateTableSchema`. Failed
+attachment publishes none of the batch; server/executor rollback removes the
+earlier table/index objects. No supporting child index is created implicitly.
 
 Every persisted relation-like object carries a `schema_id`. `ViewSchema` also
 captures the schema-id search path used to bind its stored definition. Schema id
