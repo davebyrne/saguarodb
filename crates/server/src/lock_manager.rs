@@ -278,6 +278,12 @@ impl LockManager {
         self.cond.notify_all();
     }
 
+    /// Number of owners currently blocked in the shared object/tuple wait graph.
+    /// Exposed for server diagnostics and deterministic concurrency tests.
+    pub fn waiting_owner_count(&self) -> usize {
+        self.lock().waits_for.len()
+    }
+
     fn lock(&self) -> MutexGuard<'_, LockState> {
         match self.state.lock() {
             Ok(state) => state,

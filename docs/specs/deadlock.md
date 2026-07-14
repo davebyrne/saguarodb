@@ -93,6 +93,9 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 `LockManager` (an `Arc` field on `ServerComponents`) owns row and table wait
 coordination. Row waits and table-lock waits share one wait-for graph; a second
 manager or graph is not permitted because it would miss mixed cycles.
+`waiting_owner_count()` exposes the current graph-node count for diagnostics and
+for concurrency tests that must prove a request is queued before releasing its
+blocker; it does not participate in lock acquisition or wakeup decisions.
 
 For row waits, the state and algorithm are:
 

@@ -425,6 +425,14 @@ impl PageBackedStorageEngine {
                 DependentCandidateOutcome::Restart => continue,
                 DependentCandidateOutcome::Wait(blocker) => {
                     self.wait_for_conflict(ctx, blocker)?;
+                    if ctx.isolation != common::IsolationLevel::ReadCommitted
+                        && self.txn_status_view().status(blocker) == TxnStatus::Committed
+                    {
+                        return Err(DbError::execute(
+                            SqlState::SerializationFailure,
+                            "could not serialize access due to concurrent foreign key change",
+                        ));
+                    }
                 }
             }
         }
@@ -693,6 +701,11 @@ impl PageBackedStorageEngine {
             LatestRowVersion::WouldBlock(blocker) => Ok(DependentCandidateOutcome::Wait(blocker)),
             LatestRowVersion::Deleted => Ok(DependentCandidateOutcome::Restart),
             LatestRowVersion::Live { row: current, .. } => {
+                self.ensure_current_visible_to_retained_snapshot(
+                    ctx,
+                    probe.schema,
+                    current.identity(),
+                )?;
                 let (current_key, _) =
                     row_key_for_columns(probe.schema, probe.columns, current.row())?;
                 if current_key != *probe.key {
@@ -704,11 +717,6 @@ impl PageBackedStorageEngine {
                 {
                     return Ok(DependentCandidateOutcome::Continue);
                 }
-                self.ensure_current_visible_to_retained_snapshot(
-                    ctx,
-                    probe.schema,
-                    current.identity(),
-                )?;
                 Ok(DependentCandidateOutcome::Found)
             }
         }
