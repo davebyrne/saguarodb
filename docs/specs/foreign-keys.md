@@ -91,9 +91,29 @@ SIREAD, and dependent scans a child relation SIREAD.
 ## Durability and dependencies
 
 `TableSchema.foreign_keys` and `next_foreign_key_id` are durable and serde-defaulted
-for old manifests/WAL. IDs are monotonic `u16` values `0..=4095`; `4096` means
-exhausted and dropped IDs are never reused. Recovery installs the complete schema
-from committed `UpdateTableSchema`; pre-FK payloads decode with empty metadata.
+for old manifests/WAL. Each constraint durably stores the exact declared
+PK/UNIQUE constraint-index ID selected at attachment, so duplicate eligible keys
+cannot change its identity and that index cannot be dropped while referenced. A
+legacy missing index-ID field is resolved once while loading and then persisted
+normally. IDs are monotonic `u16` values `0..=4095`; `4096` means exhausted and
+dropped IDs are never reused. Recovery installs the complete schema from
+committed `UpdateTableSchema`; pre-FK payloads decode with empty metadata.
+
+## Catalog introspection
+
+Each foreign key has a deterministic virtual OID derived from its child table ID
+and monotonic foreign-key ID. `pg_constraint` exposes it with `contype = 'f'`,
+the child and parent relation OIDs, the referenced declared PK/UNIQUE constraint
+index OID, ordered child/parent attnum arrays, `MATCH SIMPLE`, immediate validated
+flags, and `a`/`r` action codes for `NO ACTION`/`RESTRICT`. Unsupported operator
+arrays remain `NULL`.
+
+`pg_depend` records the foreign key's dependencies on its child table and source
+columns, parent table and referenced columns, and referenced constraint index.
+`pg_get_constraintdef` resolves current relation and column names, so table and
+column renames preserve the OID while changing rendered text. It omits default
+`NO ACTION` clauses and emits explicit `ON UPDATE RESTRICT` and `ON DELETE
+RESTRICT` clauses. Foreign keys add no new `information_schema` views in v1.
 
 DROP COLUMN and non-no-op ALTER COLUMN TYPE reject source/referenced columns with
 `2BP01`. A referenced PK cannot be changed/dropped. DROP TABLE and TRUNCATE require

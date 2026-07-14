@@ -4,13 +4,13 @@ use std::sync::{Arc, OnceLock};
 
 use catalog::{
     CatalogManager, CatalogOverlay, CatalogOverlaySavepoint, MemoryCatalog, TruncateCatalogOverlay,
-    index_oid, primary_key_constraint_oid, resolve_system_view, sequence_oid,
-    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
+    foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, resolve_system_view,
+    sequence_oid, synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
     CatalogIntrospectionProvider, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, DataType,
-    DbError, GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID, ParsedDefault,
-    PgType, QualifiedName, QueryCancel, RelationKind, Result, SchemaId, SequenceId,
+    DbError, ForeignKeyAction, GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID,
+    ParsedDefault, PgType, QualifiedName, QueryCancel, RelationKind, Result, SchemaId, SequenceId,
     SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider,
     TableId, TruncateCatalogUpdate, Value, WriteGuard,
 };
@@ -520,6 +520,40 @@ impl QueryCatalogIntrospection {
                     return Ok(Some(format!("CHECK ({check})")));
                 }
             }
+            for foreign_key in &table.foreign_keys {
+                if foreign_key_constraint_oid(table.id, foreign_key.id)? != constraint_oid {
+                    continue;
+                }
+                let parent = self
+                    .catalog()?
+                    .get_table(foreign_key.referenced_table)?
+                    .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
+                let parent_schema = self
+                    .catalog()?
+                    .get_schema(parent.schema_id)?
+                    .ok_or_else(|| DbError::internal("foreign-key parent schema is missing"))?;
+                let child_columns =
+                    required_column_names(&table, &foreign_key.columns, "foreign-key source")?;
+                let parent_columns = required_column_names(
+                    &parent,
+                    &foreign_key.referenced_columns,
+                    "foreign-key referenced",
+                )?;
+                let mut definition = format!(
+                    "FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                    child_columns.join(", "),
+                    parent_schema.name,
+                    parent.name,
+                    parent_columns.join(", ")
+                );
+                if foreign_key.on_update == ForeignKeyAction::Restrict {
+                    definition.push_str(" ON UPDATE RESTRICT");
+                }
+                if foreign_key.on_delete == ForeignKeyAction::Restrict {
+                    definition.push_str(" ON DELETE RESTRICT");
+                }
+                return Ok(Some(definition));
+            }
         }
         Ok(None)
     }
@@ -620,6 +654,29 @@ fn column_names(table: &common::TableSchema, columns: &[u16]) -> Vec<String> {
                 .iter()
                 .find(|candidate| candidate.id == *column)
                 .map(|definition| definition.name.clone())
+        })
+        .collect()
+}
+
+fn required_column_names(
+    table: &common::TableSchema,
+    columns: &[u16],
+    context: &str,
+) -> Result<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| {
+            table
+                .columns
+                .iter()
+                .find(|candidate| candidate.id == *column)
+                .map(|definition| definition.name.clone())
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "{context} column id {column} is missing from table {}",
+                        table.name
+                    ))
+                })
         })
         .collect()
 }
@@ -3802,7 +3859,7 @@ mod tests {
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use catalog::{
         CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, check_constraint_oid,
-        index_oid, primary_key_constraint_oid, sequence_oid, table_oid,
+        foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, sequence_oid, table_oid,
     };
     use common::{
         CancelReason, CatalogIntrospectionProvider, ColumnDefault, ConcurrencyController, DbError,
@@ -7081,6 +7138,97 @@ mod tests {
                 Value::Text("CHECK (id > 0)".to_string()),
                 Value::Integer(23),
                 Value::Null,
+            ]]
+        );
+    }
+
+    #[test]
+    fn foreign_key_constraint_definition_is_oid_stable_and_rename_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service.execute_sql("create schema app").unwrap();
+        app.query_service
+            .execute_sql(
+                "create table app.fk_def_parent (tenant integer, code text, \
+                 primary key (tenant, code))",
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table fk_def_child (id integer primary key, parent_tenant integer, \
+                 parent_code text, constraint fk_definition foreign key \
+                 (parent_tenant, parent_code) references app.fk_def_parent (tenant, code) \
+                 on update restrict, constraint fk_delete_definition foreign key \
+                 (parent_tenant, parent_code) references app.fk_def_parent (tenant, code) \
+                 on delete restrict)",
+            )
+            .unwrap();
+        let child = app
+            .components
+            .catalog
+            .get_table_by_name("fk_def_child")
+            .unwrap()
+            .unwrap();
+        let foreign_key = child.foreign_keys.first().unwrap();
+        let oid = foreign_key_constraint_oid(child.id, foreign_key.id).unwrap();
+        assert_eq!(
+            result_values(app.query_service.execute_sql(&format!(
+                "select oid, pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) \
+                 from pg_catalog.pg_constraint where oid = {oid}",
+            ))),
+            vec![vec![
+                Value::Integer(oid),
+                Value::Text(
+                    "FOREIGN KEY (parent_tenant, parent_code) REFERENCES app.fk_def_parent \
+                     (tenant, code) ON UPDATE RESTRICT"
+                        .to_string(),
+                ),
+                Value::Text(
+                    "FOREIGN KEY (parent_tenant, parent_code) REFERENCES app.fk_def_parent \
+                     (tenant, code) ON UPDATE RESTRICT"
+                        .to_string(),
+                ),
+            ]]
+        );
+        let delete_foreign_key = child
+            .foreign_keys
+            .iter()
+            .find(|foreign_key| foreign_key.name == "fk_delete_definition")
+            .unwrap();
+        let delete_oid = foreign_key_constraint_oid(child.id, delete_foreign_key.id).unwrap();
+        assert_eq!(
+            result_values(app.query_service.execute_sql(&format!(
+                "select pg_get_constraintdef(oid) from pg_catalog.pg_constraint \
+                 where oid = {delete_oid}",
+            ))),
+            vec![vec![Value::Text(
+                "FOREIGN KEY (parent_tenant, parent_code) REFERENCES app.fk_def_parent \
+                 (tenant, code) ON DELETE RESTRICT"
+                    .to_string(),
+            )]]
+        );
+
+        app.query_service
+            .execute_sql("alter table fk_def_child rename column parent_tenant to tenant_ref")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table app.fk_def_parent rename column tenant to tenant_key")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table app.fk_def_parent rename to fk_def_parent_renamed")
+            .unwrap();
+        assert_eq!(
+            result_values(app.query_service.execute_sql(
+                "select oid, pg_get_constraintdef(oid) \
+                 from pg_catalog.pg_constraint where conname = 'fk_definition'",
+            )),
+            vec![vec![
+                Value::Integer(oid),
+                Value::Text(
+                    "FOREIGN KEY (tenant_ref, parent_code) REFERENCES \
+                     app.fk_def_parent_renamed (tenant_key, code) ON UPDATE RESTRICT"
+                        .to_string(),
+                ),
             ]]
         );
     }

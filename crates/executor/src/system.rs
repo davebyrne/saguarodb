@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 
 use catalog::{
     CatalogManager, INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemView,
-    attrdef_oid, index_oid, primary_key_constraint_oid, schema_oid, sequence_oid,
-    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
+    attrdef_oid, foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, schema_oid,
+    sequence_oid, synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
-    ColumnDef, ColumnDefault, DbError, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32,
-    PgProcCatalogEntry, PgType, RelationKind, Result, Row, SequenceSchema, SessionActivityRow,
-    StatementContext, TableId, TableSchema, Value, ViewSchema, bytea, datetime, float, interval,
-    numeric, pg_proc_catalog_entries, uuid,
+    ColumnDef, ColumnDefault, DbError, ForeignKeyAction, GucSetting, IndexConstraintKind,
+    IsolationLevel, OrderedF32, PgProcCatalogEntry, PgType, RelationKind, Result, Row,
+    SequenceSchema, SessionActivityRow, StatementContext, TableId, TableSchema, Value, ViewSchema,
+    bytea, datetime, float, interval, numeric, pg_proc_catalog_entries, uuid,
 };
 
 const OWNER_OID: i64 = 10;
@@ -543,10 +543,15 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             rows.push(pg_constraint_row(ConstraintRow {
                 oid: primary_key_constraint_oid(table.id)?,
                 name,
+                namespace_oid: namespace_oid(table.schema_id)?,
                 kind: "p",
                 table_oid: table_oid(table.id)?,
                 index_oid: index_oid_value,
                 key_columns: Some(attnums_array_text(&key_columns)),
+                referenced_table_oid: 0,
+                update_action: "a",
+                delete_action: "a",
+                referenced_columns: None,
                 expression: None,
             }));
         }
@@ -554,11 +559,38 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             rows.push(pg_constraint_row(ConstraintRow {
                 oid: try_check_constraint_oid(table.id, index)?,
                 name: check_constraint_name(&table, index),
+                namespace_oid: namespace_oid(table.schema_id)?,
                 kind: "c",
                 table_oid: table_oid(table.id)?,
                 index_oid: 0,
                 key_columns: None,
+                referenced_table_oid: 0,
+                update_action: "a",
+                delete_action: "a",
+                referenced_columns: None,
                 expression: Some(check.clone()),
+            }));
+        }
+        for foreign_key in &table.foreign_keys {
+            let parent = catalog
+                .get_table(foreign_key.referenced_table)?
+                .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
+            if parent.relation_kind != RelationKind::User {
+                return Err(DbError::internal("foreign key references a non-user table"));
+            }
+            rows.push(pg_constraint_row(ConstraintRow {
+                oid: foreign_key_constraint_oid(table.id, foreign_key.id)?,
+                name: foreign_key.name.clone(),
+                namespace_oid: namespace_oid(table.schema_id)?,
+                kind: "f",
+                table_oid: table_oid(table.id)?,
+                index_oid: index_oid(foreign_key.referenced_index)?,
+                key_columns: Some(attnums_array_text(&foreign_key.columns)),
+                referenced_table_oid: table_oid(parent.id)?,
+                update_action: foreign_key_action_code(foreign_key.on_update),
+                delete_action: foreign_key_action_code(foreign_key.on_delete),
+                referenced_columns: Some(attnums_array_text(&foreign_key.referenced_columns)),
+                expression: None,
             }));
         }
     }
@@ -570,7 +602,7 @@ fn pg_constraint_row(row_data: ConstraintRow) -> Row {
     row(vec![
         int(row_data.oid),
         text(row_data.name),
-        int(PUBLIC_SCHEMA_OID),
+        int(row_data.namespace_oid),
         text(row_data.kind),
         bool_value(false),
         bool_value(false),
@@ -579,15 +611,15 @@ fn pg_constraint_row(row_data: ConstraintRow) -> Row {
         int(0),
         int(row_data.index_oid),
         int(0),
-        int(0),
-        text("a"),
-        text("a"),
+        int(row_data.referenced_table_oid),
+        text(row_data.update_action),
+        text(row_data.delete_action),
         text("s"),
         bool_value(true),
         int(0),
         bool_value(false),
         nullable_text(row_data.key_columns),
-        Value::Null,
+        nullable_text(row_data.referenced_columns),
         Value::Null,
         Value::Null,
         Value::Null,
@@ -647,6 +679,63 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 table_oid(table.id)?,
                 0,
                 "a",
+            ));
+        }
+        for foreign_key in &table.foreign_keys {
+            let constraint_oid = foreign_key_constraint_oid(table.id, foreign_key.id)?;
+            let parent = catalog
+                .get_table(foreign_key.referenced_table)?
+                .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
+            let child_oid = table_oid(table.id)?;
+            let parent_oid = table_oid(parent.id)?;
+            rows.push(pg_depend_row(
+                SystemView::PgConstraint.relation_oid(),
+                constraint_oid,
+                0,
+                SystemView::PgClass.relation_oid(),
+                child_oid,
+                0,
+                "a",
+            ));
+            for column in &foreign_key.columns {
+                rows.push(pg_depend_row(
+                    SystemView::PgConstraint.relation_oid(),
+                    constraint_oid,
+                    0,
+                    SystemView::PgClass.relation_oid(),
+                    child_oid,
+                    i64::from(*column) + 1,
+                    "a",
+                ));
+            }
+            rows.push(pg_depend_row(
+                SystemView::PgConstraint.relation_oid(),
+                constraint_oid,
+                0,
+                SystemView::PgClass.relation_oid(),
+                parent_oid,
+                0,
+                "n",
+            ));
+            for column in &foreign_key.referenced_columns {
+                rows.push(pg_depend_row(
+                    SystemView::PgConstraint.relation_oid(),
+                    constraint_oid,
+                    0,
+                    SystemView::PgClass.relation_oid(),
+                    parent_oid,
+                    i64::from(*column) + 1,
+                    "n",
+                ));
+            }
+            rows.push(pg_depend_row(
+                SystemView::PgConstraint.relation_oid(),
+                constraint_oid,
+                0,
+                SystemView::PgClass.relation_oid(),
+                index_oid(foreign_key.referenced_index)?,
+                0,
+                "n",
             ));
         }
         for column in &table.columns {
@@ -1262,11 +1351,23 @@ fn isolation_setting(level: IsolationLevel) -> &'static str {
 struct ConstraintRow {
     oid: i64,
     name: String,
+    namespace_oid: i64,
     kind: &'static str,
     table_oid: i64,
     index_oid: i64,
     key_columns: Option<String>,
+    referenced_table_oid: i64,
+    update_action: &'static str,
+    delete_action: &'static str,
+    referenced_columns: Option<String>,
     expression: Option<String>,
+}
+
+fn foreign_key_action_code(action: ForeignKeyAction) -> &'static str {
+    match action {
+        ForeignKeyAction::NoAction => "a",
+        ForeignKeyAction::Restrict => "r",
+    }
 }
 
 fn attnums_array_text(columns: &[u16]) -> String {

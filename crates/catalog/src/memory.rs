@@ -148,6 +148,7 @@ impl MemoryCatalog {
 
     pub fn try_from_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
         normalize_snapshot_storage_ids(&mut snapshot)?;
+        normalize_foreign_key_referenced_indexes(&mut snapshot)?;
         prune_orphan_statistics(&mut snapshot);
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
@@ -373,6 +374,7 @@ impl CatalogManager for MemoryCatalog {
 
     fn restore(&self, mut snapshot: CatalogSnapshot) -> Result<()> {
         normalize_snapshot_storage_ids(&mut snapshot)?;
+        normalize_foreign_key_referenced_indexes(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         let mut current = self.write_snapshot()?;
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
@@ -516,12 +518,24 @@ impl CatalogManager for MemoryCatalog {
                     &resolved,
                 )?,
             };
+            let referenced_index = resolve_foreign_key_constraint_index_in_snapshot(
+                &snapshot,
+                foreign_key.referenced_table,
+                &foreign_key.referenced_columns,
+            )
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::InvalidForeignKey,
+                    "there is no eligible unique constraint matching referenced columns",
+                )
+            })?;
             resolved.push(ForeignKeyConstraint {
                 id,
                 name,
                 columns: foreign_key.columns,
                 referenced_table: foreign_key.referenced_table,
                 referenced_columns: foreign_key.referenced_columns,
+                referenced_index,
                 on_update: foreign_key.on_update,
                 on_delete: foreign_key.on_delete,
             });
@@ -2043,6 +2057,43 @@ fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> 
     }
 
     snapshot.next_storage_id = next_storage_id.max(next_after_max_storage_id(&assigned)?);
+    Ok(())
+}
+
+fn normalize_foreign_key_referenced_indexes(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    let mut replacements = Vec::new();
+    for child in snapshot.tables_by_id.values() {
+        for foreign_key in &child.foreign_keys {
+            if foreign_key.referenced_index != PRIMARY_KEY_INDEX_ID {
+                continue;
+            }
+            let referenced_index = resolve_foreign_key_constraint_index_in_snapshot(
+                snapshot,
+                foreign_key.referenced_table,
+                &foreign_key.referenced_columns,
+            )
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "legacy foreign key {} on table {} has no eligible referenced constraint index",
+                    foreign_key.name, child.name
+                ))
+            })?;
+            replacements.push((child.id, foreign_key.id, referenced_index));
+        }
+    }
+    for (child_id, foreign_key_id, referenced_index) in replacements {
+        let child = snapshot.tables_by_id.get_mut(&child_id).ok_or_else(|| {
+            DbError::internal("foreign-key child disappeared during catalog normalization")
+        })?;
+        let foreign_key = child
+            .foreign_keys
+            .iter_mut()
+            .find(|foreign_key| foreign_key.id == foreign_key_id)
+            .ok_or_else(|| {
+                DbError::internal("foreign key disappeared during catalog normalization")
+            })?;
+        foreign_key.referenced_index = referenced_index;
+    }
     Ok(())
 }
 
@@ -3680,14 +3731,29 @@ fn validate_foreign_key_columns(
             ));
         }
     }
-    if resolve_foreign_key_index_in_snapshot(snapshot, parent, &foreign_key.referenced_columns)
-        .is_none()
-    {
+    let Some(referenced_index) = snapshot.indexes_by_id.get(&foreign_key.referenced_index) else {
         return Err(foreign_key_validation_error(
             durable_snapshot,
             SqlState::InvalidForeignKey,
             format!(
-                "there is no eligible unique constraint matching referenced columns for foreign key {}",
+                "foreign key {} references missing constraint index {}",
+                foreign_key.name, foreign_key.referenced_index
+            ),
+        ));
+    };
+    let eligible = referenced_index.table == parent.id
+        && referenced_index.columns == foreign_key.referenced_columns
+        && match referenced_index.constraint {
+            IndexConstraintKind::PrimaryKey => parent.primary_key == referenced_index.columns,
+            IndexConstraintKind::Unique => true,
+            IndexConstraintKind::None => false,
+        };
+    if !eligible {
+        return Err(foreign_key_validation_error(
+            durable_snapshot,
+            SqlState::InvalidForeignKey,
+            format!(
+                "foreign key {} does not reference an eligible declared constraint index",
                 foreign_key.name
             ),
         ));
@@ -3695,22 +3761,32 @@ fn validate_foreign_key_columns(
     Ok(())
 }
 
-fn resolve_foreign_key_index_in_snapshot(
+fn resolve_foreign_key_constraint_index_in_snapshot(
     snapshot: &CatalogSnapshot,
-    parent: &TableSchema,
+    parent: TableId,
     columns: &[ColumnId],
 ) -> Option<IndexId> {
-    if !columns.is_empty() && parent.primary_key == columns {
-        return Some(PRIMARY_KEY_INDEX_ID);
+    let table = snapshot.tables_by_id.get(&parent)?;
+    if !columns.is_empty() && table.primary_key == columns {
+        return snapshot
+            .indexes_by_id
+            .values()
+            .find(|index| {
+                index.table == parent
+                    && index.constraint == IndexConstraintKind::PrimaryKey
+                    && index.columns == columns
+            })
+            .map(|index| index.id);
     }
     snapshot
         .indexes_by_id
         .values()
-        .find(|index| {
-            index.table == parent.id
+        .filter(|index| {
+            index.table == parent
                 && index.constraint == IndexConstraintKind::Unique
                 && index.columns == columns
         })
+        .min_by_key(|index| index.id)
         .map(|index| index.id)
 }
 
@@ -4402,6 +4478,7 @@ fn replace_table_and_index_schemas(
         }
         candidate.indexes_by_id.insert(index.id, index.clone());
     }
+    normalize_foreign_key_referenced_indexes(&mut candidate)?;
     validate_snapshot(&candidate)?;
     *snapshot = candidate;
     Ok(())
@@ -4757,27 +4834,11 @@ fn reject_referenced_unique_index_drop(
     if index.constraint != IndexConstraintKind::Unique {
         return Ok(());
     }
-    let Some(parent) = snapshot.tables_by_id.get(&index.table) else {
-        return Ok(());
-    };
-    let has_alternative = (!parent.primary_key.is_empty() && parent.primary_key == index.columns)
-        || snapshot.indexes_by_id.values().any(|candidate| {
-            candidate.id != index.id
-                && candidate.table == index.table
-                && candidate.constraint == IndexConstraintKind::Unique
-                && candidate.columns == index.columns
-        });
-    if has_alternative {
-        return Ok(());
-    }
     if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
         child
             .foreign_keys
             .iter()
-            .find(|foreign_key| {
-                foreign_key.referenced_table == index.table
-                    && foreign_key.referenced_columns == index.columns
-            })
+            .find(|foreign_key| foreign_key.referenced_index == index.id)
             .map(|foreign_key| (child, foreign_key))
     }) {
         return Err(DbError::plan(
@@ -4813,14 +4874,28 @@ fn reject_referenced_primary_key_change(
     if old_primary_key.is_empty() || old_primary_key == new_primary_key {
         return Ok(());
     }
+    if !snapshot.tables_by_id.values().any(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.referenced_table == table)
+    }) {
+        return Ok(());
+    }
+    let primary_key_index = snapshot
+        .indexes_by_id
+        .values()
+        .find(|index| index.table == table && index.constraint == IndexConstraintKind::PrimaryKey);
+    let Some(primary_key_index) = primary_key_index else {
+        return Err(DbError::internal(
+            "table has primary-key metadata but no primary-key constraint index",
+        ));
+    };
     if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
         child
             .foreign_keys
             .iter()
-            .find(|foreign_key| {
-                foreign_key.referenced_table == table
-                    && foreign_key.referenced_columns == old_primary_key
-            })
+            .find(|foreign_key| foreign_key.referenced_index == primary_key_index.id)
             .map(|foreign_key| (child, foreign_key))
     }) {
         return Err(DbError::plan(

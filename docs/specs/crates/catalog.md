@@ -87,7 +87,8 @@ User `TableSchema` values also carry durable outgoing foreign keys and a
 per-table `next_foreign_key_id`. IDs are allocated from zero, never reused, and
 limited to `0..=4095`; `4096` is the exhausted sentinel. Constraints preserve
 the declared child/parent column order and immediate `NO ACTION`/`RESTRICT`
-actions. Hidden TOAST relations carry an empty list and allocator zero.
+actions, plus the exact declared parent constraint-index ID selected when the
+foreign key is attached. Hidden TOAST relations carry an empty list and allocator zero.
 `CREATE TABLE` installs its table and declared PK/UNIQUE indexes before calling
 `attach_foreign_keys` once with the fully bound batch. The catalog allocates names
 and IDs atomically, validates the resulting complete snapshot, bumps the child
@@ -226,6 +227,12 @@ and array catalog fields such as `pg_index.indkey`, `pg_proc.proargtypes`, and
 `pg_constraint.conkey` use text storage with PostgreSQL-compatible wire identities
 (`int2vector`, `oidvector`, `int2[]`, `oid[]`) where SaguaroDB has no first-class
 array/vector value type yet.
+
+Foreign-key rows use `foreign_key_constraint_oid(child_table_id,
+foreign_key_id)`. Their `conindid` is the OID of the exact durable declared
+primary-key or UNIQUE constraint-index ID selected at attachment. The executor
+also derives `pg_depend` edges from the durable table/column/index IDs, so
+renames and duplicate eligible keys do not change object identity.
 
 ## Public API
 
@@ -457,7 +464,10 @@ positive suffix avoiding table-local PK/UNIQUE/FK names. Drop preserves the ID
 allocator. Incoming lookup is ordered by child table/FK ID. Referenced-key
 resolution accepts an exact ordered primary key or exact ordered declared
 UNIQUE constraint; a standalone unique index is ineligible. Child supporting
-indexes are optional and require an exact ordered column match.
+indexes are optional and require an exact ordered column match. Attachment
+stores the selected constraint index's actual nonzero catalog ID; dependency
+checks reject dropping that exact object even when another eligible constraint
+has the same columns.
 CREATE and standalone ALTER share these mutation primitives. ALTER ADD attaches
 one proposed constraint while the server holds the publication gate, validates
 existing rows before commit, and persists the returned schema through
@@ -709,6 +719,10 @@ greater than every installed schema id.
 `TableSchema.foreign_keys` and `next_foreign_key_id` are serde-defaulted to an
 empty list and zero. Catalog v2 and legacy unversioned payloads written before
 foreign-key metadata therefore remain readable without a format-version bump.
+The exact referenced constraint-index ID is also serde-defaulted; a zero legacy
+value is resolved once from the referenced columns during validated loading or
+schema-record application. New metadata always persists the nonzero actual
+constraint-index ID, including for primary keys.
 
 On startup:
 
@@ -734,7 +748,8 @@ table-local constraint names, an allocator above every live ID and no greater
 than 4096, equal non-empty ordered column lists without duplicates, existing
 user child/parent tables and columns, exact `DataType`/concrete `PgType`/length
 metadata equality (nullability may differ), and an exact declared PK/UNIQUE
-target. Hidden TOAST relations must have no FK metadata. Violations in persisted
+target whose actual constraint-index ID equals the durable referenced index.
+Hidden TOAST relations must have no FK metadata. Violations in persisted
 metadata are `InternalError` corruption.
 
 ## WAL Interaction

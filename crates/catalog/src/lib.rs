@@ -408,10 +408,19 @@ pub trait CatalogManager: Send + Sync {
         if schema.primary_key.is_empty() || schema.primary_key == primary_key {
             return Ok(());
         }
+        let primary_key_index = self
+            .list_indexes_for_table(table)?
+            .into_iter()
+            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .ok_or_else(|| {
+                DbError::internal(
+                    "table has primary-key metadata but no primary-key constraint index",
+                )
+            })?;
         if let Some((child, foreign_key)) = self
             .list_incoming_foreign_keys(table)?
             .into_iter()
-            .find(|(_, foreign_key)| foreign_key.referenced_columns == schema.primary_key)
+            .find(|(_, foreign_key)| foreign_key.referenced_index == primary_key_index.id)
         {
             return Err(DbError::plan(
                 SqlState::DependentObjectsStillExist,
@@ -4505,6 +4514,62 @@ mod tests {
     }
 
     #[test]
+    fn foreign_key_retains_exact_referenced_constraint_index_identity() {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "identity_parent".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let selected = catalog
+            .create_index_with_constraint(
+                "identity_parent_first_key".to_string(),
+                "identity_parent",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        let alternative = catalog
+            .create_index_with_constraint(
+                "identity_parent_second_key".to_string(),
+                "identity_parent",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "identity_child".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let attached = catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![resolved_foreign_key(Some("identity_fkey"), parent.id)],
+            )
+            .unwrap();
+        assert_eq!(attached.foreign_keys[0].referenced_index, selected.id);
+
+        assert_eq!(
+            catalog.drop_index(selected.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        catalog.drop_index(alternative.id).unwrap();
+        assert_eq!(
+            catalog.get_table(child.id).unwrap().unwrap().foreign_keys[0].referenced_index,
+            selected.id
+        );
+    }
+
+    #[test]
     fn malformed_foreign_key_snapshot_is_rejected_and_legacy_metadata_defaults_empty() {
         let (catalog, parent, child) = foreign_key_catalog();
         catalog
@@ -4521,6 +4586,29 @@ mod tests {
             .next_foreign_key_id = 0;
         let err = MemoryCatalog::try_from_snapshot(malformed).unwrap_err();
         assert_eq!(err.code, SqlState::InternalError);
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let foreign_key = value
+            .get_mut("tables")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|tables| {
+                tables.iter_mut().find(|table| {
+                    table.get("name").and_then(serde_json::Value::as_str) == Some("children")
+                })
+            })
+            .and_then(|table| table.get_mut("foreign_keys"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|foreign_keys| foreign_keys.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        foreign_key.remove("referenced_index");
+        let decoded = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = MemoryCatalog::try_from_snapshot(decoded).unwrap();
+        assert_ne!(
+            loaded.get_table(child).unwrap().unwrap().foreign_keys[0].referenced_index,
+            common::PRIMARY_KEY_INDEX_ID
+        );
 
         let legacy = MemoryCatalog::empty();
         legacy
@@ -4963,6 +5051,7 @@ mod tests {
             columns: vec![0],
             referenced_table: 999,
             referenced_columns: vec![0],
+            referenced_index: 1,
             on_update: ForeignKeyAction::NoAction,
             on_delete: ForeignKeyAction::NoAction,
         });

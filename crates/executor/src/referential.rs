@@ -1,7 +1,7 @@
 use catalog::CatalogManager;
 use common::{
-    ColumnId, DbError, ForeignKeyConstraint, IndexId, Key, Result, RowIdentity, SqlState, TableId,
-    TableSchema, Value,
+    ColumnId, DbError, ForeignKeyConstraint, IndexConstraintKind, IndexId, Key,
+    PRIMARY_KEY_INDEX_ID, Result, RowIdentity, SqlState, TableId, TableSchema, Value,
 };
 use storage::DependentRowProbe;
 
@@ -40,15 +40,25 @@ impl<'a> ReferentialIntegrity<'a> {
         let mut outgoing = Vec::with_capacity(target.foreign_keys.len());
         for constraint in &target.foreign_keys {
             let parent = require_table(ctx.catalog.as_ref(), constraint.referenced_table)?;
-            let access_index = ctx
+            let referenced_index = ctx
                 .catalog
-                .resolve_foreign_key_index(parent.id, &constraint.referenced_columns)?
+                .get_index(constraint.referenced_index)?
                 .ok_or_else(|| {
                     DbError::internal(format!(
-                        "foreign key {} has no eligible referenced constraint index",
+                        "foreign key {} references a missing constraint index",
                         constraint.name
                     ))
                 })?;
+            let access_index = match referenced_index.constraint {
+                IndexConstraintKind::PrimaryKey => PRIMARY_KEY_INDEX_ID,
+                IndexConstraintKind::Unique => referenced_index.id,
+                IndexConstraintKind::None => {
+                    return Err(DbError::internal(format!(
+                        "foreign key {} references a non-constraint index",
+                        constraint.name
+                    )));
+                }
+            };
             outgoing.push(OutgoingForeignKey {
                 constraint: constraint.clone(),
                 parent,

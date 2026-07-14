@@ -298,6 +298,7 @@ pub struct ForeignKeyConstraint {
     pub columns: Vec<ColumnId>,
     pub referenced_table: TableId,
     pub referenced_columns: Vec<ColumnId>,
+    pub referenced_index: IndexId,
     pub on_update: ForeignKeyAction,
     pub on_delete: ForeignKeyAction,
 }
@@ -716,6 +717,10 @@ remains a leaf crate. Default contexts install a no-op provider that returns
 real providers return `Result` so catalog-read failures propagate instead of
 being flattened into "object not found". Default contexts install loud/no-op test
 implementations where appropriate. `StatementContext` is `Clone` but not `Copy`.
+The catalog-backed `pg_get_constraintdef` implementation recognizes durable
+foreign-key OIDs and renders current child/parent schema, table, and column
+names. It omits implicit `NO ACTION` clauses and includes explicit `RESTRICT`
+actions; the `pretty` argument does not alter this canonical v1 rendering.
 Each newly constructed context owns a fresh query-local
 `RuntimeValueSetRegistry`; its clones share the registry through `Arc`.
 Monotonically assigned IDs resolve executor-created transient membership sets,

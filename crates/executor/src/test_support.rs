@@ -197,6 +197,28 @@ impl ExecutorHarness {
         parent: &str,
         referenced_columns: &[&str],
     ) {
+        self.add_foreign_key_with_actions(
+            name,
+            child,
+            columns,
+            parent,
+            referenced_columns,
+            ForeignKeyAction::NoAction,
+            ForeignKeyAction::NoAction,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_foreign_key_with_actions(
+        &self,
+        name: &str,
+        child: &str,
+        columns: &[&str],
+        parent: &str,
+        referenced_columns: &[&str],
+        on_update: ForeignKeyAction,
+        on_delete: ForeignKeyAction,
+    ) {
         let child_schema = self.catalog.get_table_by_name(child).unwrap().unwrap();
         let parent_schema = self.catalog.get_table_by_name(parent).unwrap().unwrap();
         let resolve = |schema: &TableSchema, names: &[&str]| {
@@ -220,8 +242,8 @@ impl ExecutorHarness {
                     columns: resolve(&child_schema, columns),
                     referenced_table: parent_schema.id,
                     referenced_columns: resolve(&parent_schema, referenced_columns),
-                    on_update: ForeignKeyAction::NoAction,
-                    on_delete: ForeignKeyAction::NoAction,
+                    on_update,
+                    on_delete,
                 }],
             )
             .unwrap();

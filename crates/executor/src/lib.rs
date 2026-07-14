@@ -1062,6 +1062,160 @@ mod tests {
     }
 
     #[test]
+    fn system_scan_exposes_foreign_key_constraints_and_dependencies() {
+        let harness = ExecutorHarness::with_users();
+        harness.add_table(
+            "fk_catalog_parent",
+            &[
+                ("id", DataType::Integer, false),
+                ("tenant", DataType::Integer, false),
+                ("code", DataType::Text, false),
+                ("region", DataType::Integer, false),
+                ("slug", DataType::Text, false),
+            ],
+            &["tenant", "code"],
+        );
+        harness.add_unique_constraint("fk_catalog_parent", &["region", "slug"]);
+        harness.add_table(
+            "fk_catalog_child",
+            &[
+                ("id", DataType::Integer, false),
+                ("parent_tenant", DataType::Integer, true),
+                ("parent_code", DataType::Text, true),
+                ("parent_region", DataType::Integer, true),
+                ("parent_slug", DataType::Text, true),
+            ],
+            &["id"],
+        );
+        harness.add_foreign_key(
+            "child_parent_pk",
+            "fk_catalog_child",
+            &["parent_tenant", "parent_code"],
+            "fk_catalog_parent",
+            &["tenant", "code"],
+        );
+        harness.add_foreign_key_with_actions(
+            "child_parent_unique",
+            "fk_catalog_child",
+            &["parent_region", "parent_slug"],
+            "fk_catalog_parent",
+            &["region", "slug"],
+            common::ForeignKeyAction::Restrict,
+            common::ForeignKeyAction::Restrict,
+        );
+
+        let rows = harness
+            .select_rows(
+                "select k.conname, k.contype, child.relname, parent.relname, backing.relname, \
+                        k.confupdtype, k.confdeltype, k.confmatchtype, k.conkey, k.confkey, \
+                        k.condeferrable, k.condeferred, k.convalidated, \
+                        k.conpfeqop, k.conppeqop, k.conffeqop, k.conexclop \
+                 from pg_catalog.pg_constraint k \
+                 join pg_catalog.pg_class child on k.conrelid = child.oid \
+                 join pg_catalog.pg_class parent on k.confrelid = parent.oid \
+                 join pg_catalog.pg_class backing on k.conindid = backing.oid \
+                 where k.contype = 'f' \
+                 order by k.conname",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("child_parent_pk".to_string()),
+                        Value::Text("f".to_string()),
+                        Value::Text("fk_catalog_child".to_string()),
+                        Value::Text("fk_catalog_parent".to_string()),
+                        Value::Text("fk_catalog_parent_pkey".to_string()),
+                        Value::Text("a".to_string()),
+                        Value::Text("a".to_string()),
+                        Value::Text("s".to_string()),
+                        Value::Text("{2,3}".to_string()),
+                        Value::Text("{2,3}".to_string()),
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Boolean(true),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("child_parent_unique".to_string()),
+                        Value::Text("f".to_string()),
+                        Value::Text("fk_catalog_child".to_string()),
+                        Value::Text("fk_catalog_parent".to_string()),
+                        Value::Text("fk_catalog_parent_region_slug_key".to_string()),
+                        Value::Text("r".to_string()),
+                        Value::Text("r".to_string()),
+                        Value::Text("s".to_string()),
+                        Value::Text("{4,5}".to_string()),
+                        Value::Text("{4,5}".to_string()),
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Boolean(true),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(&format!(
+                "select k.conname, referenced.relname, d.refobjsubid, d.deptype \
+                 from pg_catalog.pg_constraint k \
+                 join pg_catalog.pg_depend d on d.classid = {} and d.objid = k.oid \
+                 join pg_catalog.pg_class referenced on d.refobjid = referenced.oid \
+                 where k.contype = 'f' \
+                 order by k.conname, referenced.relname, d.refobjsubid, d.deptype",
+                catalog::SystemView::PgConstraint.relation_oid()
+            ))
+            .unwrap();
+        assert_eq!(rows.len(), 14);
+        assert_eq!(
+            rows,
+            vec![
+                dependency_row("child_parent_pk", "fk_catalog_child", 0, "a"),
+                dependency_row("child_parent_pk", "fk_catalog_child", 2, "a"),
+                dependency_row("child_parent_pk", "fk_catalog_child", 3, "a"),
+                dependency_row("child_parent_pk", "fk_catalog_parent", 0, "n"),
+                dependency_row("child_parent_pk", "fk_catalog_parent", 2, "n"),
+                dependency_row("child_parent_pk", "fk_catalog_parent", 3, "n"),
+                dependency_row("child_parent_pk", "fk_catalog_parent_pkey", 0, "n"),
+                dependency_row("child_parent_unique", "fk_catalog_child", 0, "a"),
+                dependency_row("child_parent_unique", "fk_catalog_child", 4, "a"),
+                dependency_row("child_parent_unique", "fk_catalog_child", 5, "a"),
+                dependency_row("child_parent_unique", "fk_catalog_parent", 0, "n"),
+                dependency_row("child_parent_unique", "fk_catalog_parent", 4, "n"),
+                dependency_row("child_parent_unique", "fk_catalog_parent", 5, "n"),
+                dependency_row(
+                    "child_parent_unique",
+                    "fk_catalog_parent_region_slug_key",
+                    0,
+                    "n",
+                ),
+            ]
+        );
+    }
+
+    fn dependency_row(constraint: &str, referenced: &str, sub_id: i64, dependency: &str) -> Row {
+        Row {
+            values: vec![
+                Value::Text(constraint.to_string()),
+                Value::Text(referenced.to_string()),
+                Value::Integer(sub_id),
+                Value::Text(dependency.to_string()),
+            ],
+        }
+    }
+
+    #[test]
     fn division_by_zero_returns_sqlstate() {
         let row = ExecRow {
             row: Row { values: vec![] },

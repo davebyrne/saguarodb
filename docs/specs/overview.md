@@ -2530,8 +2530,10 @@ pub struct ViewDependency {
 
 Foreign keys are stored as ordered, ID-resolved per-table metadata. Their IDs
 are allocated monotonically in `0..=4095` (`4096` is the exhausted sentinel),
-and old catalog/WAL table-schema payloads default the list and allocator to
-empty/zero. The executor enforces installed metadata on every write path as
+and each constraint retains the exact declared parent constraint-index ID chosen
+at attachment. Old catalog/WAL table-schema payloads default the list and
+allocator to empty/zero; a legacy missing referenced-index field is resolved
+during validated loading. The executor enforces installed metadata on every write path as
 specified above. Server object discovery adds the related parents and children
 to DML relation locks and prepared schema identities, and recomputes that set
 during lock convergence so an FK published after initial discovery cannot be

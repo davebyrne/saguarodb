@@ -439,6 +439,10 @@ pub struct ForeignKeyConstraint {
     pub columns: Vec<ColumnId>,
     pub referenced_table: TableId,
     pub referenced_columns: Vec<ColumnId>,
+    /// The declared PRIMARY KEY or UNIQUE constraint index selected when the
+    /// foreign key was attached. Zero is reserved for legacy payload migration.
+    #[serde(default)]
+    pub referenced_index: IndexId,
     pub on_update: ForeignKeyAction,
     pub on_delete: ForeignKeyAction,
 }

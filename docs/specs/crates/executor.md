@@ -200,6 +200,13 @@ storage-private and are omitted from PostgreSQL-facing relation rows (`pg_class`
 `pg_attribute`, `pg_index`, `pg_constraint`, `pg_attrdef`, and `pg_depend`).
 User table rows report `reltoastrelid = 0` rather than exposing an OID for an
 omitted hidden relation.
+Foreign keys contribute `pg_constraint` rows with `contype = 'f'`, stable
+foreign-key OIDs, child/parent relation OIDs, the referenced constraint-index
+OID, ordered child/parent attnum arrays, `MATCH SIMPLE`, immediate validated
+flags, and `NO ACTION`/`RESTRICT` action codes. Their `pg_depend` rows cover the
+child table and source columns, parent table and referenced columns, and
+referenced constraint index. Unsupported foreign-key operator arrays are `NULL`;
+no additional `information_schema` view is synthesized.
 `pg_attribute` includes common
 PostgreSQL 16 metadata columns used by table-description probes, with harmless
 constants for unsupported features (no inheritance, missing values, ACLs, or

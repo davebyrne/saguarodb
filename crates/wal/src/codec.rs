@@ -976,5 +976,38 @@ mod tests {
             assert!(decoded_schema.foreign_keys.is_empty());
             assert_eq!(decoded_schema.next_foreign_key_id, 0);
         }
+
+        let mut fk_schema = schema;
+        fk_schema.foreign_keys.push(common::ForeignKeyConstraint {
+            id: 0,
+            name: "legacy_fkey".to_string(),
+            columns: vec![0],
+            referenced_table: 2,
+            referenced_columns: vec![0],
+            referenced_index: 7,
+            on_update: common::ForeignKeyAction::NoAction,
+            on_delete: common::ForeignKeyAction::Restrict,
+        });
+        fk_schema.next_foreign_key_id = 1;
+        let mut value = serde_json::to_value(WalRecordKind::UpdateTableSchema {
+            schema: fk_schema,
+            indexes: Vec::new(),
+        })
+        .unwrap();
+        value
+            .get_mut("UpdateTableSchema")
+            .and_then(|value| value.get_mut("schema"))
+            .and_then(|value| value.get_mut("foreign_keys"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|foreign_keys| foreign_keys.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("referenced_index");
+        let payload = serde_json::to_vec(&value).unwrap();
+        let decoded = decode_payload(TYPE_UPDATE_TABLE_SCHEMA, &payload).unwrap();
+        let WalRecordKind::UpdateTableSchema { schema, .. } = decoded else {
+            panic!("unexpected decoded record")
+        };
+        assert_eq!(schema.foreign_keys[0].referenced_index, 0);
     }
 }
