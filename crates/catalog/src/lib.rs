@@ -32,8 +32,8 @@ use common::{
     ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, ForeignKeyAction,
     ForeignKeyConstraint, IndexConstraintKind, IndexId, IndexSchema, NamespaceSchema,
     ParsedColumnDef, PgType, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema,
-    TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    ViewColumn, ViewDependency, ViewSchema,
+    SqlState, TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
 
 /// A name-optional but otherwise fully resolved foreign-key definition passed
@@ -172,6 +172,10 @@ pub trait CatalogManager: Send + Sync {
         indexes: &[IndexSchema],
     ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
+    /// Recovery-only single-record drop with the complete committed statement's
+    /// table set. Implementations may remove FK edges between still-present batch
+    /// members so cyclic drops replay in WAL-record order.
+    fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()>;
     /// Atomically attaches a batch of fully ID/column-resolved foreign keys to
     /// one child table. IDs must continue that table's monotonic allocator.
     fn attach_foreign_keys(
@@ -309,6 +313,10 @@ pub trait CatalogManager: Send + Sync {
         checks: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+    /// Validate a complete DROP TABLE target set without mutating it.
+    fn preflight_drop_tables(&self, tables: &[TableId]) -> Result<()>;
+    /// Atomically remove a complete DROP TABLE target set.
+    fn drop_tables(&self, tables: &[TableId]) -> Result<()>;
     fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema>;
     fn preflight_add_table_column(
         &self,
@@ -376,6 +384,37 @@ pub trait CatalogManager: Send + Sync {
         table: TableId,
         primary_key: Vec<ColumnId>,
     ) -> Result<TableSchema>;
+    /// Validates a primary-key metadata change without publishing it. A key
+    /// referenced by an installed foreign key cannot be changed or removed.
+    fn preflight_table_primary_key_change(
+        &self,
+        table: TableId,
+        primary_key: &[ColumnId],
+    ) -> Result<()> {
+        let schema = self.get_table(table)?.ok_or_else(|| {
+            DbError::plan(
+                SqlState::UndefinedTable,
+                format!("table id {table} does not exist"),
+            )
+        })?;
+        if schema.primary_key.is_empty() || schema.primary_key == primary_key {
+            return Ok(());
+        }
+        if let Some((child, foreign_key)) = self
+            .list_incoming_foreign_keys(table)?
+            .into_iter()
+            .find(|(_, foreign_key)| foreign_key.referenced_columns == schema.primary_key)
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot change primary key because constraint {} on table {} depends on it",
+                    foreign_key.name, child.name
+                ),
+            ));
+        }
+        Ok(())
+    }
     /// Atomically installs a live user table's primary-key metadata and the
     /// backing primary-key constraint index. Adding a primary key marks those
     /// columns not-null.
@@ -4574,6 +4613,187 @@ mod tests {
     }
 
     #[test]
+    fn batch_drop_allows_internal_foreign_keys_and_rejects_external_dependents_atomically() {
+        let catalog = MemoryCatalog::empty();
+        let make_table = |name: &str| {
+            let table = catalog
+                .create_table(
+                    name.to_string(),
+                    vec![id_column(false)],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+                .unwrap();
+            catalog
+                .create_index_with_constraint(
+                    format!("{name}_key"),
+                    name,
+                    &["id".to_string()],
+                    true,
+                    IndexConstraintKind::Unique,
+                )
+                .unwrap();
+            catalog.get_table(table.id).unwrap().unwrap()
+        };
+        let first = make_table("drop_first");
+        let second = make_table("drop_second");
+        let outside = make_table("drop_outside");
+        let fk = |name: &str, referenced_table| ResolvedForeignKey {
+            name: Some(name.to_string()),
+            columns: vec![0],
+            referenced_table,
+            referenced_columns: vec![0],
+            on_update: ForeignKeyAction::NoAction,
+            on_delete: ForeignKeyAction::NoAction,
+        };
+        catalog
+            .attach_foreign_keys(first.id, vec![fk("first_second", second.id)])
+            .unwrap();
+        catalog
+            .attach_foreign_keys(second.id, vec![fk("second_first", first.id)])
+            .unwrap();
+        catalog
+            .attach_foreign_keys(outside.id, vec![fk("outside_first", first.id)])
+            .unwrap();
+
+        let before = catalog.snapshot().unwrap();
+        let err = catalog.drop_tables(&[first.id, second.id]).unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        let after = catalog.snapshot().unwrap();
+        assert_eq!(after.tables_by_id, before.tables_by_id);
+        assert_eq!(after.indexes_by_id, before.indexes_by_id);
+
+        catalog
+            .drop_tables(&[first.id, second.id, outside.id])
+            .unwrap();
+        assert!(catalog.get_table(first.id).unwrap().is_none());
+        assert!(catalog.get_table(second.id).unwrap().is_none());
+        assert!(catalog.get_table(outside.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_batch_drop_removes_cycle_edges_in_wal_record_order() {
+        let catalog = MemoryCatalog::empty();
+        let make_table = |name: &str| {
+            let table = catalog
+                .create_table(
+                    name.to_string(),
+                    vec![id_column(false)],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+                .unwrap();
+            catalog
+                .create_index_with_constraint(
+                    format!("{name}_key"),
+                    name,
+                    &["id".to_string()],
+                    true,
+                    IndexConstraintKind::Unique,
+                )
+                .unwrap();
+            catalog.get_table(table.id).unwrap().unwrap()
+        };
+        let first = make_table("replay_first");
+        let second = make_table("replay_second");
+        let fk = |name: &str, referenced_table| ResolvedForeignKey {
+            name: Some(name.to_string()),
+            columns: vec![0],
+            referenced_table,
+            referenced_columns: vec![0],
+            on_update: ForeignKeyAction::NoAction,
+            on_delete: ForeignKeyAction::NoAction,
+        };
+        catalog
+            .attach_foreign_keys(first.id, vec![fk("first_second", second.id)])
+            .unwrap();
+        catalog
+            .attach_foreign_keys(second.id, vec![fk("second_first", first.id)])
+            .unwrap();
+
+        let batch = [first.id, second.id];
+        catalog.apply_drop_table_in_batch(first.id, &batch).unwrap();
+        assert!(catalog.get_table(first.id).unwrap().is_none());
+        assert!(
+            catalog
+                .get_table(second.id)
+                .unwrap()
+                .unwrap()
+                .foreign_keys
+                .is_empty()
+        );
+        catalog
+            .apply_drop_table_in_batch(second.id, &batch)
+            .unwrap();
+        assert!(catalog.get_table(second.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_batch_first_drop_removes_every_internal_cycle_edge() {
+        let catalog = MemoryCatalog::empty();
+        let make_table = |name: &str| {
+            let table = catalog
+                .create_table(
+                    name.to_string(),
+                    vec![id_column(false)],
+                    Vec::new(),
+                    CompressionSetting::None,
+                )
+                .unwrap();
+            catalog
+                .create_index_with_constraint(
+                    format!("{name}_key"),
+                    name,
+                    &["id".to_string()],
+                    true,
+                    IndexConstraintKind::Unique,
+                )
+                .unwrap();
+            catalog.get_table(table.id).unwrap().unwrap()
+        };
+        let tables = [
+            make_table("cycle_a1"),
+            make_table("cycle_a2"),
+            make_table("cycle_b1"),
+            make_table("cycle_b2"),
+        ];
+        let fk = |name: &str, referenced_table| ResolvedForeignKey {
+            name: Some(name.to_string()),
+            columns: vec![0],
+            referenced_table,
+            referenced_columns: vec![0],
+            on_update: ForeignKeyAction::NoAction,
+            on_delete: ForeignKeyAction::NoAction,
+        };
+        for (child, parent, name) in [
+            (0, 1, "a1_a2"),
+            (1, 0, "a2_a1"),
+            (2, 3, "b1_b2"),
+            (3, 2, "b2_b1"),
+        ] {
+            catalog
+                .attach_foreign_keys(tables[child].id, vec![fk(name, tables[parent].id)])
+                .unwrap();
+        }
+
+        let batch = tables.iter().map(|table| table.id).collect::<Vec<_>>();
+        catalog
+            .apply_drop_table_in_batch(tables[0].id, &batch)
+            .unwrap();
+        for table in &tables[1..] {
+            assert!(
+                catalog
+                    .get_table(table.id)
+                    .unwrap()
+                    .unwrap()
+                    .foreign_keys
+                    .is_empty()
+            );
+            catalog.apply_drop_table(table.id).unwrap();
+        }
+    }
+
+    #[test]
     fn dropping_earlier_child_column_remaps_source_but_parent_renumbering_is_rejected() {
         let catalog = MemoryCatalog::empty();
         let two_columns = || {
@@ -4680,6 +4900,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             catalog
+                .preflight_table_primary_key_change(parent, &[])
+                .unwrap_err()
+                .code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            catalog
                 .set_table_primary_key(parent, Vec::new())
                 .unwrap_err()
                 .code,
@@ -4728,7 +4955,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_foreign_key_type_alter_does_not_allocate_toast_metadata() {
+    fn foreign_key_column_type_alter_is_dependency_error_and_does_not_allocate_toast_metadata() {
         let (catalog, parent, child) = foreign_key_catalog();
         catalog
             .attach_foreign_keys(
@@ -4740,7 +4967,7 @@ mod tests {
         let err = catalog
             .alter_table_column_type(child, "parent_id", DataType::Text, PgType::Text, None)
             .unwrap_err();
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
         let after = catalog.snapshot().unwrap();
         assert_eq!(after.next_table_id, before.next_table_id);
         assert_eq!(after.next_storage_id, before.next_storage_id);

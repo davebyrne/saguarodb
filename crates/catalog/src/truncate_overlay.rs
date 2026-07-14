@@ -163,6 +163,10 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
+    fn apply_drop_table_in_batch(&self, _id: TableId, _batch: &[TableId]) -> Result<()> {
+        Self::read_only()
+    }
+
     fn create_table_in_schema_with_options(
         &self,
         _schema: SchemaId,
@@ -177,6 +181,14 @@ impl CatalogManager for TruncateCatalogOverlay {
     }
 
     fn drop_table(&self, _id: TableId) -> Result<()> {
+        Self::read_only()
+    }
+
+    fn preflight_drop_tables(&self, tables: &[TableId]) -> Result<()> {
+        self.base.preflight_drop_tables(tables)
+    }
+
+    fn drop_tables(&self, _tables: &[TableId]) -> Result<()> {
         Self::read_only()
     }
 

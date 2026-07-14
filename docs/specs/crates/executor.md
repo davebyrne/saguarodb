@@ -424,10 +424,15 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   catalog/storage mutation or logical DDL WAL records, but return
   `SqlState::WrongObjectType` if a view owns any requested name.
 - Call `SchemaOperations::drop_table`.
+- Before physical mutation, ask the catalog to validate the complete target set.
+  An incoming foreign key from a child outside that set returns
+  `SqlState::DependentObjectsStillExist`; self-references, cycles, and
+  dependencies wholly within the set are permitted.
 - For each column default that references an owned sequence, call
   `SchemaOperations::drop_sequence` in the same statement.
-- Call `CatalogManager::drop_table`, then remove the owned sequences from the
-  catalog.
+- After emitting one physical/logical drop per target, call the atomic
+  `CatalogManager::drop_tables` batch operation, then remove owned sequences
+  from the catalog.
 - `SchemaOperations::drop_table` appends the `DropTable` WAL operation record
   and each owned sequence appends a sibling `DropSequence`; server query
   orchestration appends the statement `Commit`.

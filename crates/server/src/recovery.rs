@@ -6,7 +6,7 @@ use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
 use common::{
     DbError, FlushPolicy, PageFlushInfo, RelationKind, Result, RwLockConcurrencyController,
-    TableId, TruncateTablePlan,
+    SqlState, TableId, TruncateTablePlan,
 };
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
@@ -17,6 +17,10 @@ use crate::checkpoint::{CheckpointState, cleanup_relation_generation_files, run_
 use crate::config::Config;
 use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
+
+/// Catalog table ids are limited to 16 bits by their compound virtual-OID
+/// representation, so one transaction cannot legitimately drop more tables.
+const MAX_RECOVERY_DROP_BATCH_TABLES: usize = 1 << 16;
 
 pub fn open_app(config: Config) -> Result<AppState> {
     // Shared compression state (`docs/specs/compression.md` §5a/§7): one registry
@@ -152,15 +156,42 @@ pub fn open_app(config: Config) -> Result<AppState> {
             WalRecordKind::AlterTablePrimaryKey { table_id, .. } => Some(*table_id),
             _ => None,
         };
-        apply_redo(
+        let drop_table = match &record.kind {
+            WalRecordKind::DropTable { table } => Some(*table),
+            _ => None,
+        };
+        let redo = apply_redo(
             catalog.as_ref(),
             storage.as_ref(),
             buffer_pool.as_ref(),
             compression.as_ref(),
             dict_store.as_ref(),
-            record.lsn,
             record.kind,
-        )?;
+            ReplayRecordContext {
+                lsn: record.lsn,
+                drop_batch: None,
+            },
+        );
+        if let Err(err) = redo {
+            let Some(table) = drop_table.filter(|_| {
+                err.code == SqlState::DependentObjectsStillExist && wal.is_committed(record.txn_id)
+            }) else {
+                return Err(err);
+            };
+            let batch = committed_drop_batch_for_txn(wal.as_ref(), checkpoint_lsn, record.txn_id)?;
+            apply_redo(
+                catalog.as_ref(),
+                storage.as_ref(),
+                buffer_pool.as_ref(),
+                compression.as_ref(),
+                dict_store.as_ref(),
+                WalRecordKind::DropTable { table },
+                ReplayRecordContext {
+                    lsn: record.lsn,
+                    drop_batch: Some(&batch),
+                },
+            )?;
+        }
         if let Some(table_id) = primary_key_rebuild {
             pending_identity_rebuilds.insert(table_id);
         }
@@ -258,6 +289,36 @@ pub fn open_app(config: Config) -> Result<AppState> {
         components: components.clone(),
         query_service: Arc::new(QueryService::new(components)),
     })
+}
+
+fn committed_drop_batch_for_txn(
+    wal: &dyn WalManager,
+    checkpoint_lsn: u64,
+    txn_id: u64,
+) -> Result<Vec<TableId>> {
+    let mut batch = Vec::new();
+    for record in wal.replay_from(checkpoint_lsn)? {
+        let record = record?;
+        if record.txn_id != txn_id {
+            continue;
+        }
+        let WalRecordKind::DropTable { table } = record.kind else {
+            continue;
+        };
+        if batch.len() == MAX_RECOVERY_DROP_BATCH_TABLES {
+            return Err(DbError::internal(format!(
+                "committed transaction {txn_id} exceeds the recovery DROP TABLE batch limit of \
+                 {MAX_RECOVERY_DROP_BATCH_TABLES}"
+            )));
+        }
+        batch.try_reserve(1).map_err(|_| {
+            DbError::internal(format!(
+                "could not allocate recovery DROP TABLE batch for transaction {txn_id}"
+            ))
+        })?;
+        batch.push(table);
+    }
+    Ok(batch)
 }
 
 #[allow(dead_code)]
@@ -407,14 +468,19 @@ fn reserve_storage_id(
     })
 }
 
+struct ReplayRecordContext<'a> {
+    lsn: u64,
+    drop_batch: Option<&'a [TableId]>,
+}
+
 fn apply_redo(
     catalog: &dyn CatalogManager,
     storage: &dyn RecoveryOperations,
     buffer_pool: &dyn BufferPool,
     compression: &compress::CompressionRegistry,
     dict_store: &compress::DictStore,
-    lsn: u64,
     kind: WalRecordKind,
+    context: ReplayRecordContext<'_>,
 ) -> Result<()> {
     // Normalize a dict/codec-compressed FPI to a plain raw `FullPageImage` before
     // the match below: the physical arm's OR-pattern binds `file_id`/`page_num`
@@ -458,7 +524,11 @@ fn apply_redo(
             Ok(())
         }
         WalRecordKind::DropTable { table } => {
-            catalog.apply_drop_table(*table)?;
+            if let Some(batch) = context.drop_batch {
+                catalog.apply_drop_table_in_batch(*table, batch)?;
+            } else {
+                catalog.apply_drop_table(*table)?;
+            }
             storage.apply_drop_table(*table)
         }
         WalRecordKind::CreateIndex { schema } => {
@@ -519,7 +589,7 @@ fn apply_redo(
             if !storage::page_is_valid(guard.data()) {
                 guard.data_mut().fill(0);
             }
-            storage::apply_physical_redo(guard.data_mut(), lsn, &kind)?;
+            storage::apply_physical_redo(guard.data_mut(), context.lsn, &kind)?;
             Ok(())
         }
         WalRecordKind::Commit
@@ -838,9 +908,12 @@ mod tests {
             &buffer_pool,
             &compression,
             &dict_store,
-            1,
             WalRecordKind::CreateTable {
                 schema: legacy_table.clone(),
+            },
+            super::ReplayRecordContext {
+                lsn: 1,
+                drop_batch: None,
             },
         )
         .unwrap();
@@ -874,9 +947,12 @@ mod tests {
             &buffer_pool,
             &compression,
             &dict_store,
-            2,
             WalRecordKind::CreateIndex {
                 schema: legacy_index.clone(),
+            },
+            super::ReplayRecordContext {
+                lsn: 2,
+                drop_batch: None,
             },
         )
         .unwrap();

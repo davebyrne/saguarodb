@@ -529,6 +529,110 @@ async fn transactional_truncate_rejects_overlapping_parked_queries_only() {
     conn.ok("rollback").await.rows();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncate_requires_every_foreign_key_child_and_allows_complete_sets() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table truncate_parent_fk (id integer primary key)")
+        .await;
+    conn.ok("create table truncate_child_fk (id integer primary key, parent_id integer)")
+        .await;
+    conn.ok("insert into truncate_parent_fk values (1)").await;
+    conn.ok("insert into truncate_child_fk values (1, 1)").await;
+    server
+        .attach_foreign_key(
+            "truncate_child_parent_fkey",
+            "truncate_child_fk",
+            &["parent_id"],
+            "truncate_parent_fk",
+            &["id"],
+        )
+        .unwrap();
+
+    let error = conn
+        .query("truncate truncate_parent_fk")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("parent-only TRUNCATE must fail");
+    assert!(error.message.contains("C=2BP01"), "{error}");
+    assert_eq!(
+        conn.ok("select count(*) from truncate_parent_fk")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    conn.ok("truncate truncate_child_fk").await;
+    conn.ok("insert into truncate_child_fk values (2, 1)").await;
+    conn.ok("truncate truncate_parent_fk, truncate_child_fk")
+        .await;
+    assert!(
+        conn.ok("select * from truncate_parent_fk")
+            .await
+            .rows()
+            .is_empty()
+    );
+    assert!(
+        conn.ok("select * from truncate_child_fk")
+            .await
+            .rows()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transactional_truncate_foreign_key_set_rolls_back_together() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table txn_truncate_parent_fk (id integer primary key)")
+        .await;
+    conn.ok("create table txn_truncate_child_fk (id integer primary key, parent_id integer)")
+        .await;
+    conn.ok("insert into txn_truncate_parent_fk values (1)")
+        .await;
+    conn.ok("insert into txn_truncate_child_fk values (1, 1)")
+        .await;
+    server
+        .attach_foreign_key(
+            "txn_truncate_child_parent_fkey",
+            "txn_truncate_child_fk",
+            &["parent_id"],
+            "txn_truncate_parent_fk",
+            &["id"],
+        )
+        .unwrap();
+
+    conn.ok("begin").await;
+    let error = conn
+        .query("truncate txn_truncate_parent_fk")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("transactional parent-only TRUNCATE must fail");
+    assert!(error.message.contains("C=2BP01"), "{error}");
+    conn.ok("rollback").await;
+
+    conn.ok("begin").await;
+    conn.ok("truncate txn_truncate_parent_fk, txn_truncate_child_fk")
+        .await;
+    conn.ok("rollback").await;
+    assert_eq!(
+        conn.ok("select count(*) from txn_truncate_parent_fk")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select count(*) from txn_truncate_child_fk")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
 #[tokio::test]
 async fn transactional_truncate_rejects_pipelined_autocommit_suspended_portal() {
     let server = TestServer::start().await.unwrap();

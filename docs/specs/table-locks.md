@@ -65,7 +65,10 @@ Mappings:
   (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`).
 - `RowExclusive`: `INSERT`, `UPDATE`, `DELETE`, and `COPY FROM`; a modifying
   statement takes this mode on its target and `AccessShare` on read-only source
-  tables.
+  tables. Foreign-key enforcement adds `AccessShare` on every outgoing parent
+  for child INSERT/COPY FROM/UPDATE, on every incoming child for DELETE, and on
+  incoming children whose referenced columns overlap UPDATE assignments
+  (including the update arm of an upsert).
 - `Share`: `CREATE INDEX` and the initial safe `VACUUM` integration. VACUUM may
   move to a weaker PostgreSQL-style mode only after storage is proven safe with
   concurrent writers.
@@ -270,7 +273,9 @@ checkpoint still drains their WAL/page work, plus the exclusive catalog
 publication gate across provisional catalog mutation. Actual checkpoint remains the
 only data-path operation that waits for the exclusive checkpoint guard.
 
-- Standalone multi-table TRUNCATE takes `AccessExclusive` on every target.
+- Standalone and transactional multi-table TRUNCATE take `AccessExclusive` on
+  every target and `AccessShare` on incoming foreign-key children while the
+  complete target set is validated.
 - ALTER/DROP take `AccessExclusive` on the affected table.
 - CREATE INDEX takes `Share`, permitting readers but blocking target writers.
 - VACUUM initially takes `Share` and retains writer-draining safety. A future
@@ -312,7 +317,14 @@ captured grant set together with the catalog and storage generation before-image
 VACUUM and other maintenance commands retain their documented transaction-block
 restrictions.
 
-Before swapping storage, reject `TRUNCATE` with `SqlState::ObjectInUse` (`55006`)
+Before swapping storage, reject `TRUNCATE` with
+`SqlState::DependentObjectsStillExist` (`2BP01`) when any target has an incoming
+foreign key from a child outside the complete target set. Child-only truncation,
+self-references, cycles, and complete parent/child sets are allowed. This check
+is performed after lock convergence for both standalone and transactional
+TRUNCATE.
+
+Also reject `TRUNCATE` with `SqlState::ObjectInUse` (`55006`)
 if the same session has a SQL cursor, suspended extended-protocol portal, or other
 parked `OpenQuery` whose referenced table set intersects the targets. The server
 does not invalidate a worker that still owns an old relation snapshot. Unrelated

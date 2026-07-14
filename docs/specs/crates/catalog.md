@@ -456,9 +456,10 @@ column IDs above an unrelated dropped slot within the rewritten table (including
 self-references). A parent rewrite that would require renumbering an external
 child's incoming-reference metadata is rejected until the DDL publication path
 can durably carry both schemas as one atomic update.
-Changing/dropping a primary key or declared UNIQUE key likewise rejects removal
-of the last eligible target. Type rewrites validate all incoming/outgoing FK
-declared types before allocating replacement TOAST/catalog state. Recovery
+Changing or dropping a referenced primary key or declared UNIQUE constraint is
+rejected even when another eligible constraint covers the same columns. Type
+rewrites validate all incoming/outgoing FK declared types before allocating
+replacement TOAST/catalog state. Recovery
 `apply_create_table` validates any embedded FK metadata in a candidate catalog
 before publication.
 
@@ -474,9 +475,21 @@ or column IDs. `apply_drop_table` removes an existing schema by ID without
 assigning IDs; dropping a user table also removes its linked hidden TOAST
 relation metadata and that relation's indexes, while directly dropping a linked
 hidden TOAST relation is rejected as catalog corruption. A missing ID returns
-`SqlState::UndefinedTable`.
+`SqlState::UndefinedTable`. Normal multi-table drop uses `preflight_drop_tables`
+and `drop_tables`: both resolve the complete target set, reject an incoming
+foreign key whose child is outside that set with
+`SqlState::DependentObjectsStillExist`, and permit self-references, cycles, and
+dependencies wholly inside the set. `drop_tables` validates and publishes the
+complete removal atomically. Recovery applies each existing `DropTable` WAL
+record through `apply_drop_table_in_batch` with the committed transaction's
+complete drop set. The first fallback removes every FK edge internal to that
+set, so all cycles in the transaction then replay in record order without
+another dependency fallback. These recovery-only single-record paths validate
+first and mutate the startup-only write-locked snapshot in place, avoiding a
+full catalog clone per WAL record; live `drop_tables` retains atomic
+clone-and-swap publication.
 
-Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them before scanning rows and repeats preflight under the server catalog publication gate plus target `AccessExclusive` lock. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `rename_table` and `rename_table_column` reject dependent views and stored CHECK expressions so stored SQL text cannot become stale. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
+Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them before scanning rows and repeats preflight under the server catalog publication gate plus target `AccessExclusive` lock. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, foreign-key source or referenced columns, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `ALTER COLUMN TYPE` likewise rejects foreign-key source or referenced columns unless the requested type is already identical. `preflight_table_primary_key_change` performs the read-only dependency check before maintenance WAL commit; dropping or changing a primary key referenced by a foreign key is rejected with `SqlState::DependentObjectsStillExist`. Table and column renames remain allowed for foreign-key metadata because it stores IDs; the existing view/CHECK text restrictions still apply. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
 
 `create_view`, `replace_view`, `apply_create_view`, `apply_replace_view`, `drop_view`, and `apply_drop_view` manage durable user-view metadata. Creating a view allocates from `next_table_id`, rejects relation-name/id collisions with tables or views, stores dense output columns from `ViewColumn` (including result nullability and wire type), stores canonical SQL text, validates dependencies, and starts `schema_version = 1`. View dependencies may target user tables only; dependencies on views or hidden TOAST relations are rejected to avoid dependency cycles while view expansion remains single-level for stored view definitions. `replace_view` keeps the existing id/name and increments `schema_version`. Dropping a view is rejected while another view depends on it. `list_views` returns views ordered by id.
 

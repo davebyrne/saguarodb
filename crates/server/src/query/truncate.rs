@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, atomic::Ordering};
 
 use catalog::CatalogManager;
@@ -66,14 +66,15 @@ impl QueryService {
                         ObjectLockRequest::schema(schema.schema_id, CatalogLockMode::Access)
                     })
                     .collect::<Vec<_>>();
-                requests.extend(
-                    schemas
-                        .iter()
-                        .map(|schema| {
-                            ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                let relation_requests =
+                    match truncate_relation_requests(components.catalog.as_ref(), &schemas) {
+                        Ok(requests) => requests,
+                        Err(err) => {
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(err);
+                        }
+                    };
+                requests.extend(relation_requests);
                 if let Err(err) = object_guard.acquire_many(&requests, cancel) {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
@@ -88,13 +89,39 @@ impl QueryService {
                 let current = match resolve_truncate_tables(components.catalog.as_ref(), &tables) {
                     Ok(current) => current,
                     Err(err) => {
+                        drop(catalog_publication);
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(err);
+                    }
+                };
+                let current_requests =
+                    match truncate_relation_requests(components.catalog.as_ref(), &current) {
+                        Ok(requests) => requests,
+                        Err(err) => {
+                            drop(catalog_publication);
+                            self.rollback_pre_durable_or_die(txn_id, None);
+                            return Err(err);
+                        }
+                    };
+                let covers_current = match object_guard.covers(&current_requests) {
+                    Ok(covers) => covers,
+                    Err(err) => {
+                        drop(catalog_publication);
                         self.rollback_pre_durable_or_die(txn_id, None);
                         return Err(err);
                     }
                 };
                 if current.iter().map(|schema| schema.id).collect::<Vec<_>>()
                     == schemas.iter().map(|schema| schema.id).collect::<Vec<_>>()
+                    && covers_current
                 {
+                    if let Err(err) =
+                        validate_truncate_foreign_keys(components.catalog.as_ref(), &current)
+                    {
+                        drop(catalog_publication);
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(err);
+                    }
                     break (catalog_publication, current);
                 }
                 drop(catalog_publication);
@@ -201,18 +228,16 @@ impl QueryService {
         let objects = self.ensure_transaction_lock_owner(txn, cancel)?;
         let baseline = objects.snapshot();
         let (schemas, catalog) = loop {
+            let discovery_catalog =
+                self.transaction_catalog_from_parts(&catalog_overlay, &updates_before)?;
             let mut requests = schemas
                 .iter()
                 .map(|schema| ObjectLockRequest::schema(schema.schema_id, CatalogLockMode::Access))
                 .collect::<Vec<_>>();
-            requests.extend(
-                schemas
-                    .iter()
-                    .map(|schema| {
-                        ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            requests.extend(truncate_relation_requests(
+                discovery_catalog.as_ref(),
+                &schemas,
+            )?);
             objects.acquire_many(&requests, cancel)?;
             let (current, catalog) = {
                 let catalog =
@@ -222,7 +247,9 @@ impl QueryService {
             };
             if current.iter().map(|schema| schema.id).collect::<Vec<_>>()
                 == schemas.iter().map(|schema| schema.id).collect::<Vec<_>>()
+                && objects.covers(&truncate_relation_requests(catalog.as_ref(), &current)?)?
             {
+                validate_truncate_foreign_keys(catalog.as_ref(), &current)?;
                 break (current, catalog);
             }
             objects.restore(&baseline)?;
@@ -373,6 +400,52 @@ fn resolve_truncate_tables(
         schemas.push(schema);
     }
     Ok(schemas)
+}
+
+fn truncate_relation_requests(
+    catalog: &dyn CatalogManager,
+    schemas: &[common::TableSchema],
+) -> Result<Vec<ObjectLockRequest>> {
+    let mut modes = BTreeMap::new();
+    for schema in schemas {
+        modes.insert(schema.id, RelationLockMode::AccessExclusive);
+        for (child, _) in catalog.list_incoming_foreign_keys(schema.id)? {
+            modes
+                .entry(child.id)
+                .and_modify(|mode| *mode = (*mode).max(RelationLockMode::AccessShare))
+                .or_insert(RelationLockMode::AccessShare);
+        }
+    }
+    Ok(modes
+        .into_iter()
+        .map(|(table, mode)| ObjectLockRequest::table(table, mode))
+        .collect())
+}
+
+fn validate_truncate_foreign_keys(
+    catalog: &dyn CatalogManager,
+    schemas: &[common::TableSchema],
+) -> Result<()> {
+    let targets = schemas
+        .iter()
+        .map(|schema| schema.id)
+        .collect::<HashSet<_>>();
+    for parent in schemas {
+        if let Some((child, foreign_key)) = catalog
+            .list_incoming_foreign_keys(parent.id)?
+            .into_iter()
+            .find(|(child, _)| !targets.contains(&child.id))
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot truncate table {} because constraint {} on table {} depends on it",
+                    parent.name, foreign_key.name, child.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn best_effort_retired_generation_cleanup(components: &crate::app::ServerComponents) {

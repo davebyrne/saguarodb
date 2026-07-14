@@ -454,81 +454,26 @@ impl CatalogManager for MemoryCatalog {
 
     fn apply_drop_table(&self, id: TableId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        let schema = snapshot
-            .tables_by_id
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        validate_drop_table_dependencies(&snapshot, &[id], true)?;
+        remove_drop_table_targets(&mut snapshot, &[id])
+    }
 
-        if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-            child
-                .foreign_keys
-                .iter()
-                .find(|foreign_key| foreign_key.referenced_table == id && child.id != id)
-                .map(|foreign_key| (child, foreign_key))
-        }) {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot drop table {} because constraint {} on table {} depends on it",
-                    schema.name, foreign_key.name, child.name
-                ),
-            ));
-        }
-
-        if let RelationKind::Toast { base_table } = schema.relation_kind
-            && snapshot
-                .tables_by_id
-                .get(&base_table)
-                .is_some_and(|base| base.toast_table_id == Some(id))
-        {
-            return Err(DbError::internal(format!(
-                "cannot drop hidden TOAST relation {} while base table {} still references it",
-                schema.name, base_table
-            )));
-        }
-
-        reject_dependent_views(&snapshot, id, None)?;
-
-        let mut table_ids = vec![id];
-        if let RelationKind::User = schema.relation_kind
-            && let Some(toast_table_id) = schema.toast_table_id
-        {
-            if toast_table_id == id {
-                return Err(DbError::internal(format!(
-                    "catalog table {} references itself as a TOAST relation",
-                    schema.name
-                )));
-            }
-            if let Some(toast_schema) = snapshot.tables_by_id.get(&toast_table_id) {
-                if toast_schema.relation_kind
-                    != (RelationKind::Toast {
-                        base_table: schema.id,
-                    })
-                {
-                    return Err(DbError::internal(format!(
-                        "catalog table {} references non-matching TOAST relation {}",
-                        schema.name, toast_table_id
-                    )));
-                }
-                table_ids.push(toast_table_id);
+    fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        validate_drop_table_dependencies(&snapshot, batch, false)?;
+        let mut batch_ids = HashSet::new();
+        batch_ids.try_reserve(batch.len()).map_err(|_| {
+            DbError::internal("could not allocate recovery DROP TABLE batch membership")
+        })?;
+        batch_ids.extend(batch.iter().copied());
+        for table in snapshot.tables_by_id.values_mut() {
+            if batch_ids.contains(&table.id) {
+                table
+                    .foreign_keys
+                    .retain(|foreign_key| !batch_ids.contains(&foreign_key.referenced_table));
             }
         }
-
-        for table_id in table_ids {
-            let schema = snapshot
-                .tables_by_id
-                .remove(&table_id)
-                .ok_or_else(|| undefined_table(format!("table id {table_id} does not exist")))?;
-            if schema.schema_id == PUBLIC_SCHEMA_ID
-                && snapshot.tables_by_name.get(&schema.name) == Some(&table_id)
-            {
-                snapshot.tables_by_name.remove(&schema.name);
-            }
-            drop_indexes_for_table(&mut snapshot, table_id);
-            snapshot.statistics.remove(&table_id);
-        }
-        Ok(())
+        remove_drop_table_targets(&mut snapshot, &[id])
     }
 
     fn attach_foreign_keys(
@@ -761,7 +706,17 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn drop_table(&self, id: TableId) -> Result<()> {
-        self.apply_drop_table(id)
+        self.drop_tables(&[id])
+    }
+
+    fn preflight_drop_tables(&self, tables: &[TableId]) -> Result<()> {
+        let snapshot = self.read_snapshot()?;
+        validate_drop_table_dependencies(&snapshot, tables, true)
+    }
+
+    fn drop_tables(&self, tables: &[TableId]) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        drop_table_batch_from_snapshot(&mut snapshot, tables)
     }
 
     fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema> {
@@ -1091,6 +1046,19 @@ impl CatalogManager for MemoryCatalog {
         bump_schema_version(&mut schema.schema_version)?;
         snapshot.tables_by_id.insert(table, schema.clone());
         Ok(schema)
+    }
+
+    fn preflight_table_primary_key_change(
+        &self,
+        table: TableId,
+        primary_key: &[ColumnId],
+    ) -> Result<()> {
+        let snapshot = self.read_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+        reject_referenced_primary_key_change(&snapshot, table, &schema.primary_key, primary_key)
     }
 
     fn add_table_primary_key_index(
@@ -2584,6 +2552,37 @@ fn validate_alter_column_type(
         })?;
     if target.wire_type() == *pg_type {
         return Ok(TableColumnAlteration::Noop);
+    }
+    if let Some(foreign_key) = schema
+        .foreign_keys
+        .iter()
+        .find(|foreign_key| foreign_key.columns.contains(&target.id))
+    {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot alter column {column} type because foreign key constraint {} depends on it",
+                foreign_key.name
+            ),
+        ));
+    }
+    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .find(|foreign_key| {
+                foreign_key.referenced_table == schema.id
+                    && foreign_key.referenced_columns.contains(&target.id)
+            })
+            .map(|foreign_key| (child, foreign_key))
+    }) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot alter column {column} type because constraint {} on table {} depends on it",
+                foreign_key.name, child.name
+            ),
+        ));
     }
     if !schema.checks.is_empty() {
         return Err(DbError::plan(
@@ -4798,14 +4797,6 @@ fn reject_referenced_primary_key_change(
     if old_primary_key.is_empty() || old_primary_key == new_primary_key {
         return Ok(());
     }
-    let has_alternative = snapshot.indexes_by_id.values().any(|index| {
-        index.table == table
-            && index.constraint == IndexConstraintKind::Unique
-            && index.columns == old_primary_key
-    });
-    if has_alternative {
-        return Ok(());
-    }
     if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
         child
             .foreign_keys
@@ -4918,6 +4909,126 @@ fn build_index_schema(
     };
     validate_index_schema_for_table(&schema, table)?;
     Ok(schema)
+}
+
+fn drop_table_batch_from_snapshot(
+    snapshot: &mut CatalogSnapshot,
+    tables: &[TableId],
+) -> Result<()> {
+    validate_drop_table_dependencies(snapshot, tables, true)?;
+    let mut candidate = snapshot.clone();
+    remove_drop_table_targets(&mut candidate, tables)?;
+    *snapshot = candidate;
+    Ok(())
+}
+
+fn validate_drop_table_dependencies(
+    snapshot: &CatalogSnapshot,
+    tables: &[TableId],
+    require_all: bool,
+) -> Result<()> {
+    let mut targets = HashSet::new();
+    targets
+        .try_reserve(tables.len())
+        .map_err(|_| DbError::internal("could not allocate DROP TABLE target-set membership"))?;
+    for table in tables {
+        if !targets.insert(*table) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!("DROP TABLE target set repeats table id {table}"),
+            ));
+        }
+        let Some(schema) = snapshot.tables_by_id.get(table) else {
+            if require_all {
+                return Err(undefined_table(format!("table id {table} does not exist")));
+            }
+            continue;
+        };
+        if let RelationKind::Toast { base_table } = schema.relation_kind
+            && snapshot
+                .tables_by_id
+                .get(&base_table)
+                .is_some_and(|base| base.toast_table_id == Some(*table))
+        {
+            return Err(DbError::internal(format!(
+                "cannot drop hidden TOAST relation {} while base table {} still references it",
+                schema.name, base_table
+            )));
+        }
+        if let Some(toast_table_id) = schema.toast_table_id {
+            if toast_table_id == *table {
+                return Err(DbError::internal(format!(
+                    "catalog table {} references itself as a TOAST relation",
+                    schema.name
+                )));
+            }
+            if let Some(toast_schema) = snapshot.tables_by_id.get(&toast_table_id)
+                && toast_schema.relation_kind
+                    != (RelationKind::Toast {
+                        base_table: schema.id,
+                    })
+            {
+                return Err(DbError::internal(format!(
+                    "catalog table {} references non-matching TOAST relation {}",
+                    schema.name, toast_table_id
+                )));
+            }
+        }
+        reject_dependent_views(snapshot, *table, None)?;
+    }
+
+    if let Some((parent, child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
+        child.foreign_keys.iter().find_map(|foreign_key| {
+            if targets.contains(&foreign_key.referenced_table) && !targets.contains(&child.id) {
+                snapshot
+                    .tables_by_id
+                    .get(&foreign_key.referenced_table)
+                    .map(|parent| (parent, child, foreign_key))
+            } else {
+                None
+            }
+        })
+    }) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot drop table {} because constraint {} on table {} depends on it",
+                parent.name, foreign_key.name, child.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId]) -> Result<()> {
+    for table in tables {
+        let schema = snapshot
+            .tables_by_id
+            .get(table)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+        let mut table_ids = vec![*table];
+        if schema.relation_kind == RelationKind::User
+            && let Some(toast_table_id) = schema.toast_table_id
+            && snapshot.tables_by_id.contains_key(&toast_table_id)
+        {
+            table_ids.push(toast_table_id);
+        }
+        for table_id in table_ids {
+            let removed = snapshot
+                .tables_by_id
+                .remove(&table_id)
+                .ok_or_else(|| undefined_table(format!("table id {table_id} does not exist")))?;
+            if removed.schema_id == PUBLIC_SCHEMA_ID
+                && snapshot.tables_by_name.get(&removed.name) == Some(&table_id)
+            {
+                snapshot.tables_by_name.remove(&removed.name);
+            }
+            drop_indexes_for_table(snapshot, table_id);
+            snapshot.statistics.remove(&table_id);
+        }
+    }
+    Ok(())
 }
 
 fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {

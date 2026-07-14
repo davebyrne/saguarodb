@@ -2342,12 +2342,16 @@ fn execute_drop_tables(
         resolved.push((table, owned_sequences_for_table(ctx, table)?));
     }
 
-    for (table, owned_sequences) in resolved {
-        ctx.schema_ops.drop_table(&ctx.statement, table)?;
-        for sequence in &owned_sequences {
+    let table_ids = resolved.iter().map(|(table, _)| *table).collect::<Vec<_>>();
+    ctx.catalog.preflight_drop_tables(&table_ids)?;
+    for (table, owned_sequences) in &resolved {
+        ctx.schema_ops.drop_table(&ctx.statement, *table)?;
+        for sequence in owned_sequences {
             ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
         }
-        ctx.catalog.drop_table(table)?;
+    }
+    ctx.catalog.drop_tables(&table_ids)?;
+    for (_, owned_sequences) in resolved {
         for sequence in owned_sequences {
             ctx.catalog.apply_drop_sequence(sequence.id)?;
         }

@@ -8,11 +8,11 @@ use catalog::{
     synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
 };
 use common::{
-    CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
-    GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID, ParsedDefault, PgType,
-    QualifiedName, QueryCancel, RelationKind, Result, SchemaId, SequenceId, SessionActivityRow,
-    SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider, TableId,
-    TruncateCatalogUpdate, Value, WriteGuard,
+    CatalogIntrospectionProvider, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, DataType,
+    DbError, GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID, ParsedDefault,
+    PgType, QualifiedName, QueryCancel, RelationKind, Result, SchemaId, SequenceId,
+    SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider,
+    TableId, TruncateCatalogUpdate, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -3087,6 +3087,7 @@ fn augment_catalog_resolved_objects(
     catalog: &dyn CatalogManager,
     references: &mut BoundObjectReferences,
 ) -> Result<()> {
+    augment_foreign_key_objects(bound, catalog, references)?;
     match bound {
         BoundStatement::AlterTableAddColumn { table, column, .. } => match &column.default {
             Some(ParsedDefault::Nextval(name) | ParsedDefault::OwnedNextval(name)) => {
@@ -3182,6 +3183,92 @@ fn augment_catalog_resolved_objects(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn augment_foreign_key_objects(
+    bound: &BoundStatement,
+    catalog: &dyn CatalogManager,
+    references: &mut BoundObjectReferences,
+) -> Result<()> {
+    match bound {
+        BoundStatement::Insert {
+            table, on_conflict, ..
+        } => {
+            record_outgoing_foreign_key_objects(catalog, references, *table)?;
+            if let Some(BoundOnConflict::DoUpdate { assignments, .. }) = on_conflict {
+                let assigned = assignments
+                    .iter()
+                    .map(|(column, _)| *column)
+                    .collect::<BTreeSet<_>>();
+                record_incoming_foreign_key_objects(catalog, references, *table, Some(&assigned))?;
+            }
+        }
+        BoundStatement::Copy {
+            table,
+            direction: CopyDirection::From,
+            ..
+        } => record_outgoing_foreign_key_objects(catalog, references, *table)?,
+        BoundStatement::Update {
+            table, assignments, ..
+        } => {
+            record_outgoing_foreign_key_objects(catalog, references, *table)?;
+            let assigned = assignments
+                .iter()
+                .map(|(column, _)| *column)
+                .collect::<BTreeSet<_>>();
+            record_incoming_foreign_key_objects(catalog, references, *table, Some(&assigned))?;
+        }
+        BoundStatement::Delete { table, .. } => {
+            record_incoming_foreign_key_objects(catalog, references, *table, None)?;
+        }
+        BoundStatement::DropTable { targets, .. } => {
+            for target in targets {
+                let table = match target.table {
+                    Some(table) => catalog.get_table(table)?,
+                    None => table_in_search_path(catalog, &target.search_path, &target.name.name)?,
+                };
+                if let Some(table) = table {
+                    record_incoming_foreign_key_objects(catalog, references, table.id, None)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn record_outgoing_foreign_key_objects(
+    catalog: &dyn CatalogManager,
+    references: &mut BoundObjectReferences,
+    table: TableId,
+) -> Result<()> {
+    let schema = catalog
+        .get_table(table)?
+        .ok_or_else(prepared_schema_changed_error)?;
+    for foreign_key in schema.foreign_keys {
+        record_bound_relation_version(references, foreign_key.referenced_table, None)?;
+    }
+    Ok(())
+}
+
+fn record_incoming_foreign_key_objects(
+    catalog: &dyn CatalogManager,
+    references: &mut BoundObjectReferences,
+    table: TableId,
+    assigned_columns: Option<&BTreeSet<ColumnId>>,
+) -> Result<()> {
+    for (child, foreign_key) in catalog.list_incoming_foreign_keys(table)? {
+        if assigned_columns.is_some_and(|columns| {
+            !foreign_key
+                .referenced_columns
+                .iter()
+                .any(|column| columns.contains(column))
+        }) {
+            continue;
+        }
+        record_bound_relation_version(references, child.id, None)?;
     }
     Ok(())
 }
@@ -3666,22 +3753,26 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use catalog::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, check_constraint_oid, index_oid,
-        primary_key_constraint_oid, sequence_oid, table_oid,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, check_constraint_oid,
+        index_oid, primary_key_constraint_oid, sequence_oid, table_oid,
     };
     use common::{
         CancelReason, CatalogIntrospectionProvider, ColumnDefault, ConcurrencyController, DbError,
-        FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef,
-        PgType, QueryCancel, RelationKind, Result, RwLockConcurrencyController, SequenceId,
-        SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState, TableId,
-        TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
+        FlushPolicy, ForeignKeyAction, IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo,
+        ParsedColumnDef, PgType, QueryCancel, RelationKind, Result, RwLockConcurrencyController,
+        SequenceId, SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState,
+        TableId, TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
-    use storage::{HeapPageStore, PageBackedStorageEngine, StorageEngine, StorageMode};
+    use storage::{
+        HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageEngine, StorageMode,
+    };
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
-    use super::{CopyInChunk, SessionTxnStatus, object_lock_requests, slot_status};
+    use super::{
+        CopyInChunk, SessionTxnStatus, object_lock_requests, prepared_schema_versions, slot_status,
+    };
     use crate::app::{AppState, ServerComponents};
     use crate::checkpoint::CheckpointState;
     use crate::config::Config;
@@ -3741,6 +3832,111 @@ mod tests {
                     crate::lock_manager::SequenceLockMode::Access,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn foreign_key_dml_requests_related_relations_and_prepared_identities() {
+        use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table fk_parent (id integer primary key, payload integer)",
+            "create table fk_child (id integer primary key, parent_id integer)",
+            "create table fk_self (id integer primary key, parent_id integer)",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+        let catalog = app.components.catalog.as_ref();
+        let parent = catalog.get_table_by_name("fk_parent").unwrap().unwrap();
+        let child = catalog.get_table_by_name("fk_child").unwrap().unwrap();
+        let self_table = catalog.get_table_by_name("fk_self").unwrap().unwrap();
+        catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![ResolvedForeignKey {
+                    name: Some("fk_child_parent".to_string()),
+                    columns: vec![1],
+                    referenced_table: parent.id,
+                    referenced_columns: vec![0],
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+        catalog
+            .attach_foreign_keys(
+                self_table.id,
+                vec![ResolvedForeignKey {
+                    name: Some("fk_self_parent".to_string()),
+                    columns: vec![1],
+                    referenced_table: self_table.id,
+                    referenced_columns: vec![0],
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+
+        let requests_for = |sql: &str| {
+            let statement = parser::parse(sql).unwrap();
+            let bound = planner::bind(&statement, catalog).unwrap();
+            object_lock_requests(&bound, catalog).unwrap()
+        };
+        let related = |target: TableId, other: TableId| {
+            let mut expected = vec![
+                ObjectLockRequest::table(target, RelationLockMode::RowExclusive),
+                ObjectLockRequest::table(other, RelationLockMode::AccessShare),
+            ];
+            expected.sort_by_key(|request| request.resource.clone());
+            expected
+        };
+        for sql in [
+            "insert into fk_child values (1, 1)",
+            "copy fk_child from stdin",
+            "update fk_child set parent_id = 2",
+            "insert into fk_child values (1, 1) on conflict (id) do update set parent_id = 2",
+        ] {
+            assert_eq!(requests_for(sql), related(child.id, parent.id), "{sql}");
+        }
+        for sql in [
+            "update fk_parent set id = 2",
+            "delete from fk_parent",
+            "insert into fk_parent values (1, 0) on conflict (id) do update set id = 2",
+        ] {
+            assert_eq!(requests_for(sql), related(parent.id, child.id), "{sql}");
+        }
+        for sql in [
+            "update fk_parent set payload = 2",
+            "insert into fk_parent values (1, 0) on conflict (id) do update set payload = 2",
+        ] {
+            assert_eq!(
+                requests_for(sql),
+                vec![ObjectLockRequest::table(
+                    parent.id,
+                    RelationLockMode::RowExclusive,
+                )],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            requests_for("update fk_self set parent_id = id"),
+            vec![ObjectLockRequest::table(
+                self_table.id,
+                RelationLockMode::RowExclusive,
+            )]
+        );
+
+        let statement = parser::parse("insert into fk_child values (2, 1)").unwrap();
+        let bound = planner::bind(&statement, catalog).unwrap();
+        let identities = prepared_schema_versions(&bound, catalog).unwrap();
+        assert_eq!(
+            identities
+                .iter()
+                .map(|(table, _, _)| *table)
+                .collect::<Vec<_>>(),
+            vec![parent.id, child.id]
         );
     }
 
@@ -4526,6 +4722,10 @@ mod tests {
             self.inner.apply_drop_table(id)
         }
 
+        fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()> {
+            self.inner.apply_drop_table_in_batch(id, batch)
+        }
+
         fn create_table(
             &self,
             name: String,
@@ -4579,6 +4779,14 @@ mod tests {
 
         fn drop_table(&self, id: TableId) -> Result<()> {
             self.inner.drop_table(id)
+        }
+
+        fn preflight_drop_tables(&self, tables: &[TableId]) -> Result<()> {
+            self.inner.preflight_drop_tables(tables)
+        }
+
+        fn drop_tables(&self, tables: &[TableId]) -> Result<()> {
+            self.inner.drop_tables(tables)
         }
 
         fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema> {
@@ -8147,6 +8355,228 @@ mod tests {
                 .contains("cached plan must be reprepared"),
             "message was: {}",
             insert_err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_dml_rejects_foreign_key_add_and_drop_schema_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table prepared_fk_parent (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table prepared_fk_child (id integer primary key, parent_id integer)",
+            )
+            .unwrap();
+        let parent = app
+            .components
+            .catalog
+            .get_table_by_name("prepared_fk_parent")
+            .unwrap()
+            .unwrap();
+        let child = app
+            .components
+            .catalog
+            .get_table_by_name("prepared_fk_child")
+            .unwrap()
+            .unwrap();
+        let prepared_before_add = app
+            .query_service
+            .prepare_sql("insert into prepared_fk_child values ($1, $2)", &[])
+            .unwrap();
+        let attached = app
+            .components
+            .catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![ResolvedForeignKey {
+                    name: Some("prepared_child_parent_fkey".to_string()),
+                    columns: vec![1],
+                    referenced_table: parent.id,
+                    referenced_columns: vec![0],
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+        app.components
+            .storage
+            .apply_update_table_schema(attached)
+            .unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_prepared(
+                    &prepared_before_add,
+                    &[Value::Integer(1), Value::Integer(1)],
+                )
+                .unwrap_err()
+                .code,
+            SqlState::FeatureNotSupported
+        );
+
+        let prepared_before_drop = app
+            .query_service
+            .prepare_sql("insert into prepared_fk_child values ($1, $2)", &[])
+            .unwrap();
+        let dropped = app
+            .components
+            .catalog
+            .drop_foreign_key(child.id, "prepared_child_parent_fkey", false)
+            .unwrap()
+            .unwrap();
+        app.components
+            .storage
+            .apply_update_table_schema(dropped)
+            .unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_prepared(
+                    &prepared_before_drop,
+                    &[Value::Integer(2), Value::Integer(1)],
+                )
+                .unwrap_err()
+                .code,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_parent_delete_discovers_foreign_key_added_after_prepare() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table prepared_parent_live (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table prepared_child_live (id integer primary key, parent_id integer)",
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into prepared_parent_live values (1)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into prepared_child_live values (1, 1)")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("delete from prepared_parent_live where id = $1", &[])
+            .unwrap();
+        let parent = app
+            .components
+            .catalog
+            .get_table_by_name("prepared_parent_live")
+            .unwrap()
+            .unwrap();
+        let child = app
+            .components
+            .catalog
+            .get_table_by_name("prepared_child_live")
+            .unwrap()
+            .unwrap();
+        let attached = app
+            .components
+            .catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![ResolvedForeignKey {
+                    name: Some("prepared_live_fkey".to_string()),
+                    columns: vec![1],
+                    referenced_table: parent.id,
+                    referenced_columns: vec![0],
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+        app.components
+            .storage
+            .apply_update_table_schema(attached)
+            .unwrap();
+
+        assert_eq!(
+            app.query_service
+                .execute_prepared(&prepared, &[Value::Integer(1)])
+                .unwrap_err()
+                .code,
+            SqlState::ForeignKeyViolation
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_primary_key_drop_fails_before_durable_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table drop_pk_parent (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create table drop_pk_child (id integer primary key, parent_id integer)")
+            .unwrap();
+        let parent = app
+            .components
+            .catalog
+            .get_table_by_name("drop_pk_parent")
+            .unwrap()
+            .unwrap();
+        let child = app
+            .components
+            .catalog
+            .get_table_by_name("drop_pk_child")
+            .unwrap()
+            .unwrap();
+        let attached = app
+            .components
+            .catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![ResolvedForeignKey {
+                    name: Some("drop_pk_child_parent_fkey".to_string()),
+                    columns: vec![1],
+                    referenced_table: parent.id,
+                    referenced_columns: vec![0],
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+        app.components
+            .storage
+            .apply_update_table_schema(attached)
+            .unwrap();
+
+        assert_eq!(
+            app.query_service
+                .execute_sql("alter table drop_pk_parent drop primary key")
+                .unwrap_err()
+                .code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            app.components
+                .catalog
+                .get_table(parent.id)
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            vec![0]
+        );
+        assert!(
+            !app.components
+                .wal
+                .replay_from(0)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .any(|record| {
+                    app.components.wal.is_committed(record.txn_id)
+                        && matches!(
+                            record.kind,
+                            WalRecordKind::AlterTablePrimaryKey { table_id, .. }
+                                if table_id == parent.id
+                        )
+                })
         );
     }
 

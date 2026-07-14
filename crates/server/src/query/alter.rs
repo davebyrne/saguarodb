@@ -677,6 +677,9 @@ impl QueryService {
             let catalog_before = Some(catalog_snapshot);
 
             let pre_commit = (|| {
+                components
+                    .catalog
+                    .preflight_table_primary_key_change(schema.id, &new_schema.primary_key)?;
                 let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
                 components.storage.validate_table_primary_key_change(
                     &ctx,
