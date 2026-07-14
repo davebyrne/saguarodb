@@ -80,7 +80,9 @@ Parent probes use current liveness, wait for in-progress creators, retain
 an exact existing child index or heap scan, wait/restart around in-progress child
 changes, and exclude the current identity for self-references. Read Committed
 accepts the current committed result after waiting; Repeatable Read and
-Serializable return `40001` when it lies outside their retained snapshot.
+Serializable return `40001` when it lies outside their retained snapshot. For a
+dependent probe, that includes a committed post-snapshot child update or delete
+that makes the previously matching row stop referencing the parent.
 
 Violations return `23503` with PostgreSQL-style child and parent messages.
 Related parent/child relations are discovered during lock convergence and held

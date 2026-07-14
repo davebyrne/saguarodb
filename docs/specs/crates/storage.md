@@ -205,9 +205,11 @@ corrupt HOT/REDIRECT state are structured storage errors.
 Read Committed accepts the settled current result after a wait. Repeatable Read
 and Serializable return `SerializationFailure` (`40001`) when a current row whose
 presence is required by either probe is outside the retained transaction
-snapshot. `update_requiring_update_lock` is the ordinary-update companion used
-when a referenced non-primary-key column requires `TupleLockMode::Update` even
-though the storage identity is unchanged.
+snapshot. A dependent probe therefore returns `40001` after waiting for a
+committed post-snapshot child update/delete even when its restart finds that the
+child no longer matches the parent key. `update_requiring_update_lock` is the
+ordinary-update companion used when a referenced non-primary-key column requires
+`TupleLockMode::Update` even though the storage identity is unchanged.
 
 `lock_unique_conflict` reuses the same current-state creator wait, HOT-chain
 recheck, retained-snapshot rule, and tuple-lock machinery for the primary-key

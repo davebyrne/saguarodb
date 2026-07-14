@@ -79,7 +79,10 @@ restart after each wait, and retain a parent `KeyShare` tuple lock before
 reporting a referenced row present. Child-dependent probes likewise inspect
 current committed/own versions through an exact index or heap extent. At retained
 snapshot isolation, relying on a required post-snapshot current row is a `40001`
-serialization failure; Read Committed accepts the newly settled state.
+serialization failure; a matching child that changes or disappears in a
+committed post-snapshot version is the same conflict, even when the restarted
+dependent scan finds no current match. Read Committed accepts the newly settled
+state.
 
 ### 3.1 The governing principle — where old versions physically live
 
