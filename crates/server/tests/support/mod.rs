@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use catalog::ResolvedForeignKey;
 use common::Result;
 use saguarodb_server::app::AppState;
 use saguarodb_server::checkpoint::run_checkpoint;
 use saguarodb_server::config::Config;
 use saguarodb_server::connection::handle_connection;
 use saguarodb_server::recovery::open_app;
+use storage::RecoveryOperations;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -74,6 +76,59 @@ impl TestServer {
             .components
             .dead_rows_since_vacuum
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Attach resolved FK metadata for executor/concurrency integration tests
+    /// before SQL FK-definition syntax is enabled.
+    pub fn attach_foreign_key(
+        &self,
+        name: &str,
+        child: &str,
+        child_columns: &[&str],
+        parent: &str,
+        parent_columns: &[&str],
+    ) -> Result<()> {
+        let catalog = &self.app.components.catalog;
+        let child_schema = catalog
+            .get_table_by_name(child)?
+            .ok_or_else(|| common::DbError::internal(format!("missing test table {child}")))?;
+        let parent_schema = catalog
+            .get_table_by_name(parent)?
+            .ok_or_else(|| common::DbError::internal(format!("missing test table {parent}")))?;
+        let resolve = |schema: &common::TableSchema, columns: &[&str]| -> Result<Vec<u16>> {
+            columns
+                .iter()
+                .map(|name| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .map(|column| column.id)
+                        .ok_or_else(|| {
+                            common::DbError::internal(format!(
+                                "missing test column {}.{name}",
+                                schema.name
+                            ))
+                        })
+                })
+                .collect()
+        };
+        let updated = catalog.attach_foreign_keys(
+            child_schema.id,
+            vec![ResolvedForeignKey {
+                name: Some(name.to_string()),
+                columns: resolve(&child_schema, child_columns)?,
+                referenced_table: parent_schema.id,
+                referenced_columns: resolve(&parent_schema, parent_columns)?,
+                on_update: common::ForeignKeyAction::NoAction,
+                on_delete: common::ForeignKeyAction::NoAction,
+            }],
+        )?;
+        self.app
+            .components
+            .storage
+            .apply_update_table_schema(updated)?;
+        Ok(())
     }
 
     /// The full-extent heap page count for a table (resident + evicted pages), used

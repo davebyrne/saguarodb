@@ -1727,6 +1727,18 @@ Expression semantics:
 
 `INSERT`, `UPDATE`, and `DELETE` are handled directly by the executor (not through the iterator model), call into storage, and return the affected row count. `CREATE TABLE`, `DROP TABLE`, `CREATE VIEW`, `DROP VIEW`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` also return `ExecutionResult::Modified`, using the matching command names with `count = 0`. Conditional table/view DDL no-ops (`CREATE TABLE IF NOT EXISTS` when the table already exists, `DROP TABLE IF EXISTS` when no table or view exists, `DROP VIEW IF EXISTS` when no view or table exists) return the same command tags without mutating catalog/storage or appending logical DDL WAL records; `CREATE TABLE IF NOT EXISTS` still validates the requested table definition shape before suppressing a duplicate-table conflict. If the name exists in the shared user relation namespace with the wrong kind (for example `DROP TABLE`/`DROP TABLE IF EXISTS` naming a view or `DROP VIEW`/`DROP VIEW IF EXISTS` naming a table), execution returns `SqlState::WrongObjectType`.
 
+When durable foreign-key metadata is present, one statement/COPY-job-scoped
+executor service resolves all referenced and supporting indexes and enforces it
+before each physical write. INSERT/COPY and effective upsert rows probe outgoing
+parents in deterministic order under retained `KeyShare`; UPDATE checks changed
+outgoing keys and scans incoming dependents before changing a referenced key;
+DELETE scans all incoming dependents. `MATCH SIMPLE` skips a key containing NULL,
+self-referencing resulting rows are supported, and `NO ACTION`/`RESTRICT` are the
+same immediate per-row check. Violations return `23503` with child/parent context.
+`ON CONFLICT DO NOTHING` does not validate the rejected proposed row. Definition
+syntax and server dependency locking are enabled in later foreign-key stages and
+are not implied by this executor contract.
+
 ## 7. Storage Engine
 
 The `storage` crate owns the on-disk data format, page-backed row storage, and each table's durable on-disk storage-identity B-tree.
@@ -1795,6 +1807,16 @@ pub trait StorageEngine: Send + Sync {
         access_index: IndexId,
         key: &Key,
     ) -> Result<bool>;
+
+    /// Current-state primary-key conflict probe returning the settled locked row.
+    fn lock_unique_conflict(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>>;
 
     /// Current-state child lookup through an exact index or bounded heap scan.
     fn dependent_row_exists(
@@ -1922,6 +1944,13 @@ lookup processes exact-index candidates or bounded heap-page HOT-root batches,
 validates REDIRECT/HOT topology, and may exclude one identity for self-reference.
 Read Committed accepts settled current state; retained-snapshot isolation returns
 `40001` when a required current row is outside that snapshot.
+The primary-key `ON CONFLICT` arbiter reuses this current-state wait/recheck path
+but returns the settled locked row, preventing an in-progress conflict from
+falling through to FK validation or a plain uniqueness error. It and every
+ordinary PK insert retain the same transaction-owned `NoKeyUpdate` reservation
+on the proposed key before FK checks or heap work, so a new competitor cannot
+claim the key in the no-conflict probe-to-insert gap. An existing-conflict path
+restores the reservation and rechecks under its ordinary action row lock.
 
 Every operation takes a `StatementContext`. It carries the `txn_id`, the MVCC `snapshot` used for visibility, the `isolation` level, and the `gc_horizon` — so each storage operation sees and stamps versions consistently without changing any call sites.
 
@@ -2487,8 +2516,9 @@ pub struct ViewDependency {
 Foreign keys are stored as ordered, ID-resolved per-table metadata. Their IDs
 are allocated monotonically in `0..=4095` (`4096` is the exhausted sentinel),
 and old catalog/WAL table-schema payloads default the list and allocator to
-empty/zero. SQL creation syntax and write enforcement are enabled by later
-foreign-key slices.
+empty/zero. The executor enforces installed metadata on every write path as
+specified above; SQL definition syntax and server dependency locking are enabled
+by later foreign-key slices.
 
 `create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
 metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;

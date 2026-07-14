@@ -2138,6 +2138,10 @@ impl StorageEngine for PageBackedStorageEngine {
         let table_handle = self.table_handle(relations, table)?;
         let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
+        if !schema.primary_key.is_empty() {
+            let reservation_key = primary_key_for_row(&schema, &row)?;
+            let _retained_reservation = crate::reserve_unique_key(ctx, table, &reservation_key)?;
+        }
 
         // Write the new heap tuple first (under its own per-heap latch inside
         // `write_new_row`, released on return), THEN insert the table identity entry
@@ -2213,13 +2217,54 @@ impl StorageEngine for PageBackedStorageEngine {
         access_index: IndexId,
         key: &Key,
     ) -> Result<bool> {
-        self.probe_referenced_key(
-            ctx,
-            pagebacked_relations(relations)?,
-            table,
-            access_index,
-            key,
-        )
+        Ok(self
+            .probe_referenced_key_locked(
+                ctx,
+                pagebacked_relations(relations)?,
+                table,
+                access_index,
+                key,
+                TupleLockMode::KeyShare,
+            )?
+            .is_some())
+    }
+
+    fn lock_unique_conflict(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>> {
+        let relations = pagebacked_relations(relations)?;
+        loop {
+            let reservation = crate::reserve_unique_key(ctx, table, key)?;
+            if self
+                .probe_referenced_key_locked(
+                    ctx,
+                    relations,
+                    table,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    key,
+                    TupleLockMode::NoKeyUpdate,
+                )?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            restore_tuple_changes(ctx, vec![reservation])?;
+            if let Some(locked) = self.probe_referenced_key_locked(
+                ctx,
+                relations,
+                table,
+                common::PRIMARY_KEY_INDEX_ID,
+                key,
+                mode,
+            )? {
+                return Ok(Some(locked));
+            }
+        }
     }
 
     fn dependent_row_exists(

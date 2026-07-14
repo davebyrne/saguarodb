@@ -342,9 +342,11 @@ transferred, matching PostgreSQL.
 - `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), plus the
   `CopyIn` row-insert driver and the `CopyOut` row-producer. `CopyIn` reuses the
   shared INSERT row mapping (`build_insert_row`, including defaults, type and
-  row-constraint validation, numeric coercion, and `CHECK` evaluation) before
-  `storage.insert`; `CopyOut` scans via `storage.scan` and projects the COPY
-  columns by slot.
+  row-constraint validation, numeric coercion, and `CHECK` evaluation) and one
+  job-scoped resolved foreign-key enforcement service before `storage.insert`;
+  each completed row therefore receives the same immediate outgoing `MATCH
+  SIMPLE` checks as INSERT, and any violation aborts the all-or-nothing COPY.
+  `CopyOut` scans via `storage.scan` and projects the COPY columns by slot.
 - `server`: the COPY connection state machine, channels, transaction
   integration, command tag, and rejection of unsupported forms / extended-protocol
   COPY.

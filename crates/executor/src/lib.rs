@@ -15,6 +15,7 @@ pub mod copy;
 mod expr;
 mod instrumentation;
 mod query;
+mod referential;
 mod result;
 mod subquery;
 mod system;
@@ -40,8 +41,8 @@ mod tests {
         ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
         DataType, ExecRow, GucSetting, Key, POSTGRES_COMPAT_VERSION, ParsedColumnDef, RelationKind,
         Result, Row, RowId, RowIdentity, SequenceManager, SessionActivityRow, SessionInfo,
-        SessionSequenceState, SqlState, StatementContext, SystemStateProvider, TableSchema,
-        ToastOptions, Value,
+        SessionSequenceState, SqlState, SsiTracker, StatementContext, SystemStateProvider,
+        TableSchema, ToastOptions, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -54,6 +55,33 @@ mod tests {
     struct TestSequenceManager {
         next_values: Mutex<Vec<i64>>,
         set_calls: Mutex<Vec<(u64, u32, i64, bool)>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSsiTracker {
+        tuple_reads: Mutex<Vec<(u64, u32, Key)>>,
+        relation_reads: Mutex<Vec<(u64, u32)>>,
+    }
+
+    impl SsiTracker for RecordingSsiTracker {
+        fn record_tuple_read(&self, reader: u64, table: u32, key: &Key) {
+            self.tuple_reads
+                .lock()
+                .unwrap()
+                .push((reader, table, key.clone()));
+        }
+
+        fn record_relation_read(&self, reader: u64, table: u32) {
+            self.relation_reads.lock().unwrap().push((reader, table));
+        }
+
+        fn note_write(&self, _writer: u64, _table: u32, _key: &Key) -> Result<()> {
+            Ok(())
+        }
+
+        fn note_relation_write(&self, _writer: u64, _table: u32) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl TestSequenceManager {
@@ -3139,6 +3167,332 @@ mod tests {
 
     fn csv_opts() -> CopyOptions {
         CopyOptions::defaults_for(CopyFormat::Csv)
+    }
+
+    fn foreign_key_harness() -> ExecutorHarness {
+        let harness = ExecutorHarness::with_users();
+        harness.add_table(
+            "parents",
+            &[
+                ("id", DataType::Integer, false),
+                ("code", DataType::Text, false),
+            ],
+            &["id"],
+        );
+        harness.add_unique_constraint("parents", &["code"]);
+        harness.add_table(
+            "children",
+            &[
+                ("id", DataType::Integer, false),
+                ("parent_id", DataType::Integer, true),
+                ("parent_code", DataType::Text, true),
+            ],
+            &["id"],
+        );
+        harness.add_foreign_key(
+            "children_parent_id_fkey",
+            "children",
+            &["parent_id"],
+            "parents",
+            &["id"],
+        );
+        harness.add_foreign_key(
+            "children_parent_code_fkey",
+            "children",
+            &["parent_code"],
+            "parents",
+            &["code"],
+        );
+        harness
+    }
+
+    #[test]
+    fn foreign_keys_enforce_insert_match_simple_and_exact_errors_before_mutation() {
+        let harness = foreign_key_harness();
+        harness
+            .execute("insert into parents values (1, 'one')")
+            .unwrap();
+        harness
+            .execute("insert into children values (1, 1, 'one'), (2, null, null)")
+            .unwrap();
+
+        let err = harness
+            .execute("insert into children values (3, 99, 'one')")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert_eq!(
+            err.message,
+            "insert or update on table \"children\" violates foreign key constraint \"children_parent_id_fkey\""
+        );
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Key (parent_id)=(99) is not present in table \"parents\".")
+        );
+        assert_eq!(
+            harness
+                .select_rows("select id from children order by id")
+                .unwrap(),
+            vec![
+                Row {
+                    values: vec![Value::Integer(1)]
+                },
+                Row {
+                    values: vec![Value::Integer(2)]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn foreign_keys_enforce_composite_declared_unique_references_in_order() {
+        let harness = ExecutorHarness::with_users();
+        harness.add_table(
+            "composite_parents",
+            &[
+                ("id", DataType::Integer, false),
+                ("a", DataType::Integer, false),
+                ("b", DataType::Text, false),
+            ],
+            &["id"],
+        );
+        harness.add_unique_constraint("composite_parents", &["a", "b"]);
+        harness.add_table(
+            "composite_children",
+            &[
+                ("id", DataType::Integer, false),
+                ("x", DataType::Integer, true),
+                ("y", DataType::Text, true),
+            ],
+            &["id"],
+        );
+        harness.add_foreign_key(
+            "composite_children_xy_fkey",
+            "composite_children",
+            &["x", "y"],
+            "composite_parents",
+            &["a", "b"],
+        );
+        harness
+            .execute("insert into composite_parents values (1, 7, 'seven')")
+            .unwrap();
+        harness
+            .execute("insert into composite_children values (1, 7, 'seven'), (2, 7, null)")
+            .unwrap();
+        let err = harness
+            .execute("insert into composite_children values (3, 8, 'seven')")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Key (x, y)=(8, seven) is not present in table \"composite_parents\".")
+        );
+    }
+
+    #[test]
+    fn foreign_keys_restrict_child_and_parent_updates_and_parent_deletes() {
+        let harness = foreign_key_harness();
+        harness
+            .execute("insert into parents values (1, 'one'), (2, 'two')")
+            .unwrap();
+        harness
+            .execute("insert into children values (10, 1, 'one')")
+            .unwrap();
+
+        let err = harness
+            .execute("update children set parent_id = 99 where id = 10")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        let err = harness
+            .execute("update parents set code = 'changed' where id = 1")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert_eq!(
+            err.message,
+            "update or delete on table \"parents\" violates foreign key constraint \"children_parent_code_fkey\" on table \"children\""
+        );
+        let err = harness
+            .execute("delete from parents where id = 1")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+
+        let result = harness
+            .execute("update children set parent_id = 2, parent_code = 'two' where id = 10 returning parent_id")
+            .unwrap();
+        match result {
+            ExecutionResult::ModifiedReturning {
+                command,
+                count,
+                rows,
+                ..
+            } => {
+                assert_eq!(command, "UPDATE");
+                assert_eq!(count, 1);
+                assert_eq!(
+                    rows,
+                    vec![Row {
+                        values: vec![Value::Integer(2)]
+                    }]
+                );
+            }
+            other => panic!("expected UPDATE RETURNING, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_keys_handle_self_reference_and_upsert_branches() {
+        let harness = foreign_key_harness();
+        harness.add_table(
+            "nodes",
+            &[
+                ("id", DataType::Integer, false),
+                ("parent_id", DataType::Integer, true),
+            ],
+            &["id"],
+        );
+        harness.add_foreign_key(
+            "nodes_parent_id_fkey",
+            "nodes",
+            &["parent_id"],
+            "nodes",
+            &["id"],
+        );
+        harness.execute("insert into nodes values (1, 1)").unwrap();
+        let err = harness
+            .execute("update nodes set id = 2 where id = 1")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        harness
+            .execute("update nodes set id = 2, parent_id = 2 where id = 1")
+            .unwrap();
+        harness.execute("delete from nodes where id = 2").unwrap();
+
+        harness
+            .execute("insert into parents values (1, 'one')")
+            .unwrap();
+        harness
+            .execute("insert into children values (1, 1, 'one')")
+            .unwrap();
+        harness
+            .execute("insert into children values (1, 99, 'missing') on conflict (id) do nothing")
+            .unwrap();
+        let err = harness
+            .execute(
+                "insert into children values (1, 99, 'missing') on conflict (id) do update set parent_id = excluded.parent_id",
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        let err = harness
+            .execute(
+                "insert into parents values (1, 'changed') on conflict (id) do update set code = excluded.code",
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert_eq!(
+            harness
+                .select_rows("select parent_id, parent_code from children where id = 1")
+                .unwrap(),
+            vec![Row {
+                values: vec![Value::Integer(1), Value::Text("one".to_string())]
+            }]
+        );
+    }
+
+    #[test]
+    fn on_conflict_waits_for_current_conflict_before_foreign_key_validation() {
+        let harness = foreign_key_harness();
+        harness
+            .execute("insert into parents values (1, 'one')")
+            .unwrap();
+        harness
+            .insert_uncommitted(
+                "children",
+                50,
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("one".to_string()),
+                ],
+            )
+            .unwrap();
+
+        let result = harness
+            .execute_after_committing_blocker(
+                "insert into children values (1, 99, 'missing') on conflict (id) do nothing",
+                50,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            ExecutionResult::Modified {
+                command: "INSERT".to_string(),
+                count: 0,
+            }
+        );
+        assert_eq!(
+            harness
+                .select_rows("select parent_id, parent_code from children where id = 1")
+                .unwrap(),
+            vec![Row {
+                values: vec![Value::Integer(1), Value::Text("one".to_string())]
+            }]
+        );
+    }
+
+    #[test]
+    fn foreign_keys_make_copy_from_failure_roll_back_all_rows() {
+        let harness = foreign_key_harness();
+        harness
+            .execute("insert into parents values (1, 'one')")
+            .unwrap();
+        let err = harness
+            .copy_in("children", &[], text_opts(), &[b"1\t1\tone\n2\t99\tone\n"])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert!(
+            harness
+                .select_rows("select * from children")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn foreign_key_probes_record_required_ssi_reads() {
+        let harness = foreign_key_harness();
+        harness
+            .execute("insert into parents values (1, 'one')")
+            .unwrap();
+        let parents = harness.table_schema("parents");
+        let children = harness.table_schema("children");
+        let tracker = Arc::new(RecordingSsiTracker::default());
+        harness
+            .execute_with_ssi_tracker("insert into children values (1, 1, 'one')", tracker.clone())
+            .unwrap();
+        assert!(tracker.tuple_reads.lock().unwrap().iter().any(
+            |(_, table, key)| *table == parents.id && *key == Key(vec![Value::Integer(1)])
+        ));
+        assert!(
+            tracker
+                .relation_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, table)| *table == parents.id)
+        );
+
+        let tracker = Arc::new(RecordingSsiTracker::default());
+        let err = harness
+            .execute_with_ssi_tracker("delete from parents where id = 1", tracker.clone())
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::ForeignKeyViolation);
+        assert!(
+            tracker
+                .relation_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, table)| *table == children.id)
+        );
     }
 
     #[test]

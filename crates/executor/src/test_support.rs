@@ -1,9 +1,10 @@
-use catalog::{CatalogManager, MemoryCatalog};
+use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
-    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexConstraintKind, IndexId,
-    IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result, Row, RowId, RowIdentity,
-    SqlState, StatementContext, StoredRow, TableId, TableSchema, TupleLockAcquire,
-    TupleLockManager, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnStatus, Value,
+    ColumnId, ColumnInfo, ConflictWaiter, CopyOptions, DataType, DbError, ForeignKeyAction,
+    IndexConstraintKind, IndexId, IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result,
+    Row, RowId, RowIdentity, SqlState, SsiTracker, StatementContext, StoredRow, TableId,
+    TableSchema, TupleLockAcquire, TupleLockManager, TupleLockMode, TupleLockTag,
+    TupleLockWaitPolicy, TxnStatus, Value,
 };
 use planner::{ExplainAnalysis, PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
@@ -34,9 +35,33 @@ impl common::SequenceManager for TestSequenceRuntime {
     }
 }
 
+struct CommittingMemoryWaiter {
+    storage: Arc<MemoryStorage>,
+    blocker: u64,
+}
+
+impl std::fmt::Debug for CommittingMemoryWaiter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommittingMemoryWaiter")
+            .field("blocker", &self.blocker)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConflictWaiter for CommittingMemoryWaiter {
+    fn wait_for(&self, _waiter: u64, blocker: u64, cancel: &QueryCancel) -> Result<()> {
+        cancel.check()?;
+        if blocker != self.blocker {
+            return Err(DbError::internal("unexpected executor-harness blocker"));
+        }
+        self.storage.commit_txn(blocker)
+    }
+}
+
 pub struct ExecutorHarness {
     catalog: Arc<MemoryCatalog>,
-    storage: MemoryStorage,
+    storage: Arc<MemoryStorage>,
     engine: QueryEngine,
 }
 
@@ -68,7 +93,7 @@ impl ExecutorHarness {
                 common::CompressionSetting::None,
             )
             .unwrap();
-        let storage = MemoryStorage::empty();
+        let storage = Arc::new(MemoryStorage::empty());
         storage
             .create_table(&memory_statement_context(0), &schema)
             .unwrap();
@@ -95,6 +120,128 @@ impl ExecutorHarness {
         self.execute_with_cancel(sql, &QueryCancel::new())
     }
 
+    pub fn add_table(
+        &self,
+        name: &str,
+        columns: &[(&str, DataType, bool)],
+        primary_key: &[&str],
+    ) -> TableSchema {
+        let schema = self
+            .catalog
+            .create_table(
+                name.to_string(),
+                columns
+                    .iter()
+                    .map(|(name, data_type, nullable)| ParsedColumnDef {
+                        name: (*name).to_string(),
+                        data_type: data_type.clone(),
+                        nullable: *nullable,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    })
+                    .collect(),
+                primary_key.iter().map(|name| (*name).to_string()).collect(),
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        self.storage
+            .create_table(&memory_statement_context(0), &schema)
+            .unwrap();
+        if !primary_key.is_empty() {
+            let index = self
+                .catalog
+                .create_index_with_constraint(
+                    format!("{name}_pkey"),
+                    name,
+                    &primary_key
+                        .iter()
+                        .map(|column| (*column).to_string())
+                        .collect::<Vec<_>>(),
+                    true,
+                    IndexConstraintKind::PrimaryKey,
+                )
+                .unwrap();
+            self.storage
+                .create_index(&memory_statement_context(0), &index, 0)
+                .unwrap();
+        }
+        schema
+    }
+
+    pub fn add_unique_constraint(&self, table: &str, columns: &[&str]) -> IndexSchema {
+        let index = self
+            .catalog
+            .create_index_with_constraint(
+                format!("{}_{}_key", table, columns.join("_")),
+                table,
+                &columns
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect::<Vec<_>>(),
+                true,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap();
+        self.storage
+            .create_index(&memory_statement_context(0), &index, 0)
+            .unwrap();
+        index
+    }
+
+    pub fn add_foreign_key(
+        &self,
+        name: &str,
+        child: &str,
+        columns: &[&str],
+        parent: &str,
+        referenced_columns: &[&str],
+    ) {
+        let child_schema = self.catalog.get_table_by_name(child).unwrap().unwrap();
+        let parent_schema = self.catalog.get_table_by_name(parent).unwrap().unwrap();
+        let resolve = |schema: &TableSchema, names: &[&str]| {
+            names
+                .iter()
+                .map(|name| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .unwrap()
+                        .id
+                })
+                .collect::<Vec<_>>()
+        };
+        self.catalog
+            .attach_foreign_keys(
+                child_schema.id,
+                vec![ResolvedForeignKey {
+                    name: Some(name.to_string()),
+                    columns: resolve(&child_schema, columns),
+                    referenced_table: parent_schema.id,
+                    referenced_columns: resolve(&parent_schema, referenced_columns),
+                    on_update: ForeignKeyAction::NoAction,
+                    on_delete: ForeignKeyAction::NoAction,
+                }],
+            )
+            .unwrap();
+    }
+
+    pub fn insert_uncommitted(&self, table: &str, xid: u64, values: Vec<Value>) -> Result<()> {
+        let schema = self
+            .catalog
+            .get_table_by_name(table)?
+            .ok_or_else(|| undefined_table_by_name(table))?;
+        let relations = self.storage.capture_relation_snapshot()?;
+        self.storage.insert(
+            &memory_statement_context(xid),
+            relations.as_ref(),
+            schema.id,
+            Row { values },
+        )?;
+        Ok(())
+    }
+
     pub fn execute_with_cancel(&self, sql: &str, cancel: &QueryCancel) -> Result<ExecutionResult> {
         self.execute_with_spill(sql, cancel, spill::SpillConfig::default())
     }
@@ -105,19 +252,70 @@ impl ExecutorHarness {
         cancel: &QueryCancel,
         spill: spill::SpillConfig,
     ) -> Result<ExecutionResult> {
+        self.execute_with_runtime(sql, cancel, spill, None, None)
+    }
+
+    pub fn execute_with_ssi_tracker(
+        &self,
+        sql: &str,
+        tracker: Arc<dyn SsiTracker>,
+    ) -> Result<ExecutionResult> {
+        self.execute_with_runtime(
+            sql,
+            &QueryCancel::new(),
+            spill::SpillConfig::default(),
+            Some(tracker),
+            None,
+        )
+    }
+
+    pub fn execute_after_committing_blocker(
+        &self,
+        sql: &str,
+        blocker: u64,
+    ) -> Result<ExecutionResult> {
+        self.execute_with_runtime(
+            sql,
+            &QueryCancel::new(),
+            spill::SpillConfig::default(),
+            None,
+            Some(blocker),
+        )
+    }
+
+    fn execute_with_runtime(
+        &self,
+        sql: &str,
+        cancel: &QueryCancel,
+        spill: spill::SpillConfig,
+        ssi_tracker: Option<Arc<dyn SsiTracker>>,
+        committing_blocker: Option<u64>,
+    ) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
         let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.catalog.as_ref())?;
         let is_read = is_read_plan(&physical);
-        let statement = memory_statement_context(if is_read { 0 } else { 1 });
+        let mut statement = memory_statement_context(if is_read { 0 } else { 1 });
+        if let Some(ssi_tracker) = ssi_tracker {
+            statement = statement.with_ssi_tracker(ssi_tracker);
+        }
+        if let Some(blocker) = committing_blocker {
+            statement = statement.with_conflict_waiter(
+                Arc::new(CommittingMemoryWaiter {
+                    storage: Arc::clone(&self.storage),
+                    blocker,
+                }),
+                Arc::new(QueryCancel::new()),
+            );
+        }
         let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
-            storage: &self.storage,
-            schema_ops: &self.storage,
+            storage: self.storage.as_ref(),
+            schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel,
             spill,
@@ -169,8 +367,8 @@ impl ExecutorHarness {
                 .with_sequence_manager(Arc::new(TestSequenceRuntime)),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
-            storage: &self.storage,
-            schema_ops: &self.storage,
+            storage: self.storage.as_ref(),
+            schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
             spill: spill::SpillConfig::default(),
@@ -196,8 +394,8 @@ impl ExecutorHarness {
             statement: memory_statement_context(0),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
-            storage: &self.storage,
-            schema_ops: &self.storage,
+            storage: self.storage.as_ref(),
+            schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
             spill: spill::SpillConfig::default(),
@@ -250,8 +448,8 @@ impl ExecutorHarness {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
-            storage: &self.storage,
-            schema_ops: &self.storage,
+            storage: self.storage.as_ref(),
+            schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
             spill: spill::SpillConfig::default(),
@@ -293,8 +491,8 @@ impl ExecutorHarness {
             statement: memory_statement_context(0),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
-            storage: &self.storage,
-            schema_ops: &self.storage,
+            storage: self.storage.as_ref(),
+            schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
             spill: spill::SpillConfig::default(),
@@ -797,91 +995,15 @@ impl MemoryStorage {
             )),
         }
     }
-}
 
-struct MemoryRelationSnapshot;
-
-impl RelationSnapshot for MemoryRelationSnapshot {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn relation_epoch(&self) -> u64 {
-        0
-    }
-}
-
-impl StorageEngine for MemoryStorage {
-    fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>> {
-        Ok(Arc::new(MemoryRelationSnapshot))
-    }
-
-    fn insert(
+    fn probe_memory_referenced_key_locked(
         &self,
         ctx: &StatementContext,
-        _relations: &dyn RelationSnapshot,
-        table: TableId,
-        row: Row,
-    ) -> Result<RowId> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| DbError::internal("storage lock poisoned"))?;
-        begin_txn(&mut state, ctx.txn_id);
-        let schema = state
-            .schemas
-            .get(&table)
-            .cloned()
-            .ok_or_else(|| undefined_table(table))?;
-        let key = storage_identity_key_for_insert(&mut state, &schema, &row)?;
-        validate_unique_indexes(&state, &schema, None, &row)?;
-        if state
-            .rows
-            .get(&table)
-            .is_some_and(|rows| rows.contains_key(&key))
-        {
-            return Err(duplicate_storage_identity_error(&schema));
-        }
-        let row_id = allocate_memory_row_id(&mut state)?;
-        let rows = state.rows.entry(table).or_default();
-        rows.insert(
-            key,
-            MemoryStoredRow {
-                row_id,
-                xmin: ctx.txn_id,
-                row,
-                predecessors: Vec::new(),
-            },
-        );
-        Ok(row_id)
-    }
-
-    fn get(
-        &self,
-        _ctx: &StatementContext,
-        _relations: &dyn RelationSnapshot,
-        table: TableId,
-        key: &Key,
-    ) -> Result<Option<Row>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| DbError::internal("storage lock poisoned"))?;
-        Ok(state
-            .rows
-            .get(&table)
-            .and_then(|rows| rows.get(key))
-            .map(|stored| stored.row.clone()))
-    }
-
-    fn referenced_key_exists(
-        &self,
-        ctx: &StatementContext,
-        _relations: &dyn RelationSnapshot,
         table: TableId,
         access_index: IndexId,
         key: &Key,
-    ) -> Result<bool> {
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>> {
         loop {
             let candidate = {
                 let state = self
@@ -944,7 +1066,7 @@ impl StorageEngine for MemoryStorage {
                 candidate
             };
             let (identity, columns, schema) = match candidate {
-                MemoryProbeCandidate::Missing => return Ok(false),
+                MemoryProbeCandidate::Missing => return Ok(None),
                 MemoryProbeCandidate::Wait(blocker) => {
                     ctx.conflict_waiter
                         .wait_for(ctx.txn_id, blocker, ctx.cancel.as_ref())?;
@@ -952,13 +1074,8 @@ impl StorageEngine for MemoryStorage {
                 }
                 MemoryProbeCandidate::Found(candidate) => candidate,
             };
-            let (lock_result, change) = self.lock_row_with_change(
-                ctx,
-                table,
-                &identity,
-                TupleLockMode::KeyShare,
-                TupleLockWaitPolicy::Block,
-            )?;
+            let (lock_result, change) =
+                self.lock_row_with_change(ctx, table, &identity, mode, TupleLockWaitPolicy::Block)?;
             match lock_result {
                 LockRowResult::Locked(locked) => {
                     let current_key = match key_for_columns(&schema, &columns, locked.row()) {
@@ -971,7 +1088,7 @@ impl StorageEngine for MemoryStorage {
                         if let Err(err) = ensure_memory_current_visible(ctx, locked.identity()) {
                             return restore_memory_lock_change_after_error(ctx, change, err);
                         }
-                        return Ok(true);
+                        return Ok(Some(locked));
                     }
                     restore_memory_lock_change(ctx, change)?;
                 }
@@ -981,6 +1098,145 @@ impl StorageEngine for MemoryStorage {
                         "blocking foreign-key test-storage probe skipped a row",
                     ));
                 }
+            }
+        }
+    }
+}
+
+struct MemoryRelationSnapshot;
+
+impl RelationSnapshot for MemoryRelationSnapshot {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn relation_epoch(&self) -> u64 {
+        0
+    }
+}
+
+impl StorageEngine for MemoryStorage {
+    fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>> {
+        Ok(Arc::new(MemoryRelationSnapshot))
+    }
+
+    fn insert(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        row: Row,
+    ) -> Result<RowId> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let key = storage_identity_key_for_insert(&mut state, &schema, &row)?;
+        if !schema.primary_key.is_empty() {
+            drop(state);
+            let _retained_reservation = storage::reserve_unique_key(ctx, table, &key)?;
+            state = self
+                .state
+                .lock()
+                .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        }
+        validate_unique_indexes(&state, &schema, None, &row)?;
+        if state
+            .rows
+            .get(&table)
+            .is_some_and(|rows| rows.contains_key(&key))
+        {
+            return Err(duplicate_storage_identity_error(&schema));
+        }
+        let row_id = allocate_memory_row_id(&mut state)?;
+        let rows = state.rows.entry(table).or_default();
+        rows.insert(
+            key,
+            MemoryStoredRow {
+                row_id,
+                xmin: ctx.txn_id,
+                row,
+                predecessors: Vec::new(),
+            },
+        );
+        Ok(row_id)
+    }
+
+    fn get(
+        &self,
+        _ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+    ) -> Result<Option<Row>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        Ok(state
+            .rows
+            .get(&table)
+            .and_then(|rows| rows.get(key))
+            .map(|stored| stored.row.clone()))
+    }
+
+    fn referenced_key_exists(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        access_index: IndexId,
+        key: &Key,
+    ) -> Result<bool> {
+        Ok(self
+            .probe_memory_referenced_key_locked(
+                ctx,
+                table,
+                access_index,
+                key,
+                TupleLockMode::KeyShare,
+            )?
+            .is_some())
+    }
+
+    fn lock_unique_conflict(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>> {
+        loop {
+            let reservation = storage::reserve_unique_key(ctx, table, key)?;
+            if self
+                .probe_memory_referenced_key_locked(
+                    ctx,
+                    table,
+                    common::PRIMARY_KEY_INDEX_ID,
+                    key,
+                    TupleLockMode::NoKeyUpdate,
+                )?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            ctx.tuple_locks
+                .restore_tuple_grants(ctx.txn_id, vec![reservation])?;
+            if let Some(locked) = self.probe_memory_referenced_key_locked(
+                ctx,
+                table,
+                common::PRIMARY_KEY_INDEX_ID,
+                key,
+                mode,
+            )? {
+                return Ok(Some(locked));
             }
         }
     }
@@ -1757,6 +2013,64 @@ mod memory_storage_identity_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct ExclusiveReservationLocks {
+        holder: Mutex<Option<(u64, TupleLockTag)>>,
+    }
+
+    impl TupleLockManager for ExclusiveReservationLocks {
+        fn acquire_tuple(
+            &self,
+            xid: u64,
+            tag: &TupleLockTag,
+            _mode: TupleLockMode,
+            _wait_policy: TupleLockWaitPolicy,
+            cancel: &QueryCancel,
+        ) -> Result<TupleLockAcquire> {
+            cancel.check()?;
+            let mut holder = self
+                .holder
+                .lock()
+                .map_err(|_| DbError::internal("test reservation lock poisoned"))?;
+            match holder.as_ref() {
+                Some((owner, held_tag)) if *owner != xid && held_tag == tag => {
+                    Err(DbError::execute(
+                        SqlState::LockNotAvailable,
+                        "test unique-key reservation is held",
+                    ))
+                }
+                Some(_) => Ok(TupleLockAcquire::Acquired(
+                    TupleLockGrantChange::manager_receipt(()),
+                )),
+                None => {
+                    *holder = Some((xid, tag.clone()));
+                    Ok(TupleLockAcquire::Acquired(
+                        TupleLockGrantChange::manager_receipt(()),
+                    ))
+                }
+            }
+        }
+
+        fn restore_tuple_grants(
+            &self,
+            _xid: u64,
+            _changes: Vec<TupleLockGrantChange>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn holds_tuple(&self, xid: u64, tag: &TupleLockTag, _mode: TupleLockMode) -> bool {
+            self.holder
+                .lock()
+                .map(|holder| {
+                    holder
+                        .as_ref()
+                        .is_some_and(|(owner, held_tag)| *owner == xid && held_tag == tag)
+                })
+                .unwrap_or(false)
+        }
+    }
+
     #[derive(Debug)]
     struct RejectTupleLocks;
 
@@ -1958,6 +2272,38 @@ mod memory_storage_identity_tests {
         Row {
             values: vec![Value::Integer(id), Value::Text(name.to_string())],
         }
+    }
+
+    #[test]
+    fn on_conflict_missing_probe_reserves_key_against_a_late_insert() {
+        let (storage, schema, relations) = storage_with_users();
+        let locks = Arc::new(ExclusiveReservationLocks::default());
+        let key = Key(vec![Value::Integer(1)]);
+        let arbiter = memory_statement_context(10).with_tuple_lock_manager(locks.clone());
+        assert!(
+            storage
+                .lock_unique_conflict(
+                    &arbiter,
+                    relations.as_ref(),
+                    schema.id,
+                    &key,
+                    TupleLockMode::KeyShare,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let competing = memory_statement_context(20).with_tuple_lock_manager(locks);
+        let err = storage
+            .insert(&competing, relations.as_ref(), schema.id, user(1, "late"))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::LockNotAvailable);
+        assert_eq!(
+            storage
+                .get(&arbiter, relations.as_ref(), schema.id, &key)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;
 pub use traits::{
     DependentRowProbe, LockRowResult, LockedRow, RecoveryOperations, RelationSnapshot, RowIterator,
-    SchemaOperations, StorageEngine,
+    SchemaOperations, StorageEngine, reserve_unique_key,
 };
 
 #[cfg(test)]

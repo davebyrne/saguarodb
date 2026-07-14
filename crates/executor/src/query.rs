@@ -30,6 +30,7 @@ use crate::ops::{
     LimitOp, LockRowsInput, LockRowsOp, MergeJoinOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp,
     SetOpOp, SortOp, TableFunctionOp, ValuesOp,
 };
+use crate::referential::ReferentialIntegrity;
 
 pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
@@ -1126,6 +1127,7 @@ fn execute_insert(
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog.as_ref(), table)?;
+    let integrity = ReferentialIntegrity::new(ctx, schema.clone())?;
     let has_conflict_arbiter = if let Some(on_conflict) = on_conflict {
         validate_on_conflict_arbiter(on_conflict, &schema)?
     } else {
@@ -1176,10 +1178,31 @@ fn execute_insert(
             ctx.statement
                 .ssi_tracker
                 .record_tuple_read(ctx.statement.txn_id, table, &key);
-            if let Some(existing) =
-                ctx.storage
-                    .get(&ctx.statement, ctx.relations.as_ref(), table, &key)?
-            {
+            let conflict_mode = match on_conflict {
+                BoundOnConflict::DoNothing { .. } => TupleLockMode::KeyShare,
+                BoundOnConflict::DoUpdate { assignments, .. }
+                    if assignments
+                        .iter()
+                        .any(|(column, _)| schema.primary_key.contains(column))
+                        || integrity.requires_update_lock(
+                            &assignments
+                                .iter()
+                                .map(|(column, _)| *column)
+                                .collect::<Vec<_>>(),
+                        ) =>
+                {
+                    TupleLockMode::Update
+                }
+                BoundOnConflict::DoUpdate { .. } => TupleLockMode::NoKeyUpdate,
+            };
+            let conflict = ctx.storage.lock_unique_conflict(
+                &ctx.statement,
+                ctx.relations.as_ref(),
+                table,
+                &key,
+                conflict_mode,
+            )?;
+            if let Some(existing) = conflict {
                 if let BoundOnConflict::DoUpdate {
                     assignments,
                     filter,
@@ -1189,12 +1212,12 @@ fn execute_insert(
                         ctx,
                         table,
                         &schema,
-                        &key,
                         &existing,
                         &row,
                         assignments,
                         filter.as_ref(),
                         check_exprs,
+                        &integrity,
                     )?
                 {
                     if let Some(returning) = returning {
@@ -1207,6 +1230,8 @@ fn execute_insert(
             }
         }
 
+        reserve_insert_key(ctx, &schema, &row.values)?;
+        integrity.validate_outgoing(&row.values)?;
         let returning_values = returning.map(|_| row.values.clone());
         ctx.storage
             .insert(&ctx.statement, ctx.relations.as_ref(), table, row)?;
@@ -1258,6 +1283,19 @@ fn primary_key_for_row(schema: &TableSchema, values: &[Value]) -> Result<Key> {
     Ok(Key(key))
 }
 
+fn reserve_insert_key(
+    ctx: &ExecutionContext<'_>,
+    schema: &TableSchema,
+    values: &[Value],
+) -> Result<()> {
+    if schema.primary_key.is_empty() {
+        return Ok(());
+    }
+    let key = primary_key_for_row(schema, values)?;
+    let _retained_reservation = storage::reserve_unique_key(&ctx.statement, schema.id, &key)?;
+    Ok(())
+}
+
 /// Apply an `ON CONFLICT ... DO UPDATE` to the conflicting `existing` row. The
 /// assignment values and optional `WHERE` evaluate over the combined
 /// `existing ++ proposed` row (so bare columns are the existing row and
@@ -1269,14 +1307,14 @@ fn apply_conflict_update(
     ctx: &ExecutionContext<'_>,
     table: TableId,
     schema: &TableSchema,
-    key: &Key,
-    existing: &Row,
+    existing: &LockedRow,
     proposed: &Row,
     assignments: &[(ColumnId, BoundExpr)],
     filter: Option<&BoundExpr>,
     check_exprs: &[BoundExpr],
+    integrity: &ReferentialIntegrity<'_>,
 ) -> Result<Option<Vec<Value>>> {
-    let mut combined = existing.values.clone();
+    let mut combined = existing.row().values.clone();
     combined.extend(proposed.values.iter().cloned());
     let combined_row = ExecRow {
         row: Row { values: combined },
@@ -1293,7 +1331,7 @@ fn apply_conflict_update(
         return Ok(None);
     }
 
-    let mut new_values = existing.values.clone();
+    let mut new_values = existing.row().values.clone();
     for (column, expr) in assignments {
         let slot = column_slot(schema, *column)?;
         new_values[slot] = eval_expr(&ctx.statement, expr, &combined_row)?;
@@ -1301,18 +1339,27 @@ fn apply_conflict_update(
     coerce_numeric_columns(schema, &mut new_values)?;
     validate_row_constraints(schema, &new_values)?;
     validate_check_constraints(&ctx.statement, schema, check_exprs, &new_values)?;
+    if !schema.primary_key.is_empty()
+        && primary_key_for_row(schema, &existing.row().values)?
+            != primary_key_for_row(schema, &new_values)?
+    {
+        reserve_insert_key(ctx, schema, &new_values)?;
+    }
+    integrity.validate_outgoing_update(&existing.row().values, &new_values)?;
+    integrity.validate_parent_update(
+        &existing.row().values,
+        &new_values,
+        Some(existing.identity()),
+    )?;
     let updated = new_values.clone();
-    if ctx.storage.update(
+    let changed = ctx.storage.update_locked(
         &ctx.statement,
         ctx.relations.as_ref(),
         table,
-        key,
+        existing,
         Row { values: new_values },
-    )? {
-        Ok(Some(updated))
-    } else {
-        Ok(None)
-    }
+    )?;
+    if changed { Ok(Some(updated)) } else { Ok(None) }
 }
 
 /// Map a row's `columns`-ordered values onto a full table row (NULL for omitted
@@ -1389,17 +1436,19 @@ fn evaluate_column_default(
 /// the table's bound `CHECK` constraints (enforced per row), so COPY matches INSERT.
 pub(crate) fn map_and_insert_row(
     ctx: &ExecutionContext<'_>,
-    table: TableId,
-    schema: &TableSchema,
+    integrity: &ReferentialIntegrity<'_>,
     columns: &[ColumnId],
     values: Vec<Value>,
     default_exprs: &[(ColumnId, BoundExpr)],
     check_exprs: &[BoundExpr],
 ) -> Result<()> {
+    let schema = integrity.target();
     let row = build_insert_row(&ctx.statement, schema, columns, values, default_exprs)?;
     validate_check_constraints(&ctx.statement, schema, check_exprs, &row.values)?;
+    reserve_insert_key(ctx, schema, &row.values)?;
+    integrity.validate_outgoing(&row.values)?;
     ctx.storage
-        .insert(&ctx.statement, ctx.relations.as_ref(), table, row)?;
+        .insert(&ctx.statement, ctx.relations.as_ref(), schema.id, row)?;
     Ok(())
 }
 
@@ -1454,7 +1503,7 @@ fn modified_result(
 /// runs in one transaction (the server owns the txn/guard and commit).
 pub struct CopyIn<'a> {
     ctx: &'a ExecutionContext<'a>,
-    schema: TableSchema,
+    integrity: ReferentialIntegrity<'a>,
     columns: Vec<ColumnId>,
     /// Bound expression defaults for omitted columns and the table's bound `CHECK`
     /// constraints, so COPY FROM applies defaults and enforces checks like INSERT.
@@ -1481,9 +1530,10 @@ impl<'a> CopyIn<'a> {
                     .clone())
             })
             .collect::<Result<Vec<_>>>()?;
+        let integrity = ReferentialIntegrity::new(ctx, schema.clone())?;
         Ok(Self {
             ctx,
-            schema,
+            integrity,
             columns,
             default_exprs,
             check_exprs,
@@ -1498,8 +1548,7 @@ impl<'a> CopyIn<'a> {
         for row in self.parser.push(chunk)? {
             map_and_insert_row(
                 self.ctx,
-                self.schema.id,
-                &self.schema,
+                &self.integrity,
                 &self.columns,
                 row,
                 &self.default_exprs,
@@ -1515,8 +1564,7 @@ impl<'a> CopyIn<'a> {
         for row in self.parser.finish()? {
             map_and_insert_row(
                 self.ctx,
-                self.schema.id,
-                &self.schema,
+                &self.integrity,
                 &self.columns,
                 row,
                 &self.default_exprs,
@@ -1784,9 +1832,12 @@ fn execute_update(
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog.as_ref(), table)?;
+    let integrity = ReferentialIntegrity::new(ctx, schema.clone())?;
+    let assigned_columns: Vec<_> = assignments.iter().map(|(column, _)| *column).collect();
     let lock_mode = if assignments
         .iter()
         .any(|(column, _)| schema.primary_key.contains(column))
+        || integrity.requires_update_lock(&assigned_columns)
     {
         TupleLockMode::Update
     } else {
@@ -1838,6 +1889,12 @@ fn execute_update(
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
             validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
+            integrity.validate_outgoing_update(&locked.row().values, &values)?;
+            integrity.validate_parent_update(
+                &locked.row().values,
+                &values,
+                Some(locked.identity()),
+            )?;
             let returning_values = returning.map(|_| values.clone());
             if ctx.storage.update_locked(
                 &ctx.statement,
@@ -1869,6 +1926,7 @@ fn execute_delete(
     open_executor(executor.as_mut())?;
     let result = (|| {
         let schema = require_table(ctx.catalog.as_ref(), table)?;
+        let integrity = ReferentialIntegrity::new(ctx, schema.clone())?;
         let mut count = 0;
         let mut returned = Vec::new();
         // DELETE ... USING: combined source rows, deleted once per target —
@@ -1906,6 +1964,7 @@ fn execute_delete(
                 values.truncate(schema.columns.len());
                 values
             });
+            integrity.validate_parent_delete(&locked.row().values, Some(locked.identity()))?;
             if ctx
                 .storage
                 .delete_locked(&ctx.statement, ctx.relations.as_ref(), table, &locked)?

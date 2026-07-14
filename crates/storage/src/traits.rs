@@ -2,10 +2,38 @@ use std::any::Any;
 use std::sync::Arc;
 
 use common::{
-    ColumnId, ColumnInfo, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result, Row, RowId,
-    RowIdentity, SchemaId, SequenceId, SequenceSchema, StatementContext, StoredRow, TableId,
-    TableSchema, TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, ViewSchema,
+    ColumnId, ColumnInfo, DbError, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result,
+    Row, RowId, RowIdentity, SchemaId, SequenceId, SequenceSchema, StatementContext, StoredRow,
+    TableId, TableSchema, TruncateCatalogUpdate, TupleLockAcquire, TupleLockMode, TupleLockTag,
+    TupleLockWaitPolicy, ViewSchema,
 };
+
+/// Reserve a primary-key value through the transaction-owned tuple lock manager.
+/// The grant is intentionally retained until transaction end. Every PK insert and
+/// `ON CONFLICT` arbiter uses this before any heap mutation or FK validation.
+#[doc(hidden)]
+pub fn reserve_unique_key(
+    ctx: &StatementContext,
+    table: TableId,
+    key: &Key,
+) -> Result<common::TupleLockGrantChange> {
+    let tag = TupleLockTag {
+        table,
+        key: key.clone(),
+    };
+    match ctx.tuple_locks.acquire_tuple(
+        ctx.txn_id,
+        &tag,
+        TupleLockMode::NoKeyUpdate,
+        TupleLockWaitPolicy::Block,
+        ctx.cancel.as_ref(),
+    )? {
+        TupleLockAcquire::Acquired(retained) => Ok(retained),
+        TupleLockAcquire::Skipped => Err(DbError::internal(
+            "blocking unique-key reservation unexpectedly skipped",
+        )),
+    }
+}
 
 /// The latest physical version reached after taking the requested tuple lock.
 /// The identity names that version, which may differ from the scan-time identity
@@ -126,6 +154,17 @@ pub trait StorageEngine: Send + Sync {
         access_index: IndexId,
         key: &Key,
     ) -> Result<bool>;
+    /// Probe the current primary-key state for `INSERT ... ON CONFLICT`, waiting
+    /// for an in-progress creator and retaining the requested tuple lock on the
+    /// settled conflicting row. Returns `None` when no current conflict remains.
+    fn lock_unique_conflict(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>>;
     /// Probe current child rows whose ordered `columns` equal `key`. `supporting_index`
     /// must name an exact-column child index when present. `excluded` suppresses one
     /// physical identity for self-referential parent mutation.

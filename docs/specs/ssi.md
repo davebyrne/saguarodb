@@ -13,9 +13,8 @@ the prior decision that `SERIALIZABLE` is a bare alias for Repeatable Read.
 The storage layer exposes current-state parent/child referential probes and
 returns `40001` when a required current row lies outside a Serializable retained
 snapshot. The probes do not independently choose SSI predicate granularity; the
-executor enforcement layer added with DML enforcement must record the exact
-parent tuple or conservative parent/child relation SIREAD associated with the
-semantic FK check.
+executor enforcement layer records the exact parent tuple or conservative
+parent/child relation SIREAD associated with the semantic FK check.
 
 ## 1. Purpose and scope
 
@@ -146,7 +145,7 @@ method (so they distinguish a point lookup from a scan) and run for `SELECT` and
 - **`SeqScan`, non-primary-key `IndexScan`, composite-primary-key prefix `IndexScan`, or `IndexScan` over a range** →
   `record_relation_read(table)`.
 
-Two reads do **not** flow through the scan operators and so record their SIREAD lock at
+Referential checks and two other reads do **not** flow through the scan operators and so record their SIREAD lock at
 their own site (a missed read here is a silent serializability hole):
 
 - **`COPY ... TO`** scans the whole relation → `record_relation_read(table)` in
@@ -154,6 +153,12 @@ their own site (a missed read here is a silent serializability hole):
 - **The `INSERT ... ON CONFLICT` primary-key arbiter probe** is a point read of the
   proposed key → `record_tuple_read(table, key)` (recorded even when the key is absent,
   for phantom protection), right before the storage identity lookup.
+- **An outgoing foreign-key parent probe** records an exact tuple read for a
+  primary-key parent and a conservative parent-relation read for a declared
+  secondary UNIQUE parent.
+- **An incoming foreign-key dependent probe** records a conservative child-relation
+  read whether it uses a supporting index or the heap, covering a later child
+  insert phantom.
 
 Recording at the scan operator (rather than in the storage `is_visible` path) is both
 cleaner — one site per access method — and correct for the chosen granularity: the

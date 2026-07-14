@@ -52,6 +52,7 @@ pub trait StorageEngine: Send + Sync {
     fn insert(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, row: Row) -> Result<RowId>;
     fn get(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<Option<Row>>;
     fn referenced_key_exists(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, access_index: IndexId, key: &Key) -> Result<bool>;
+    fn lock_unique_conflict(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key, mode: TupleLockMode) -> Result<Option<LockedRow>>;
     fn dependent_row_exists(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, probe: DependentRowProbe<'_>) -> Result<bool>;
     fn delete(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<bool>;
     fn lock_row(
@@ -207,6 +208,20 @@ presence is required by either probe is outside the retained transaction
 snapshot. `update_requiring_update_lock` is the ordinary-update companion used
 when a referenced non-primary-key column requires `TupleLockMode::Update` even
 though the storage identity is unchanged.
+
+`lock_unique_conflict` reuses the same current-state creator wait, HOT-chain
+recheck, retained-snapshot rule, and tuple-lock machinery for the primary-key
+`ON CONFLICT` arbiter. It returns the settled locked row rather than a boolean,
+so `DO NOTHING` can skip before outgoing FK validation and `DO UPDATE` can
+evaluate and mutate the exact conflict even when its creator committed after the
+statement snapshot. Before probing it retains a `NoKeyUpdate` reservation on the
+proposed primary-key tuple-lock tag. Every ordinary primary-key insert acquires
+the same reservation before heap preparation/writes, closing the no-conflict
+probe-to-insert gap without carrying an index, page, or frame latch across FK
+checks or waits. A no-conflict arbiter keeps the reservation through validation
+and insertion. When a conflict exists, it restores that reservation and rechecks
+while acquiring only the action's ordinary row-lock mode, avoiding persistent
+reservation locks for `DO NOTHING`.
 
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions/storage ids a statement should resolve plus the storage relation epoch observed

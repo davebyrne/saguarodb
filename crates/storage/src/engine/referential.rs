@@ -196,14 +196,15 @@ impl PageBackedStorageEngine {
         }
     }
 
-    pub(super) fn probe_referenced_key(
+    pub(super) fn probe_referenced_key_locked(
         &self,
         ctx: &StatementContext,
         relations: &PageBackedRelationSnapshot,
         table: TableId,
         access_index: IndexId,
         key: &Key,
-    ) -> Result<bool> {
+        mode: TupleLockMode,
+    ) -> Result<Option<LockedRow>> {
         let table_handle = self.table_handle(relations, table)?;
         let schema = table_handle.schema.clone();
         let (columns, secondary_index) = if access_index == common::PRIMARY_KEY_INDEX_ID {
@@ -288,7 +289,7 @@ impl PageBackedStorageEngine {
                     relations,
                     table,
                     &identity,
-                    TupleLockMode::KeyShare,
+                    mode,
                     TupleLockWaitPolicy::Block,
                 )?;
                 match lock_result {
@@ -319,7 +320,7 @@ impl PageBackedStorageEngine {
                                 }
                             }
                             restore_tagged_changes(ctx, stale)?;
-                            return Ok(true);
+                            return Ok(Some(locked));
                         }
                         restore_tagged_changes(ctx, changes)?;
                         rescan = true;
@@ -339,7 +340,7 @@ impl PageBackedStorageEngine {
             if rescan {
                 continue;
             }
-            return Ok(false);
+            return Ok(None);
         }
     }
 

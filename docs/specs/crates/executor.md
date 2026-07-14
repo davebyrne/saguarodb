@@ -324,17 +324,23 @@ in `docs/specs/subqueries.md`.
 - Coerce `NUMERIC(p, s)` column values to the column scale (`coerce_numeric_columns`): each `Value::Numeric` is rounded to `s` (half away from zero) and rejected with `SqlState::NumericValueOutOfRange` when the integer part exceeds `p - s` digits. Bare `NUMERIC` columns and non-numeric values are unchanged. Runs before constraint validation, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, and `COPY ... FROM`.
 - Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
 - Validate `CHECK` constraints (`validate_check_constraints`) over the full proposed row, using the bound `CHECK` expressions the binder attached to the INSERT: each constraint that evaluates to `false` is rejected with `SqlState::CheckViolation` (`23514`); a `true` or `NULL` (unknown) result passes. This runs before conflict arbitration, so a proposed row that violates a check is rejected even under `ON CONFLICT DO NOTHING` (matching PostgreSQL). `COPY ... FROM` enforces the same checks per row (the binder attaches the bound table schema and `CHECK` expressions to `BoundStatement::Copy`), aborting the whole COPY on a violation.
+- Resolve the table's outgoing foreign keys once per statement, build each ordered
+  composite source key with checked column access, and apply immediate `MATCH
+  SIMPLE`: any NULL component passes. Remaining parent probes are sorted by
+  `(parent table, key, foreign-key id)`, acquire and retain parent `KeyShare`, and
+  reject a missing parent with `ForeignKeyViolation` (`23503`) before insertion.
+  A self-referencing proposed row may satisfy its own resulting referenced key.
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.
 
-`INSERT ... ON CONFLICT` (arbiter = primary key): before executing, any bound conflict arbiter is rechecked against the current table primary key, so a prepared statement whose arbiter no longer matches primary-key DDL is rejected with `FeatureNotSupported` rather than silently using a different arbiter. Prepared statements also carry referenced table schema versions, so primary-key DDL after prepare rejects the cached plan even when targetless `DO NOTHING` originally bound with no arbiter. For each source row, build the full insert row, then probe the visible row at the proposed primary key through storage's identity lookup (snapshot visibility, so the statement's own earlier inserts are seen — a duplicate key within one multi-row INSERT is caught). On a conflict: `DO NOTHING` skips the row (not counted, no `RETURNING` row); `DO UPDATE` evaluates the assignment values and optional `WHERE` over the combined `existing ++ proposed` row (`excluded.<col>` is the proposed row), and — when the `WHERE` passes — writes the new row via `StorageEngine::update` (counted toward `INSERT 0 n`, and projected by `RETURNING`). With no conflict the row is inserted normally. The arbiter is the primary key only: a conflict on a unique **secondary** index is not arbitrated here and surfaces as a `UniqueViolation` (`23505`) from `insert`, aborting the statement. A non-prepared statement on a table with no primary key has no conflict arbiter for targetless `DO NOTHING` and therefore attempts the insert normally.
+`INSERT ... ON CONFLICT` (arbiter = primary key): before executing, any bound conflict arbiter is rechecked against the current table primary key, so a prepared statement whose arbiter no longer matches primary-key DDL is rejected with `FeatureNotSupported` rather than silently using a different arbiter. Prepared statements also carry referenced table schema versions, so primary-key DDL after prepare rejects the cached plan even when targetless `DO NOTHING` originally bound with no arbiter. For each source row, build the full insert row, then use storage's current-state primary-key arbiter: it first retains the same per-key `NoKeyUpdate` reservation required by every PK insert, waits for an in-progress creator, restarts after settlement, and returns the locked conflicting row even when it was outside the original statement snapshot (retained-snapshot isolation returns `40001`). When no conflict exists, the reservation remains held across FK validation and insertion, closing the late-conflict gap. When a conflict exists, storage restores the reservation and rechecks under only the action's requested row lock; the statement's own earlier inserts are also seen. On a conflict: `DO NOTHING` skips the row (not counted, no `RETURNING` row) without checking foreign keys on the rejected proposed row; `DO UPDATE` evaluates the assignment values and optional `WHERE` over the combined `existing ++ proposed` locked row (`excluded.<col>` is the proposed row), validates outgoing and incoming foreign keys on the effective replacement, and — when the `WHERE` passes — writes through `update_locked`. The arbiter requests `Update` up front when an assignment can change the PK or an incoming referenced key, otherwise `NoKeyUpdate`. With no conflict the row receives the ordinary outgoing checks and is inserted normally. The arbiter is the primary key only: a conflict on a unique **secondary** index is not arbitrated here and surfaces as a `UniqueViolation` (`23505`) from `insert`, aborting the statement. A non-prepared statement on a table with no primary key has no conflict arbiter for targetless `DO NOTHING` and therefore attempts the insert normally.
 
 `UPDATE`:
 
 - Build source executor.
 - For each source `ExecRow`, read identity key.
-- Acquire `NoKeyUpdate`, or `Update` when any primary-key column is assigned,
-  and resolve the latest tuple version.
+- Acquire `NoKeyUpdate`, or `Update` when any primary-key column or incoming
+  foreign-key referenced column is assigned, and resolve the latest tuple version.
 - Under Read Committed, when resolution advances, inject the locked row into a
   clone of the DML source plan and execute it to recheck all qualifications and
   rebuild the combined target/FROM row. Under retained-snapshot isolation, a
@@ -343,6 +349,13 @@ in `docs/specs/subqueries.md`.
 - Build a full replacement row. If the update changes primary-key columns, storage writes a non-HOT version and enforces primary-key uniqueness on the replacement key.
 - Validate per-column row constraints on the replacement row (`validate_row_constraints`): non-null and bounded character-type length, same as INSERT.
 - Validate `CHECK` constraints on the replacement row (`validate_check_constraints`), same as INSERT: a constraint evaluating to `false` is rejected with `SqlState::CheckViolation` (`23514`); `true`/`NULL` passes. The `ON CONFLICT DO UPDATE` path applies the same check to the row it writes.
+- Validate every changed outgoing source key against its parent. For a
+  self-reference, changing the row's referenced key also revalidates an unchanged
+  source key so the disappearing old version cannot satisfy the result.
+- For each changed key referenced by an incoming foreign key, probe the child by
+  its exact supporting index when available and otherwise by heap. A matching
+  current child rejects the update with `23503`; a self-referencing target excludes
+  only its own physical identity. `NO ACTION` and `RESTRICT` are both immediate.
 - Call `StorageEngine::update_locked` with the exact locked capability.
 - Return count.
 
@@ -352,6 +365,9 @@ in `docs/specs/subqueries.md`.
 - For each source `ExecRow`, read identity key.
 - Acquire `Update` and resolve the latest tuple version, applying the same
   isolation and source-plan EPQ rules as UPDATE.
+- Probe every incoming foreign key for a current dependent row before mutation,
+  excluding the target identity only for a self-reference; a match returns
+  `23503`.
 - Call `StorageEngine::delete_locked`; `RETURNING` sees the latest deleted row.
 - Return count.
 

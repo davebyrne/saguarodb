@@ -556,8 +556,11 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 `SqlState::code` is the single source of truth for PostgreSQL wire SQLSTATE
 strings, and `SqlState::from_code` is the reverse parser for known codes.
 Foreign-key metadata reserves `23503` (`ForeignKeyViolation`), `42830`
-(`InvalidForeignKey`), and `42710` (`DuplicateObject`) before SQL syntax is
-enabled.
+(`InvalidForeignKey`), and `42710` (`DuplicateObject`). Executor enforcement uses
+`23503` for both a missing referenced parent and an incoming dependent row;
+catalog definition validation uses `42830`, while table-local constraint-name
+collisions use `42710`. SQL definition syntax is enabled separately from these
+durable/error contracts.
 
 `DuplicateCursor` maps to `42P03` for a duplicate SQL cursor declaration.
 `InvalidCursorName` maps to `34000` for `FETCH`/`CLOSE` of a cursor that is not
