@@ -1866,6 +1866,7 @@ mod tests {
             statement: StatementContext::new(1),
             relations: storage.capture_relation_snapshot().unwrap(),
             catalog: Arc::new(catalog),
+            allocator_catalog: None,
             storage: &storage,
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,

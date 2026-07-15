@@ -457,22 +457,23 @@ not diverge between ALTER validation and later DML.
   dependencies wholly within the set are permitted.
 - For each column default that references an owned sequence, call
   `SchemaOperations::drop_sequence` in the same statement.
-- After emitting one physical/logical drop per target, call the atomic
+- After emitting the statement's generic catalog change before physical drops, call the atomic
   `CatalogManager::drop_tables` batch operation, then remove owned sequences
   from the catalog.
-- `SchemaOperations::drop_table` appends the `DropTable` WAL operation record
-  and each owned sequence appends a sibling `DropSequence`; server query
-  orchestration appends the statement `Commit`.
+- The executor diffs the complete before/after catalog snapshots and appends one
+  `CatalogChange` containing all table, index, hidden-relation, and owned-sequence
+  removals before storage mutation; server query orchestration appends `Commit`.
 - Apply every target under one statement transaction and return `Modified {
   command: "DROP TABLE", count: 0 }`. A pre-commit failure restores the entire
-  statement; WAL uses the existing per-object records under one transaction id.
+  statement; the metadata removals are one atomic change set.
 
 `CREATE INDEX`:
 
 - Server query orchestration acquires the write guard before execution.
 - Use `CatalogManager::create_index` to validate the table/columns/name and assign the `IndexId`.
 - Call `SchemaOperations::create_index` to build and backfill the secondary tree; storage does not publish the new index generation until that build succeeds. On failure, roll back the catalog with `CatalogManager::drop_index` before returning the error (mirroring `CREATE TABLE`).
-- `SchemaOperations::create_index` appends the `CreateIndex` WAL operation record; server query orchestration appends the statement `Commit`.
+- Append the index `CatalogChange` before `SchemaOperations::create_index` builds
+  the physical tree; server query orchestration appends `Commit`.
 - Return `Modified { command: "CREATE INDEX", count: 0 }`.
 
 `DROP INDEX`:
@@ -480,7 +481,8 @@ not diverge between ALTER validation and later DML.
 - Resolve the index to its `IndexId` in binder.
 - Call `SchemaOperations::drop_index`.
 - Call `CatalogManager::drop_index`.
-- `SchemaOperations::drop_index` appends the `DropIndex` WAL operation record; server query orchestration appends the statement `Commit`.
+- Append the index-removal `CatalogChange` before `SchemaOperations::drop_index`;
+  server query orchestration appends `Commit`.
 - Return `Modified { command: "DROP INDEX", count: 0 }`.
 
 `CREATE SEQUENCE`:
@@ -488,9 +490,9 @@ not diverge between ALTER validation and later DML.
 - Server query orchestration acquires the DDL guard before execution.
 - Use `CatalogManager::create_sequence` to validate options and assign the
   `SequenceId`.
-- Call `SchemaOperations::create_sequence`, which appends the `CreateSequence`
-  WAL operation record. On failure, remove the catalog sequence before returning
-  the error.
+- Append the sequence `CatalogChange`, then call
+  `SchemaOperations::create_sequence`. On failure, remove the catalog sequence
+  before returning the error.
 - Return `Modified { command: "CREATE SEQUENCE", count: 0 }`.
 
 `DROP SEQUENCE`:
@@ -499,9 +501,9 @@ not diverge between ALTER validation and later DML.
   `SqlState::UndefinedTable` unless `IF EXISTS` was present.
 - For an existing sequence, call `CatalogManager::drop_sequence` first so a
   referenced sequence is rejected with `SqlState::DependentObjectsStillExist`
-  before storage changes. Then call `SchemaOperations::drop_sequence`, which
-  appends the `DropSequence` WAL operation record; if storage fails, restore the
-  catalog sequence before returning the error.
+  before storage changes. Append the sequence-removal `CatalogChange`, then call
+  `SchemaOperations::drop_sequence`; if storage fails, restore the catalog
+  sequence before returning the error.
 - For `IF EXISTS` and a missing sequence, perform no catalog or WAL mutation and
   return the normal command tag.
 - Return `Modified { command: "DROP SEQUENCE", count: 0 }`.
@@ -517,7 +519,8 @@ not diverge between ALTER validation and later DML.
   release it only after Commit or rollback restore.
 - For `OR REPLACE` with an existing view, call `CatalogManager::replace_view`
   (same id/name, incremented schema version), then
-  `SchemaOperations::replace_view`, which appends `ReplaceView`; if storage/WAL
+  `SchemaOperations::replace_view`; the before/after view is carried by the
+  statement `CatalogChange`. If storage/WAL
   append fails, restore the previous view schema before returning the error.
 - A non-`OR REPLACE` duplicate relation name returns `SqlState::DuplicateTable`.
 - Return `Modified { command: "CREATE VIEW", count: 0 }`.
@@ -528,8 +531,8 @@ not diverge between ALTER validation and later DML.
   `SqlState::UndefinedTable` unless `IF EXISTS` was present.
 - If the name belongs to an existing table, return `SqlState::WrongObjectType`
   rather than treating the statement as missing or as an `IF EXISTS` no-op.
-- For an existing view, call `SchemaOperations::drop_view`, which appends the
-  `DropView` WAL operation record, then `CatalogManager::drop_view`.
+- For an existing view, append the view-removal `CatalogChange`, call
+  `SchemaOperations::drop_view`, then publish the catalog removal.
 - For `IF EXISTS` and a missing view, perform no catalog or WAL mutation and
   return the normal command tag.
 - Return `Modified { command: "DROP VIEW", count: 0 }`.

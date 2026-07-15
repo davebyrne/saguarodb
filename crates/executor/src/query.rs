@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
-use catalog::{CatalogManager, ResolvedForeignKey, TableColumnAlteration};
+use catalog::{CatalogAllocatorState, CatalogManager, ResolvedForeignKey, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexConstraintKind, IndexId, IsolationLevel, Key, KeyRange, ParsedColumnDef,
@@ -36,6 +36,9 @@ pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
     pub relations: Arc<dyn RelationSnapshot>,
     pub catalog: Arc<dyn CatalogManager>,
+    /// Shared live catalog whose allocators are claimed before catalog WAL and
+    /// dependent physical DDL. Test-only/direct executor contexts may omit it.
+    pub allocator_catalog: Option<&'a dyn CatalogManager>,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
     /// The GC horizon (minimum advertised snapshot `xmin`) captured by the server,
@@ -2002,6 +2005,39 @@ fn execute_delete(
     close_after(executor.as_mut(), result)
 }
 
+fn mutate_catalog<T>(
+    ctx: &ExecutionContext<'_>,
+    mutation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let before = ctx.catalog.snapshot()?;
+    let result = mutation()?;
+    let after = ctx.catalog.snapshot()?;
+    let change_set = catalog::catalog_change_set_between(&before, &after);
+    let expected_allocators = CatalogAllocatorState::from_snapshot(&before);
+    let desired_allocators = CatalogAllocatorState::from_snapshot(&after);
+    if let Some(allocator_catalog) = ctx.allocator_catalog
+        && !allocator_catalog.claim_change_allocators(
+            expected_allocators,
+            desired_allocators,
+            &change_set.allocator_high_water,
+        )?
+    {
+        let _ = ctx.catalog.restore(before);
+        return Err(DbError::plan(
+            SqlState::SerializationFailure,
+            "catalog allocators changed concurrently; retry the statement",
+        ));
+    }
+    if let Err(error) = ctx
+        .schema_ops
+        .apply_catalog_change(&ctx.statement, &change_set)
+    {
+        let _ = ctx.catalog.restore(before);
+        return Err(error);
+    }
+    Ok(result)
+}
+
 fn execute_create_schema(
     ctx: &ExecutionContext<'_>,
     name: &str,
@@ -2019,7 +2055,7 @@ fn execute_create_schema(
             format!("schema {name} already exists"),
         ));
     }
-    let schema = ctx.catalog.create_schema(name.to_string())?;
+    let schema = mutate_catalog(ctx, || ctx.catalog.create_schema(name.to_string()))?;
     if let Err(err) = ctx.schema_ops.create_schema(&ctx.statement, &schema) {
         let _ = ctx.catalog.apply_drop_schema(schema.id);
         return Err(err);
@@ -2047,8 +2083,8 @@ fn execute_drop_schema(
             format!("schema {name} does not exist"),
         ));
     };
+    mutate_catalog(ctx, || ctx.catalog.drop_schema(schema.id))?;
     ctx.schema_ops.drop_schema(&ctx.statement, schema.id)?;
-    ctx.catalog.drop_schema(schema.id)?;
     Ok(ExecutionResult::Modified {
         command: "DROP SCHEMA".to_string(),
         count: 0,
@@ -2084,11 +2120,17 @@ fn execute_create_table(
             ));
         }
     }
+    let catalog_before = ctx.catalog.snapshot()?;
 
     let serial = resolve_serial_columns(ctx.catalog.as_ref(), namespace, name, columns)?;
     let mut created_sequences = Vec::new();
     for serial_column in &serial {
-        match create_owned_serial_sequence(ctx, namespace, &serial_column.sequence) {
+        match ctx.catalog.create_sequence_in_schema(
+            namespace,
+            serial_column.sequence.clone(),
+            SequenceOptions::default(),
+            true,
+        ) {
             Ok(sequence) => created_sequences.push(sequence),
             Err(err) => {
                 cleanup_serial_sequences(ctx, &created_sequences);
@@ -2128,31 +2170,32 @@ fn execute_create_table(
         ),
         None => None,
     };
-    if let Err(err) = ctx.schema_ops.create_table(&ctx.statement, &schema) {
-        cleanup_created_table(ctx, schema.id, &created_sequences);
-        return Err(err);
-    }
-    if let Some(toast_schema) = &toast_schema
-        && let Err(err) = ctx.schema_ops.create_table(&ctx.statement, toast_schema)
-    {
-        cleanup_created_table(ctx, schema.id, &created_sequences);
-        return Err(err);
-    }
-    if !primary_key.is_empty()
-        && let Err(err) = create_primary_key_constraint_index(ctx, &schema, primary_key)
-    {
-        cleanup_created_table(ctx, schema.id, &created_sequences);
-        return Err(err);
+    let mut created_indexes = Vec::new();
+    if !primary_key.is_empty() {
+        let index = ctx.catalog.create_index_in_schema_with_constraint(
+            schema.schema_id,
+            format!("{}_pkey", schema.name),
+            schema.id,
+            primary_key,
+            true,
+            IndexConstraintKind::PrimaryKey,
+        )?;
+        created_indexes.push(index);
     }
     // Each UNIQUE constraint becomes a unique index built on the just-created
     // (empty) table, in declared order. On any failure, drop the table — which
     // cascades to every index created so far in the catalog — and return; the
     // autocommit unit also rolls back the storage-side DDL state.
     for columns in unique {
-        if let Err(err) = create_unique_constraint_index(ctx, &schema, columns) {
-            cleanup_created_table(ctx, schema.id, &created_sequences);
-            return Err(err);
-        }
+        let index = ctx.catalog.create_index_in_schema_with_constraint(
+            schema.schema_id,
+            format!("{}_{}_key", schema.name, columns.join("_")),
+            schema.id,
+            columns,
+            true,
+            IndexConstraintKind::Unique,
+        )?;
+        created_indexes.push(index);
     }
     if !foreign_keys.is_empty() {
         let resolved = match resolve_create_table_foreign_keys(&schema, foreign_keys) {
@@ -2162,23 +2205,44 @@ fn execute_create_table(
                 return Err(err);
             }
         };
-        let attached = match ctx.catalog.attach_foreign_keys(schema.id, resolved) {
-            Ok(attached) => attached,
-            Err(err) => {
-                cleanup_created_table(ctx, schema.id, &created_sequences);
-                return Err(err);
-            }
-        };
-        let indexes = match ctx.catalog.list_indexes_for_table(schema.id) {
-            Ok(indexes) => indexes,
-            Err(err) => {
-                cleanup_created_table(ctx, schema.id, &created_sequences);
-                return Err(err);
-            }
-        };
+        if let Err(err) = ctx.catalog.attach_foreign_keys(schema.id, resolved) {
+            cleanup_created_table(ctx, schema.id, &created_sequences);
+            return Err(err);
+        }
+    }
+    let final_schema = ctx
+        .catalog
+        .get_table(schema.id)?
+        .ok_or_else(|| DbError::internal("created table disappeared from the catalog"))?;
+    let catalog_after = ctx.catalog.snapshot()?;
+    let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+    if let Err(err) = ctx
+        .schema_ops
+        .apply_catalog_change(&ctx.statement, &change_set)
+    {
+        let _ = ctx.catalog.restore(catalog_before);
+        return Err(err);
+    }
+    for sequence in &created_sequences {
+        if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, sequence) {
+            cleanup_created_table(ctx, schema.id, &created_sequences);
+            return Err(err);
+        }
+    }
+    if let Err(err) = ctx.schema_ops.create_table(&ctx.statement, &final_schema) {
+        cleanup_created_table(ctx, schema.id, &created_sequences);
+        return Err(err);
+    }
+    if let Some(toast_schema) = &toast_schema
+        && let Err(err) = ctx.schema_ops.create_table(&ctx.statement, toast_schema)
+    {
+        cleanup_created_table(ctx, schema.id, &created_sequences);
+        return Err(err);
+    }
+    for index in &created_indexes {
         if let Err(err) = ctx
             .schema_ops
-            .update_table_schema(&ctx.statement, &attached, &indexes)
+            .create_index(&ctx.statement, index, ctx.gc_horizon)
         {
             cleanup_created_table(ctx, schema.id, &created_sequences);
             return Err(err);
@@ -2291,24 +2355,6 @@ fn choose_serial_sequence_name(
     }
 }
 
-fn create_owned_serial_sequence(
-    ctx: &ExecutionContext<'_>,
-    schema: SchemaId,
-    name: &str,
-) -> Result<SequenceSchema> {
-    let sequence = ctx.catalog.create_sequence_in_schema(
-        schema,
-        name.to_string(),
-        SequenceOptions::default(),
-        true,
-    )?;
-    if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &sequence) {
-        let _ = ctx.catalog.apply_drop_sequence(sequence.id);
-        return Err(err);
-    }
-    Ok(sequence)
-}
-
 fn columns_with_serial_defaults(
     columns: &[ParsedColumnDef],
     serial: &[ResolvedSerialColumn],
@@ -2343,56 +2389,6 @@ fn cleanup_serial_sequences(ctx: &ExecutionContext<'_>, sequences: &[SequenceSch
         let _ = ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id);
         let _ = ctx.catalog.apply_drop_sequence(sequence.id);
     }
-}
-
-/// Create one `UNIQUE` constraint's backing index on a freshly created table. The
-/// index name follows PostgreSQL's `<table>_<col...>_key` convention.
-fn create_unique_constraint_index(
-    ctx: &ExecutionContext<'_>,
-    schema: &TableSchema,
-    columns: &[String],
-) -> Result<()> {
-    let name = format!("{}_{}_key", schema.name, columns.join("_"));
-    let index = ctx.catalog.create_index_in_schema_with_constraint(
-        schema.schema_id,
-        name,
-        schema.id,
-        columns,
-        true,
-        IndexConstraintKind::Unique,
-    )?;
-    if let Err(err) = ctx
-        .schema_ops
-        .create_index(&ctx.statement, &index, ctx.gc_horizon)
-    {
-        let _ = ctx.catalog.drop_index(index.id);
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn create_primary_key_constraint_index(
-    ctx: &ExecutionContext<'_>,
-    schema: &TableSchema,
-    columns: &[String],
-) -> Result<()> {
-    let name = format!("{}_pkey", schema.name);
-    let index = ctx.catalog.create_index_in_schema_with_constraint(
-        schema.schema_id,
-        name,
-        schema.id,
-        columns,
-        true,
-        IndexConstraintKind::PrimaryKey,
-    )?;
-    if let Err(err) = ctx
-        .schema_ops
-        .create_index(&ctx.statement, &index, ctx.gc_horizon)
-    {
-        let _ = ctx.catalog.apply_drop_index(index.id);
-        return Err(err);
-    }
-    Ok(())
 }
 
 fn execute_drop_tables(
@@ -2440,16 +2436,19 @@ fn execute_drop_tables(
 
     let table_ids = resolved.iter().map(|(table, _)| *table).collect::<Vec<_>>();
     ctx.catalog.preflight_drop_tables(&table_ids)?;
+    mutate_catalog(ctx, || {
+        ctx.catalog.drop_tables(&table_ids)?;
+        for (_, owned_sequences) in &resolved {
+            for sequence in owned_sequences {
+                ctx.catalog.apply_drop_sequence(sequence.id)?;
+            }
+        }
+        Ok(())
+    })?;
     for (table, owned_sequences) in &resolved {
         ctx.schema_ops.drop_table(&ctx.statement, *table)?;
         for sequence in owned_sequences {
             ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
-        }
-    }
-    ctx.catalog.drop_tables(&table_ids)?;
-    for (_, owned_sequences) in resolved {
-        for sequence in owned_sequences {
-            ctx.catalog.apply_drop_sequence(sequence.id)?;
         }
     }
     Ok(ExecutionResult::Modified {
@@ -2482,10 +2481,12 @@ fn execute_alter_table_add_column(
     }
 
     let old_relations = ctx.relations.clone();
-    let added = ctx
-        .catalog
-        .add_table_column(old_schema.id, column.clone())?;
-    let rewrite = apply_rewrite_storage_ids(ctx, added.id)?;
+    let rewrite = mutate_catalog(ctx, || {
+        let added = ctx
+            .catalog
+            .add_table_column(old_schema.id, column.clone())?;
+        apply_rewrite_storage_ids(ctx, added.id)
+    })?;
     let schema = rewrite.table;
     if old_schema.toast_table_id != schema.toast_table_id
         && let Some(toast_schema) = rewrite.toast_table.as_ref()
@@ -2553,8 +2554,10 @@ fn execute_alter_table_drop_column(
         .ok_or_else(|| DbError::internal("preflight accepted a missing dropped column"))?;
 
     let old_relations = ctx.relations.clone();
-    let dropped = ctx.catalog.drop_table_column(old_schema.id, column)?;
-    let rewrite = apply_rewrite_storage_ids(ctx, dropped.id)?;
+    let rewrite = mutate_catalog(ctx, || {
+        let dropped = ctx.catalog.drop_table_column(old_schema.id, column)?;
+        apply_rewrite_storage_ids(ctx, dropped.id)
+    })?;
     let schema = rewrite.table;
     if let Some(toast_schema) = rewrite.toast_table.as_ref() {
         ctx.schema_ops
@@ -2621,14 +2624,16 @@ fn execute_alter_table_alter_column_type(
     };
 
     let old_relations = ctx.relations.clone();
-    let altered = ctx.catalog.alter_table_column_type(
-        old_schema.id,
-        column,
-        data_type.clone(),
-        pg_type.clone(),
-        converted_default,
-    )?;
-    let rewrite = apply_rewrite_storage_ids(ctx, altered.id)?;
+    let rewrite = mutate_catalog(ctx, || {
+        let altered = ctx.catalog.alter_table_column_type(
+            old_schema.id,
+            column,
+            data_type.clone(),
+            pg_type.clone(),
+            converted_default,
+        )?;
+        apply_rewrite_storage_ids(ctx, altered.id)
+    })?;
     let schema = rewrite.table;
     if old_schema.toast_table_id != schema.toast_table_id
         && let Some(toast_schema) = rewrite.toast_table.as_ref()
@@ -2712,9 +2717,10 @@ fn execute_alter_table_rename_column(
     new_name: &str,
 ) -> Result<ExecutionResult> {
     let old_schema = require_table(ctx.catalog.as_ref(), table)?;
-    let schema = ctx
-        .catalog
-        .rename_table_column(old_schema.id, old_name, new_name.to_string())?;
+    let schema = mutate_catalog(ctx, || {
+        ctx.catalog
+            .rename_table_column(old_schema.id, old_name, new_name.to_string())
+    })?;
     let indexes = ctx.catalog.list_indexes_for_table(schema.id)?;
     ctx.schema_ops
         .update_table_schema(&ctx.statement, &schema, &indexes)?;
@@ -2727,9 +2733,10 @@ fn execute_alter_table_rename_table(
     new_name: &str,
 ) -> Result<ExecutionResult> {
     let old_schema = require_table(ctx.catalog.as_ref(), table)?;
-    let schema = ctx
-        .catalog
-        .rename_table(old_schema.id, new_name.to_string())?;
+    let schema = mutate_catalog(ctx, || {
+        ctx.catalog
+            .rename_table(old_schema.id, new_name.to_string())
+    })?;
     if schema != old_schema {
         let indexes = ctx.catalog.list_indexes_for_table(schema.id)?;
         ctx.schema_ops
@@ -2760,13 +2767,15 @@ fn execute_create_view(
     let output = create_view_output_columns(columns, query);
     let schema = match ctx.catalog.get_view_in_schema(namespace, name)? {
         Some(existing) if or_replace => {
-            let replaced = ctx.catalog.replace_view_with_search_path(
-                existing.id,
-                output,
-                definition.to_string(),
-                dependencies.to_vec(),
-                definition_search_path.to_vec(),
-            )?;
+            let replaced = mutate_catalog(ctx, || {
+                ctx.catalog.replace_view_with_search_path(
+                    existing.id,
+                    output,
+                    definition.to_string(),
+                    dependencies.to_vec(),
+                    definition_search_path.to_vec(),
+                )
+            })?;
             if let Err(err) = ctx.schema_ops.replace_view(&ctx.statement, &replaced) {
                 let _ = ctx.catalog.apply_replace_view(existing);
                 return Err(err);
@@ -2780,14 +2789,16 @@ fn execute_create_view(
             ));
         }
         None => {
-            let schema = ctx.catalog.create_view_in_schema(
-                namespace,
-                name.to_string(),
-                output,
-                definition.to_string(),
-                dependencies.to_vec(),
-                definition_search_path.to_vec(),
-            )?;
+            let schema = mutate_catalog(ctx, || {
+                ctx.catalog.create_view_in_schema(
+                    namespace,
+                    name.to_string(),
+                    output,
+                    definition.to_string(),
+                    dependencies.to_vec(),
+                    definition_search_path.to_vec(),
+                )
+            })?;
             if let Err(err) = ctx.schema_ops.create_view(&ctx.statement, &schema) {
                 let _ = ctx.catalog.apply_drop_view(schema.id);
                 return Err(err);
@@ -2861,8 +2872,8 @@ fn execute_drop_view(
             format!("view {name} does not exist"),
         ));
     };
+    mutate_catalog(ctx, || ctx.catalog.drop_view(view.id))?;
     ctx.schema_ops.drop_view(&ctx.statement, view.id)?;
-    ctx.catalog.drop_view(view.id)?;
     Ok(ExecutionResult::Modified {
         command: "DROP VIEW".to_string(),
         count: 0,
@@ -2921,14 +2932,16 @@ fn execute_create_index(
                 format!("table {table} does not exist"),
             )
         })?;
-    let schema = ctx.catalog.create_index_in_schema_with_constraint(
-        namespace,
-        name.to_string(),
-        schema.id,
-        columns,
-        unique,
-        IndexConstraintKind::None,
-    )?;
+    let schema = mutate_catalog(ctx, || {
+        ctx.catalog.create_index_in_schema_with_constraint(
+            namespace,
+            name.to_string(),
+            schema.id,
+            columns,
+            unique,
+            IndexConstraintKind::None,
+        )
+    })?;
     if let Err(err) = ctx
         .schema_ops
         .create_index(&ctx.statement, &schema, ctx.gc_horizon)
@@ -2953,8 +2966,8 @@ fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<Exec
             "cannot drop index backing a primary key constraint",
         ));
     }
+    mutate_catalog(ctx, || ctx.catalog.drop_index(index))?;
     ctx.schema_ops.drop_index(&ctx.statement, index)?;
-    ctx.catalog.drop_index(index)?;
     Ok(ExecutionResult::Modified {
         command: "DROP INDEX".to_string(),
         count: 0,
@@ -2967,12 +2980,10 @@ fn execute_create_sequence(
     name: &str,
     options: &common::SequenceOptions,
 ) -> Result<ExecutionResult> {
-    let schema = ctx.catalog.create_sequence_in_schema(
-        namespace,
-        name.to_string(),
-        options.clone(),
-        false,
-    )?;
+    let schema = mutate_catalog(ctx, || {
+        ctx.catalog
+            .create_sequence_in_schema(namespace, name.to_string(), options.clone(), false)
+    })?;
     if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &schema) {
         let _ = ctx.catalog.drop_sequence(schema.id);
         return Err(err);
@@ -3014,7 +3025,7 @@ fn execute_drop_sequence(
             format!("sequence {name} does not exist"),
         ));
     };
-    ctx.catalog.drop_sequence(sequence.id)?;
+    mutate_catalog(ctx, || ctx.catalog.drop_sequence(sequence.id))?;
     if let Err(err) = ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id) {
         let _ = ctx.catalog.apply_create_sequence(sequence);
         return Err(err);

@@ -12,12 +12,17 @@
 )]
 
 mod catalog_overlay;
+mod change_set;
 mod memory;
 mod serialize;
 pub mod system;
 mod truncate_overlay;
 
 pub use catalog_overlay::{CatalogOverlay, CatalogOverlaySavepoint};
+pub use change_set::{
+    apply_catalog_change_set, catalog_change_set_between, merge_allocator_high_water,
+    reserve_change_allocators,
+};
 pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
@@ -62,6 +67,7 @@ pub struct CatalogAllocatorState {
     pub next_sequence_id: SequenceId,
     pub next_dictionary_id: u32,
     pub next_storage_id: FileId,
+    pub next_constraint_id: common::ConstraintId,
 }
 
 impl CatalogAllocatorState {
@@ -73,6 +79,7 @@ impl CatalogAllocatorState {
             next_sequence_id: snapshot.next_sequence_id,
             next_dictionary_id: snapshot.next_dictionary_id,
             next_storage_id: snapshot.next_storage_id,
+            next_constraint_id: snapshot.next_constraint_id,
         }
     }
 
@@ -83,6 +90,7 @@ impl CatalogAllocatorState {
             && self.next_sequence_id >= other.next_sequence_id
             && self.next_dictionary_id >= other.next_dictionary_id
             && self.next_storage_id >= other.next_storage_id
+            && self.next_constraint_id >= other.next_constraint_id
     }
 }
 
@@ -100,6 +108,18 @@ pub trait CatalogManager: Send + Sync {
     ) -> Result<bool> {
         Err(DbError::internal(
             "catalog does not support allocator claims",
+        ))
+    }
+    /// Atomically claims global allocator advances and reserves every allocator
+    /// carried by a catalog change before dependent physical work begins.
+    fn claim_change_allocators(
+        &self,
+        _expected: CatalogAllocatorState,
+        _desired: CatalogAllocatorState,
+        _high_water: &common::CatalogAllocatorHighWater,
+    ) -> Result<bool> {
+        Err(DbError::internal(
+            "catalog does not support catalog-change allocator claims",
         ))
     }
     fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
@@ -450,9 +470,9 @@ pub trait CatalogManager: Send + Sync {
     /// "never analyzed (or cleared by a schema change)".
     fn get_table_statistics(&self, table: TableId) -> Result<Option<TableStatistics>>;
     /// Replaces a live user table's optimizer statistics (ANALYZE, or
-    /// recovery replay of a committed `UpdateTableStatistics` record —
-    /// `docs/specs/statistics.md` §4; replay skips records whose table no
-    /// longer exists). Statistics changes do not bump `schema_version`.
+    /// recovery replay of a committed generic catalog change —
+    /// `docs/specs/statistics.md` §4). Statistics changes do not bump
+    /// `schema_version`.
     /// Rejects unknown tables, non-user relations, statistics that reference
     /// column ids the table does not have, and non-finite numbers (the JSON
     /// manifest payload cannot round-trip them).
@@ -1229,6 +1249,10 @@ mod tests {
             .unwrap();
         let before_failed_ddl = catalog.snapshot().unwrap();
 
+        let mut reserved = before_failed_ddl.clone();
+        reserved.next_constraint_id = 41;
+        catalog.restore(reserved).unwrap();
+
         let failed_table = catalog
             .create_table(
                 "orders".to_string(),
@@ -1269,6 +1293,7 @@ mod tests {
 
         assert_eq!(recreated_table.id, failed_table.id + 1);
         assert_eq!(recreated_index.id, failed_index.id + 1);
+        assert_eq!(catalog.snapshot().unwrap().next_constraint_id, 41);
     }
 
     #[test]
@@ -2526,6 +2551,7 @@ mod tests {
             next_sequence_id: 2,
             next_dictionary_id: 1,
             next_storage_id: 4,
+            next_constraint_id: 1,
             views_by_name: HashMap::new(),
             views_by_id: HashMap::new(),
             statistics: HashMap::new(),
@@ -2993,6 +3019,7 @@ mod tests {
         assert!(!updated.columns[0].nullable);
         assert_eq!(updated.schema_version, schema.schema_version + 1);
         assert_eq!(catalog.get_index(index.id).unwrap(), Some(index));
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 8);
         assert_eq!(
             catalog.get_table(schema.id).unwrap().unwrap().primary_key,
             vec![0]
@@ -4244,6 +4271,18 @@ mod tests {
         assert_eq!(
             bytes,
             serialize_catalog(&catalog.snapshot().unwrap()).unwrap()
+        );
+
+        let mut pre_foundation = value.clone();
+        pre_foundation
+            .as_object_mut()
+            .unwrap()
+            .remove("next_constraint_id");
+        let error = deserialize_catalog(&serde_json::to_vec(&pre_foundation).unwrap()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported pre-foundation catalog v3 layout")
         );
 
         let legacy = serde_json::json!({

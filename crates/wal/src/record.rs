@@ -1,8 +1,4 @@
-use common::{
-    ColumnId, CompressionSetting, FileId, IndexId, IndexSchema, Lsn, NamespaceSchema, PageNum,
-    SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions,
-    ViewSchema,
-};
+use common::{FileId, Lsn, PageNum, SequenceId, TableId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,43 +10,10 @@ pub struct WalRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalRecordKind {
-    // Logical (structured) records, JSON payloads.
-    CreateTable {
-        schema: TableSchema,
-    },
-    DropTable {
-        table: TableId,
-    },
-    UpdateTableSchema {
-        schema: TableSchema,
-        indexes: Vec<IndexSchema>,
-    },
-    CreateIndex {
-        schema: IndexSchema,
-    },
-    DropIndex {
-        index: IndexId,
-    },
-    CreateSequence {
-        schema: SequenceSchema,
-    },
-    DropSequence {
-        sequence: SequenceId,
-    },
-    CreateView {
-        schema: ViewSchema,
-    },
-    ReplaceView {
-        schema: ViewSchema,
-    },
-    DropView {
-        view: TableId,
-    },
-    CreateSchema {
-        schema: NamespaceSchema,
-    },
-    DropSchema {
-        schema: SchemaId,
+    /// Authoritative logical catalog metadata record. Physical records never
+    /// independently mutate the catalog during recovery.
+    CatalogChange {
+        change_set: common::CatalogChangeSet,
     },
     /// Non-transactional sequence advance produced by `nextval`. Recovery replays
     /// it regardless of the writer transaction's eventual outcome so rolled-back
@@ -140,46 +103,6 @@ pub enum WalRecordKind {
         dict_id: u32,
         table_id: TableId,
         bytes: Vec<u8>,
-    },
-    /// DDL: updates a table's compression setting + active dictionary
-    /// (CLOG-gated on replay like other DDL).
-    AlterTableCompression {
-        table_id: TableId,
-        compression: CompressionSetting,
-        active_dict_id: Option<u32>,
-    },
-    /// DDL: updates a table's TOAST policy and linked hidden TOAST relation
-    /// (CLOG-gated on replay like other DDL).
-    AlterTableToast {
-        table_id: TableId,
-        toast: ToastOptions,
-        toast_table_id: Option<TableId>,
-    },
-    /// DDL: swaps a table and its dependent physical storage generations.
-    TruncateTable {
-        table_id: TableId,
-        new_table_storage_id: FileId,
-        new_toast_storage_id: Option<(TableId, FileId)>,
-        new_index_storage_ids: Vec<(IndexId, FileId)>,
-    },
-    /// DDL: updates a user table's primary-key column list. The derived storage
-    /// identity B-tree is rebuilt from heap rows when this committed logical
-    /// record is applied.
-    AlterTablePrimaryKey {
-        table_id: TableId,
-        primary_key: Vec<ColumnId>,
-    },
-    /// Maintenance: replaces a user table's optimizer statistics
-    /// (`docs/specs/statistics.md` §4). Catalog-only and CLOG-gated on replay
-    /// like DDL — applied only for committed transactions, in LSN order (last
-    /// write wins). A skipped or dropped-table record reserves nothing. The
-    /// payload must be finite — serde_json cannot round-trip NaN/Infinity and
-    /// record decode happens for every retained record regardless of its
-    /// transaction's outcome — so the codec itself refuses to encode a
-    /// non-finite payload (`TableStatistics::is_finite`).
-    UpdateTableStatistics {
-        table_id: TableId,
-        statistics: TableStatistics,
     },
 }
 

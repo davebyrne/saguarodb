@@ -3,10 +3,9 @@
 **Date:** 2026-07-12
 **Status:** Living crate contract
 
-`SchemaOperations` includes namespace creation and deletion. These operations
-append `CreateSchema`/`DropSchema` logical WAL records but allocate no relation
-files; recovery applies them only for committed transactions like other logical
-catalog records.
+`SchemaOperations` includes namespace creation and deletion. Namespace metadata
+is carried by the caller's generic `CatalogChange`; these operations allocate no
+relation files.
 
 ## Purpose
 
@@ -101,6 +100,7 @@ pub trait SchemaOperations: Send + Sync {
 }
 
 pub trait RecoveryOperations: Send + Sync {
+    fn reconcile_catalog_change(&self, change_set: &CatalogChangeSet) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
     fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
@@ -116,20 +116,6 @@ pub trait RecoveryOperations: Send + Sync {
         value: i64,
         is_called: bool,
     ) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... SET (compression)`: installs the
-    /// updated schema and re-registers the file compression configs. Must not
-    /// append WAL (see At-Rest Page Compression).
-    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... SET (toast...)`: installs the updated
-    /// schema metadata. Must not append WAL.
-    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
-    /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
-    /// table/index generations produced by catalog replay. Must not append WAL.
-    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: installs the
-    /// updated schema metadata during WAL replay. The derived identity tree is
-    /// rebuilt after replay reaches the final heap state. Must not append WAL.
-    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()>;
     /// Rebuild the derived table identity tree from heap rows after recovery
     /// replay. Must not append WAL.
     fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;
@@ -237,7 +223,11 @@ pinning unrelated tables. Reads and writes use only the statement-captured
 generations; missing/stale write handles remain errors. A relation snapshot is
 retained through its statement stream/portal/COPY lifetime and then released.
 
-`RecoveryOperations` carries storage-owned logical replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate preparation appends the logical `TruncateTable` WAL record before creating replacement heap/index files, so recovery can reserve replacement storage IDs before replaying orphan page records from an uncommitted prepare; committed truncate replay publishes the catalog-provided replacement generations without appending WAL. Schema-rewrite `update_table_schema` follows the same durable ordering for fresh rewrite storage ids: append `UpdateTableSchema` first, then initialize replacement B-tree pages. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RecoveryOperations` carries storage-owned application of committed generic catalog changes; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. The caller appends `CatalogChange` before invoking schema operations that create, drop, or rewrite physical generations. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate and schema-rewrite preparation receive catalog changes whose allocator high-water marks reserve fresh storage ids before replacement heap/index files are initialized. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. Recovery operations must not append WAL records.
+
+`RecoveryOperations::reconcile_catalog_change` is the single entry point for
+that storage-owned metadata reconciliation. It consumes the complete generic
+change set and performs no WAL append.
 
 ## Table Storage
 
@@ -1007,8 +997,9 @@ After the DDL commit is durable, the identity tree is reset and rebuilt from hea
 rows under the table's identity rewrite gate, so concurrent identity scans cannot
 observe the transient empty or partially rebuilt tree. In normal execution the
 reset and inserts log full-page-image redo for the identity B-tree and the server
-flushes that WAL before checkpoint truncation can run. The committed logical
-`AlterTablePrimaryKey` record is still the recovery source of truth when the
+flushes that WAL before checkpoint truncation can run. The committed generic
+catalog change carrying the table and backing-index replacement is the recovery
+source of truth when the
 crash happens before a checkpoint containing the rebuild completes: recovery
 installs primary-key metadata while replaying WAL, defers the derived identity
 rebuild until after all retained WAL records have replayed and crashed writers
@@ -1206,8 +1197,8 @@ files and may change on relation-swap truncate.
 - **Crash safety.** Like the identity index, every catalog-index node mutation
   logs a `FullPageImage` and stamps the page-LSN, so index pages recover through
   the same redo path as the heap. Index *metadata* (which indexes exist) is made
-  durable by the `CreateIndex` / `DropIndex` WAL records — replayed into both
-  catalog and storage — plus the catalog snapshot at each checkpoint.
+  durable by generic `CatalogChange` WAL — replayed into both catalog and
+  storage metadata — plus the catalog snapshot at each checkpoint.
 
 ## Sequence Runtime
 
@@ -1337,8 +1328,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
   live `TableState` and re-registers the heap file's config plus every live
   secondary-index file's config (still dict-less) under the new setting. Pure
   in-memory bookkeeping — it appends no WAL and takes no page latch; the
-  caller (the server's `ALTER TABLE` handler, or its recovery replay via
-  `apply_set_table_compression`) owns WAL record emission and ordering
+  caller (the server's `ALTER TABLE` handler, or generic catalog-change recovery
+  through `apply_update_table_schema`) owns WAL record emission and ordering
   (`docs/specs/compression.md` §8, and `docs/specs/crates/server.md`).
 - **`sample_heap_pages(schema, cap)`.** Returns up to `cap` **heap-only**
   initialized page images, evenly sampled across the heap file's current
@@ -1410,14 +1401,15 @@ Normal data operations append physiological redo records as they mutate pages, s
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
 - Each identity or catalog index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the identity index, and `create_index` initializes and backfills a catalog index, logged the same way.
-- `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
-- `SchemaOperations::update_table_schema` logs `UpdateTableSchema { schema, indexes }` before initializing any replacement B-tree pages for rewrite storage ids. If the table `storage_id` changed, storage registers the new file configs and initializes empty primary/secondary index files before rows are reinserted by the executor; metadata-only updates keep the existing files. Recovery applies carried index schemas and table schema through `RecoveryOperations` without appending WAL; physical replacement pages are restored from normal page redo records.
-- `SchemaOperations::create_sequence` / `drop_sequence` log `CreateSequence` /
-  `DropSequence`. Recovery applies them to both catalog and storage sequence
-  metadata when the DDL transaction committed.
-- `SchemaOperations::create_view` / `replace_view` / `drop_view` log
-  `CreateView` / `ReplaceView` / `DropView`. Views have no physical storage
-  metadata, so recovery applies these records to the catalog only.
+- The caller appends one generic `CatalogChange` before invoking schema
+  operations. It may atomically carry tables, hidden relations, indexes,
+  sequences, views, schemas, and statistics. Schema operations append only the
+  dependent physical page WAL required for relation/index construction.
+- `SchemaOperations::update_table_schema` initializes replacement B-tree pages
+  only after the caller has appended the change containing fresh rewrite storage
+  ids. Recovery applies committed table/index objects through
+  `RecoveryOperations` without appending WAL; physical replacement pages are
+  restored from normal page redo records.
 - `SequenceManager::nextval` / `setval` log `SequenceAdvance` /
   `SetSequenceValue` and flush that WAL before the live value changes. Recovery
   replays these value records unconditionally against storage's installed
@@ -1435,7 +1427,7 @@ Server query orchestration appends `Commit` and flushes WAL after the statement 
 The storage engine can be initialized in recovery mode. In recovery mode:
 
 - Normal `StorageEngine` methods are not used.
-- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations` only when their transaction is committed, including committed relation-swap `TruncateTable` records.
+- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. Committed `CatalogChange` objects are installed in LSN order and relation/index/sequence replacements are reflected through `RecoveryOperations`.
 - Sequence value records replay via `RecoveryOperations` regardless of CLOG
   status because sequence advancement is non-transactional.
 - No WAL append occurs.
@@ -1532,9 +1524,9 @@ the file ids are sorted/deduplicated for deterministic scoped flushing.
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
-Normal standalone TRUNCATE preparation remains per table so each target emits
-the existing `TruncateTable` logical WAL record under the statement's shared
-transaction id. Multi-table publication uses
+Normal standalone TRUNCATE preparation computes one catalog change for the
+complete target set and appends it before replacement files are initialized.
+Multi-table publication uses
 `publish_truncate_tables(Vec<TruncateCatalogUpdate>)`, which validates the
 complete update set and swaps every table/index generation under one storage
 state write lock. The server also holds `relation_publish_gate` across catalog
@@ -1795,5 +1787,5 @@ different files can proceed concurrently.
 - A dropped index is no longer maintained but retained entries remain scannable for
   already-planned readers; a rolled-back create removes it.
 - A secondary index is not visible to relation snapshots captured while its physical tree/backfill is still in progress.
-- `create_index` logs a `CreateIndex` record; recovery-apply index methods append no WAL.
+- `create_index` consumes a caller-supplied preceding `CatalogChange`; recovery-apply index methods append no WAL.
 - After a restart, a catalog index created post-checkpoint is replayed (catalog + storage metadata and its rebuilt tree) and remains scannable.

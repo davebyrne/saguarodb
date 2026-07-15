@@ -24,6 +24,7 @@ struct CatalogV3<'a> {
     next_sequence_id: SequenceId,
     next_dictionary_id: u32,
     next_storage_id: FileId,
+    next_constraint_id: common::ConstraintId,
 }
 
 #[derive(Deserialize)]
@@ -43,11 +44,13 @@ struct OwnedCatalogV3 {
     next_sequence_id: SequenceId,
     next_dictionary_id: u32,
     next_storage_id: FileId,
+    next_constraint_id: common::ConstraintId,
 }
 
 #[derive(Deserialize)]
 struct CatalogHeader {
     version: Option<u32>,
+    next_constraint_id: Option<common::ConstraintId>,
 }
 
 pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
@@ -82,6 +85,7 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         next_sequence_id: snapshot.next_sequence_id,
         next_dictionary_id: snapshot.next_dictionary_id,
         next_storage_id: snapshot.next_storage_id,
+        next_constraint_id: snapshot.next_constraint_id,
     })
     .map_err(|err| DbError::internal(format!("failed to serialize catalog: {err}")))?;
     if bytes.len() > MAX_CATALOG_BYTES {
@@ -107,6 +111,11 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
             "unsupported catalog format version {}",
             version
         )));
+    }
+    if header.next_constraint_id.is_none() {
+        return Err(DbError::internal(
+            "unsupported pre-foundation catalog v3 layout",
+        ));
     }
     let catalog: OwnedCatalogV3 = serde_json::from_slice(bytes)
         .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")))?;
@@ -168,6 +177,7 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         next_sequence_id: catalog.next_sequence_id,
         next_dictionary_id: catalog.next_dictionary_id,
         next_storage_id: catalog.next_storage_id,
+        next_constraint_id: catalog.next_constraint_id,
         statistics,
     })
 }

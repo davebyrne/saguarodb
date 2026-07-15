@@ -21,8 +21,6 @@ const CRC_LEN: usize = 4;
 /// t_ctid page(4) + t_ctid slot(2) + infomask(2).
 const HEAP_UPDATE_HEADER_LEN: usize = 4 + 4 + 2 + 8 + 4 + 2 + 2;
 
-const TYPE_CREATE_TABLE: u8 = 1;
-const TYPE_DROP_TABLE: u8 = 2;
 const TYPE_COMMIT: u8 = 3;
 const TYPE_CHECKPOINT: u8 = 4;
 // Physiological redo records use compact binary payloads instead of JSON.
@@ -30,28 +28,15 @@ const TYPE_HEAP_INIT: u8 = 5;
 const TYPE_HEAP_INSERT: u8 = 6;
 const TYPE_HEAP_DELETE: u8 = 7;
 const TYPE_FULL_PAGE_IMAGE: u8 = 8;
-const TYPE_CREATE_INDEX: u8 = 9;
-const TYPE_DROP_INDEX: u8 = 10;
 const TYPE_ABORT: u8 = 11;
 const TYPE_HEAP_UPDATE_HEADER: u8 = 12;
 const TYPE_COMMIT_WITH_SUBXIDS: u8 = 13;
-const TYPE_CREATE_SEQUENCE: u8 = 14;
-const TYPE_DROP_SEQUENCE: u8 = 15;
 const TYPE_SEQUENCE_ADVANCE: u8 = 16;
 const TYPE_SET_SEQUENCE_VALUE: u8 = 17;
 pub(crate) const TYPE_FULL_PAGE_IMAGE_COMPRESSED: u8 = 18;
 pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
-pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
-pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
-pub(crate) const TYPE_TRUNCATE_TABLE: u8 = 22;
-pub(crate) const TYPE_ALTER_TABLE_PRIMARY_KEY: u8 = 23;
-pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
-pub(crate) const TYPE_CREATE_VIEW: u8 = 25;
-pub(crate) const TYPE_REPLACE_VIEW: u8 = 26;
-pub(crate) const TYPE_DROP_VIEW: u8 = 27;
-pub(crate) const TYPE_UPDATE_TABLE_STATISTICS: u8 = 28;
-pub(crate) const TYPE_CREATE_SCHEMA: u8 = 29;
-pub(crate) const TYPE_DROP_SCHEMA: u8 = 30;
+pub(crate) const TYPE_CATALOG_CHANGE: u8 = 31;
+const MAX_CATALOG_CHANGE_PAYLOAD_BYTES: usize = 67_108_864;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -188,17 +173,7 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
 
 fn record_type(kind: &WalRecordKind) -> u8 {
     match kind {
-        WalRecordKind::CreateTable { .. } => TYPE_CREATE_TABLE,
-        WalRecordKind::DropTable { .. } => TYPE_DROP_TABLE,
-        WalRecordKind::CreateIndex { .. } => TYPE_CREATE_INDEX,
-        WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
-        WalRecordKind::CreateSequence { .. } => TYPE_CREATE_SEQUENCE,
-        WalRecordKind::DropSequence { .. } => TYPE_DROP_SEQUENCE,
-        WalRecordKind::CreateView { .. } => TYPE_CREATE_VIEW,
-        WalRecordKind::ReplaceView { .. } => TYPE_REPLACE_VIEW,
-        WalRecordKind::DropView { .. } => TYPE_DROP_VIEW,
-        WalRecordKind::CreateSchema { .. } => TYPE_CREATE_SCHEMA,
-        WalRecordKind::DropSchema { .. } => TYPE_DROP_SCHEMA,
+        WalRecordKind::CatalogChange { .. } => TYPE_CATALOG_CHANGE,
         WalRecordKind::SequenceAdvance { .. } => TYPE_SEQUENCE_ADVANCE,
         WalRecordKind::SetSequenceValue { .. } => TYPE_SET_SEQUENCE_VALUE,
         WalRecordKind::Commit => TYPE_COMMIT,
@@ -212,12 +187,6 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::FullPageImage { .. } => TYPE_FULL_PAGE_IMAGE,
         WalRecordKind::FullPageImageCompressed { .. } => TYPE_FULL_PAGE_IMAGE_COMPRESSED,
         WalRecordKind::CreateDictionary { .. } => TYPE_CREATE_DICTIONARY,
-        WalRecordKind::AlterTableCompression { .. } => TYPE_ALTER_TABLE_COMPRESSION,
-        WalRecordKind::AlterTableToast { .. } => TYPE_ALTER_TABLE_TOAST,
-        WalRecordKind::TruncateTable { .. } => TYPE_TRUNCATE_TABLE,
-        WalRecordKind::AlterTablePrimaryKey { .. } => TYPE_ALTER_TABLE_PRIMARY_KEY,
-        WalRecordKind::UpdateTableSchema { .. } => TYPE_UPDATE_TABLE_SCHEMA,
-        WalRecordKind::UpdateTableStatistics { .. } => TYPE_UPDATE_TABLE_STATISTICS,
     }
 }
 
@@ -311,23 +280,17 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             buf.extend_from_slice(bytes);
             Ok(buf)
         }
-        WalRecordKind::UpdateTableStatistics { statistics, .. } => {
-            // serde_json writes a non-finite float as `null` and cannot read
-            // it back, and decode runs for every retained record regardless
-            // of its transaction's outcome — one such payload would poison
-            // replay of the whole log. Refuse it at append time so the
-            // invariant holds by construction, not appender discipline.
-            if !statistics.is_finite() {
-                return Err(wal_error(
-                    "statistics WAL payload contains a non-finite number",
-                ));
+        WalRecordKind::CatalogChange { change_set } => {
+            change_set
+                .validate_shape()
+                .map_err(|message| wal_error(format!("invalid catalog change set: {message}")))?;
+            let payload = serde_json::to_vec(kind)
+                .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}")))?;
+            if payload.len() > MAX_CATALOG_CHANGE_PAYLOAD_BYTES {
+                return Err(wal_error("catalog change WAL payload exceeds 64 MiB"));
             }
-            serde_json::to_vec(kind)
-                .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}")))
+            Ok(payload)
         }
-        // AlterTableCompression/AlterTableToast/TruncateTable/AlterTablePrimaryKey/
-        // UpdateTableSchema and the view DDL records: no arms — the `_ =>`
-        // serde_json fallback handles logical DDL records.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -426,14 +389,29 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
             })
         }
         _ => {
+            if is_legacy_catalog_type(type_id) {
+                return Err(wal_error("unsupported legacy catalog WAL record format"));
+            }
+            if type_id == TYPE_CATALOG_CHANGE && payload.len() > MAX_CATALOG_CHANGE_PAYLOAD_BYTES {
+                return Err(wal_error("catalog change WAL payload exceeds 64 MiB"));
+            }
             let kind: WalRecordKind = serde_json::from_slice(payload)
                 .map_err(|err| wal_error(format!("failed to deserialize WAL payload: {err}")))?;
             if type_id != record_type(&kind) {
                 return Err(wal_error("WAL record type does not match payload"));
             }
+            if let WalRecordKind::CatalogChange { change_set } = &kind {
+                change_set.validate_shape().map_err(|message| {
+                    wal_error(format!("invalid catalog change set: {message}"))
+                })?;
+            }
             Ok(kind)
         }
     }
+}
+
+fn is_legacy_catalog_type(type_id: u8) -> bool {
+    matches!(type_id, 1 | 2 | 9 | 10 | 14 | 15 | 20..=30)
 }
 
 fn encoded_payload_buffer(header_len: usize, body_len: usize) -> Result<Vec<u8>> {
@@ -514,8 +492,8 @@ mod tests {
     use crate::{WalRecord, WalRecordKind};
 
     use super::{
-        CRC_LEN, HEADER_LEN, TYPE_CREATE_TABLE, TYPE_HEAP_DELETE, TYPE_UPDATE_TABLE_SCHEMA,
-        decode_payload, decode_record, encode_record,
+        CRC_LEN, HEADER_LEN, MAX_CATALOG_CHANGE_PAYLOAD_BYTES, TYPE_CATALOG_CHANGE,
+        TYPE_HEAP_DELETE, decode_payload, decode_record, encode_record,
     };
 
     #[test]
@@ -576,148 +554,24 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_logical_schema_and_sequence_records() {
+    fn round_trips_catalog_change_and_sequence_value_records() {
+        let schema = common::NamespaceSchema {
+            id: 2,
+            name: "app".to_string(),
+        };
+        let change_set = common::CatalogChangeSet::between(
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::from([(
+                common::CatalogObjectId::Schema(schema.id),
+                common::CatalogObject::Schema(schema),
+            )]),
+            common::CatalogAllocatorHighWater {
+                next_schema_id: 3,
+                ..common::CatalogAllocatorHighWater::default()
+            },
+        );
         let kinds = [
-            WalRecordKind::CreateIndex {
-                schema: common::IndexSchema {
-                    id: 3,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    storage_id: 30,
-                    table: 1,
-                    name: "users_name".to_string(),
-                    columns: vec![1],
-                    unique: true,
-                    constraint: common::IndexConstraintKind::None,
-                },
-            },
-            WalRecordKind::UpdateTableSchema {
-                schema: common::TableSchema {
-                    id: 1,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    storage_id: 10,
-                    name: "users".to_string(),
-                    columns: vec![
-                        common::ColumnDef {
-                            id: 0,
-                            object_id: 1,
-                            name: "id".to_string(),
-                            data_type: common::DataType::Integer,
-                            nullable: false,
-                            max_length: None,
-                            default: None,
-                            pg_type: None,
-                        },
-                        common::ColumnDef {
-                            id: 1,
-                            object_id: 2,
-                            name: "code".to_string(),
-                            data_type: common::DataType::Integer,
-                            nullable: true,
-                            max_length: None,
-                            default: None,
-                            pg_type: None,
-                        },
-                    ],
-                    primary_key: vec![0],
-                    schema_version: 2,
-                    compression: common::CompressionSetting::None,
-                    active_dict_id: None,
-                    toast: common::ToastOptions::legacy_catalog_default(),
-                    toast_table_id: None,
-                    relation_kind: common::RelationKind::User,
-                    checks: Vec::new(),
-                    foreign_keys: Vec::new(),
-                    next_foreign_key_id: 0,
-                    next_column_object_id: u32::MAX,
-                },
-                indexes: vec![common::IndexSchema {
-                    id: 3,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    storage_id: 31,
-                    table: 1,
-                    name: "users_code".to_string(),
-                    columns: vec![1],
-                    unique: false,
-                    constraint: common::IndexConstraintKind::None,
-                }],
-            },
-            WalRecordKind::DropIndex { index: 3 },
-            WalRecordKind::CreateSequence {
-                schema: common::SequenceSchema {
-                    id: 4,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    name: "users_id_seq".to_string(),
-                    increment: 1,
-                    min_value: 1,
-                    max_value: i64::MAX,
-                    start: 1,
-                    cycle: false,
-                    owned: false,
-                    last_value: 1,
-                    is_called: false,
-                },
-            },
-            WalRecordKind::DropSequence { sequence: 4 },
-            WalRecordKind::CreateView {
-                schema: common::ViewSchema {
-                    id: 5,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    name: "active_users".to_string(),
-                    columns: vec![common::ColumnDef {
-                        id: 0,
-                        object_id: 1,
-                        name: "id".to_string(),
-                        data_type: common::DataType::Integer,
-                        nullable: true,
-                        max_length: None,
-                        default: None,
-                        pg_type: None,
-                    }],
-                    definition: "select id from users".to_string(),
-                    dependencies: vec![common::ViewDependency {
-                        relation: 1,
-                        columns: vec![0],
-                        all_columns: false,
-                    }],
-                    schema_version: 1,
-                    definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
-                    next_column_object_id: u32::MAX,
-                },
-            },
-            WalRecordKind::ReplaceView {
-                schema: common::ViewSchema {
-                    id: 5,
-                    schema_id: common::PUBLIC_SCHEMA_ID,
-                    name: "active_users".to_string(),
-                    columns: vec![common::ColumnDef {
-                        id: 0,
-                        object_id: 1,
-                        name: "id".to_string(),
-                        data_type: common::DataType::Integer,
-                        nullable: true,
-                        max_length: None,
-                        default: None,
-                        pg_type: None,
-                    }],
-                    definition: "select id from users where id > 0".to_string(),
-                    dependencies: vec![common::ViewDependency {
-                        relation: 1,
-                        columns: vec![0],
-                        all_columns: false,
-                    }],
-                    schema_version: 2,
-                    definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
-                    next_column_object_id: u32::MAX,
-                },
-            },
-            WalRecordKind::DropView { view: 5 },
-            WalRecordKind::CreateSchema {
-                schema: common::NamespaceSchema {
-                    id: 2,
-                    name: "app".to_string(),
-                },
-            },
-            WalRecordKind::DropSchema { schema: 2 },
+            WalRecordKind::CatalogChange { change_set },
             WalRecordKind::SequenceAdvance {
                 sequence: 4,
                 value: 11,
@@ -740,6 +594,131 @@ mod tests {
     }
 
     #[test]
+    fn catalog_change_rejects_unknown_version() {
+        let kind = WalRecordKind::CatalogChange {
+            change_set: common::CatalogChangeSet {
+                version: common::CATALOG_CHANGE_SET_VERSION + 1,
+                mutations: Vec::new(),
+                allocator_high_water: common::CatalogAllocatorHighWater::default(),
+            },
+        };
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: kind.clone(),
+        };
+        assert!(
+            encode_record(&record)
+                .unwrap_err()
+                .message
+                .contains("unsupported catalog change-set version")
+        );
+
+        let payload = serde_json::to_vec(&kind).unwrap();
+        assert!(
+            decode_payload(TYPE_CATALOG_CHANGE, &payload)
+                .unwrap_err()
+                .message
+                .contains("unsupported catalog change-set version")
+        );
+    }
+
+    #[test]
+    fn catalog_change_decoder_rejects_oversized_list_before_decoding_extra_mutation() {
+        let mutation = common::CatalogMutation {
+            before: None,
+            after: Some(common::CatalogObject::Schema(common::NamespaceSchema {
+                id: 2,
+                name: "app".to_string(),
+            })),
+        };
+        let mut mutations =
+            vec![serde_json::to_value(mutation).unwrap(); common::MAX_CATALOG_CHANGE_MUTATIONS];
+        // If the decoder materializes this element as a CatalogMutation before
+        // enforcing the count limit, serde reports a type error instead of the
+        // required bounded-list error.
+        mutations.push(serde_json::json!("malformed over-limit mutation"));
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "CatalogChange": {
+                "change_set": {
+                    "version": common::CATALOG_CHANGE_SET_VERSION,
+                    "mutations": mutations,
+                    "allocator_high_water": common::CatalogAllocatorHighWater::default(),
+                }
+            }
+        }))
+        .unwrap();
+        assert!(
+            decode_payload(TYPE_CATALOG_CHANGE, &payload)
+                .unwrap_err()
+                .message
+                .contains("too many mutations")
+        );
+    }
+
+    #[test]
+    fn catalog_change_codec_rejects_oversized_payload_before_decode() {
+        let oversized_payload = vec![0; MAX_CATALOG_CHANGE_PAYLOAD_BYTES + 1];
+        let error = decode_payload(TYPE_CATALOG_CHANGE, &oversized_payload).unwrap_err();
+        assert!(
+            error.message.contains("exceeds 64 MiB"),
+            "{}",
+            error.message
+        );
+
+        let oversized_name = "x".repeat(MAX_CATALOG_CHANGE_PAYLOAD_BYTES);
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::CatalogChange {
+                change_set: common::CatalogChangeSet {
+                    version: common::CATALOG_CHANGE_SET_VERSION,
+                    mutations: vec![common::CatalogMutation {
+                        before: None,
+                        after: Some(common::CatalogObject::Schema(common::NamespaceSchema {
+                            id: 2,
+                            name: oversized_name,
+                        })),
+                    }],
+                    allocator_high_water: common::CatalogAllocatorHighWater::default(),
+                },
+            },
+        };
+        let error = encode_record(&record).unwrap_err();
+        assert!(
+            error.message.contains("exceeds 64 MiB"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn catalog_change_codec_rejects_reserved_constraint_objects() {
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::CatalogChange {
+                change_set: common::CatalogChangeSet {
+                    version: common::CATALOG_CHANGE_SET_VERSION,
+                    mutations: vec![common::CatalogMutation {
+                        before: None,
+                        after: Some(common::CatalogObject::Constraint(1)),
+                    }],
+                    allocator_high_water: common::CatalogAllocatorHighWater::default(),
+                },
+            },
+        };
+        let error = encode_record(&record).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("constraint objects are not supported"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
     fn full_page_image_uses_compact_binary_payload() {
         let record = WalRecord {
             lsn: 1,
@@ -756,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_compression_and_toast_records() {
+    fn round_trips_compression_physical_records() {
         let kinds = [
             WalRecordKind::FullPageImageCompressed {
                 file_id: 3,
@@ -769,60 +748,6 @@ mod tests {
                 dict_id: 7,
                 table_id: 3,
                 bytes: vec![9; 64],
-            },
-            WalRecordKind::AlterTableCompression {
-                table_id: 3,
-                compression: common::CompressionSetting::Zstd,
-                active_dict_id: Some(7),
-            },
-            WalRecordKind::AlterTableCompression {
-                table_id: 4,
-                compression: common::CompressionSetting::None,
-                active_dict_id: None,
-            },
-            WalRecordKind::AlterTableToast {
-                table_id: 5,
-                toast: common::ToastOptions {
-                    mode: common::ToastMode::Aggressive,
-                    tuple_target: 4096,
-                    min_value_size: 512,
-                    compression: common::ToastCompression::Zstd,
-                    active_dict_id: None,
-                },
-                toast_table_id: Some(6),
-            },
-            WalRecordKind::TruncateTable {
-                table_id: 5,
-                new_table_storage_id: 20,
-                new_toast_storage_id: Some((6, 21)),
-                new_index_storage_ids: vec![(7, 22), (8, 23)],
-            },
-            WalRecordKind::AlterTablePrimaryKey {
-                table_id: 5,
-                primary_key: vec![0, 2],
-            },
-            WalRecordKind::UpdateTableStatistics {
-                table_id: 5,
-                statistics: common::TableStatistics {
-                    row_count: 1000,
-                    page_count: 10,
-                    columns: std::collections::BTreeMap::from([(
-                        0,
-                        common::ColumnStatistics {
-                            null_frac: common::OrderedF64::new(0.25),
-                            avg_width: 8,
-                            n_distinct: common::NDistinct::Count(3),
-                            most_common: vec![(
-                                common::Value::Text("a".to_string()),
-                                common::OrderedF64::new(0.5),
-                            )],
-                            histogram_bounds: vec![
-                                common::Value::Integer(1),
-                                common::Value::Integer(9),
-                            ],
-                        },
-                    )]),
-                },
             },
         ];
         for kind in kinds {
@@ -847,21 +772,30 @@ mod tests {
         let record = WalRecord {
             lsn: 1,
             txn_id: 1,
-            kind: WalRecordKind::UpdateTableStatistics {
-                table_id: 5,
-                statistics: common::TableStatistics {
-                    row_count: 10,
-                    page_count: 1,
-                    columns: std::collections::BTreeMap::from([(
-                        0,
-                        common::ColumnStatistics {
-                            null_frac: common::OrderedF64::new(f64::NAN),
-                            avg_width: 8,
-                            n_distinct: common::NDistinct::Count(1),
-                            most_common: Vec::new(),
-                            histogram_bounds: Vec::new(),
-                        },
-                    )]),
+            kind: WalRecordKind::CatalogChange {
+                change_set: common::CatalogChangeSet {
+                    version: common::CATALOG_CHANGE_SET_VERSION,
+                    mutations: vec![common::CatalogMutation {
+                        before: None,
+                        after: Some(common::CatalogObject::Statistics {
+                            table: 5,
+                            statistics: common::TableStatistics {
+                                row_count: 10,
+                                page_count: 1,
+                                columns: std::collections::BTreeMap::from([(
+                                    0,
+                                    common::ColumnStatistics {
+                                        null_frac: common::OrderedF64::new(f64::NAN),
+                                        avg_width: 8,
+                                        n_distinct: common::NDistinct::Count(1),
+                                        most_common: Vec::new(),
+                                        histogram_bounds: Vec::new(),
+                                    },
+                                )]),
+                            },
+                        }),
+                    }],
+                    allocator_high_water: common::CatalogAllocatorHighWater::default(),
                 },
             },
         };
@@ -922,101 +856,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_table_schema_wal_payloads_default_foreign_key_metadata() {
-        let schema = common::TableSchema {
-            id: 1,
-            schema_id: common::PUBLIC_SCHEMA_ID,
-            storage_id: 10,
-            name: "legacy".to_string(),
-            columns: vec![common::ColumnDef {
-                id: 0,
-                object_id: 1,
-                name: "id".to_string(),
-                data_type: common::DataType::Integer,
-                nullable: false,
-                max_length: None,
-                default: None,
-                pg_type: None,
-            }],
-            primary_key: Vec::new(),
-            schema_version: 1,
-            compression: common::CompressionSetting::None,
-            active_dict_id: None,
-            toast: common::ToastOptions::legacy_catalog_default(),
-            toast_table_id: None,
-            relation_kind: common::RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
-            next_column_object_id: u32::MAX,
-        };
-        for (type_id, kind_name, kind) in [
-            (
-                TYPE_CREATE_TABLE,
-                "CreateTable",
-                WalRecordKind::CreateTable {
-                    schema: schema.clone(),
-                },
-            ),
-            (
-                TYPE_UPDATE_TABLE_SCHEMA,
-                "UpdateTableSchema",
-                WalRecordKind::UpdateTableSchema {
-                    schema: schema.clone(),
-                    indexes: Vec::new(),
-                },
-            ),
-        ] {
-            let mut value = serde_json::to_value(kind).unwrap();
-            let schema = value
-                .get_mut(kind_name)
-                .and_then(|value| value.get_mut("schema"))
-                .and_then(serde_json::Value::as_object_mut)
-                .unwrap();
-            schema.remove("foreign_keys");
-            schema.remove("next_foreign_key_id");
-            let payload = serde_json::to_vec(&value).unwrap();
-            let decoded = decode_payload(type_id, &payload).unwrap();
-            let decoded_schema = match decoded {
-                WalRecordKind::CreateTable { schema }
-                | WalRecordKind::UpdateTableSchema { schema, .. } => schema,
-                other => panic!("unexpected decoded record: {other:?}"),
-            };
-            assert!(decoded_schema.foreign_keys.is_empty());
-            assert_eq!(decoded_schema.next_foreign_key_id, 0);
-        }
-
-        let mut fk_schema = schema;
-        fk_schema.foreign_keys.push(common::ForeignKeyConstraint {
-            id: 0,
-            name: "legacy_fkey".to_string(),
-            columns: vec![0],
-            referenced_table: 2,
-            referenced_columns: vec![0],
-            referenced_index: 7,
-            on_update: common::ForeignKeyAction::NoAction,
-            on_delete: common::ForeignKeyAction::Restrict,
-        });
-        fk_schema.next_foreign_key_id = 1;
-        let mut value = serde_json::to_value(WalRecordKind::UpdateTableSchema {
-            schema: fk_schema,
-            indexes: Vec::new(),
-        })
-        .unwrap();
-        value
-            .get_mut("UpdateTableSchema")
-            .and_then(|value| value.get_mut("schema"))
-            .and_then(|value| value.get_mut("foreign_keys"))
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|foreign_keys| foreign_keys.first_mut())
-            .and_then(serde_json::Value::as_object_mut)
-            .unwrap()
-            .remove("referenced_index");
-        let payload = serde_json::to_vec(&value).unwrap();
-        let decoded = decode_payload(TYPE_UPDATE_TABLE_SCHEMA, &payload).unwrap();
-        let WalRecordKind::UpdateTableSchema { schema, .. } = decoded else {
-            panic!("unexpected decoded record")
-        };
-        assert_eq!(schema.foreign_keys[0].referenced_index, 0);
+    fn specialized_catalog_wal_payload_is_rejected() {
+        let error = decode_payload(1, br#"{"CreateTable":{"schema":{}}}"#).unwrap_err();
+        assert!(
+            error.message.contains("unsupported legacy catalog WAL"),
+            "{}",
+            error.message
+        );
     }
 }

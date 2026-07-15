@@ -1,7 +1,7 @@
 //! Optimizer statistics collected by `ANALYZE` (`docs/specs/statistics.md`).
 //!
 //! These types are durable catalog state: they ride inside the catalog JSON
-//! snapshot in the manifest and inside the `UpdateTableStatistics` WAL record
+//! snapshot in the manifest and inside the generic catalog-change WAL record
 //! (`docs/specs/statistics.md` §4). Fractions use [`OrderedF64`] (not `f64`)
 //! so the types keep `Eq`, which the WAL record enum derives.
 

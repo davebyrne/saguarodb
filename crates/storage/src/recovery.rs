@@ -1,7 +1,4 @@
-use common::{
-    IndexId, IndexSchema, Result, SequenceId, SequenceSchema, TableId, TableSchema,
-    TruncateCatalogUpdate,
-};
+use common::{IndexId, IndexSchema, Result, SequenceId, SequenceSchema, TableId, TableSchema};
 
 use crate::engine::PageBackedStorageEngine;
 use crate::traits::RecoveryOperations;
@@ -50,22 +47,6 @@ impl RecoveryOperations for PageBackedStorageEngine {
         is_called: bool,
     ) -> Result<()> {
         self.apply_set_sequence_value_without_wal(sequence, value, is_called)
-    }
-
-    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()> {
-        self.set_table_compression(&schema)
-    }
-
-    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()> {
-        self.set_table_toast_metadata(&schema)
-    }
-
-    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()> {
-        self.apply_truncate_table_without_wal(update)
-    }
-
-    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()> {
-        self.set_table_primary_key_metadata(&schema)
     }
 
     fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()> {

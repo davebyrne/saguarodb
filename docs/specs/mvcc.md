@@ -635,14 +635,10 @@ becomes load-bearing once writers run concurrently (E2b).
   then. Per the no-undo model (§4 Decision 3) recovery appends **no** WAL record for
   this — the abort lives in the in-memory CLOG and is made durable via `clog.dat`. There
   is **no undo pass**.
-  - **Logical catalog records** (`CreateTable`/`DropTable`/`CreateIndex`/
-    `DropIndex`) are the one exception: they mutate the durable catalog directly
-    (not idempotent PageLSN-gated page bytes), so redo gates them by the rebuilt
-    CLOG — only a *committed* DDL replays. Transactional DDL that aborts or remains
-    in flight is skipped; skipped
-    `CreateTable` / `CreateIndex` records still reserve their IDs, because their
-    index/heap pages may replay as unreferenced, invisible orphan files that a later
-    object must not reuse.
+  - **Generic `CatalogChange` records** are the one non-PageLSN metadata class:
+    recovery publishes only committed sets, but pre-scans every set and burns its
+    allocator high-water even when the transaction aborted or remained in flight.
+    Thus orphan physical pages/generations can never collide with a later object.
 - **Checkpoint** ordering (`crates/server/src/checkpoint.rs`):
   `wal.flush` → `flush_dirty_pages` → `store.sync_all` → control record →
   `persist_clog` → `Checkpoint` marker → `truncate_before` → `mark_all_clean`.

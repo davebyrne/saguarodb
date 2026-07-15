@@ -19,9 +19,9 @@ impl PageBackedStorageEngine {
     pub(crate) fn apply_drop_table_without_wal(&self, table: TableId) -> Result<()> {
         let mut state = self.lock_state()?;
         let toast_table_id = live_toast_table_id(&state, table);
-        // Recovery replays a single DropTable record; cascade to the table's
-        // indexes and hidden TOAST relation here, matching the catalog's
-        // apply_drop_table cascade. txn 0 means no rollback tracking.
+        // A table removal in a catalog change cascades to the table's indexes
+        // and hidden TOAST relation here, matching catalog application. txn 0
+        // means no rollback tracking.
         mark_table_dropped(&mut state, 0, table);
         if let Some(toast_table_id) = toast_table_id {
             mark_table_dropped(&mut state, 0, toast_table_id);

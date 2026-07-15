@@ -2215,7 +2215,7 @@ The control record uses the version-4 binary envelope: magic `SGMF`, a `u32` ver
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (seeded from `clog.dat` and folded forward with later `Commit`/`Abort`, or rebuilt from retained WAL when no snapshot exists) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their schema/table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL** plus one authoritative generic metadata record, `CatalogChange { change_set }`. Physical page records are PageLSN-gated; catalog change sets carry deterministic object-ID-sorted before/after objects and allocator high-water; dictionary bytes, non-transactional sequence values, and transaction/checkpoint markers remain separate. Recovery is redo-all for physical records, pre-reserves allocators from every catalog change regardless of outcome, and applies only committed change sets atomically in LSN order. The CLOG decides tuple visibility, and sequence values replay unconditionally.
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -2258,15 +2258,7 @@ This gives the invariants:
 
 | Type | Payload |
 |---|---|
-| `CreateTable` | serialized `TableSchema` (logical id, storage id, name, columns, primary key) |
-| `DropTable` | `TableId` |
-| `CreateIndex` | serialized `IndexSchema` (logical id, storage id, table, name, columns, unique) |
-| `DropIndex` | `IndexId` |
-| `CreateSchema` | serialized `NamespaceSchema` |
-| `DropSchema` | `SchemaId` |
-| `TruncateTable` | `TableId`, new table/TOAST/index storage ids |
-| `AlterTablePrimaryKey` | `table_id`, primary-key `ColumnId` list |
-| `UpdateTableSchema` | serialized `TableSchema` and carried `IndexSchema` list for schema-evolution DDL |
+| `CatalogChange` | versioned `CatalogChangeSet`: sorted object mutations with complete `before`/`after` values plus allocator high-water |
 | `Commit` | (empty — marks the transaction as committed) |
 | `Abort` | (empty — marks the transaction as aborted; `txn_id` in the header) |
 | `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
@@ -2416,13 +2408,16 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 ### Crash Recovery (REDO)
 
-The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, seeded from `clog.dat` and folded forward with later `Commit`/`Abort` records (or rebuilt from retained WAL when the snapshot is absent), then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions. When a committed `DropTable` first encounters an internal FK dependency, recovery discovers only that transaction's complete target set through an on-demand streaming WAL pass bounded by the catalog table-id domain, applies the record with that context, and immediately discards the batch; cyclic drops therefore replay safely in record order without retaining all drop history. Skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/index/sequence/storage IDs or carried rewrite storage IDs so orphan page files, relation-generation files, or catalog IDs are not reused.
+The control record names the redo boundary and catalog. Recovery loads that snapshot, pre-scans all later `CatalogChange` records to merge allocator high-water even for aborted/in-flight transactions, replays physical records under PageLSN gating, and applies committed change sets atomically in LSN order. A skipped change's allocator reservation is installed at its WAL position so later exact before-images observe earlier burned stable-column/FK IDs; the merged reservation is reapplied after replay for sparse entries whose relation was created later. Complete multi-object drops are already one change set, so recovery has no per-DDL catalog dispatch or special drop batching.
 
 **Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
 ```rust
 pub trait RecoveryOperations: Send + Sync {
+    fn reconcile_catalog_change(&self, change_set: &CatalogChangeSet) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, index: IndexId) -> Result<()>;
@@ -2430,13 +2425,11 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_drop_sequence(&self, sequence: SequenceId) -> Result<()>;
     fn apply_sequence_advance(&self, sequence: SequenceId, value: i64) -> Result<()>;
     fn apply_set_sequence_value(&self, sequence: SequenceId, value: i64, is_called: bool) -> Result<()>;
-    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
-    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
-    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
+    fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;
 }
 ```
 
-Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Table/index/sequence DDL, table metadata ALTER records, and committed relation-swap truncate records replay through `RecoveryOperations` when committed. Sequence value records replay through `RecoveryOperations` unconditionally because sequence advancement is non-transactional. Recovery replay must not append WAL.
+Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Committed table/index/sequence and table-metadata changes enter storage through the single `reconcile_catalog_change` boundary; its default implementation dispatches the generic object's create/update/drop to the small no-WAL metadata primitives. Relation-swap generations are already represented by the table/index replacement objects. Sequence value records replay through `RecoveryOperations` unconditionally because sequence advancement is non-transactional. Recovery replay must not append WAL.
 
 Concrete storage is opened with:
 
@@ -2463,17 +2456,15 @@ impl PageBackedStorageEngine {
 3. Initialize storage in recovery mode and the catalog; install table, index,
    and sequence schemas from the catalog snapshot, then seed and validate the
    dictionary resolver.
-4. Redo-all: replay every record with `LSN > checkpoint_lsn`
+4. Pre-scan every post-checkpoint `CatalogChange` to reserve all carried
+   allocators, then redo every record with `LSN > checkpoint_lsn`
    (`WalManager::replay_from`): physical-redo records via `apply_physical_redo`
    (PageLSN-gated; torn/missing pages are zeroed so a
    `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike,
-   regardless of transaction outcome — committed table/index/sequence/view DDL,
-   committed table metadata ALTER records, committed `UpdateTableSchema`, and
-   committed `TruncateTable` relation swaps through catalog plus
-   `RecoveryOperations`; allocator-only reservation for skipped
-   aborted/in-flight object/rewrite IDs; and unconditional sequence value
-   records. `AlterTablePrimaryKey` defers the identity-tree rebuild until after
-   replay and crashed-writer abort resolution. The seeded/folded CLOG decides
+   regardless of transaction outcome — committed generic catalog change sets
+   through shared atomic application plus `RecoveryOperations`, and unconditional
+   sequence value records. Table before/after changes to the primary key defer
+   the identity-tree rebuild until after replay and crashed-writer abort resolution. The seeded/folded CLOG decides
    tuple visibility; when `clog.dat` is absent it is rebuilt from retained WAL.
 5. If records were replayed: checkpoint to persist the redone state and advance
    the boundary.
@@ -2576,6 +2567,11 @@ System-catalog CHECK OID construction is fallible and propagates invalid catalog
 indices as `InternalError` rather than truncating them into colliding OIDs.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, catalog-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for storage's per-table identity index). User tables, user views, user-visible indexes, public sequences, and primary-key auto-names share the public relation-name namespace exposed through `pg_class`/`to_regclass`; duplicate names across those kinds are rejected. Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable relation/index IDs plus schema-version-local column IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
+
+Transactional DDL claims every allocator advance in the shared catalog before
+catalog WAL or dependent physical work. The claim remains burned if later
+validation, backfill, or rewrite fails, preventing concurrent and subsequent
+DDL from reusing an object or storage-generation identity.
 
 The catalog crate also owns a static virtual system-view registry for the
 driver-oriented `pg_catalog` and `information_schema` surface. The registry
@@ -2767,14 +2763,13 @@ pub struct CatalogSnapshot {
 }
 ```
 
-Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, `next_sequence_id = 1`, and `next_storage_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing logical IDs and advances `next_table_id` and `next_storage_id` past that schema; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` and `reserve_storage_id` advance allocators without installing schemas; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. Normal multi-table drop first validates its complete target set and atomically publishes all catalog removals; an incoming FK from outside the set is a `2BP01` dependency error, while self, cyclic, and wholly internal dependencies are permitted. Recovery supplies `apply_drop_table_in_batch` with all committed `DropTable` targets for that transaction so cyclic batches replay safely despite retaining one logical record per table. `apply_create_index`/`apply_update_index_schema`/`apply_drop_index` do the same for catalog indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Normal `CREATE INDEX` may make the catalog index visible before the storage tree is published, but storage publishes the new `IndexGeneration` only after the empty tree is created and backfill succeeds; a scan defensively falls back to a table scan if its statement-captured relation generation lacks the planned index. `prepare_truncate_table` burns fresh storage ids for the base table, optional hidden TOAST table, and catalog indexes without publishing them; `build_truncate_table_update` returns the updated schemas without mutating the catalog so storage can prepare empty files before commit; `apply_truncate_table` revalidates and swaps only `storage_id` fields after durable commit. `preflight_add_table_column` and `preflight_drop_table_column` validate schema-evolution changes without mutating state so the server can avoid snapshot fencing for harmless conditional statements. ADD/DROP column rewrites use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as part of the logical schema change, then storage publishes the matching `UpdateTableSchema` record. Renames are metadata-only and keep existing storage ids. `apply_update_table_and_index_schemas` is the recovery path for committed rewrite DDL and validates the replayed table schema together with its carried index schemas before publishing either, so remapped primary-key constraint indexes are checked against the replayed table metadata. Primary-key catalog helpers atomically add or drop the table's primary-key metadata together with the backing primary-key constraint index and reject removal or change while referenced. DROP COLUMN and ALTER COLUMN TYPE reject FK source/referenced columns (except an identical type no-op); table/column renames remain safe because FK metadata stores IDs. `create_view` validates the shared table/view name namespace, assigns a relation ID from `next_table_id`, and stores dependency metadata; `CREATE OR REPLACE VIEW` preserves the relation ID and increments `schema_version`; `drop_view` removes only view metadata. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records so their IDs and rewrite storage IDs are not reused while physical page records, relation-generation files, or logical sequence IDs may have been observed in WAL.
+Empty catalogs start with global allocator high-water values at their documented first IDs. Typed catalog mutation methods retain their existing validation responsibilities. `CatalogChangeSet::between` exposes their complete results as generic objects, and shared atomic apply verifies carried before-images, applies the whole candidate, advances every allocator without rewinding, rebuilds name indexes, and validates the final snapshot. Recovery therefore does not select type-specific catalog mutation APIs from WAL variants.
 
 For multi-table TRUNCATE, `apply_truncate_tables` validates every prepared plan
 against one catalog state, rejects any replacement storage id reused across the
 batch, and publishes the complete set of storage-id swaps under one catalog
 write lock. Storage performs the same global collision check before one-lock
-batch publication. The single-plan apply method remains the recovery path for
-each existing logical WAL record. Transactional top-level commit instead calls
+batch publication. Transactional top-level commit calls
 `apply_truncate_updates` with its prebuilt overlay batch; the method reconstructs
 and validates the equivalent plans against one catalog state, reserves all carried
 storage ids, and atomically publishes every base/TOAST/index schema or none.
@@ -2784,11 +2779,11 @@ each statement.
 
 ### Persistence
 
-The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Loaded into memory on startup. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE, TRUNCATE, schema-evolution ALTER TABLE, CREATE/DROP INDEX, CREATE/DROP SEQUENCE, CREATE/REPLACE/DROP VIEW, dictionaries, and table metadata ALTERs) are durable.
+The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Between checkpoints, generic `CatalogChange` records make every metadata mutation durable; dictionary bytes remain separate.
 
 ### WAL Integration
 
-`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, relation-swap `TRUNCATE`, schema-evolution `UpdateTableSchema`, and table metadata ALTERs including `AlterTablePrimaryKey`, `CreateDictionary`, `AlterTableCompression`, and `AlterTableToast` are logged to the WAL. Conditional table DDL no-ops do not emit logical DDL records. On crash recovery, the catalog is loaded from the control record and updated by replaying committed table/index/sequence/view/dictionary/table-metadata records, committed `TruncateTable`, and committed `UpdateTableSchema`. Aborted/in-flight create, truncate, and schema-rewrite records are not installed, but their IDs or carried storage IDs are reserved so later objects do not reuse file names, storage IDs, or catalog IDs whose orphan records may have been replayed.
+Every catalog mutation is logged as `CatalogChange`; conditional DDL no-ops emit none. Recovery publishes only committed sets but burns allocator high-water from all sets. `CreateDictionary`, page redo, transaction markers, and sequence value changes remain distinct records.
 
 ### Concurrency
 
@@ -2815,8 +2810,8 @@ The `server` crate is the binary entry point.
    every currently referenced dictionary before redo.
 7. Redo-all for records with `LSN > checkpoint_lsn`: apply physical records
    under PageLSN gating regardless of transaction outcome; apply committed
-   logical catalog records; reserve IDs from skipped aborted/in-flight logical
-   records; and replay sequence values unconditionally. The seeded/folded CLOG
+   committed generic catalog changes; reserve allocator high-water from every
+   change; and replay sequence values unconditionally. The seeded/folded CLOG
    decides visibility, and recovery appends no WAL.
 8. Resolve crashed in-flight writers as aborted and perform deferred primary-key
    identity-tree rebuilds.

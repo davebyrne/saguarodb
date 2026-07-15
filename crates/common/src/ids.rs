@@ -10,6 +10,8 @@ pub type ColumnId = u16;
 pub type ColumnObjectId = u32;
 /// Stable PostgreSQL-compatible OID of a built-in scalar function.
 pub type FunctionId = u32;
+/// Globally durable identity of a catalog constraint.
+pub type ConstraintId = u32;
 /// Per-table foreign-key identifier. Values are allocated monotonically and
 /// never reused.
 pub type ForeignKeyId = u16;

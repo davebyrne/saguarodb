@@ -4,8 +4,8 @@ use std::sync::Arc;
 use common::{
     ColumnId, ColumnInfo, DbError, IndexId, IndexSchema, Key, KeyRange, NamespaceSchema, Result,
     Row, RowId, RowIdentity, SchemaId, SequenceId, SequenceSchema, StatementContext, StoredRow,
-    TableId, TableSchema, TruncateCatalogUpdate, TupleLockAcquire, TupleLockMode, TupleLockTag,
-    TupleLockWaitPolicy, ViewSchema,
+    TableId, TableSchema, TupleLockAcquire, TupleLockMode, TupleLockTag, TupleLockWaitPolicy,
+    ViewSchema,
 };
 
 /// Reserve a primary-key value through the transaction-owned tuple lock manager.
@@ -281,6 +281,13 @@ pub trait StorageEngine: Send + Sync {
 }
 
 pub trait SchemaOperations: Send + Sync {
+    /// Append the authoritative generic catalog metadata change before any
+    /// physical operation that depends on it.
+    fn apply_catalog_change(
+        &self,
+        ctx: &StatementContext,
+        change_set: &common::CatalogChangeSet,
+    ) -> Result<()>;
     fn create_schema(&self, ctx: &StatementContext, schema: &NamespaceSchema) -> Result<()>;
     fn drop_schema(&self, ctx: &StatementContext, schema: SchemaId) -> Result<()>;
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
@@ -315,6 +322,49 @@ pub trait SchemaOperations: Send + Sync {
 }
 
 pub trait RecoveryOperations: Send + Sync {
+    /// Reconcile storage metadata from one committed generic catalog change.
+    /// Recovery implementations must not append WAL.
+    fn reconcile_catalog_change(&self, change_set: &common::CatalogChangeSet) -> Result<()> {
+        for mutation in &change_set.mutations {
+            match (&mutation.before, &mutation.after) {
+                (None, Some(common::CatalogObject::Table(schema))) => {
+                    self.apply_create_table(schema.clone())?;
+                }
+                (
+                    Some(common::CatalogObject::Table(_)),
+                    Some(common::CatalogObject::Table(schema)),
+                ) => self.apply_update_table_schema(schema.clone())?,
+                (Some(common::CatalogObject::Table(schema)), None) => {
+                    self.apply_drop_table(schema.id)?;
+                }
+                (None, Some(common::CatalogObject::Index(schema))) => {
+                    self.apply_create_index(schema.clone())?;
+                }
+                (
+                    Some(common::CatalogObject::Index(_)),
+                    Some(common::CatalogObject::Index(schema)),
+                ) => self.apply_update_index_schema(schema.clone())?,
+                (Some(common::CatalogObject::Index(schema)), None) => {
+                    self.apply_drop_index(schema.id)?;
+                }
+                (None, Some(common::CatalogObject::Sequence(schema))) => {
+                    self.apply_create_sequence(schema.clone())?;
+                }
+                (
+                    Some(common::CatalogObject::Sequence(_)),
+                    Some(common::CatalogObject::Sequence(schema)),
+                ) => {
+                    self.apply_drop_sequence(schema.id)?;
+                    self.apply_create_sequence(schema.clone())?;
+                }
+                (Some(common::CatalogObject::Sequence(schema)), None) => {
+                    self.apply_drop_sequence(schema.id)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
     fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
@@ -330,20 +380,6 @@ pub trait RecoveryOperations: Send + Sync {
         value: i64,
         is_called: bool,
     ) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... SET (compression)`: installs the
-    /// updated schema and re-registers file configs. Must not append WAL.
-    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... SET (toast...)`: installs the updated
-    /// schema metadata. Must not append WAL.
-    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
-    /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
-    /// table/index generations produced by catalog replay. Must not append WAL.
-    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
-    /// Recovery apply for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: installs the
-    /// updated schema metadata while WAL is replayed. The derived identity tree is
-    /// rebuilt after the replay pass, once all heap records are applied and
-    /// crashed writers are resolved. Must not append WAL.
-    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()>;
     /// Rebuild the derived storage identity tree from heap rows after recovery
     /// replay has reached a stable final heap state. Must not append WAL.
     fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;

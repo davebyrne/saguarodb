@@ -364,15 +364,36 @@ async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
         .unwrap();
     let create_table_records = records
         .iter()
-        .filter(|record| matches!(record.kind, WalRecordKind::CreateTable { .. }))
+        .flat_map(|record| match &record.kind {
+            WalRecordKind::CatalogChange { change_set } => change_set.mutations.iter(),
+            _ => [].iter(),
+        })
+        .filter(|mutation| {
+            mutation.before.is_none()
+                && matches!(mutation.after, Some(common::CatalogObject::Table(_)))
+        })
         .count();
     let drop_table_records = records
         .iter()
-        .filter(|record| matches!(record.kind, WalRecordKind::DropTable { .. }))
+        .flat_map(|record| match &record.kind {
+            WalRecordKind::CatalogChange { change_set } => change_set.mutations.iter(),
+            _ => [].iter(),
+        })
+        .filter(|mutation| {
+            mutation.after.is_none()
+                && matches!(mutation.before, Some(common::CatalogObject::Table(_)))
+        })
         .count();
     let create_index_records = records
         .iter()
-        .filter(|record| matches!(record.kind, WalRecordKind::CreateIndex { .. }))
+        .flat_map(|record| match &record.kind {
+            WalRecordKind::CatalogChange { change_set } => change_set.mutations.iter(),
+            _ => [].iter(),
+        })
+        .filter(|mutation| {
+            mutation.before.is_none()
+                && matches!(mutation.after, Some(common::CatalogObject::Index(_)))
+        })
         .count();
 
     assert_eq!(create_table_records, 1);
@@ -396,7 +417,7 @@ async fn column_default_survives_restart() {
             .simple_query("insert into t (id) values (1)")
             .await
             .unwrap();
-        // No checkpoint: force recovery to replay the CreateTable WAL record.
+        // No checkpoint: force recovery to replay the table's catalog change.
     }
 
     let server = restart(&path).await;
@@ -522,7 +543,7 @@ async fn expression_default_survives_restart() {
             .simple_query("insert into t (id) values (1)")
             .await
             .unwrap();
-        // No checkpoint: force recovery to replay the CreateTable WAL record.
+        // No checkpoint: force recovery to replay the table's catalog change.
     }
 
     let server = restart(&path).await;
@@ -846,7 +867,7 @@ async fn check_uses_stable_column_identity_after_rename_and_dense_shift() {
             .err()
             .expect("stored CHECK should reject the invalid value");
         assert!(error.message.contains("23514"));
-        // No second checkpoint: restart must replay both UpdateTableSchema
+        // No second checkpoint: restart must replay both catalog changes
         // records while preserving the surviving column object identity.
     }
 
@@ -892,7 +913,7 @@ async fn check_constraint_survives_restart() {
             .simple_query("insert into t (id, n) values (1, 5)")
             .await
             .unwrap();
-        // No checkpoint: force recovery to replay the CreateTable WAL record.
+        // No checkpoint: force recovery to replay the table's catalog change.
     }
 
     let server = restart(&path).await;
@@ -1927,7 +1948,7 @@ async fn alter_table_primary_key_survives_restart() {
             .simple_query("alter table only t add constraint t_pkey primary key (id)")
             .await
             .unwrap();
-        // No checkpoint: recovery must replay AlterTablePrimaryKey and the
+        // No checkpoint: recovery must replay the primary-key catalog change and the
         // primary-key constraint CreateIndex.
     }
 

@@ -48,7 +48,7 @@ explicit constraint-name collisions and allocator capacity, before deciding that
 an existing table makes the statement a no-op. Existing parents are prepared-plan
 schema identities and are held with `AccessShare` while CREATE publishes. The
 table and PK/UNIQUE indexes are installed first; then the complete resolved FK
-batch is attached atomically, and `UpdateTableSchema` persists the final schema
+batch is attached atomically, and the statement's generic `CatalogChange` persists the final schema
 with the current index list. Pre-commit errors roll back the table, indexes,
 TOAST relation, owned sequences, and storage metadata through transactional DDL.
 CREATE remains transaction- and savepoint-aware.
@@ -57,7 +57,7 @@ Standalone ADD resolves both relations again after taking `AccessExclusive` on
 the child and `Share` on the parent. It constructs the proposed FK-bearing schema
 under the catalog publication gate, validates every existing child row through
 the shared executor enforcement service, and persists the complete schema and
-current index list with `UpdateTableSchema`. DROP takes `AccessExclusive` on the
+current index list in the same generic catalog change. DROP takes `AccessExclusive` on the
 child and `AccessShare` on the parent, resolves the name after locking, preserves
 the monotonic allocator, and uses the same durable schema record. Pre-commit
 validation, cancellation, WAL, or storage failures restore catalog/storage state.
@@ -99,7 +99,7 @@ cannot change its identity and that index cannot be dropped while referenced.
 Older catalog formats are rejected rather than normalized. IDs are monotonic
 `u16` values `0..=4095`; `4096` means exhausted and
 dropped IDs are never reused. Recovery installs the complete schema from
-committed `UpdateTableSchema`.
+committed `CatalogChange`.
 
 ## Catalog introspection
 

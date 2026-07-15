@@ -5,8 +5,7 @@ use std::sync::{Arc, RwLock};
 use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
 use common::{
-    DbError, FlushPolicy, PageFlushInfo, RelationKind, Result, RwLockConcurrencyController,
-    SqlState, TableId, TruncateTablePlan,
+    DbError, FlushPolicy, PageFlushInfo, RelationKind, Result, RwLockConcurrencyController, TableId,
 };
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
@@ -17,10 +16,6 @@ use crate::checkpoint::{CheckpointState, cleanup_relation_generation_files, run_
 use crate::config::Config;
 use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
-
-/// Catalog table ids are limited to 16 bits by their compound virtual-OID
-/// representation, so one transaction cannot legitimately drop more tables.
-const MAX_RECOVERY_DROP_BATCH_TABLES: usize = 1 << 16;
 
 pub fn open_app(config: Config) -> Result<AppState> {
     // Shared compression state (`docs/specs/compression.md` §5a/§7): one registry
@@ -114,15 +109,12 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // redo-committed-only filter (`replay_committed_from`), which could not handle
     // the flushed-but-uncommitted pages the relaxed flush gate (D1) now admits.
     //
-    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`TruncateTable`/
-    // `CreateIndex`/`DropIndex` and sequence DDL) are the exception: they mutate
-    // the durable catalog directly (not idempotent PageLSN-gated page bytes), so an
-    // aborted DDL's catalog record must NOT take effect. Transactional DDL records
-    // replay only for committed transactions; aborted/in-flight records are skipped,
-    // gated by the rebuilt CLOG. Skipped CreateTable/CreateIndex/
-    // CreateSequence records still reserve their IDs: their index/heap page records
-    // may replay as orphan files, or their sequence IDs may have been observed in
-    // WAL, and a future object must not reuse those identifiers.
+    // Generic catalog changes are the exception: they mutate the durable catalog
+    // directly (not idempotent PageLSN-gated page bytes), so an aborted DDL's
+    // metadata must NOT take effect. Transactional changes replay only for committed
+    // transactions. The pre-scan below still burns every carried allocation and
+    // registers every referenced physical generation because page redo is outcome
+    // independent and may encounter durable pages belonging to an orphan generation.
     let mut replay_applied = false;
     // Writers whose page mutations were replayed: any of these left InProgress (no
     // durable Commit/Abort) is a crashed in-flight transaction whose versions are on
@@ -131,6 +123,90 @@ pub fn open_app(config: Config) -> Result<AppState> {
     let mut writer_xids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut pending_identity_rebuilds: std::collections::BTreeSet<TableId> =
         std::collections::BTreeSet::new();
+    // Allocations are burned independently of transaction outcome. This pass
+    // also runs before page redo so every later physical record observes the
+    // maximum durable storage-generation reservation carried by catalog WAL.
+    let mut recovery_table_compression = catalog
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.id, table.compression))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut recovery_allocator_high_water = common::CatalogAllocatorHighWater::default();
+    for record in wal.replay_from(checkpoint_lsn)? {
+        let record = record?;
+        if let WalRecordKind::CatalogChange { change_set } = &record.kind {
+            change_set.validate_shape().map_err(|message| {
+                DbError::internal(format!(
+                    "invalid catalog change set during recovery: {message}"
+                ))
+            })?;
+            let mut before_compression = std::collections::HashMap::new();
+            let mut after_compression = std::collections::HashMap::new();
+            let committed = wal.is_committed(record.txn_id);
+            for mutation in &change_set.mutations {
+                if let Some(common::CatalogObject::Table(schema)) = &mutation.before {
+                    storage.register_recovery_table_generation(schema);
+                    before_compression.insert(schema.id, schema.compression);
+                }
+                if let Some(common::CatalogObject::Table(schema)) = &mutation.after {
+                    let reuses_uncommitted_generation = !committed
+                        && matches!(
+                            &mutation.before,
+                            Some(common::CatalogObject::Table(before))
+                                if before.storage_id == schema.storage_id
+                        );
+                    if !reuses_uncommitted_generation {
+                        storage.register_recovery_table_generation(schema);
+                    }
+                    after_compression.insert(schema.id, schema.compression);
+                }
+            }
+            for mutation in &change_set.mutations {
+                if let Some(common::CatalogObject::Index(schema)) = &mutation.before {
+                    let table_compression = before_compression
+                        .get(&schema.table)
+                        .or_else(|| recovery_table_compression.get(&schema.table))
+                        .copied()
+                        .ok_or_else(|| unknown_index_table(schema))?;
+                    storage.register_recovery_index_generation(schema, table_compression);
+                }
+                if let Some(common::CatalogObject::Index(schema)) = &mutation.after {
+                    let reuses_uncommitted_generation = !committed
+                        && matches!(
+                            &mutation.before,
+                            Some(common::CatalogObject::Index(before))
+                                if before.storage_id == schema.storage_id
+                        );
+                    if !reuses_uncommitted_generation {
+                        let table_compression = after_compression
+                            .get(&schema.table)
+                            .or_else(|| recovery_table_compression.get(&schema.table))
+                            .copied()
+                            .ok_or_else(|| unknown_index_table(schema))?;
+                        storage.register_recovery_index_generation(schema, table_compression);
+                    }
+                }
+            }
+            for (table, compression) in after_compression {
+                if committed || !recovery_table_compression.contains_key(&table) {
+                    recovery_table_compression.insert(table, compression);
+                }
+            }
+            if committed {
+                for mutation in &change_set.mutations {
+                    if let Some(common::CatalogObject::Table(schema)) = &mutation.before
+                        && mutation.after.is_none()
+                    {
+                        recovery_table_compression.remove(&schema.id);
+                    }
+                }
+            }
+            catalog::merge_allocator_high_water(
+                &mut recovery_allocator_high_water,
+                &change_set.allocator_high_water,
+            );
+        }
+    }
     for record in wal.replay_from(checkpoint_lsn)? {
         let record = record?;
         if !is_redo_operation(&record.kind) {
@@ -141,62 +217,49 @@ pub fn open_app(config: Config) -> Result<AppState> {
         if record.txn_id != 0 {
             writer_xids.insert(record.txn_id);
         }
-        if is_logical_catalog_record(&record.kind) && !wal.is_committed(record.txn_id) {
+        if let WalRecordKind::CatalogChange { change_set } = &record.kind
+            && !wal.is_committed(record.txn_id)
+        {
             // An aborted/in-flight DDL's catalog mutation must not be applied
             // (redo-all does not hide a non-idempotent catalog change behind the
             // CLOG the way it hides per-tuple versions). Its allocated object ID
             // must still stay burned, because physical page records for that ID
             // may have replayed and future objects map IDs to the same file names.
-            if reserve_catalog_id(catalog.as_ref(), &record.kind)? {
-                replay_applied = true;
-            }
+            // Make this reservation visible immediately: a later committed
+            // mutation's exact before-image may already include the burned
+            // per-relation column/FK high-water.
+            let mut snapshot = catalog.snapshot()?;
+            catalog::reserve_change_allocators(&mut snapshot, &change_set.allocator_high_water);
+            catalog.restore(snapshot)?;
             continue;
         }
-        let primary_key_rebuild = match &record.kind {
-            WalRecordKind::AlterTablePrimaryKey { table_id, .. } => Some(*table_id),
-            _ => None,
-        };
-        let drop_table = match &record.kind {
-            WalRecordKind::DropTable { table } => Some(*table),
-            _ => None,
-        };
-        let redo = apply_redo(
+        if matches!(record.kind, WalRecordKind::CreateDictionary { .. })
+            && !wal.is_committed(record.txn_id)
+        {
+            continue;
+        }
+        let primary_key_rebuilds = catalog_change_identity_rebuilds(&record.kind);
+        apply_redo(
             catalog.as_ref(),
             storage.as_ref(),
             buffer_pool.as_ref(),
             compression.as_ref(),
             dict_store.as_ref(),
             record.kind,
-            ReplayRecordContext {
-                lsn: record.lsn,
-                drop_batch: None,
-            },
-        );
-        if let Err(err) = redo {
-            let Some(table) = drop_table.filter(|_| {
-                err.code == SqlState::DependentObjectsStillExist && wal.is_committed(record.txn_id)
-            }) else {
-                return Err(err);
-            };
-            let batch = committed_drop_batch_for_txn(wal.as_ref(), checkpoint_lsn, record.txn_id)?;
-            apply_redo(
-                catalog.as_ref(),
-                storage.as_ref(),
-                buffer_pool.as_ref(),
-                compression.as_ref(),
-                dict_store.as_ref(),
-                WalRecordKind::DropTable { table },
-                ReplayRecordContext {
-                    lsn: record.lsn,
-                    drop_batch: Some(&batch),
-                },
-            )?;
-        }
-        if let Some(table_id) = primary_key_rebuild {
+            ReplayRecordContext { lsn: record.lsn },
+        )?;
+        for table_id in primary_key_rebuilds {
             pending_identity_rebuilds.insert(table_id);
         }
         replay_applied = true;
     }
+    // Reapply the merged outcome-independent reservation after committed object
+    // replay. Skipped changes were reserved in WAL order above so later exact
+    // before-images can observe their burns; the final merge also carries sparse
+    // reservations for relations created by a later committed change.
+    let mut snapshot = catalog.snapshot()?;
+    catalog::reserve_change_allocators(&mut snapshot, &recovery_allocator_high_water);
+    catalog.restore(snapshot)?;
     if replay_applied {
         validate_referenced_dictionaries(
             catalog.as_ref(),
@@ -291,34 +354,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
     })
 }
 
-fn committed_drop_batch_for_txn(
-    wal: &dyn WalManager,
-    checkpoint_lsn: u64,
-    txn_id: u64,
-) -> Result<Vec<TableId>> {
-    let mut batch = Vec::new();
-    for record in wal.replay_from(checkpoint_lsn)? {
-        let record = record?;
-        if record.txn_id != txn_id {
-            continue;
-        }
-        let WalRecordKind::DropTable { table } = record.kind else {
-            continue;
-        };
-        if batch.len() == MAX_RECOVERY_DROP_BATCH_TABLES {
-            return Err(DbError::internal(format!(
-                "committed transaction {txn_id} exceeds the recovery DROP TABLE batch limit of \
-                 {MAX_RECOVERY_DROP_BATCH_TABLES}"
-            )));
-        }
-        batch.try_reserve(1).map_err(|_| {
-            DbError::internal(format!(
-                "could not allocate recovery DROP TABLE batch for transaction {txn_id}"
-            ))
-        })?;
-        batch.push(table);
-    }
-    Ok(batch)
+fn unknown_index_table(schema: &common::IndexSchema) -> DbError {
+    DbError::internal(format!(
+        "catalog change index {} references unknown table {}",
+        schema.id, schema.table
+    ))
 }
 
 #[allow(dead_code)]
@@ -360,120 +400,36 @@ impl FlushPolicy for WalFlushPolicy {
     }
 }
 
-/// Whether `kind` is a logical catalog mutation (`CreateTable`/`DropTable`/
-/// `CreateIndex`/`DropIndex`/sequence/view DDL). These directly mutate the durable catalog rather
-/// than being idempotent PageLSN-gated page writes, so redo-all gates them by
-/// transaction outcome (only a committed DDL replays); the physical heap/index
-/// page records are not gated.
-fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
-    matches!(
-        kind,
-        WalRecordKind::CreateTable { .. }
-            | WalRecordKind::DropTable { .. }
-            | WalRecordKind::TruncateTable { .. }
-            | WalRecordKind::UpdateTableSchema { .. }
-            | WalRecordKind::CreateIndex { .. }
-            | WalRecordKind::DropIndex { .. }
-            | WalRecordKind::CreateSequence { .. }
-            | WalRecordKind::DropSequence { .. }
-            | WalRecordKind::CreateView { .. }
-            | WalRecordKind::ReplaceView { .. }
-            | WalRecordKind::DropView { .. }
-            | WalRecordKind::CreateSchema { .. }
-            | WalRecordKind::DropSchema { .. }
-            | WalRecordKind::CreateDictionary { .. }
-            | WalRecordKind::AlterTableCompression { .. }
-            | WalRecordKind::AlterTableToast { .. }
-            | WalRecordKind::AlterTablePrimaryKey { .. }
-            | WalRecordKind::UpdateTableStatistics { .. }
-    )
-}
-
-fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Result<bool> {
-    match kind {
-        WalRecordKind::CreateTable { schema } => {
-            catalog.reserve_table_id(schema.id)?;
-            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
-            if let Some(toast_table_id) = schema.toast_table_id {
-                catalog.reserve_table_id(toast_table_id)?;
-            }
-            Ok(true)
-        }
-        WalRecordKind::CreateIndex { schema } => {
-            catalog.reserve_index_id(schema.id)?;
-            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
-            Ok(true)
-        }
-        WalRecordKind::CreateSequence { schema } => {
-            catalog.reserve_sequence_id(schema.id)?;
-            Ok(true)
-        }
-        WalRecordKind::CreateView { schema } => {
-            catalog.reserve_table_id(schema.id)?;
-            Ok(true)
-        }
-        WalRecordKind::CreateSchema { schema } => {
-            catalog.reserve_schema_id(schema.id)?;
-            Ok(true)
-        }
-        WalRecordKind::CreateDictionary { dict_id, .. } => {
-            catalog.reserve_dictionary_id(*dict_id)?;
-            Ok(true)
-        }
-        WalRecordKind::TruncateTable {
-            new_table_storage_id,
-            new_toast_storage_id,
-            new_index_storage_ids,
-            ..
-        } => {
-            catalog.reserve_storage_id(*new_table_storage_id)?;
-            if let Some((_, storage_id)) = new_toast_storage_id {
-                catalog.reserve_storage_id(*storage_id)?;
-            }
-            for (_, storage_id) in new_index_storage_ids {
-                catalog.reserve_storage_id(*storage_id)?;
-            }
-            Ok(true)
-        }
-        WalRecordKind::UpdateTableSchema { schema, indexes } => {
-            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
-            if catalog.get_table(schema.id)?.is_some() {
-                catalog.reserve_foreign_key_allocator(schema.id, schema.next_foreign_key_id)?;
-            }
-            for index in indexes {
-                reserve_storage_id(catalog, index.storage_id, index.id)?;
-            }
-            Ok(true)
-        }
-        WalRecordKind::DropTable { .. }
-        | WalRecordKind::DropIndex { .. }
-        | WalRecordKind::DropSequence { .. }
-        | WalRecordKind::ReplaceView { .. }
-        | WalRecordKind::DropView { .. }
-        | WalRecordKind::DropSchema { .. }
-        | WalRecordKind::AlterTableCompression { .. }
-        | WalRecordKind::AlterTableToast { .. }
-        | WalRecordKind::AlterTablePrimaryKey { .. }
-        | WalRecordKind::UpdateTableStatistics { .. } => Ok(false),
-        _ => Ok(false),
-    }
-}
-
-fn reserve_storage_id(
-    catalog: &dyn CatalogManager,
-    storage_id: common::FileId,
-    legacy_id: common::FileId,
-) -> Result<()> {
-    catalog.reserve_storage_id(if storage_id == 0 {
-        legacy_id
-    } else {
-        storage_id
-    })
-}
-
-struct ReplayRecordContext<'a> {
+struct ReplayRecordContext {
     lsn: u64,
-    drop_batch: Option<&'a [TableId]>,
+}
+
+fn catalog_change_identity_rebuilds(kind: &WalRecordKind) -> Vec<TableId> {
+    let WalRecordKind::CatalogChange { change_set } = kind else {
+        return Vec::new();
+    };
+    change_set
+        .mutations
+        .iter()
+        .filter_map(|mutation| match (&mutation.before, &mutation.after) {
+            (
+                Some(common::CatalogObject::Table(before)),
+                Some(common::CatalogObject::Table(after)),
+            ) if before.primary_key != after.primary_key => Some(after.id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn apply_catalog_change_recovery(
+    catalog: &dyn CatalogManager,
+    storage: &dyn RecoveryOperations,
+    change_set: &common::CatalogChangeSet,
+) -> Result<()> {
+    let before_snapshot = catalog.snapshot()?;
+    let after_snapshot = catalog::apply_catalog_change_set(&before_snapshot, change_set)?;
+    catalog.restore(after_snapshot)?;
+    storage.reconcile_catalog_change(change_set)
 }
 
 fn apply_redo(
@@ -483,7 +439,7 @@ fn apply_redo(
     compression: &compress::CompressionRegistry,
     dict_store: &compress::DictStore,
     kind: WalRecordKind,
-    context: ReplayRecordContext<'_>,
+    context: ReplayRecordContext,
 ) -> Result<()> {
     // Normalize a dict/codec-compressed FPI to a plain raw `FullPageImage` before
     // the match below: the physical arm's OR-pattern binds `file_id`/`page_num`
@@ -508,63 +464,9 @@ fn apply_redo(
         other => other,
     };
     match &kind {
-        WalRecordKind::CreateTable { schema } => {
-            catalog.apply_create_table(schema.clone())?;
-            let installed = catalog.get_table(schema.id)?.ok_or_else(|| {
-                DbError::internal(format!(
-                    "replayed CreateTable for table {} did not install a catalog schema",
-                    schema.id
-                ))
-            })?;
-            storage.apply_create_table(installed)
+        WalRecordKind::CatalogChange { change_set } => {
+            apply_catalog_change_recovery(catalog, storage, change_set)
         }
-        WalRecordKind::UpdateTableSchema { schema, indexes } => {
-            catalog.apply_update_table_and_index_schemas(schema.clone(), indexes)?;
-            for index in indexes {
-                storage.apply_update_index_schema(index.clone())?;
-            }
-            storage.apply_update_table_schema(schema.clone())?;
-            Ok(())
-        }
-        WalRecordKind::DropTable { table } => {
-            if let Some(batch) = context.drop_batch {
-                catalog.apply_drop_table_in_batch(*table, batch)?;
-            } else {
-                catalog.apply_drop_table(*table)?;
-            }
-            storage.apply_drop_table(*table)
-        }
-        WalRecordKind::CreateIndex { schema } => {
-            catalog.apply_create_index(schema.clone())?;
-            let installed = catalog
-                .list_indexes_for_table(schema.table)?
-                .into_iter()
-                .find(|index| index.id == schema.id)
-                .ok_or_else(|| {
-                    DbError::internal(format!(
-                        "replayed CreateIndex for index {} did not install a catalog schema",
-                        schema.id
-                    ))
-                })?;
-            storage.apply_create_index(installed)
-        }
-        WalRecordKind::DropIndex { index } => {
-            catalog.apply_drop_index(*index)?;
-            storage.apply_drop_index(*index)
-        }
-        WalRecordKind::CreateSequence { schema } => {
-            catalog.apply_create_sequence(schema.clone())?;
-            storage.apply_create_sequence(schema.clone())
-        }
-        WalRecordKind::DropSequence { sequence } => {
-            catalog.apply_drop_sequence(*sequence)?;
-            storage.apply_drop_sequence(*sequence)
-        }
-        WalRecordKind::CreateView { schema } => catalog.apply_create_view(schema.clone()),
-        WalRecordKind::ReplaceView { schema } => catalog.apply_replace_view(schema.clone()),
-        WalRecordKind::DropView { view } => catalog.apply_drop_view(*view),
-        WalRecordKind::CreateSchema { schema } => catalog.apply_create_schema(schema.clone()),
-        WalRecordKind::DropSchema { schema } => catalog.apply_drop_schema(*schema),
         WalRecordKind::SequenceAdvance { sequence, value } => {
             storage.apply_sequence_advance(*sequence, *value)
         }
@@ -610,57 +512,6 @@ fn apply_redo(
             dict_store.save(*dict_id, *table_id, bytes)?;
             compression.register_dictionary(*dict_id, bytes)?;
             catalog.reserve_dictionary_id(*dict_id)?;
-            Ok(())
-        }
-        WalRecordKind::AlterTableCompression {
-            table_id,
-            compression: setting,
-            active_dict_id,
-        } => {
-            let schema = catalog.set_table_compression(*table_id, *setting, *active_dict_id)?;
-            storage.apply_set_table_compression(schema)
-        }
-        WalRecordKind::AlterTableToast {
-            table_id,
-            toast,
-            toast_table_id,
-        } => {
-            let schema =
-                catalog.set_table_toast_metadata(*table_id, toast.clone(), *toast_table_id)?;
-            storage.apply_set_table_toast_metadata(schema)
-        }
-        WalRecordKind::TruncateTable {
-            table_id,
-            new_table_storage_id,
-            new_toast_storage_id,
-            new_index_storage_ids,
-        } => {
-            let plan = TruncateTablePlan {
-                table_id: *table_id,
-                new_table_storage_id: *new_table_storage_id,
-                new_toast_storage_id: *new_toast_storage_id,
-                new_index_storage_ids: new_index_storage_ids.clone(),
-            };
-            let update = catalog.apply_truncate_table(&plan)?;
-            storage.apply_truncate_table(update)
-        }
-        WalRecordKind::AlterTablePrimaryKey {
-            table_id,
-            primary_key,
-        } => {
-            let schema = catalog.set_table_primary_key(*table_id, primary_key.clone())?;
-            storage.apply_set_table_primary_key(schema)
-        }
-        WalRecordKind::UpdateTableStatistics {
-            table_id,
-            statistics,
-        } => {
-            // Catalog-only; storage is untouched. The table may have been
-            // dropped later in the log — advisory statistics for it are
-            // simply skipped, never an error.
-            if catalog.get_table(*table_id)?.is_some() {
-                catalog.set_table_statistics(*table_id, statistics.clone())?;
-            }
             Ok(())
         }
         // Normalized away above: `FullPageImageCompressed` never reaches this match
@@ -765,8 +616,21 @@ mod tests {
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
     use catalog::CatalogManager;
-    use storage::RecoveryOperations;
+    use storage::{RecoveryOperations, SchemaOperations};
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    fn catalog_change(
+        catalog: &dyn CatalogManager,
+        mutation: impl FnOnce(&catalog::MemoryCatalog) -> common::Result<()>,
+    ) -> WalRecordKind {
+        let before = catalog.snapshot().unwrap();
+        let staged = catalog::MemoryCatalog::try_from_snapshot(before.clone()).unwrap();
+        mutation(&staged).unwrap();
+        let after = staged.snapshot().unwrap();
+        WalRecordKind::CatalogChange {
+            change_set: catalog::catalog_change_set_between(&before, &after),
+        }
+    }
 
     #[test]
     fn startup_creates_a_writable_spill_directory() {
@@ -811,7 +675,6 @@ mod tests {
     struct CapturingRecoveryOps {
         tables: Mutex<Vec<common::TableSchema>>,
         indexes: Mutex<Vec<common::IndexSchema>>,
-        truncates: Mutex<Vec<common::TruncateCatalogUpdate>>,
     }
 
     impl RecoveryOperations for CapturingRecoveryOps {
@@ -868,30 +731,7 @@ mod tests {
             Ok(())
         }
 
-        fn apply_set_table_compression(&self, _schema: common::TableSchema) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_set_table_toast_metadata(
-            &self,
-            _schema: common::TableSchema,
-        ) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_set_table_primary_key(&self, _schema: common::TableSchema) -> common::Result<()> {
-            Ok(())
-        }
-
         fn apply_rebuild_table_identity(&self, _schema: common::TableSchema) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_truncate_table(
-            &self,
-            update: common::TruncateCatalogUpdate,
-        ) -> common::Result<()> {
-            self.truncates.lock().expect("truncates lock").push(update);
             Ok(())
         }
     }
@@ -907,19 +747,17 @@ mod tests {
 
         let mut legacy_table = table_schema(41, "legacy_table");
         legacy_table.storage_id = 0;
+        legacy_table.primary_key.clear();
         super::apply_redo(
             &catalog,
             &storage,
             &buffer_pool,
             &compression,
             &dict_store,
-            WalRecordKind::CreateTable {
-                schema: legacy_table.clone(),
-            },
-            super::ReplayRecordContext {
-                lsn: 1,
-                drop_batch: None,
-            },
+            catalog_change(&catalog, |staged| {
+                staged.apply_create_table(legacy_table.clone())
+            }),
+            super::ReplayRecordContext { lsn: 1 },
         )
         .unwrap();
 
@@ -952,13 +790,10 @@ mod tests {
             &buffer_pool,
             &compression,
             &dict_store,
-            WalRecordKind::CreateIndex {
-                schema: legacy_index.clone(),
-            },
-            super::ReplayRecordContext {
-                lsn: 2,
-                drop_batch: None,
-            },
+            catalog_change(&catalog, |staged| {
+                staged.apply_create_index(legacy_index.clone())
+            }),
+            super::ReplayRecordContext { lsn: 2 },
         )
         .unwrap();
 
@@ -1061,6 +896,15 @@ mod tests {
                 .catalog
                 .build_truncate_table_update(&plan)
                 .unwrap();
+            let catalog_before = app.components.catalog.snapshot().unwrap();
+            let staged = catalog::MemoryCatalog::try_from_snapshot(catalog_before.clone()).unwrap();
+            staged.apply_truncate_table(&plan).unwrap();
+            let catalog_after = staged.snapshot().unwrap();
+            let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+            app.components
+                .storage
+                .apply_catalog_change(&common::StatementContext::new(41), &change_set)
+                .unwrap();
 
             app.components
                 .storage
@@ -1139,11 +983,15 @@ mod tests {
                 .append(WalRecord {
                     lsn: 0,
                     txn_id: 41,
-                    kind: WalRecordKind::AlterTableToast {
-                        table_id,
-                        toast: updated_toast.clone(),
-                        toast_table_id,
-                    },
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .set_table_toast_metadata(
+                                table_id,
+                                updated_toast.clone(),
+                                toast_table_id,
+                            )
+                            .map(|_| ())
+                    }),
                 })
                 .unwrap();
             app.components
@@ -1202,11 +1050,15 @@ mod tests {
                 .append(WalRecord {
                     lsn: 0,
                     txn_id: 42,
-                    kind: WalRecordKind::AlterTableToast {
-                        table_id,
-                        toast: aborted_toast,
-                        toast_table_id: original_toast_table_id,
-                    },
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .set_table_toast_metadata(
+                                table_id,
+                                aborted_toast,
+                                original_toast_table_id,
+                            )
+                            .map(|_| ())
+                    }),
                 })
                 .unwrap();
             app.components
@@ -1230,11 +1082,15 @@ mod tests {
                 .append(WalRecord {
                     lsn: 0,
                     txn_id: 43,
-                    kind: WalRecordKind::AlterTableToast {
-                        table_id,
-                        toast: in_flight_toast,
-                        toast_table_id: original_toast_table_id,
-                    },
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .set_table_toast_metadata(
+                                table_id,
+                                in_flight_toast,
+                                original_toast_table_id,
+                            )
+                            .map(|_| ())
+                    }),
                 })
                 .unwrap();
             app.components.wal.flush().unwrap();
@@ -1249,6 +1105,231 @@ mod tests {
             .expect("users table exists after recovery");
         assert_eq!(users.toast, original_toast);
         assert_eq!(users.toast_table_id, original_toast_table_id);
+    }
+
+    #[test]
+    fn recovery_keeps_committed_compression_for_aborted_in_place_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            let users = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap();
+            storage_id = users.storage_id;
+
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 44,
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .set_table_compression(users.id, common::CompressionSetting::Zstd, None)
+                            .map(|_| ())
+                    }),
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 44,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened.components.compression.file_config(storage_id),
+            compress::FileCompression::None
+        );
+    }
+
+    #[test]
+    fn recovery_replays_column_allocator_change_before_burning_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            table_id = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .id;
+
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 45,
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .add_table_column(
+                                table_id,
+                                common::ParsedColumnDef {
+                                    name: "active".to_string(),
+                                    data_type: common::DataType::Boolean,
+                                    nullable: true,
+                                    max_length: None,
+                                    default: None,
+                                    pg_type: None,
+                                },
+                            )
+                            .map(|_| ())
+                    }),
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 45,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table(table_id)
+            .unwrap()
+            .unwrap();
+        let active = users
+            .columns
+            .iter()
+            .find(|column| column.name == "active")
+            .unwrap();
+        assert!(users.next_column_object_id > active.object_id);
+    }
+
+    #[test]
+    fn recovery_applies_aborted_column_burn_before_later_table_before_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            table_id = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .id;
+
+            let before = app.components.catalog.snapshot().unwrap();
+            let staged = catalog::MemoryCatalog::try_from_snapshot(before.clone()).unwrap();
+            staged
+                .add_table_column(
+                    table_id,
+                    common::ParsedColumnDef {
+                        name: "discarded".to_string(),
+                        data_type: common::DataType::Boolean,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                )
+                .unwrap();
+            let aborted_change =
+                catalog::catalog_change_set_between(&before, &staged.snapshot().unwrap());
+            let mut live = before;
+            catalog::reserve_change_allocators(&mut live, &aborted_change.allocator_high_water);
+            app.components.catalog.restore(live).unwrap();
+
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 45,
+                    kind: WalRecordKind::CatalogChange {
+                        change_set: aborted_change,
+                    },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 45,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 46,
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .add_table_column(
+                                table_id,
+                                common::ParsedColumnDef {
+                                    name: "retained".to_string(),
+                                    data_type: common::DataType::Boolean,
+                                    nullable: true,
+                                    max_length: None,
+                                    default: None,
+                                    pg_type: None,
+                                },
+                            )
+                            .map(|_| ())
+                    }),
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 46,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table(table_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            users
+                .columns
+                .iter()
+                .all(|column| column.name != "discarded")
+        );
+        let retained = users
+            .columns
+            .iter()
+            .find(|column| column.name == "retained")
+            .unwrap();
+        assert_eq!(retained.object_id, 3);
     }
 
     #[test]
@@ -1277,11 +1358,11 @@ mod tests {
                 .append(WalRecord {
                     lsn: 0,
                     txn_id: 44,
-                    kind: WalRecordKind::AlterTableToast {
-                        table_id,
-                        toast,
-                        toast_table_id,
-                    },
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .set_table_toast_metadata(table_id, toast, toast_table_id)
+                            .map(|_| ())
+                    }),
                 })
                 .unwrap();
             app.components
@@ -1367,12 +1448,13 @@ mod tests {
         let skipped_schema = table_schema(41, "aborted_table");
         {
             let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            let empty = catalog::MemoryCatalog::empty();
             wal.append(WalRecord {
                 lsn: 0,
                 txn_id: 3,
-                kind: WalRecordKind::CreateTable {
-                    schema: skipped_schema.clone(),
-                },
+                kind: catalog_change(&empty, |staged| {
+                    staged.apply_create_table(skipped_schema.clone())
+                }),
             })
             .unwrap();
             wal.append(WalRecord {
@@ -1536,10 +1618,10 @@ mod tests {
                 .append(WalRecord {
                     lsn: 0,
                     txn_id: 42,
-                    kind: WalRecordKind::UpdateTableSchema {
-                        schema: replayed_table,
-                        indexes: vec![replayed_index],
-                    },
+                    kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                        staged
+                            .apply_update_table_and_index_schemas(replayed_table, &[replayed_index])
+                    }),
                 })
                 .unwrap();
             app.components
@@ -1601,12 +1683,13 @@ mod tests {
         };
         {
             let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            let empty = catalog::MemoryCatalog::empty();
             wal.append(WalRecord {
                 lsn: 0,
                 txn_id: 3,
-                kind: WalRecordKind::CreateSequence {
-                    schema: skipped_schema.clone(),
-                },
+                kind: catalog_change(&empty, |staged| {
+                    staged.apply_create_sequence(skipped_schema.clone())
+                }),
             })
             .unwrap();
             wal.append(WalRecord {
@@ -2120,10 +2203,11 @@ mod tests {
             .append(WalRecord {
                 lsn: 0,
                 txn_id,
-                kind: WalRecordKind::UpdateTableStatistics {
-                    table_id,
-                    statistics: users_statistics(),
-                },
+                kind: catalog_change(app.components.catalog.as_ref(), |staged| {
+                    staged
+                        .set_table_statistics(table_id, users_statistics())
+                        .map(|_| ())
+                }),
             })
             .unwrap();
         if let Some(kind) = outcome {
@@ -2205,9 +2289,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let app = AppState::open_for_test(dir.path()).unwrap();
-            // A committed statistics record whose table id never resolves:
-            // advisory data must never fail recovery.
-            append_statistics_record(&app, 42, 9999, Some(WalRecordKind::Commit));
+            let statistics = common::CatalogObject::Statistics {
+                table: 9999,
+                statistics: users_statistics(),
+            };
+            let change_set = common::CatalogChangeSet::between(
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::from([(
+                    common::CatalogObjectId::Statistics(9999),
+                    statistics,
+                )]),
+                common::CatalogAllocatorHighWater::default(),
+            );
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::CatalogChange { change_set },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
         }
 
         let reopened = AppState::open_for_test(dir.path()).unwrap();

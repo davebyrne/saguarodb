@@ -62,6 +62,9 @@ pub struct CatalogSnapshot {
     // before relation generations existed migrate from logical ids.
     #[serde(default = "default_next_storage_id")]
     pub next_storage_id: FileId,
+    /// Reserved global constraint allocator used by generic catalog changes.
+    #[serde(default = "default_next_constraint_id")]
+    pub next_constraint_id: common::ConstraintId,
     // Optimizer statistics per analyzed user table (docs/specs/statistics.md).
     // Defaults so catalogs written before ANALYZE existed still deserialize.
     #[serde(default)]
@@ -87,6 +90,7 @@ impl Default for CatalogSnapshot {
             next_sequence_id: default_next_sequence_id(),
             next_dictionary_id: default_next_dictionary_id(),
             next_storage_id: default_next_storage_id(),
+            next_constraint_id: default_next_constraint_id(),
             statistics: HashMap::new(),
         }
     }
@@ -123,6 +127,10 @@ fn default_next_dictionary_id() -> u32 {
 }
 
 fn default_next_storage_id() -> FileId {
+    1
+}
+
+fn default_next_constraint_id() -> common::ConstraintId {
     1
 }
 
@@ -195,6 +203,33 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_sequence_id = desired.next_sequence_id;
         snapshot.next_dictionary_id = desired.next_dictionary_id;
         snapshot.next_storage_id = desired.next_storage_id;
+        snapshot.next_constraint_id = desired.next_constraint_id;
+        Ok(true)
+    }
+
+    fn claim_change_allocators(
+        &self,
+        expected: CatalogAllocatorState,
+        desired: CatalogAllocatorState,
+        high_water: &common::CatalogAllocatorHighWater,
+    ) -> Result<bool> {
+        if !desired.is_at_least(expected) {
+            return Err(DbError::internal(
+                "catalog allocator claim would rewind an allocator",
+            ));
+        }
+        let mut snapshot = self.write_snapshot()?;
+        if desired != expected && CatalogAllocatorState::from_snapshot(&snapshot) != expected {
+            return Ok(false);
+        }
+        snapshot.next_schema_id = snapshot.next_schema_id.max(desired.next_schema_id);
+        snapshot.next_table_id = snapshot.next_table_id.max(desired.next_table_id);
+        snapshot.next_index_id = snapshot.next_index_id.max(desired.next_index_id);
+        snapshot.next_sequence_id = snapshot.next_sequence_id.max(desired.next_sequence_id);
+        snapshot.next_dictionary_id = snapshot.next_dictionary_id.max(desired.next_dictionary_id);
+        snapshot.next_storage_id = snapshot.next_storage_id.max(desired.next_storage_id);
+        snapshot.next_constraint_id = snapshot.next_constraint_id.max(desired.next_constraint_id);
+        crate::reserve_change_allocators(&mut snapshot, high_water);
         Ok(true)
     }
 
@@ -384,6 +419,7 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_sequence_id = snapshot.next_sequence_id.max(current.next_sequence_id);
         snapshot.next_dictionary_id = snapshot.next_dictionary_id.max(current.next_dictionary_id);
         snapshot.next_storage_id = snapshot.next_storage_id.max(current.next_storage_id);
+        snapshot.next_constraint_id = snapshot.next_constraint_id.max(current.next_constraint_id);
         for (table_id, restored_table) in &mut snapshot.tables_by_id {
             if let Some(current_table) = current.tables_by_id.get(table_id) {
                 restored_table.next_foreign_key_id = restored_table
@@ -1150,6 +1186,7 @@ impl CatalogManager for MemoryCatalog {
             .indexes_by_name
             .insert(index.name.clone(), index.id);
         snapshot.next_index_id = snapshot.next_index_id.max(next_after_index);
+        reserve_storage_id_value(&mut snapshot.next_storage_id, index.storage_id)?;
         snapshot.indexes_by_id.insert(index.id, index);
         Ok(schema)
     }
@@ -4406,7 +4443,7 @@ fn validate_column_default(
         }
         // A non-finite constant default (e.g. `DEFAULT 1e400`, which parses
         // to Infinity) would serialize as JSON `null` in both the manifest's
-        // catalog payload and the CreateTable/UpdateTableSchema WAL records —
+        // catalog payload and generic catalog-change WAL —
         // and `null` fails to deserialize back, making the NEXT STARTUP unable
         // to load the catalog. Reject it before it can become durable. (No
         // valid durable artifact can already contain one: it would never have

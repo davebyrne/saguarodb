@@ -1252,7 +1252,9 @@ impl QueryService {
 fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
     matches!(
         bound,
-        BoundStatement::CreateTable { .. }
+        BoundStatement::CreateSchema { .. }
+            | BoundStatement::DropSchema { .. }
+            | BoundStatement::CreateTable { .. }
             | BoundStatement::DropTable { .. }
             | BoundStatement::AlterTableAddColumn { .. }
             | BoundStatement::AlterTableDropColumn { .. }

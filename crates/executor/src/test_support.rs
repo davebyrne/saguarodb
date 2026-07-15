@@ -336,6 +336,7 @@ impl ExecutorHarness {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
+            allocator_catalog: None,
             storage: self.storage.as_ref(),
             schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -389,6 +390,7 @@ impl ExecutorHarness {
                 .with_sequence_manager(Arc::new(TestSequenceRuntime)),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
+            allocator_catalog: None,
             storage: self.storage.as_ref(),
             schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -416,6 +418,7 @@ impl ExecutorHarness {
             statement: memory_statement_context(0),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
+            allocator_catalog: None,
             storage: self.storage.as_ref(),
             schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -470,6 +473,7 @@ impl ExecutorHarness {
             statement,
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
+            allocator_catalog: None,
             storage: self.storage.as_ref(),
             schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -513,6 +517,7 @@ impl ExecutorHarness {
             statement: memory_statement_context(0),
             relations: self.storage.capture_relation_snapshot()?,
             catalog: self.catalog.clone(),
+            allocator_catalog: None,
             storage: self.storage.as_ref(),
             schema_ops: self.storage.as_ref(),
             gc_horizon: common::FIRST_NORMAL_XID,
@@ -1606,6 +1611,14 @@ impl StorageEngine for MemoryStorage {
 }
 
 impl SchemaOperations for MemoryStorage {
+    fn apply_catalog_change(
+        &self,
+        _ctx: &StatementContext,
+        _change_set: &common::CatalogChangeSet,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn create_schema(
         &self,
         _ctx: &StatementContext,

@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`catalog` owns schema metadata, stable table/column IDs, and name-to-ID resolution for binder. Its persisted form is included in the control record and updated by replaying WAL DDL records for changes after the checkpoint.
+`catalog` owns schema metadata, stable table/column IDs, name-to-ID resolution, generic catalog snapshot diffs, and atomic change-set application. Its persisted form is included in the control record and updated by replaying committed `CatalogChange` WAL records after the checkpoint.
 
 The catalog's internal lock protects data-structure consistency. Separately, the
 server wraps SQL binding/name lookup and system-catalog capture in the shared
@@ -17,13 +17,13 @@ it again to publish the overlay atomically after the Commit record is durable;
 rollback discards the overlay. Startup/recovery precedes user access and does not
 need the gate.
 
-`CatalogOverlay` generalizes that publication model for transactional DDL. It
-stores object replacements and tombstones rather than a frozen whole-catalog
-copy. Materialization starts from the current live catalog, so unrelated commits
-remain visible, then applies transaction-local changes. Object/storage allocator
-reservations advance the live high-water marks immediately (ids are never
-reused), but objects remain private until `publish` performs one validated
-catalog restore while the caller holds the publication gate.
+`CatalogOverlay` stores a journal of generic, versioned change sets rather than
+per-kind delta maps. Materialization starts from the current live catalog and
+applies each journal entry with exact `before` matching, so unrelated commits
+remain visible while conflicting object changes fail. Savepoints capture the
+journal position and allocator state. Object/storage allocator reservations
+advance live high-water immediately and are never rewound; objects remain private
+until `publish` validates and installs the materialized snapshot under the gate.
 
 ## Depends On
 
@@ -92,7 +92,8 @@ foreign key is attached. Hidden TOAST relations carry an empty list and allocato
 `CREATE TABLE` installs its table and declared PK/UNIQUE indexes before calling
 `attach_foreign_keys` once with the fully bound batch. The catalog allocates names
 and IDs atomically, validates the resulting complete snapshot, bumps the child
-schema version, and returns the schema persisted by `UpdateTableSchema`. Failed
+schema version, and returns the schema included in the statement's generic
+catalog change. Failed
 attachment publishes none of the batch; server/executor rollback removes the
 earlier table/index objects. No supporting child index is created implicitly.
 
@@ -433,17 +434,12 @@ pub trait CatalogManager: Send + Sync {
 
 Methods return owned schema copies. The catalog is stored behind an `RwLock`.
 Normal transactional DDL uses `CatalogOverlay` journaling rather than restoring a
-public before-image. `snapshot` and `restore` remain the validated persistence and
-maintenance primitives; `restore` reinstalls the snapshot's object maps but must
-not lower any allocator below the current in-memory high-water mark. Failed DDL
-can leave aborted page/index artifacts behind, so future IDs remain monotonic and
-are never reused. The `reserve_*_id` methods advance only allocator high-water
-marks and install no object maps; recovery uses them for skipped aborted/in-flight
-schema/table/index/sequence/dictionary creates and relation rewrites whose IDs or
-physical files must not be reused. `apply_update_table_and_index_schemas` is the
-committed-recovery path for schema-evolution replay: it validates the replayed
-table schema and all carried index schemas in one candidate snapshot before
-publishing any of them.
+public before-image. `catalog_change_set_between` converts complete snapshots to
+deterministic object-ID-sorted mutations and allocator high-water;
+`apply_catalog_change_set` verifies every current object equals its carried
+`before`, applies all mutations to a candidate, preserves existing allocator
+high-water, validates the complete snapshot, and only then returns it for atomic
+publication. Live publication and recovery share this implementation.
 
 The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
 
@@ -470,12 +466,12 @@ checks reject dropping that exact object even when another eligible constraint
 has the same columns.
 CREATE and standalone ALTER share these mutation primitives. ALTER ADD attaches
 one proposed constraint while the server holds the publication gate, validates
-existing rows before commit, and persists the returned schema through
-`UpdateTableSchema`; ALTER DROP removes the execution-time-resolved name and
+existing rows before commit, and persists the returned schema through a generic
+catalog change; ALTER DROP removes the execution-time-resolved name and
 leaves `next_foreign_key_id` unchanged.
 Catalog restore preserves the greatest per-table FK allocator high-water for
 tables present in both states, just as it preserves global allocators. Recovery
-can advance that same high-water from a skipped `UpdateTableSchema` without
+can advance that same high-water from a skipped `CatalogChange` without
 installing its aborted FK metadata. Table and
 declared-UNIQUE drops reject surviving incoming dependencies. Constraint-index
 creation/update consults the same table-local constraint-name namespace.
@@ -508,14 +504,9 @@ and `drop_tables`: both resolve the complete target set, reject an incoming
 foreign key whose child is outside that set with
 `SqlState::DependentObjectsStillExist`, and permit self-references, cycles, and
 dependencies wholly inside the set. `drop_tables` validates and publishes the
-complete removal atomically. Recovery applies each existing `DropTable` WAL
-record through `apply_drop_table_in_batch` with the committed transaction's
-complete drop set. The first fallback removes every FK edge internal to that
-set, so all cycles in the transaction then replay in record order without
-another dependency fallback. These recovery-only single-record paths validate
-first and mutate the startup-only write-locked snapshot in place, avoiding a
-full catalog clone per WAL record; live `drop_tables` retains atomic
-clone-and-swap publication.
+complete removal atomically. The statement's single `CatalogChange` contains
+every table, index, hidden relation, and owned-sequence removal, so recovery
+validates and applies the complete committed result atomically.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `add_table_column` assigns both the next dense `ColumnId` and the table's next never-reused `ColumnObjectId`. `drop_table_column` may renumber dense ordinals but preserves every surviving stable ID; a CHECK blocks the drop only when its typed tree references the target stable column. Existing index, FK, view, primary-key, and owned-sequence restrictions remain. Table and column renames change names without rewriting stored CHECK/default IR. Public changes increment `schema_version`, and preflight is repeated under the publication and relation locks.
 
@@ -619,8 +610,9 @@ execution. `rename_table`, `add_table_column`, `drop_table_column`, and
 the same no-op/dependency checks without mutating state so the server can avoid
 snapshot fencing for harmless conditional statements. ADD/DROP column rewrites
 use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as
-part of the logical schema change, then storage publishes the matching
-`UpdateTableSchema` record. Renames are metadata-only and keep existing storage
+part of the logical schema change. The caller appends the matching generic
+catalog change before storage initializes physical replacements. Renames are
+metadata-only and keep existing storage
 ids. Table/column renames reject dependent views. Table and column renames allow
 stored CHECK constraints because typed stable-column references, rather than
 canonical SQL, are execution authority. A column drop is blocked only by CHECKs
@@ -653,9 +645,9 @@ indexed, view-dependent, and owned-sequence-default columns.
   catalog indexes created by the executor immediately after the table. The
   primary-key constraint index uses the PostgreSQL-style auto name
   `<table>_pkey`; unique constraints use `<table>_<col...>_key`. Both reuse the
-  normal create-index orchestration (catalog + storage + `CreateIndex` WAL
-  record), and recovery replays the `CreateTable` then `CreateIndex` records in
-  order.
+  normal create-index orchestration. One generic catalog change carries the
+  table, hidden relation, declared indexes, owned sequences, and attached FK
+  metadata atomically before physical relation/index initialization.
 - `create_table_with_options` is the SQL DDL path. Its `compression: CompressionSetting` parameter (binder-resolved from optional `CREATE TABLE ... WITH (compression = ...)`, defaulting to `CompressionSetting::None`) is stored verbatim as `TableSchema.compression`; `active_dict_id` starts `None` — a freshly created `zstd` table is dict-less until an `ALTER` trains a dictionary (`docs/specs/compression.md` §4, §7). Its `toast: ToastOptions` parameter is stored verbatim on the user table after catalog validation. If the user table has at least one `TEXT` or `BYTEA` column, the catalog allocates a second `TableId` and a distinct storage id, stores the table id as `TableSchema.toast_table_id`, and creates a hidden TOAST relation by ID only. The hidden relation name is `"\0toast_<base_table_id>"`; columns are `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`; `compression = none`; `toast = ToastOptions::legacy_catalog_default()`; `toast_table_id = None`; `relation_kind = Toast { base_table }`. The hidden relation is not inserted into the user table name map.
 - `create_table` is a compatibility helper that delegates to `create_table_with_options` with `ToastOptions::legacy_catalog_default()`. New SQL DDL should use `create_table_with_options`.
 - `validate_create_table_definition(name, columns, primary_key, unique)` performs
@@ -665,7 +657,7 @@ indexed, view-dependent, and owned-sequence-default columns.
   suppressing a duplicate-table error for `CREATE TABLE IF NOT EXISTS`, so invalid
   table definitions are still rejected even when the named table already exists.
 - `set_table_toast_metadata(table, toast, toast_table_id)` validates the target is a user table, validates TOAST bounds, validates any supplied hidden relation cross-link, updates `toast` and `toast_table_id` atomically in the catalog snapshot, and reserves `toast.active_dict_id` when present.
-- `set_table_primary_key(table, primary_key)` validates the target is a user table, validates that every `ColumnId` exists and appears once, replaces `TableSchema.primary_key`, increments `TableSchema.schema_version`, and marks those columns non-null. Clearing the primary-key list does not restore earlier nullability. Recovery uses this while replaying `AlterTablePrimaryKey`; normal runtime `ADD PRIMARY KEY` uses the atomic helper below so readers do not observe a table primary key without its backing constraint index.
+- `set_table_primary_key(table, primary_key)` validates the target is a user table, validates that every `ColumnId` exists and appears once, replaces `TableSchema.primary_key`, increments `TableSchema.schema_version`, and marks those columns non-null. Clearing the primary-key list does not restore earlier nullability. Recovery applies the table replacement from generic catalog WAL; normal runtime `ADD PRIMARY KEY` uses the atomic helper below so readers do not observe a table primary key without its backing constraint index.
 - `add_table_primary_key_index(table, primary_key, index)` atomically installs `TableSchema.primary_key` and the backing primary-key constraint index in the same catalog snapshot. It validates the target is a user table with no current primary key, validates the primary-key columns, validates the supplied index name/id/table/columns/constraint metadata, marks key columns non-null, increments `TableSchema.schema_version`, and advances the index allocator.
 - `drop_table_primary_key_index(table, index)` atomically clears `TableSchema.primary_key`, increments `TableSchema.schema_version`, and removes the named primary-key constraint index from the same catalog snapshot. It is the runtime `ALTER TABLE ... DROP PRIMARY KEY` path, so readers never observe a table with `primary_key = []` while the old primary-key constraint index is still catalog-visible. Former primary-key columns remain non-null.
 
@@ -703,37 +695,31 @@ indexed, view-dependent, and owned-sequence-default columns.
 - `IndexId` is assigned from `next_index_id`, starting at `PRIMARY_KEY_INDEX_ID + 1`; `storage_id` is assigned independently from `next_storage_id`.
 - The `unique` flag and constraint kind (`None`, `Unique`, or `PrimaryKey`) are recorded here; duplicate-value rejection for unique indexes happens at the storage layer, not in the catalog. A primary-key constraint index must be unique and must cover exactly the table's primary-key columns.
 - `drop_index` rejects primary-key constraint indexes with `SqlState::DependentObjectsStillExist`; dropping the primary key itself is an `ALTER TABLE` operation.
-- Dropping a table cascades in the catalog to remove every index on that table and, when the table has a hidden TOAST relation, the hidden relation metadata and its indexes. Owned SERIAL sequences are removed by separate `DropSequence` records emitted by the executor in the same statement. The cascade runs on the recovery `apply_drop_table` path, so the durable `DropTable` record alone restores table/index/hidden-TOAST catalog state while the sibling `DropSequence` records restore owned-sequence state.
+- Dropping a table cascades in the catalog to remove every index on that table and, when the table has a hidden TOAST relation, the hidden relation metadata and its indexes. Owned SERIAL sequences are removed in the same catalog mutation. The durable generic change carries the complete object removal and recovery applies it atomically.
 
 ## Catalog Persistence
 
-The catalog snapshot is deterministic JSON format version `3` inside the control record. Unversioned and older catalog formats are rejected explicitly; development data directories are rebuilt rather than migrated. Catalog input and output are capped at 64 MiB. Transaction-local catalog mutation rejects growth past that durable limit with `ProgramLimitExceeded` before recording or publishing its overlay, so every successful catalog mutation remains checkpointable and reopenable. Validation requires unique nonzero stable column IDs below each relation's allocator, validates every stored-expression version/shape/reference and its bounded lists, requires each constant or stored-expression default to match its owning column type, and rejects unknown column, function, or sequence identities as catalog corruption. Canonical expression SQL is retained but is not execution authority.
+The catalog snapshot is deterministic JSON format version `3` inside the control record. Unversioned, older, and pre-foundation v3 layouts without the required typed-catalog allocator fields are rejected explicitly; development data directories are rebuilt rather than migrated. Catalog input and output are capped at 64 MiB. Transaction-local catalog mutation rejects growth past that durable limit with `ProgramLimitExceeded` before recording or publishing its overlay, so every successful catalog mutation remains checkpointable and reopenable. Validation requires unique nonzero stable column IDs below each relation's allocator, validates every stored-expression version/shape/reference and its bounded lists, requires each constant or stored-expression default to match its owning column type, and rejects unknown column, function, or sequence identities as catalog corruption. Canonical expression SQL is retained but is not execution authority.
 
-The schema maps and `next_schema_id` also carry serde defaults for snapshots
-written before namespaces existed: loading supplies the mandatory `public`
-schema and starts user allocation at `FIRST_USER_SCHEMA_ID`. Snapshot validation
-requires `public` to retain its fixed id/name, schema name/id maps to be
-bidirectionally consistent with unique names and ids, and `next_schema_id` to be
-greater than every installed schema id.
+Snapshot validation requires `public` to retain its fixed id/name, schema
+name/id maps to be bidirectionally consistent with unique names and ids, and
+`next_schema_id` to be greater than every installed schema id.
 
 `TableSchema.foreign_keys` and `next_foreign_key_id` remain durable fields in
-catalog v3. Older payload compatibility is intentionally not provided.
-The exact referenced constraint-index ID is also serde-defaulted for specialized
-schema-record decoding; a zero value is resolved from the referenced columns
-during schema-record application. New metadata always persists the nonzero actual
-constraint-index ID, including for primary keys.
+catalog v3. Older payload compatibility is intentionally not provided. New
+metadata always persists the nonzero actual referenced constraint-index ID,
+including for primary keys.
 
 On startup:
 
 1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
-3. Recovery replays every committed post-checkpoint logical catalog record,
-   including schema, table/schema-evolution, index, sequence, view, dictionary,
-   TRUNCATE generation, compression, TOAST, and primary-key changes. Records
-   with a storage representation update both catalog and storage. Aborted or
-   in-flight create/rewrite records are not installed, but recovery still calls
-   the matching `reserve_*_id` methods so IDs and storage generations are never
-   reused.
+3. Recovery pre-scans all post-checkpoint `CatalogChange` records to merge
+   their global and per-relation stable-column/legacy-FK allocator high-water,
+   regardless of commit state. During LSN-order replay, skipped changes install
+   their reservations immediately so later exact before-images observe burned
+   IDs; only committed object mutations are applied. The merged reservation is
+   reapplied after replay for relations created after an earlier sparse entry.
 
 Transactional catalog mutations update the private overlay immediately; only
 allocator high-water reservations update the live catalog before commit. WAL
@@ -757,13 +743,14 @@ metadata are `InternalError` corruption.
 
 ## WAL Interaction
 
-All catalog-changing SQL is logged with logical DDL records: CREATE/DROP for
-schemas, tables, indexes, and sequences; CREATE/REPLACE/DROP for views; table
-schema evolution; and relation-generation, dictionary, compression, TOAST, and
-primary-key changes. The exact record variants and payload contracts are
-authoritative in `docs/specs/crates/wal.md`.
-The executor/storage orchestration must stage catalog and storage mutations under
-the same transaction and make them durable at top-level commit.
+All catalog-changing SQL uses `WalRecordKind::CatalogChange`; specialized
+schema/table/view/index/sequence/statistics/ALTER metadata records do not exist.
+The statement captures its transaction catalog before state, performs existing
+typed catalog validation, diffs the result, appends the change set before
+dependent physical work, and publishes only after durable commit. Dictionary
+bytes, page redo, transaction markers, and non-transactional sequence values
+remain separate WAL responsibilities. The exact record contract is authoritative
+in `docs/specs/crates/wal.md`.
 
 If normal DDL fails after staging catalog changes, an explicit transaction enters
 the failed state. Transaction rollback discards all staged state; an explicit

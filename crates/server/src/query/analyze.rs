@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use catalog::{CatalogManager, MemoryCatalog};
 use common::{
     ColumnId, ColumnStatistics, DbError, NDistinct, OrderedF64, QueryCancel, RelationKind, Result,
     Row, SqlState, StatementContext, TableSchema, TableStatistics, Value, value_is_finite,
@@ -365,8 +366,8 @@ impl QueryService {
     /// statistics for one named user table or every user table, under
     /// `AccessShare` target locks (writers keep flowing; concurrent ANALYZE of
     /// the same table is a benign last-committed-wins race), and publish them
-    /// durably — one `UpdateTableStatistics` WAL record per table plus the
-    /// catalog update, in one maintenance transaction whose `Commit` is
+    /// durably — one generic catalog change containing every target, in one
+    /// maintenance transaction whose `Commit` is
     /// flushed before success is reported. A crash mid-pass applies none of
     /// the targets.
     pub(super) fn run_analyze_pass(
@@ -483,9 +484,11 @@ impl QueryService {
             }
         }
 
-        // Publish under the catalog publication gate: WAL record before the
-        // in-memory catalog update (WAL-before-state, like DDL). The codec
-        // and set_table_statistics both refuse non-finite payloads.
+        // Publish and make the commit durable under the catalog publication
+        // gate. A concurrent ANALYZE may collect in parallel, but it must not
+        // capture this transaction's `after` image as its own durable `before`
+        // until this commit is recoverable. The codec and
+        // set_table_statistics both refuse non-finite payloads.
         {
             let _catalog_write = match components.catalog_publication_gate.write() {
                 Ok(guard) => guard,
@@ -494,30 +497,50 @@ impl QueryService {
                     return Err(DbError::internal("catalog publication gate poisoned"));
                 }
             };
-            for (schema, statistics) in tables.iter().zip(&collected) {
-                if let Err(err) = components.wal.append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::UpdateTableStatistics {
-                        table_id: schema.id,
-                        statistics: statistics.clone(),
-                    },
-                }) {
+            let catalog_before = match components.catalog.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
                 }
-                if let Err(err) = components
-                    .catalog
-                    .set_table_statistics(schema.id, statistics.clone())
-                {
+            };
+            let staged = match MemoryCatalog::try_from_snapshot(catalog_before.clone()) {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            for (schema, statistics) in tables.iter().zip(&collected) {
+                if let Err(err) = staged.set_table_statistics(schema.id, statistics.clone()) {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
                 }
             }
-        }
-        if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
-            self.rollback_pre_durable_or_die(txn_id, None);
-            return Err(err);
+            let catalog_after = match staged.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+            if let Err(err) = components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::CatalogChange { change_set },
+            }) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            if let Err(err) = components.catalog.restore(catalog_after) {
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+                return Err(err);
+            }
+            if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+                return Err(err);
+            }
         }
         if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
             fatal_after_durable_maintenance_commit(components, err);
@@ -576,19 +599,19 @@ pub(crate) fn checkpoint_auto_analyze(components: &ServerComponents) -> Result<(
             .catalog_publication_gate
             .write()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        let catalog_before = components.catalog.snapshot()?;
+        let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone())?;
         for (schema, statistics) in tables.iter().zip(&collected) {
-            components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::UpdateTableStatistics {
-                    table_id: schema.id,
-                    statistics: statistics.clone(),
-                },
-            })?;
-            components
-                .catalog
-                .set_table_statistics(schema.id, statistics.clone())?;
+            staged.set_table_statistics(schema.id, statistics.clone())?;
         }
+        let catalog_after = staged.snapshot()?;
+        let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+        components.wal.append(WalRecord {
+            lsn: 0,
+            txn_id,
+            kind: WalRecordKind::CatalogChange { change_set },
+        })?;
+        components.catalog.restore(catalog_after)?;
         Ok(())
     })();
     if let Err(err) = result {

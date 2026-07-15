@@ -282,20 +282,17 @@ the checkpoint path, which writes them into the catalog snapshot baseline.
 
 ### 4.3 WAL records (`wal`)
 
-Four new logical record kinds, encoded like the existing logical DDL records
-(JSON payloads):
+Sequence create/drop metadata is carried as `CatalogObject::Sequence` inside
+the generic `CatalogChange`. The two non-transactional value records remain:
 
 ```rust
-CreateSequence { schema: SequenceSchema }     // CLOG-gated (txn-scoped, like DDL)
-DropSequence   { sequence: SequenceId }       // CLOG-gated
 SequenceAdvance { sequence: SequenceId, value: i64 }       // UNCONDITIONAL replay
 SetSequenceValue { sequence: SequenceId, value: i64, is_called: bool } // UNCONDITIONAL
 ```
 
-**Replay gating is the crux of gap semantics.** `CreateSequence`/`DropSequence`
-are part of a transaction (a `CREATE SEQUENCE`, or the `CREATE TABLE` that
-desugars `SERIAL`); they are replayed only if that transaction committed, exactly
-like `CreateTable`/`DropTable`. `SequenceAdvance`/`SetSequenceValue` are
+**Replay gating is the crux of gap semantics.** Sequence catalog mutations are
+part of a transaction and publish only from a committed `CatalogChange`.
+`SequenceAdvance`/`SetSequenceValue` are
 **non-transactional**: recovery applies them regardless of the surrounding
 transaction's commit/abort, fast-forwarding each sequence to the maximum
 advanced value (and the last `setval`). This is what guarantees a value handed
@@ -316,8 +313,8 @@ operation; recovery never appends WAL (`docs/specs/crates/wal.md`).
   the snapshot baseline before writing the control record, and WAL truncation
   proceeds as today.
 - **Recovery:** load sequence definitions + baseline values from the manifest;
-  reserve sequence ids; replay post-checkpoint WAL — install committed
-  `CreateSequence`, remove committed `DropSequence`, and unconditionally
+  reserve sequence ids from all catalog allocator high-water values; apply
+  committed sequence mutations, and unconditionally
   fast-forward each surviving sequence past every `SequenceAdvance` / last
   `SetSequenceValue`. No value is ever reissued.
 
@@ -385,8 +382,8 @@ stores no table reference (`owned: bool` only, §4.1) — so the order is simply
   1. Choose each owned sequence name from the current catalog under the DDL guard:
      `<table>_<column>_seq`, appending the smallest free numeric suffix if taken.
      For each request, `catalog.create_sequence(...)` (increment 1, start 1, min
-     1, max `i64::MAX`, no cycle, `owned: true`) → `SequenceId`, appending a
-     `CreateSequence` WAL record. The record is final — it carries no table id.
+     1, max `i64::MAX`, no cycle, `owned: true`) → `SequenceId`. The final
+     sequence objects are included with the table in one generic catalog change.
   2. Set each SERIAL column's default to internal
      `ParsedDefault::OwnedNextval(<generated name>)`.
   3. `catalog.create_table_with_options(...)`, which resolves explicit `Nextval(name)`
@@ -396,7 +393,7 @@ stores no table reference (`owned: bool` only, §4.1) — so the order is simply
 
 Because the sequences and table are created in the same autocommit transaction,
 they share its commit/abort outcome — if `CREATE TABLE` aborts, neither exists
-(the `CreateSequence` records are CLOG-gated to the same txn).
+(the containing `CatalogChange` is CLOG-gated to that txn).
 
 A SERIAL column may participate in a (possibly composite) `PRIMARY KEY` or a
 `UNIQUE` constraint — both now exist — with no special handling: the default
@@ -405,8 +402,8 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 **Ownership rules:**
 
 - `DROP TABLE t` cascade-drops its owned sequences: for each column of `t` whose
-  default is `ColumnDefault::Nextval(s)` with `catalog.sequence(s).owned`, emit a
-  `DropSequence` record alongside `DropTable` in the same transaction.
+  default is `ColumnDefault::Nextval(s)` with `catalog.sequence(s).owned`, include
+  the sequence removal with the table removal in the same catalog change.
 - `DROP SEQUENCE s` where `s.owned` → dependency error. To name the owning table
   the catalog scans tables for the column whose default is `Nextval(s)` (rare op;
   a linear scan is fine). `IF EXISTS` suppresses the not-found case, not this one.
@@ -483,9 +480,9 @@ A single implementation plan, sequenced as independently testable commits:
    lower and evaluate the stored default. Existing DEFAULT tests stay green;
    `Nextval` has no producer yet.
 2. **Sequence catalog object + DDL.** `SequenceId`/`SequenceSchema`, catalog
-   map + allocator + recovery hooks, manifest field, `CreateSequence`/
-   `DropSequence` WAL records, `CREATE`/`DROP SEQUENCE` parsing and server DDL
-   dispatch, recovery replay. No functions yet.
+   map + allocator + recovery hooks, manifest field, generic catalog WAL,
+   `CREATE`/`DROP SEQUENCE` parsing and server DDL dispatch, recovery replay. No
+   functions yet.
 3. **Functions + runtime.** `SequenceManager` with WAL-logged advance/setval and
    recovery fast-forward, `nextval`/`currval`/`setval` evaluation, session
    state + `StatementContext` threading, write-path routing for

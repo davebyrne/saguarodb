@@ -86,8 +86,8 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // Checkpoint auto-analyze (`docs/specs/statistics.md` §10): when enough
     // committed rows changed since the last pass, re-collect statistics for
     // every user table. Like the auto-prune above, it runs BEFORE
-    // `wal.flush()` and the catalog snapshot: its `UpdateTableStatistics`
-    // records are flushed by this checkpoint and sit below `checkpoint_lsn`,
+    // `wal.flush()` and the catalog snapshot: its generic catalog change is
+    // flushed by this checkpoint and sits below `checkpoint_lsn`,
     // and the manifest written below carries the fresh statistics — so
     // truncating those records is safe (their effect is already durable).
     let analyze_threshold = components.config.auto_analyze_changed_rows;

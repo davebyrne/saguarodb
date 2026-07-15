@@ -3891,10 +3891,11 @@ mod tests {
     };
     use common::{
         CancelReason, CatalogIntrospectionProvider, ColumnDefault, ConcurrencyController, DbError,
-        FlushPolicy, ForeignKeyAction, IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo,
-        ParsedColumnDef, PgType, QueryCancel, RelationKind, Result, RwLockConcurrencyController,
-        SequenceId, SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState,
-        TableId, TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
+        FlushPolicy, ForeignKeyAction, IndexConstraintKind, IndexId, IndexSchema, IsolationLevel,
+        Lsn, PageFlushInfo, ParsedColumnDef, PgType, QueryCancel, RelationKind, Result,
+        RwLockConcurrencyController, SequenceId, SequenceOptions, SequenceSchema, SessionInfo,
+        SessionSequenceState, SqlState, TableId, TableSchema, ToastCompression, ToastMode, TxnId,
+        TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -4585,9 +4586,9 @@ mod tests {
 
     impl WalManager for FailingAbortWal {
         fn append(&self, record: WalRecord) -> Result<Lsn> {
-            if matches!(record.kind, WalRecordKind::TruncateTable { .. })
+            if matches!(record.kind, WalRecordKind::CatalogChange { .. })
                 && self.fail_second_truncate.load(Ordering::SeqCst)
-                && self.truncate_records.fetch_add(1, Ordering::SeqCst) == 1
+                && self.truncate_records.fetch_add(1, Ordering::SeqCst) == 0
             {
                 self.fail_second_truncate.store(false, Ordering::SeqCst);
                 return Err(DbError::io("injected second TRUNCATE append failure"));
@@ -5536,6 +5537,118 @@ mod tests {
     }
 
     #[test]
+    fn analyze_commit_failure_restores_uncommitted_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let wal: Arc<dyn WalManager> = failing_wal.clone();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table analyzed (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into analyzed values (1)")
+            .unwrap();
+        let table = app
+            .components
+            .catalog
+            .get_table_by_name("analyzed")
+            .unwrap()
+            .unwrap();
+
+        failing_wal.fail_next_commit();
+        let error = app
+            .query_service
+            .execute_sql("analyze analyzed")
+            .unwrap_err();
+        assert!(error.message.contains("injected Commit append failure"));
+        assert_eq!(
+            app.components
+                .catalog
+                .get_table_statistics(table.id)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn aborted_add_primary_key_burns_storage_id_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let wal: Arc<dyn WalManager> = failing_wal.clone();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        app.query_service
+            .execute_sql("create table primary_key_later (id integer not null)")
+            .unwrap();
+        let planned_storage_id = app.components.catalog.snapshot().unwrap().next_storage_id;
+
+        failing_wal.fail_next_commit();
+        let error = app
+            .query_service
+            .execute_sql("alter table primary_key_later add primary key (id)")
+            .unwrap_err();
+        assert!(error.message.contains("injected Commit append failure"));
+        assert!(
+            app.components.catalog.snapshot().unwrap().next_storage_id > planned_storage_id,
+            "the live allocator must retain the failed index generation"
+        );
+
+        drop(app);
+        drop(failing_wal);
+        let recovered = crate::recovery::open_app(Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(
+            recovered
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_storage_id
+                > planned_storage_id,
+            "recovery must reserve the aborted index generation"
+        );
+        recovered
+            .query_service
+            .execute_sql("alter table primary_key_later add primary key (id)")
+            .unwrap();
+        let table = recovered
+            .components
+            .catalog
+            .get_table_by_name("primary_key_later")
+            .unwrap()
+            .unwrap();
+        let index = recovered
+            .components
+            .catalog
+            .list_indexes_for_table(table.id)
+            .unwrap()
+            .into_iter()
+            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .expect("primary-key index");
+        assert_ne!(index.storage_id, planned_storage_id);
+    }
+
+    #[test]
     fn direct_query_helpers_reject_copy_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -5646,7 +5759,10 @@ mod tests {
             slot,
             &cancel,
         );
-        assert!(result.is_err(), "the injected second prepare must fail");
+        assert!(
+            result.is_err(),
+            "the injected catalog change append must fail"
+        );
         assert_eq!(slot_status(&slot), SessionTxnStatus::Failed);
 
         let (slot, result) = app
@@ -6736,6 +6852,41 @@ mod tests {
                 .get_schema_by_name("app")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_allocator_claims_preserve_later_autocommit_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let cancel = Arc::new(QueryCancel::new());
+
+        app.query_service
+            .execute_sql("create schema removed")
+            .unwrap();
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("drop schema removed", slot, &cancel);
+        result.unwrap();
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+
+        app.query_service
+            .execute_sql("create schema preserved")
+            .unwrap();
+        assert!(
+            app.components
+                .catalog
+                .get_schema_by_name("preserved")
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -8130,16 +8281,36 @@ mod tests {
         ] {
             app.query_service.execute_sql(sql).unwrap();
         }
+        let allocator_before = app.components.catalog.snapshot().unwrap();
 
         let err = app
             .query_service
             .execute_sql("create unique index users_name on users (name)")
             .unwrap_err();
-        assert_eq!(err.code, SqlState::UniqueViolation);
+        assert_eq!(err.code, SqlState::UniqueViolation, "{}", err.message);
+        let allocator_after = app.components.catalog.snapshot().unwrap();
+        assert!(allocator_after.next_index_id > allocator_before.next_index_id);
+        assert!(allocator_after.next_storage_id > allocator_before.next_storage_id);
         // The rolled-back create left no index behind, so a non-unique one succeeds.
         app.query_service
             .execute_sql("create index users_name on users (name)")
             .unwrap();
+        let users = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let users_name = app
+            .components
+            .catalog
+            .list_indexes_for_table(users.id)
+            .unwrap()
+            .into_iter()
+            .find(|index| index.name == "users_name")
+            .expect("replacement index");
+        assert!(users_name.id >= allocator_after.next_index_id);
+        assert!(users_name.storage_id >= allocator_after.next_storage_id);
 
         let executor::ExecutionResult::Query { rows, .. } = app
             .query_service
@@ -8152,6 +8323,63 @@ mod tests {
             rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
             vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_transactional_index_backfill_burns_shared_allocators() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "insert into users (id, name) values (1, 'Ada')",
+            "insert into users (id, name) values (2, 'Ada')",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+        let allocator_before = app.components.catalog.snapshot().unwrap();
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple_default(
+            "create unique index users_name on users (name)",
+            slot,
+            &cancel,
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation, "{}", err.message);
+
+        let allocator_after_failure = app.components.catalog.snapshot().unwrap();
+        assert!(allocator_after_failure.next_index_id > allocator_before.next_index_id);
+        assert!(allocator_after_failure.next_storage_id > allocator_before.next_storage_id);
+
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+
+        app.query_service
+            .execute_sql("create index users_name on users (name)")
+            .unwrap();
+        let users = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let users_name = app
+            .components
+            .catalog
+            .list_indexes_for_table(users.id)
+            .unwrap()
+            .into_iter()
+            .find(|index| index.name == "users_name")
+            .expect("replacement index");
+        assert!(users_name.id >= allocator_after_failure.next_index_id);
+        assert!(users_name.storage_id >= allocator_after_failure.next_storage_id);
     }
 
     #[tokio::test]
@@ -9054,11 +9282,17 @@ mod tests {
                 .filter_map(std::result::Result::ok)
                 .any(|record| {
                     app.components.wal.is_committed(record.txn_id)
-                        && matches!(
-                            record.kind,
-                            WalRecordKind::AlterTablePrimaryKey { table_id, .. }
-                                if table_id == parent.id
-                        )
+                        && matches!(record.kind, WalRecordKind::CatalogChange { ref change_set }
+                        if change_set.mutations.iter().any(|mutation| {
+                            matches!(
+                                (&mutation.before, &mutation.after),
+                                (
+                                    Some(common::CatalogObject::Table(before)),
+                                    Some(common::CatalogObject::Table(after)),
+                                ) if before.id == parent.id
+                                    && before.primary_key != after.primary_key
+                            )
+                        }))
                 })
         );
     }

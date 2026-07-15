@@ -339,9 +339,9 @@ parked queries are allowed.
 Transactional TRUNCATE is a physical generation swap:
 
 1. Resolve, sort, lock, and revalidate every target before allocating storage ids.
-2. Prepare all replacement heap/identity-index/secondary-index/TOAST files and
-   append the existing per-table logical `TruncateTable` WAL records under the
-   transaction's current writing xid.
+2. Append one generic catalog change carrying all replacement generations under
+   the transaction's current writing xid, then prepare the replacement
+   heap/identity-index/secondary-index/TOAST files.
 3. Record storage before-images and add replacement schemas to the transaction's
    catalog overlay without changing public catalog maps.
 4. Install the storage replacement generations without appending/flushing Commit.
@@ -374,8 +374,8 @@ SSI failure, or commit-flush failure discards the overlay, restores old storage
 generations, retires/removes replacements, and releases locks only afterward.
 
 Replacement storage ids remain burned after rollback, matching existing recovery
-rules. Recovery applies committed `TruncateTable` records and later physical COPY/
-DML redo in WAL order. In-flight/aborted truncate records are skipped for catalog
+rules. Recovery applies committed catalog changes and later physical COPY/DML
+redo in WAL order. In-flight/aborted changes are skipped for catalog
 publication while their replacement storage ids remain reserved.
 
 For TRUNCATE beneath a savepoint, `ROLLBACK TO` restores the prior catalog overlay,

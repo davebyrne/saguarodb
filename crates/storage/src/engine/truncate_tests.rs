@@ -430,6 +430,18 @@ fn prepare_truncate_logs_logical_record_before_physical_pages() {
     let plan = truncate_plan();
     let update = truncate_update();
 
+    let change_set = common::CatalogChangeSet {
+        version: common::CATALOG_CHANGE_SET_VERSION,
+        mutations: vec![common::CatalogMutation {
+            before: None,
+            after: Some(common::CatalogObject::Table(update.table.clone())),
+        }],
+        allocator_high_water: common::CatalogAllocatorHighWater::default(),
+    };
+    fixture
+        .engine
+        .apply_catalog_change(&ctx(400), &change_set)
+        .unwrap();
     fixture
         .engine
         .prepare_truncate_table(&ctx(400), &plan, &update)
@@ -439,12 +451,12 @@ fn prepare_truncate_logs_logical_record_before_physical_pages() {
     assert!(
         matches!(
             records.first(),
-            Some(WalRecordKind::TruncateTable {
-                table_id: TABLE_ID,
-                new_table_storage_id: NEW_BASE_STORAGE_ID,
-                new_toast_storage_id: Some((TOAST_TABLE_ID, NEW_TOAST_STORAGE_ID)),
-                ..
-            })
+            Some(WalRecordKind::CatalogChange { change_set })
+                if matches!(
+                    change_set.mutations.first().and_then(|mutation| mutation.after.as_ref()),
+                    Some(common::CatalogObject::Table(schema))
+                        if schema.id == TABLE_ID && schema.storage_id == NEW_BASE_STORAGE_ID
+                )
         ),
         "first truncate WAL record was {records:?}"
     );
@@ -464,6 +476,18 @@ fn schema_rewrite_logs_logical_record_before_physical_pages() {
     schema.schema_version += 1;
     let index = name_index(NEW_NAME_INDEX_STORAGE_ID);
 
+    let change_set = common::CatalogChangeSet {
+        version: common::CATALOG_CHANGE_SET_VERSION,
+        mutations: vec![common::CatalogMutation {
+            before: None,
+            after: Some(common::CatalogObject::Table(schema.clone())),
+        }],
+        allocator_high_water: common::CatalogAllocatorHighWater::default(),
+    };
+    fixture
+        .engine
+        .apply_catalog_change(&ctx(401), &change_set)
+        .unwrap();
     fixture
         .engine
         .update_table_schema(&ctx(401), &schema, std::slice::from_ref(&index))
@@ -473,12 +497,12 @@ fn schema_rewrite_logs_logical_record_before_physical_pages() {
     assert!(
         matches!(
             records.first(),
-            Some(WalRecordKind::UpdateTableSchema {
-                schema: logged_schema,
-                indexes,
-            }) if logged_schema.storage_id == NEW_BASE_STORAGE_ID
-                && indexes.len() == 1
-                && indexes[0].storage_id == NEW_NAME_INDEX_STORAGE_ID
+            Some(WalRecordKind::CatalogChange { change_set })
+                if matches!(
+                    change_set.mutations.first().and_then(|mutation| mutation.after.as_ref()),
+                    Some(common::CatalogObject::Table(logged_schema))
+                        if logged_schema.storage_id == NEW_BASE_STORAGE_ID
+                )
         ),
         "first schema rewrite WAL record was {records:?}"
     );

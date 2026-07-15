@@ -347,11 +347,10 @@ dictionary file, which is harmless and whose id startup reserves (§7).
 3. If the new setting is `zstd` and the table has data: train a dictionary
    from current heap page images; persist the dict file (§7). If training
    is skipped/fails, `active_dict_id` becomes `None`.
-4. Append + flush WAL: `CreateDictionary` (if trained) and a logical
-   `AlterTableCompression { table_id, compression, active_dict_id }` DDL
-   record, then the commit record (immediate-commit maintenance DDL).
-   Recovery applies `AlterTableCompression` to the catalog CLOG-gated,
-   exactly like other DDL records.
+4. Append + flush WAL: `CreateDictionary` (if trained), then the generic
+   `CatalogChange` carrying the rewritten table/index generations, then the
+   commit record (immediate-commit maintenance DDL). Recovery applies the
+   catalog change only when its transaction committed.
 5. Update the in-memory catalog and the store's file configs (heap + all
    index files of the table).
 6. **Rewrite pass (an FPI per page — torn-page repair, exactly like
@@ -540,8 +539,8 @@ crate boundaries as the implementation:
   compression config registration, TOAST row preparation/materialization,
   TOAST-aware VACUUM helpers, and `rewrite_table_pages`.
 - `docs/specs/crates/wal.md` owns the durable record shapes
-  `FullPageImageCompressed`, `CreateDictionary`, `AlterTableCompression`, and
-  `AlterTableToast`, plus replay ordering.
+  `FullPageImageCompressed`, `CreateDictionary`, and `CatalogChange`, plus replay
+  ordering.
 - `docs/specs/crates/catalog.md` owns durable table compression metadata,
   TOAST metadata, hidden TOAST relation metadata, and dictionary-id allocation.
 - `docs/specs/crates/parser.md` owns `CREATE TABLE ... WITH (...)`,

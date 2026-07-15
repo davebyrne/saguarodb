@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, atomic::Ordering};
 
-use catalog::CatalogManager;
+use catalog::{CatalogManager, MemoryCatalog};
 use common::{
     DbError, IsolationLevel, PUBLIC_SCHEMA_ID, QualifiedName, QueryCancel, RelationKind, Result,
     SqlState, SsiTracker, StatementContext, TableSchema, TruncateTablePlan,
 };
 use executor::ExecutionResult;
 use parser::Statement;
+use storage::SchemaOperations;
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::lock_manager::{CatalogLockMode, ObjectLockRequest, RelationLockMode};
@@ -154,6 +155,36 @@ impl QueryService {
             let ctx = StatementContext::new(txn_id)
                 .with_tuple_lock_manager(components.lock_manager.clone())
                 .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
+            let catalog_before = match components.catalog.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let staged = match MemoryCatalog::try_from_snapshot(catalog_before.clone()) {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = staged.apply_truncate_tables(&plans) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            let catalog_after = match staged.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+            let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+            if let Err(err) = components.storage.apply_catalog_change(&ctx, &change_set) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
             for (plan, update) in plans.iter().zip(&updates) {
                 if let Err(err) = components
                     .storage
@@ -177,8 +208,8 @@ impl QueryService {
                 return Err(err);
             }
 
-            let committed_updates = match components.catalog.apply_truncate_tables(&plans) {
-                Ok(updates) => updates,
+            let committed_updates = match components.catalog.restore(catalog_after) {
+                Ok(()) => updates,
                 Err(err) => self.fatal_after_durable_commit(err),
             };
             if let Err(err) = components
@@ -292,6 +323,18 @@ impl QueryService {
         // transaction rollback state. From this point onward even a failed
         // statement must take the write-abort path.
         txn.has_writes = true;
+        let catalog_before = catalog.snapshot()?;
+        let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone())?;
+        staged.apply_truncate_tables(&plans)?;
+        let mut catalog_after = staged.snapshot()?;
+        let allocator_snapshot = self.components.catalog.snapshot()?;
+        catalog_after.next_storage_id = catalog_after
+            .next_storage_id
+            .max(allocator_snapshot.next_storage_id);
+        let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+        self.components
+            .storage
+            .apply_catalog_change(&ctx, &change_set)?;
         for (plan, update) in plans.iter().zip(&updates) {
             self.components
                 .storage

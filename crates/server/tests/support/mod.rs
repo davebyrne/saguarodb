@@ -878,7 +878,7 @@ pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Append a durable `CreateSchema` without a transaction outcome so recovery
+/// Append a durable schema catalog change without a transaction outcome so recovery
 /// must skip the object while still reserving its id.
 pub fn write_uncommitted_schema_for_test(path: &Path, schema_id: u32) -> Result<()> {
     fs::create_dir_all(path).map_err(|err| {
@@ -888,14 +888,29 @@ pub fn write_uncommitted_schema_for_test(path: &Path, schema_id: u32) -> Result<
         ))
     })?;
     let wal = FileWalManager::open(path.join("wal.dat"))?;
+    let schema = common::NamespaceSchema {
+        id: schema_id,
+        name: "crashed_schema".to_string(),
+    };
+    let after = BTreeMap::from([(
+        common::CatalogObjectId::Schema(schema_id),
+        common::CatalogObject::Schema(schema),
+    )]);
+    let allocator_high_water = common::CatalogAllocatorHighWater {
+        next_schema_id: schema_id
+            .checked_add(1)
+            .ok_or_else(|| common::DbError::internal("test schema id overflow"))?,
+        ..common::CatalogAllocatorHighWater::default()
+    };
     wal.append(WalRecord {
         lsn: 0,
         txn_id: common::FIRST_NORMAL_XID,
-        kind: WalRecordKind::CreateSchema {
-            schema: common::NamespaceSchema {
-                id: schema_id,
-                name: "crashed_schema".to_string(),
-            },
+        kind: WalRecordKind::CatalogChange {
+            change_set: common::CatalogChangeSet::between(
+                &BTreeMap::new(),
+                &after,
+                allocator_high_water,
+            ),
         },
     })?;
     wal.flush()?;

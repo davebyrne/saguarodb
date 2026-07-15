@@ -366,7 +366,7 @@ pub struct ColumnDef {
     #[serde(default)]
     pub max_length: Option<u32>,
     /// The column `DEFAULT` applied when an `INSERT`/`COPY` omits the column.
-    /// Persisted with the catalog and replayed via the `CreateTable` WAL record.
+    /// Persisted inside its relation object and replayed through catalog changes.
     #[serde(default)]
     pub default: Option<ColumnDefault>,
     /// The declared PostgreSQL wire type, persisted so the column reports the same

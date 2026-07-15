@@ -140,7 +140,13 @@ mod tests {
         let record = WalRecord {
             lsn: 3,
             txn_id: 9,
-            kind: WalRecordKind::DropTable { table: 7 },
+            kind: WalRecordKind::CatalogChange {
+                change_set: common::CatalogChangeSet {
+                    version: common::CATALOG_CHANGE_SET_VERSION,
+                    mutations: Vec::new(),
+                    allocator_high_water: common::CatalogAllocatorHighWater::default(),
+                },
+            },
         };
 
         let bytes = encode_record(&record).unwrap();

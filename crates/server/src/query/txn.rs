@@ -1106,7 +1106,14 @@ impl QueryService {
                 .runtime
                 .with_catalog_introspection(introspection, false);
         }
-        self.execution_context_with_catalog(input, self.components.catalog.clone())
+        let mut context =
+            self.execution_context_with_catalog(input, self.components.catalog.clone())?;
+        // This path holds the catalog publication gate and mutates the shared
+        // catalog directly, so its mutation itself claims allocator high-water
+        // before physical DDL. Only transaction-local statement catalogs need
+        // the separate shared allocator claim in `mutate_catalog`.
+        context.allocator_catalog = None;
+        Ok(context)
     }
 
     pub(super) fn execution_context_for_bound<'a>(
@@ -1210,6 +1217,7 @@ impl QueryService {
             statement,
             relations,
             catalog,
+            allocator_catalog: Some(self.components.catalog.as_ref()),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,

@@ -9,7 +9,8 @@
 
 ## Owns
 
-- Stable identifiers: `SchemaId`, `TableId`, `ColumnId`, `ForeignKeyId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
+- Stable identifiers: `SchemaId`, `TableId`, `ColumnObjectId`, `ConstraintId`, `FunctionId`, `ForeignKeyId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`; `ColumnId` remains the dense runtime/storage ordinal.
+- Generic catalog durability types: `CatalogObjectId`, `CatalogObject`, `CatalogMutation`, `CatalogAllocatorHighWater`, and versioned `CatalogChangeSet`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
 - The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
@@ -46,8 +47,8 @@
   by VACUUM (Milestone F) rather than by snapshot-relative reads.
 - Optimizer statistics types collected by ANALYZE (`docs/specs/statistics.md`):
   `TableStatistics`, `ColumnStatistics`, and `NDistinct`. Durable catalog
-  state — they ride inside the catalog JSON snapshot and the
-  `UpdateTableStatistics` WAL record (`docs/specs/statistics.md` §4).
+  state — they ride inside the catalog JSON snapshot and the statistics object
+  of a generic `CatalogChange` WAL record (`docs/specs/statistics.md` §4).
   Fractions use `OrderedF64` so the types keep `Eq` for the
   WAL record enum. `TableStatistics.columns` is a
   `BTreeMap<ColumnId, ColumnStatistics>` (deterministic serialization), and
@@ -67,6 +68,9 @@ pub type SchemaId = u32;
 pub const PUBLIC_SCHEMA_ID: SchemaId = 1;
 pub const FIRST_USER_SCHEMA_ID: SchemaId = 2;
 pub type ColumnId = u16;
+pub type ColumnObjectId = u32;
+pub type ConstraintId = u32;
+pub type FunctionId = u32;
 pub type IndexId = u32;
 pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;
@@ -98,6 +102,17 @@ pub enum Value {
     Array(SqlArray), // homogeneous rectangular SQL array, row-major elements
 }
 ```
+
+`CatalogObjectId` addresses schemas, tables/hidden relations, views, indexes,
+sequences, reserved constraint identities, statistics, and nested stable columns.
+`CatalogObject` carries complete replaceable object values; columns remain nested
+inside table/view schemas. `CatalogChangeSet::between` produces deterministic,
+object-ID-sorted before/after mutations and carries global plus per-relation
+stable-column and legacy foreign-key allocator high-water. `validate_shape`
+rejects unknown versions, empty/no-op or mismatched mutations,
+unsorted/duplicate identities, non-finite statistics, reserved constraint
+objects, and over-limit mutation/column-allocator collections. Durable decoding
+applies those collection limits before growing the decoded vectors/maps.
 
 `SqlArray::new` validates rectangular shape, scalar element types, signed
 dimension bounds, and the canonical zero-dimensional empty representation. It

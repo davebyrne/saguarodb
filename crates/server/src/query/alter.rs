@@ -4,8 +4,8 @@ use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
     ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema,
     IsolationLevel, QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext,
-    TableId, TableOptionPatch, TableSchema, ToastCompression, ToastOptions, WriteGuard,
-    needs_toast_relation, toast_schema,
+    TableId, TableOptionPatch, TableSchema, ToastCompression, WriteGuard, needs_toast_relation,
+    toast_schema,
 };
 use executor::{ExecutionContext, ExecutionResult, validate_existing_foreign_keys};
 use parser::{ParsedForeignKey, Statement};
@@ -28,23 +28,24 @@ const TOAST_DICT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 struct ToastAlterPostCommit {
     table_id: TableId,
-    toast: ToastOptions,
-    toast_table_id: Option<TableId>,
     hidden_schema: Option<TableSchema>,
+    catalog_after: catalog::CatalogSnapshot,
+    change_set: common::CatalogChangeSet,
 }
 
 enum PrimaryKeyAlterPostCommit {
     Add {
         txn_id: u64,
         schema: TableSchema,
-        index: IndexSchema,
         gc_horizon: u64,
+        catalog_after: catalog::CatalogSnapshot,
     },
     Drop {
         txn_id: u64,
         schema: TableSchema,
         index_id: IndexId,
         gc_horizon: u64,
+        catalog_after: catalog::CatalogSnapshot,
     },
 }
 
@@ -517,23 +518,25 @@ impl QueryService {
                     }
                 }
 
+                let catalog_before = components.catalog.snapshot()?;
+                let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone())?;
+                staged.set_table_compression(schema.id, compression, active_dict_id)?;
+                let catalog_after = staged.snapshot()?;
+                let change_set =
+                    catalog::catalog_change_set_between(&catalog_before, &catalog_after);
                 // 4. DDL record + immediate commit, flushed durable before any page
                 // image can reference the new state. THIS is the durable commit
                 // point: everything above (and this block) is rolled back on error.
                 components.wal.append(WalRecord {
                     lsn: 0,
                     txn_id,
-                    kind: WalRecordKind::AlterTableCompression {
-                        table_id: schema.id,
-                        compression,
-                        active_dict_id,
-                    },
+                    kind: WalRecordKind::CatalogChange { change_set },
                 })?;
                 cancel.check()?;
-                Ok(active_dict_id)
+                Ok(catalog_after)
             })();
-            let active_dict_id = match pre_commit {
-                Ok(active_dict_id) => active_dict_id,
+            let catalog_after = match pre_commit {
+                Ok(prepared) => prepared,
                 Err(err) => {
                     self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                     return Err(err);
@@ -547,11 +550,9 @@ impl QueryService {
             // Post-durable-commit cleanup: install + rewrite + fsync. Any error
             // from here on is fatal (process exit) rather than a statement
             // error — see the doc comment above.
-            if let Err(err) = self.finish_alter_table_compression_after_commit(
-                schema.id,
-                compression,
-                active_dict_id,
-            ) {
+            if let Err(err) =
+                self.finish_alter_table_compression_after_commit(schema.id, catalog_after)
+            {
                 self.fatal_after_durable_commit(err);
             }
             if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
@@ -581,16 +582,15 @@ impl QueryService {
     fn finish_alter_table_compression_after_commit(
         &self,
         table_id: TableId,
-        compression: CompressionSetting,
-        active_dict_id: Option<u32>,
+        catalog_after: catalog::CatalogSnapshot,
     ) -> Result<()> {
         let components = &self.components;
 
         // 5. Install in catalog + engine/registry.
-        let schema =
-            components
-                .catalog
-                .set_table_compression(table_id, compression, active_dict_id)?;
+        components.catalog.restore(catalog_after)?;
+        let schema = components.catalog.get_table(table_id)?.ok_or_else(|| {
+            DbError::internal("committed compression table is missing from catalog")
+        })?;
         components.storage.set_table_compression(&schema)?;
 
         // 6-8. Rewrite: re-encode every page, logging a FullPageImage per page
@@ -668,14 +668,21 @@ impl QueryService {
             if let Err(err) = components.wal.append(WalRecord {
                 lsn: 0,
                 txn_id,
-                kind: WalRecordKind::AlterTableToast {
-                    table_id: post_commit.table_id,
-                    toast: post_commit.toast.clone(),
-                    toast_table_id: post_commit.toast_table_id,
+                kind: WalRecordKind::CatalogChange {
+                    change_set: post_commit.change_set.clone(),
                 },
             }) {
                 self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                 return Err(err);
+            }
+            if let Some(hidden) = &post_commit.hidden_schema {
+                let ctx = StatementContext::new(txn_id)
+                    .with_tuple_lock_manager(components.lock_manager.clone())
+                    .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
+                if let Err(err) = components.storage.create_table(&ctx, hidden) {
+                    self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
+                    return Err(err);
+                }
             }
             if let Err(err) = cancel.check() {
                 self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
@@ -752,7 +759,6 @@ impl QueryService {
             base.toast_table_id = Some(toast_table_id);
             let mut hidden = toast_schema(&base, toast_table_id);
             hidden.storage_id = toast_storage_id;
-            components.storage.create_table(&ctx, &hidden)?;
             Some(hidden)
         } else {
             None
@@ -762,11 +768,19 @@ impl QueryService {
             .map(|schema| schema.id)
             .or(schema.toast_table_id);
 
+        let catalog_before = components.catalog.snapshot()?;
+        let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone())?;
+        if let Some(hidden) = &hidden_schema {
+            staged.apply_create_table(hidden.clone())?;
+        }
+        staged.set_table_toast_metadata(schema.id, toast.clone(), toast_table_id)?;
+        let catalog_after = staged.snapshot()?;
+        let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
         Ok(ToastAlterPostCommit {
             table_id: schema.id,
-            toast,
-            toast_table_id,
             hidden_schema,
+            catalog_after,
+            change_set,
         })
     }
 
@@ -784,14 +798,11 @@ impl QueryService {
 
     fn finish_alter_table_toast_after_commit(&self, post: ToastAlterPostCommit) -> Result<()> {
         let components = &self.components;
-        if let Some(hidden_schema) = post.hidden_schema {
-            components.catalog.apply_create_table(hidden_schema)?;
-        }
-        let schema = components.catalog.set_table_toast_metadata(
-            post.table_id,
-            post.toast,
-            post.toast_table_id,
-        )?;
+        components.catalog.restore(post.catalog_after)?;
+        let schema = components
+            .catalog
+            .get_table(post.table_id)?
+            .ok_or_else(|| DbError::internal("committed TOAST table is missing from catalog"))?;
         components.storage.set_table_toast_metadata(&schema)
     }
 
@@ -857,14 +868,14 @@ impl QueryService {
                 };
                 Ok::<_, DbError>((primary_key, new_schema, gc_horizon, index, catalog_snapshot))
             })();
-            let (primary_key, new_schema, gc_horizon, index, catalog_snapshot) = match prepared {
+            let (_primary_key, new_schema, gc_horizon, index, catalog_snapshot) = match prepared {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
                 }
             };
-            let catalog_before = Some(catalog_snapshot);
+            let catalog_before = Some(catalog_snapshot.clone());
 
             let pre_commit = (|| {
                 let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
@@ -875,20 +886,26 @@ impl QueryService {
                 )?;
                 components.catalog.reserve_index_id(index.id)?;
                 components.catalog.reserve_storage_id(index.storage_id)?;
+                let staged = MemoryCatalog::try_from_snapshot(catalog_snapshot.clone())?;
+                staged.add_table_primary_key_index(
+                    schema.id,
+                    new_schema.primary_key.clone(),
+                    index.clone(),
+                )?;
+                let catalog_after = staged.snapshot()?;
+                let change_set =
+                    catalog::catalog_change_set_between(&catalog_snapshot, &catalog_after);
                 components.wal.append(WalRecord {
                     lsn: 0,
                     txn_id,
-                    kind: WalRecordKind::AlterTablePrimaryKey {
-                        table_id: schema.id,
-                        primary_key,
-                    },
+                    kind: WalRecordKind::CatalogChange { change_set },
                 })?;
                 components.storage.create_index(&ctx, &index, gc_horizon)?;
                 Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Add {
                     txn_id,
                     schema: new_schema,
-                    index,
                     gc_horizon,
+                    catalog_after,
                 })
             })();
 
@@ -974,6 +991,7 @@ impl QueryService {
                     statement,
                     relations: captured.relations,
                     catalog: proposed_catalog,
+                    allocator_catalog: Some(components.catalog.as_ref()),
                     storage: components.storage.as_ref(),
                     schema_ops: components.storage.as_ref(),
                     gc_horizon,
@@ -992,6 +1010,12 @@ impl QueryService {
                         "validated foreign-key schema differs from live catalog attachment",
                     ));
                 }
+                let catalog_after = components.catalog.snapshot()?;
+                let change_set =
+                    catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+                components
+                    .storage
+                    .apply_catalog_change(&execution.statement, &change_set)?;
                 components.storage.update_table_schema(
                     &execution.statement,
                     &attached,
@@ -1128,6 +1152,9 @@ impl QueryService {
                 components.gc_horizon(),
                 cancel.clone(),
             );
+            let catalog_after = components.catalog.snapshot()?;
+            let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+            components.storage.apply_catalog_change(&ctx, &change_set)?;
             components
                 .storage
                 .update_table_schema(&ctx, &dropped, &indexes)
@@ -1249,7 +1276,7 @@ impl QueryService {
                 return Err(err);
             }
         };
-        let catalog_before = Some(catalog_snapshot);
+        let catalog_before = Some(catalog_snapshot.clone());
         let pre_commit = (|| {
             components
                 .catalog
@@ -1258,24 +1285,21 @@ impl QueryService {
             components
                 .storage
                 .validate_table_primary_key_change(&ctx, &new_schema, gc_horizon)?;
+            let staged = MemoryCatalog::try_from_snapshot(catalog_snapshot.clone())?;
+            staged.drop_table_primary_key_index(schema.id, index.id)?;
+            let catalog_after = staged.snapshot()?;
+            let change_set = catalog::catalog_change_set_between(&catalog_snapshot, &catalog_after);
             components.wal.append(WalRecord {
                 lsn: 0,
                 txn_id,
-                kind: WalRecordKind::AlterTablePrimaryKey {
-                    table_id: schema.id,
-                    primary_key: Vec::new(),
-                },
-            })?;
-            components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::DropIndex { index: index.id },
+                kind: WalRecordKind::CatalogChange { change_set },
             })?;
             Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Drop {
                 txn_id,
                 schema: new_schema,
                 index_id: index.id,
                 gc_horizon,
+                catalog_after,
             })
         })();
         let post_commit = match pre_commit {
@@ -1370,8 +1394,8 @@ impl QueryService {
             PrimaryKeyAlterPostCommit::Add {
                 txn_id,
                 schema,
-                index,
                 gc_horizon,
+                catalog_after,
             } => {
                 self.components
                     .ssi_manager
@@ -1380,11 +1404,14 @@ impl QueryService {
                     .storage
                     .set_table_primary_key_logged(&schema, gc_horizon, txn_id)?;
                 self.components.wal.flush()?;
-                let committed_schema = self.components.catalog.add_table_primary_key_index(
-                    schema.id,
-                    schema.primary_key.clone(),
-                    index,
-                )?;
+                self.components.catalog.restore(catalog_after)?;
+                let committed_schema =
+                    self.components
+                        .catalog
+                        .get_table(schema.id)?
+                        .ok_or_else(|| {
+                            DbError::internal("committed primary-key table is missing from catalog")
+                        })?;
                 self.components
                     .storage
                     .set_table_primary_key_metadata(&committed_schema)
@@ -1394,11 +1421,16 @@ impl QueryService {
                 schema,
                 index_id,
                 gc_horizon,
+                catalog_after,
             } => {
-                let committed_schema = self
-                    .components
-                    .catalog
-                    .drop_table_primary_key_index(schema.id, index_id)?;
+                self.components.catalog.restore(catalog_after)?;
+                let committed_schema =
+                    self.components
+                        .catalog
+                        .get_table(schema.id)?
+                        .ok_or_else(|| {
+                            DbError::internal("committed primary-key table is missing from catalog")
+                        })?;
                 self.components
                     .ssi_manager
                     .promote_table_identity_locks_to_relation(schema.id);

@@ -1,34 +1,24 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
-use common::{
-    DbError, IndexId, IndexSchema, NamespaceSchema, PUBLIC_SCHEMA_ID, RelationKind, Result,
-    SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, ViewSchema,
-};
+use common::{CatalogAllocatorHighWater, CatalogChangeSet, DbError, Result};
 
 use crate::{
-    CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog, serialize_catalog,
+    CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog,
+    apply_catalog_change_set, catalog_change_set_between, merge_allocator_high_water,
+    reserve_change_allocators, serialize_catalog,
 };
 
 #[derive(Clone, Default)]
-struct CatalogDelta {
-    schemas: BTreeMap<SchemaId, Option<NamespaceSchema>>,
-    tables: BTreeMap<TableId, Option<TableSchema>>,
-    views: BTreeMap<TableId, Option<ViewSchema>>,
-    indexes: BTreeMap<IndexId, Option<IndexSchema>>,
-    sequences: BTreeMap<SequenceId, Option<SequenceSchema>>,
-    next_schema_id: SchemaId,
-    next_table_id: TableId,
-    next_index_id: IndexId,
-    next_sequence_id: SequenceId,
-    next_dictionary_id: u32,
-    next_storage_id: u32,
+struct CatalogJournal {
+    change_sets: Vec<CatalogChangeSet>,
+    allocator_high_water: CatalogAllocatorHighWater,
 }
 
 #[derive(Clone)]
-pub struct CatalogOverlaySavepoint(CatalogDelta);
+pub struct CatalogOverlaySavepoint {
+    journal_len: usize,
+    allocator_high_water: CatalogAllocatorHighWater,
+}
 
 /// Writable transaction-local catalog state.
 ///
@@ -38,23 +28,23 @@ pub struct CatalogOverlaySavepoint(CatalogDelta);
 /// catalog publication gate while publishing the resulting snapshot.
 pub struct CatalogOverlay {
     base: Arc<dyn CatalogManager>,
-    delta: RwLock<CatalogDelta>,
+    journal: RwLock<CatalogJournal>,
 }
 
 impl CatalogOverlay {
     pub fn new(base: Arc<dyn CatalogManager>) -> Self {
         Self {
             base,
-            delta: RwLock::new(CatalogDelta::default()),
+            journal: RwLock::new(CatalogJournal::default()),
         }
     }
 
     pub fn snapshot(&self) -> Result<CatalogSnapshot> {
-        let delta = self
-            .delta
+        let journal = self
+            .journal
             .read()
             .map_err(|_| DbError::internal("catalog overlay read lock poisoned"))?;
-        materialize(self.base.snapshot()?, &delta)
+        materialize(self.base.snapshot()?, &journal)
     }
 
     pub fn catalog(&self) -> Result<MemoryCatalog> {
@@ -62,11 +52,11 @@ impl CatalogOverlay {
     }
 
     pub fn apply<T>(&self, mutation: impl FnOnce(&MemoryCatalog) -> Result<T>) -> Result<T> {
-        let mut delta = self
-            .delta
+        let mut journal = self
+            .journal
             .write()
             .map_err(|_| DbError::internal("catalog overlay write lock poisoned"))?;
-        let before = materialize(self.base.snapshot()?, &delta)?;
+        let before = materialize(self.base.snapshot()?, &journal)?;
         let expected = CatalogAllocatorState::from_snapshot(&before);
         let catalog = MemoryCatalog::try_from_snapshot(before.clone())?;
         let result = mutation(&catalog)?;
@@ -76,13 +66,22 @@ impl CatalogOverlay {
         // reopened under the durable decoder's matching limit.
         serialize_catalog(&after)?;
         let desired = CatalogAllocatorState::from_snapshot(&after);
-        if !self.base.claim_allocators(expected, desired)? {
+        let change_set = catalog_change_set_between(&before, &after);
+        if !self.base.claim_change_allocators(
+            expected,
+            desired,
+            &change_set.allocator_high_water,
+        )? {
             return Err(DbError::plan(
                 common::SqlState::SerializationFailure,
                 "catalog allocators changed concurrently; retry the statement",
             ));
         }
-        record_changes(&mut delta, &before, &after);
+        merge_allocator_high_water(
+            &mut journal.allocator_high_water,
+            &change_set.allocator_high_water,
+        );
+        journal.change_sets.push(change_set);
         Ok(result)
     }
 
@@ -91,32 +90,39 @@ impl CatalogOverlay {
     }
 
     pub fn is_empty(&self) -> Result<bool> {
-        let delta = self
-            .delta
+        let journal = self
+            .journal
             .read()
             .map_err(|_| DbError::internal("catalog overlay read lock poisoned"))?;
-        Ok(delta.schemas.is_empty()
-            && delta.tables.is_empty()
-            && delta.views.is_empty()
-            && delta.indexes.is_empty()
-            && delta.sequences.is_empty())
+        Ok(journal.change_sets.is_empty())
     }
 
     pub fn savepoint(&self) -> Result<CatalogOverlaySavepoint> {
-        Ok(CatalogOverlaySavepoint(
-            self.delta
-                .read()
-                .map_err(|_| DbError::internal("catalog overlay read lock poisoned"))?
-                .clone(),
-        ))
+        let journal = self
+            .journal
+            .read()
+            .map_err(|_| DbError::internal("catalog overlay read lock poisoned"))?;
+        Ok(CatalogOverlaySavepoint {
+            journal_len: journal.change_sets.len(),
+            allocator_high_water: journal.allocator_high_water.clone(),
+        })
     }
 
     pub fn rollback_to(&self, savepoint: &CatalogOverlaySavepoint) -> Result<()> {
-        *self
-            .delta
+        let mut journal = self
+            .journal
             .write()
-            .map_err(|_| DbError::internal("catalog overlay write lock poisoned"))? =
-            savepoint.0.clone();
+            .map_err(|_| DbError::internal("catalog overlay write lock poisoned"))?;
+        if savepoint.journal_len > journal.change_sets.len() {
+            return Err(DbError::internal(
+                "catalog overlay savepoint is ahead of the mutation journal",
+            ));
+        }
+        journal.change_sets.truncate(savepoint.journal_len);
+        merge_allocator_high_water(
+            &mut journal.allocator_high_water,
+            &savepoint.allocator_high_water,
+        );
         Ok(())
     }
 
@@ -125,119 +131,13 @@ impl CatalogOverlay {
     }
 }
 
-fn materialize(mut snapshot: CatalogSnapshot, delta: &CatalogDelta) -> Result<CatalogSnapshot> {
-    apply_objects(&mut snapshot.schemas_by_id, &delta.schemas);
-    apply_objects(&mut snapshot.tables_by_id, &delta.tables);
-    apply_objects(&mut snapshot.views_by_id, &delta.views);
-    apply_objects(&mut snapshot.indexes_by_id, &delta.indexes);
-    apply_objects(&mut snapshot.sequences_by_id, &delta.sequences);
-
-    snapshot.next_schema_id = snapshot.next_schema_id.max(delta.next_schema_id);
-    snapshot.next_table_id = snapshot.next_table_id.max(delta.next_table_id);
-    snapshot.next_index_id = snapshot.next_index_id.max(delta.next_index_id);
-    snapshot.next_sequence_id = snapshot.next_sequence_id.max(delta.next_sequence_id);
-    snapshot.next_dictionary_id = snapshot.next_dictionary_id.max(delta.next_dictionary_id);
-    snapshot.next_storage_id = snapshot.next_storage_id.max(delta.next_storage_id);
-    rebuild_name_indexes(&mut snapshot);
-    MemoryCatalog::try_from_snapshot(snapshot.clone())?;
+fn materialize(snapshot: CatalogSnapshot, journal: &CatalogJournal) -> Result<CatalogSnapshot> {
+    let mut snapshot = snapshot;
+    for change_set in &journal.change_sets {
+        snapshot = apply_catalog_change_set(&snapshot, change_set)?;
+    }
+    reserve_change_allocators(&mut snapshot, &journal.allocator_high_water);
     Ok(snapshot)
-}
-
-fn apply_objects<K, V>(target: &mut HashMap<K, V>, changes: &BTreeMap<K, Option<V>>)
-where
-    K: Copy + Eq + std::hash::Hash + Ord,
-    V: Clone,
-{
-    for (id, value) in changes {
-        match value {
-            Some(value) => {
-                target.insert(*id, value.clone());
-            }
-            None => {
-                target.remove(id);
-            }
-        }
-    }
-}
-
-fn rebuild_name_indexes(snapshot: &mut CatalogSnapshot) {
-    snapshot.schemas_by_name = snapshot
-        .schemas_by_id
-        .values()
-        .map(|schema| (schema.name.clone(), schema.id))
-        .collect();
-    snapshot.tables_by_name = snapshot
-        .tables_by_id
-        .values()
-        .filter(|table| {
-            table.schema_id == PUBLIC_SCHEMA_ID && table.relation_kind == RelationKind::User
-        })
-        .map(|table| (table.name.clone(), table.id))
-        .collect();
-    snapshot.views_by_name = snapshot
-        .views_by_id
-        .values()
-        .filter(|view| view.schema_id == PUBLIC_SCHEMA_ID)
-        .map(|view| (view.name.clone(), view.id))
-        .collect();
-    snapshot.indexes_by_name = snapshot
-        .indexes_by_id
-        .values()
-        .filter(|index| index.schema_id == PUBLIC_SCHEMA_ID)
-        .map(|index| (index.name.clone(), index.id))
-        .collect();
-    snapshot.sequences_by_name = snapshot
-        .sequences_by_id
-        .values()
-        .filter(|sequence| sequence.schema_id == PUBLIC_SCHEMA_ID)
-        .map(|sequence| (sequence.name.clone(), sequence.id))
-        .collect();
-}
-
-fn record_changes(delta: &mut CatalogDelta, before: &CatalogSnapshot, after: &CatalogSnapshot) {
-    diff_objects(
-        &mut delta.schemas,
-        &before.schemas_by_id,
-        &after.schemas_by_id,
-    );
-    diff_objects(&mut delta.tables, &before.tables_by_id, &after.tables_by_id);
-    diff_objects(&mut delta.views, &before.views_by_id, &after.views_by_id);
-    diff_objects(
-        &mut delta.indexes,
-        &before.indexes_by_id,
-        &after.indexes_by_id,
-    );
-    diff_objects(
-        &mut delta.sequences,
-        &before.sequences_by_id,
-        &after.sequences_by_id,
-    );
-    delta.next_schema_id = delta.next_schema_id.max(after.next_schema_id);
-    delta.next_table_id = delta.next_table_id.max(after.next_table_id);
-    delta.next_index_id = delta.next_index_id.max(after.next_index_id);
-    delta.next_sequence_id = delta.next_sequence_id.max(after.next_sequence_id);
-    delta.next_dictionary_id = delta.next_dictionary_id.max(after.next_dictionary_id);
-    delta.next_storage_id = delta.next_storage_id.max(after.next_storage_id);
-}
-
-fn diff_objects<K, V>(
-    delta: &mut BTreeMap<K, Option<V>>,
-    before: &HashMap<K, V>,
-    after: &HashMap<K, V>,
-) where
-    K: Copy + Eq + std::hash::Hash + Ord,
-    V: Clone + PartialEq,
-{
-    for (id, value) in after {
-        if before.get(id) != Some(value) {
-            delta.insert(*id, Some(value.clone()));
-        }
-    }
-    for id in before.keys() {
-        if !after.contains_key(id) {
-            delta.insert(*id, None);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -494,6 +394,41 @@ mod tests {
             })
             .unwrap();
         assert!(next.id > created.id);
+    }
+
+    #[test]
+    fn rollback_to_savepoint_does_not_reuse_stable_column_ids() {
+        let concrete = Arc::new(MemoryCatalog::empty());
+        let table = concrete
+            .create_table(
+                "items".to_string(),
+                vec![column()],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let base: Arc<dyn CatalogManager> = concrete;
+        let overlay = CatalogOverlay::new(base);
+        let savepoint = overlay.savepoint().unwrap();
+        let discarded = overlay
+            .apply(|catalog| {
+                let mut added = column();
+                added.name = "discarded".to_string();
+                catalog.add_table_column(table.id, added)
+            })
+            .unwrap();
+        let discarded_id = discarded.columns[1].object_id;
+
+        overlay.rollback_to(&savepoint).unwrap();
+        let replacement = overlay
+            .apply(|catalog| {
+                let mut added = column();
+                added.name = "replacement".to_string();
+                catalog.add_table_column(table.id, added)
+            })
+            .unwrap();
+
+        assert!(replacement.columns[1].object_id > discarded_id);
     }
 
     #[test]

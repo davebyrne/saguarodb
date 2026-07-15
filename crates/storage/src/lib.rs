@@ -1113,12 +1113,24 @@ mod tests {
     #[test]
     fn nextval_logs_advances_and_keeps_gaps_after_rollback() {
         let harness = StorageHarness::new();
+        let sequence = sequence_schema(7, "users_id_seq", 1, 1, 3, 1, false);
         harness
             .storage
-            .create_sequence(
+            .apply_catalog_change(
                 &crate::test_statement_context(1),
-                &sequence_schema(7, "users_id_seq", 1, 1, 3, 1, false),
+                &common::CatalogChangeSet {
+                    version: common::CATALOG_CHANGE_SET_VERSION,
+                    mutations: vec![common::CatalogMutation {
+                        before: None,
+                        after: Some(common::CatalogObject::Sequence(sequence.clone())),
+                    }],
+                    allocator_high_water: common::CatalogAllocatorHighWater::default(),
+                },
             )
+            .unwrap();
+        harness
+            .storage
+            .create_sequence(&crate::test_statement_context(1), &sequence)
             .unwrap();
 
         assert_eq!(harness.wal.record_count(), 1);
@@ -1504,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn create_index_logs_a_create_index_record() {
+    fn create_index_uses_caller_supplied_catalog_change_record() {
         let dir = tempfile::tempdir().unwrap();
         let buffer = Arc::new(MemoryBufferPool::empty(64));
         let wal = Arc::new(wal::FileWalManager::open(dir.path().join("wal.dat")).unwrap());
@@ -1512,15 +1524,28 @@ mod tests {
             PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
         let ctx = crate::test_statement_context(1);
         storage.create_table(&ctx, &users_schema()).unwrap();
-        storage.create_index(&ctx, &name_index(false), 0).unwrap();
+        let index = name_index(false);
+        let change_set = common::CatalogChangeSet {
+            version: common::CATALOG_CHANGE_SET_VERSION,
+            mutations: vec![common::CatalogMutation {
+                before: None,
+                after: Some(common::CatalogObject::Index(index.clone())),
+            }],
+            allocator_high_water: common::CatalogAllocatorHighWater::default(),
+        };
+        storage.apply_catalog_change(&ctx, &change_set).unwrap();
+        storage.create_index(&ctx, &index, 0).unwrap();
         wal.flush().unwrap();
 
         let logged = wal
             .replay_from(0)
             .unwrap()
             .filter_map(|record| record.ok())
-            .any(|record| matches!(record.kind, wal::WalRecordKind::CreateIndex { .. }));
-        assert!(logged, "create_index should log a CreateIndex WAL record");
+            .any(|record| matches!(record.kind, wal::WalRecordKind::CatalogChange { .. }));
+        assert!(
+            logged,
+            "create_index should follow a catalog change WAL record"
+        );
     }
 
     #[test]
@@ -2680,10 +2705,7 @@ mod tests {
         updated.toast.mode = ToastMode::Aggressive;
         updated.toast.min_value_size = 512;
         updated.toast.compression = ToastCompression::Zstd;
-        harness
-            .storage
-            .apply_set_table_toast_metadata(updated)
-            .unwrap();
+        harness.storage.apply_update_table_schema(updated).unwrap();
         assert_eq!(
             harness.wal.record_count(),
             0,

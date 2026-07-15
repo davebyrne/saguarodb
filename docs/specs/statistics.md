@@ -96,8 +96,8 @@ pub struct TableStatistics {
 Column ids are **dense** and are remapped by `DROP COLUMN` (ids above the
 dropped column shift down, mirroring the catalog's index remapping), so
 per-column statistics cannot blindly survive schema changes — after a drop
-they would attach to the wrong columns, and the generic `UpdateTableSchema`
-replay path cannot know which column was dropped. The catalog therefore
+they would attach to the wrong columns, and generic object replacement cannot
+infer which column was dropped. The catalog therefore
 applies one conservative reconciliation rule in its single schema-replacement
 funnel (used by both live DDL and recovery replay): statistics survive a
 schema replacement only when every prior `(id, name, type)` column is
@@ -136,24 +136,15 @@ independently of them:
   They go stale until the next ANALYZE, and the generation-undo rollback path
   never has to restore them.
 
-## 4. WAL record and recovery
+## 4. WAL and recovery
 
-New logical record, mirroring the DDL record lifecycle:
-
-```rust
-/// Maintenance: replaces a user table's optimizer statistics.
-/// CLOG-gated on replay like DDL: applied only for committed transactions.
-UpdateTableStatistics {
-    table_id: TableId,
-    statistics: TableStatistics,
-},
-```
+Statistics are `CatalogObject::Statistics { table, statistics }` values inside
+the generic `CatalogChange` record. There is no statistics-specific WAL variant.
 
 - Classified as a redo operation (`is_redo_operation` → true).
-- Recovery applies committed records to the catalog in LSN order (last write
-  wins); the storage engine ignores it. A skipped uncommitted/aborted record
-  needs **no id or storage reservation** (unlike `CreateTable`) — it allocates
-  nothing.
+- Recovery applies committed change sets in LSN order (last write wins); storage
+  ignores statistics mutations. Aborted/in-flight statistics objects are not
+  published, while the generic allocator reservation pass remains harmless.
 - If the record's `table_id` no longer resolves at apply time (table dropped
   later in the log), the record is skipped.
 - Normal durability lifecycle: the record is appended before the in-memory
@@ -201,11 +192,13 @@ our catalog mutations are non-transactional). Orchestration lives in
    Cancellation is checked per leaf page by the streaming pass;
    `statement_timeout` applies.
 6. Compute per-column statistics from the sample (§6).
-7. Under the catalog publication gate: append one `UpdateTableStatistics`
-   record per table, update the in-memory catalog.
-8. Append `Commit`, flush the WAL, run the standard
-   post-durable-commit cleanup. One transaction covers all targets: a crash
-   mid-pass applies none of them.
+7. Under the catalog publication gate: stage every target's statistics, append
+   one atomic `CatalogChange` containing all statistics objects, update the
+   in-memory catalog, append `Commit`, and flush the WAL. The gate remains held
+   through the flush so another concurrent ANALYZE cannot use an uncommitted
+   statistics image as its durable `before` state.
+8. Run the standard post-durable-commit cleanup. One transaction covers all
+   targets: a crash mid-pass applies none of them.
 
 Randomness: seed from `getrandom` (already a server dependency) into a small
 deterministic PRNG (xorshift/splitmix64, no new crate dependency); tests
@@ -377,7 +370,7 @@ Mirrors checkpoint auto-prune:
 - `run_checkpoint` gains a step after auto-prune: when the counter reaches
   the threshold, re-collect statistics for every user table under the already
   held exclusive checkpoint guard (one committed maintenance transaction; its
-  `UpdateTableStatistics` records precede the checkpoint's WAL flush so the
+  generic catalog change precedes the checkpoint's WAL flush so the
   manifest carries the results), then reset the counter. Uses the built-in
   default statistics target (no session). A manual full `ANALYZE` (no table)
   also resets the counter; a single-table ANALYZE does not.
@@ -397,10 +390,9 @@ shared with checkpointing itself, resolved by a future background scheduler.
   changes between resolution and lock grant, exactly like VACUUM.
 - **Deadlock**: lock acquisition goes through the shared object-lock manager
   and participates in the existing wait-for graph and timeout detector.
-- **Durable-format conservatism**: statistics ride in the catalog JSON blob
-  (serde-default field) and a new WAL record variant appended at the end of
-  `WalRecordKind` — both established, backward-compatible evolution patterns.
-  `Value` variant order is untouched.
+- **Durable-format conservatism**: statistics ride in the catalog JSON blob and
+  generic catalog object payload. Old catalog/WAL formats are intentionally
+  rejected; `Value` variant order is untouched.
 
 ## 12. Milestones
 
@@ -412,8 +404,8 @@ tests, spec updates, and a green `cargo fmt` / `clippy -D warnings` /
   `CatalogSnapshot.statistics` (serde-default), get/set/removal hooks wired to
   DROP TABLE / DROP COLUMN, serialization round-trip + old-manifest
   compatibility tests. No SQL surface.
-- **B — WAL record + recovery.** `UpdateTableStatistics`, recovery apply
-  (committed-only, LSN order, dropped-table skip), replay + checkpoint
+- **B — WAL + recovery.** Generic statistics catalog mutation, recovery apply
+  (committed-only, LSN order), replay + checkpoint
   round-trip tests at the wal/server level.
 - **C — Collector.** Reservoir sampling over a snapshot-visible heap scan,
   estimator math (§6) as pure functions, deterministic-seed unit tests on

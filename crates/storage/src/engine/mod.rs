@@ -1070,6 +1070,26 @@ impl PageBackedStorageEngine {
             .set_file_config(primary_index_file_id(schema.storage_id), index_config);
     }
 
+    /// Register a table storage generation discovered during the recovery WAL
+    /// pre-scan without installing it as a live relation. Aborted generations
+    /// can still have durable compressed pages that physical redo must read.
+    pub fn register_recovery_table_generation(&self, schema: &TableSchema) {
+        self.register_table_compression(schema);
+    }
+
+    /// Register a secondary-index storage generation discovered during the
+    /// recovery WAL pre-scan without installing it as a live index.
+    pub fn register_recovery_index_generation(
+        &self,
+        schema: &IndexSchema,
+        table_compression: CompressionSetting,
+    ) {
+        self.compression.set_file_config(
+            secondary_index_file_id(schema.storage_id),
+            index_compression_for(table_compression),
+        );
+    }
+
     /// Install an ALTERed schema: publish a new table generation and re-register
     /// file configs. No WAL — the caller (server ALTER / recovery replay) owns
     /// record emission and ordering (`compression.md` §8).
@@ -1616,16 +1636,6 @@ impl PageBackedStorageEngine {
         {
             let mut state = self.lock_state()?;
             validate_truncate_update_storage_ids_are_fresh(&state, update)?;
-            self.append_wal(
-                &state,
-                ctx,
-                WalRecordKind::TruncateTable {
-                    table_id: plan.table_id,
-                    new_table_storage_id: plan.new_table_storage_id,
-                    new_toast_storage_id: plan.new_toast_storage_id,
-                    new_index_storage_ids: plan.new_index_storage_ids.clone(),
-                },
-            )?;
             if ctx.txn_id != 0 {
                 state
                     .rollback
@@ -1973,13 +1983,6 @@ impl PageBackedStorageEngine {
             bump_relation_epoch(&mut state);
         }
         Ok(())
-    }
-
-    pub(crate) fn apply_truncate_table_without_wal(
-        &self,
-        update: TruncateCatalogUpdate,
-    ) -> Result<()> {
-        self.publish_truncate_tables(vec![update])
     }
 
     pub fn try_cleanup_retired_generations(&self) -> Result<usize> {
@@ -2714,38 +2717,39 @@ impl StorageEngine for PageBackedStorageEngine {
 }
 
 impl SchemaOperations for PageBackedStorageEngine {
-    fn create_schema(
+    fn apply_catalog_change(
         &self,
         ctx: &StatementContext,
-        schema: &common::NamespaceSchema,
+        change_set: &common::CatalogChangeSet,
     ) -> Result<()> {
         let state = self.lock_state()?;
         self.append_wal(
             &state,
             ctx,
-            WalRecordKind::CreateSchema {
-                schema: schema.clone(),
+            WalRecordKind::CatalogChange {
+                change_set: change_set.clone(),
             },
         )?;
         Ok(())
     }
 
+    fn create_schema(
+        &self,
+        ctx: &StatementContext,
+        schema: &common::NamespaceSchema,
+    ) -> Result<()> {
+        let _ = (ctx, schema);
+        Ok(())
+    }
+
     fn drop_schema(&self, ctx: &StatementContext, schema: common::SchemaId) -> Result<()> {
-        let state = self.lock_state()?;
-        self.append_wal(&state, ctx, WalRecordKind::DropSchema { schema })?;
+        let _ = (ctx, schema);
         Ok(())
     }
 
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()> {
         {
             let mut state = self.lock_state()?;
-            self.append_wal(
-                &state,
-                ctx,
-                WalRecordKind::CreateTable {
-                    schema: schema.clone(),
-                },
-            )?;
             record_table_before(&mut state, ctx.txn_id, schema.id);
             state.tables.insert(
                 schema.id,
@@ -2783,7 +2787,6 @@ impl SchemaOperations for PageBackedStorageEngine {
             return Ok(());
         }
         let toast_table_id = live_toast_table_id(&state, table);
-        self.append_wal(&state, ctx, WalRecordKind::DropTable { table })?;
         mark_table_dropped(&mut state, ctx.txn_id, table);
         if let Some(toast_table_id) = toast_table_id {
             mark_table_dropped(&mut state, ctx.txn_id, toast_table_id);
@@ -2885,17 +2888,6 @@ impl SchemaOperations for PageBackedStorageEngine {
                 .set_file_config(secondary_index_file_id(index.storage_id), index_config);
         }
 
-        let state = self.lock_state()?;
-        self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::UpdateTableSchema {
-                schema: schema.clone(),
-                indexes: secondary_indexes.clone(),
-            },
-        )?;
-        drop(state);
-
         if rewrite_storage {
             self.btree(primary_index_file_id(schema.storage_id))
                 .create(ctx.txn_id)?;
@@ -2918,13 +2910,6 @@ impl SchemaOperations for PageBackedStorageEngine {
         let pk_file_id = table_handle.primary_index_file_id;
         {
             let mut state = self.lock_state()?;
-            self.append_wal(
-                &state,
-                ctx,
-                WalRecordKind::CreateIndex {
-                    schema: schema.clone(),
-                },
-            )?;
             record_index_before(&mut state, ctx.txn_id, schema.id);
             if ctx.txn_id != 0 {
                 state
@@ -3075,7 +3060,6 @@ impl SchemaOperations for PageBackedStorageEngine {
         {
             return Ok(());
         }
-        self.append_wal(&state, ctx, WalRecordKind::DropIndex { index })?;
         record_index_before(&mut state, ctx.txn_id, index);
         let schema = state
             .indexes
@@ -3101,13 +3085,6 @@ impl SchemaOperations for PageBackedStorageEngine {
         schema: &common::SequenceSchema,
     ) -> Result<()> {
         let mut state = self.lock_state()?;
-        self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::CreateSequence {
-                schema: schema.clone(),
-            },
-        )?;
         record_sequence_before(&mut state, ctx.txn_id, schema.id)?;
         state
             .sequences
@@ -3120,39 +3097,23 @@ impl SchemaOperations for PageBackedStorageEngine {
         if !state.sequences.contains_key(&sequence) {
             return Ok(());
         }
-        self.append_wal(&state, ctx, WalRecordKind::DropSequence { sequence })?;
         record_sequence_before(&mut state, ctx.txn_id, sequence)?;
         state.sequences.remove(&sequence);
         Ok(())
     }
 
     fn create_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
-        let state = self.lock_state()?;
-        self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::CreateView {
-                schema: schema.clone(),
-            },
-        )?;
+        let _ = (ctx, schema);
         Ok(())
     }
 
     fn replace_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
-        let state = self.lock_state()?;
-        self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::ReplaceView {
-                schema: schema.clone(),
-            },
-        )?;
+        let _ = (ctx, schema);
         Ok(())
     }
 
     fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()> {
-        let state = self.lock_state()?;
-        self.append_wal(&state, ctx, WalRecordKind::DropView { view })?;
+        let _ = (ctx, view);
         Ok(())
     }
 }

@@ -4,9 +4,11 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use catalog::{CatalogManager, MemoryCatalog};
 use common::{
     KeyRange, QueryCancel, RelationKind, SqlState, StatementContext, ToastCompression, ToastMode,
 };
+use storage::SchemaOperations;
 use support::{
     Connection, TestServer, write_uncommitted_record_for_test, write_uncommitted_schema_for_test,
 };
@@ -1169,9 +1171,31 @@ async fn transactional_schema_ddl_commit_and_rollback_survive_restart() {
         conn.ok("commit").await;
 
         conn.ok("create schema preserved").await;
+        assert_eq!(
+            server
+                .simple_query(
+                    "select nspname from pg_catalog.pg_namespace where nspname = 'preserved'",
+                )
+                .await
+                .unwrap()
+                .unwrap_rows(),
+            vec![vec![Some("preserved".to_string())]],
+            "autocommit CREATE SCHEMA must publish the schema",
+        );
         conn.ok("begin").await;
         conn.ok("drop schema preserved").await;
         conn.ok("rollback").await;
+        assert_eq!(
+            server
+                .simple_query(
+                    "select nspname from pg_catalog.pg_namespace where nspname = 'preserved'",
+                )
+                .await
+                .unwrap()
+                .unwrap_rows(),
+            vec![vec![Some("preserved".to_string())]],
+            "rolled-back DROP SCHEMA must leave the schema present before restart",
+        );
     }
 
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -1754,6 +1778,15 @@ async fn precommit_truncate_prepare_is_skipped_and_storage_ids_are_burned() {
             )
             .collect::<Vec<_>>();
 
+        let catalog_before = components.catalog.snapshot().unwrap();
+        let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone()).unwrap();
+        staged.apply_truncate_table(&plan).unwrap();
+        let catalog_after = staged.snapshot().unwrap();
+        let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
+        components
+            .storage
+            .apply_catalog_change(&StatementContext::new(900), &change_set)
+            .unwrap();
         components
             .storage
             .prepare_truncate_table(&StatementContext::new(900), &plan, &update)

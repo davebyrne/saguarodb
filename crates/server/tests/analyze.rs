@@ -60,6 +60,35 @@ async fn analyze_collects_statistics_and_survives_restart() {
 }
 
 #[tokio::test]
+async fn concurrent_analyze_commits_form_a_recoverable_before_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut setup = Connection::connect(&server).await.unwrap();
+        create_skewed_users(&mut setup).await;
+        let mut first = Connection::connect(&server).await.unwrap();
+        let mut second = Connection::connect(&server).await.unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.query_raw("analyze users"),
+            second.query_raw("analyze users")
+        );
+        assert_eq!(
+            command_tags(&first_result.unwrap()).unwrap(),
+            vec!["ANALYZE"]
+        );
+        assert_eq!(
+            command_tags(&second_result.unwrap()).unwrap(),
+            vec!["ANALYZE"]
+        );
+    }
+
+    let reopened = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let stats = table_statistics(&reopened, "users").expect("statistics after concurrent ANALYZE");
+    assert_eq!(stats.row_count, 100);
+}
+
+#[tokio::test]
 async fn analyze_without_a_table_covers_every_user_table() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

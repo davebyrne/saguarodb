@@ -79,8 +79,9 @@ trait seams.
   storage-identity B-trees, secondary B-tree indexes, TOAST relations for large
   values, at-rest page compression, dictionary-backed zstd payload compression,
   and WAL full-page-image compression.
-- Physiological redo WAL with full-page-image torn-page protection, manifest
-  checkpoints, WAL truncation, and crash recovery.
+- Physiological redo WAL with full-page-image torn-page protection, one generic
+  atomic catalog-change record for metadata, manifest checkpoints, WAL
+  truncation, and crash recovery.
 
 SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, or time-travel
@@ -343,7 +344,7 @@ QueryService
             |
             +-- SELECT: scans storage and returns rows
             +-- DML:    mutates storage pages and appends WAL operation records
-            +-- DDL:    mutates catalog/storage and appends WAL operation records
+            +-- DDL:    appends a generic catalog change before physical WAL
             +-- COPY:   uses COPY sub-protocol encoders/decoders around storage
 ```
 
@@ -469,8 +470,10 @@ images repair any torn page writes.
 
 Startup opens the WAL and its durable `clog.dat` snapshot, enables buffer
 stealing, reads the control record for the redo boundary and catalog, validates
-the dictionary store, then replays WAL records after `checkpoint_lsn` onto heap
-and index pages (redo-all). The CLOG is seeded from `clog.dat` and folded forward
+the dictionary store, pre-scans generic catalog changes to burn all allocated
+IDs and register referenced physical generations, then replays WAL after
+`checkpoint_lsn` onto heap and index pages (redo-all). It atomically applies only
+committed catalog changes in LSN order. The CLOG is seeded from `clog.dat` and folded forward
 with later `Commit`/`Abort` records, including subtransaction commit records; if
 the snapshot is absent, it is rebuilt from retained WAL records.
 
@@ -489,7 +492,8 @@ server startup
     +-- install table, hidden TOAST, secondary-index, and sequence schemas
     |       into storage
     |
-    +-- replay WAL records with LSN > checkpoint_lsn (redo-all); use the CLOG
+    +-- pre-scan catalog allocator/generation high-water, then replay WAL records
+    |       with LSN > checkpoint_lsn (redo-all); use the CLOG
     |       seeded/folded at WAL open for transaction visibility
     |       page-LSN gating makes redo idempotent; torn or missing pages are
     |       zeroed so a FullPageImage / FullPageImageCompressed / HeapInit
@@ -503,9 +507,9 @@ server startup
     +-- bind TCP listener
 ```
 
-Recovery replays redo records onto heap and index pages and applies catalog,
-schema, sequence, compression, TOAST, and dictionary records without appending
-new WAL records. The storage-identity index is an on-disk B-tree recovered
+Recovery replays redo records onto heap and index pages and applies committed
+generic catalog changes plus dictionary and sequence-value records without
+appending new WAL. The storage-identity index is an on-disk B-tree recovered
 through the same redo path, so there is no in-memory directory to rebuild.
 Normal storage operations append WAL after startup switches to normal mode.
 

@@ -107,7 +107,7 @@ async fn dictionary_and_compressed_wal_survive_restart() {
                 .unwrap();
         }
         // No checkpoint here: recovery must replay CreateDictionary +
-        // AlterTableCompression + dict-compressed FPIs from the WAL.
+        // CatalogChange + dict-compressed FPIs from the WAL.
     }
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
     let rows = server
@@ -471,7 +471,7 @@ async fn alter_table_rewrite_trips_checkpoint_wal_bytes_threshold() {
     }
 
     // Reset the WAL-bytes accounting baseline so only the ALTER's own WAL
-    // activity below (dict training record + AlterTableCompression + Commit +
+    // activity below (dict training record + CatalogChange + Commit +
     // one FullPageImage per rewritten page) is measured against the threshold.
     server.force_checkpoint().await.unwrap();
     let before = server.checkpoint_count();
@@ -524,7 +524,7 @@ async fn recovery_fails_fast_on_missing_referenced_dictionary() {
             .simple_query("alter table logs set (compression = 'zstd')")
             .await
             .unwrap();
-        // Checkpoint so the WAL's `CreateDictionary`/`AlterTableCompression`
+        // Checkpoint so the WAL's `CreateDictionary`/`CatalogChange`
         // records are truncated away: otherwise recovery's redo replay would
         // just re-save the deleted dict file below from the WAL record's
         // embedded bytes, masking the missing-file case this test targets.
@@ -609,7 +609,7 @@ fn legacy_schema_without_toast() -> TableSchema {
                 pg_type: Some(PgType::Text),
             },
         ],
-        primary_key: vec![0],
+        primary_key: Vec::new(),
         schema_version: common::INITIAL_SCHEMA_VERSION,
         compression: CompressionSetting::None,
         active_dict_id: None,

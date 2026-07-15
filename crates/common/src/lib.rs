@@ -14,6 +14,7 @@
 pub mod array;
 pub mod bytea;
 pub mod cancel;
+pub mod catalog_change;
 pub mod checked_bytes;
 pub mod concurrency;
 pub mod context;
@@ -45,6 +46,10 @@ pub use array::{
     format_array_text_structure, parse_array_text_structure, value_matches_type,
 };
 pub use cancel::{CancelReason, QueryCancel};
+pub use catalog_change::{
+    CATALOG_CHANGE_SET_VERSION, CatalogAllocatorHighWater, CatalogChangeSet, CatalogMutation,
+    CatalogObject, CatalogObjectId, MAX_CATALOG_CHANGE_MUTATIONS,
+};
 pub use checked_bytes::{CheckedSliceReader, SliceReadError, SliceReadErrorKind};
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
@@ -66,8 +71,8 @@ pub use functions::{
     scalar_function_id, scalar_function_id_matches, scalar_function_result_pg_type,
 };
 pub use ids::{
-    BindingId, ColumnId, ColumnObjectId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID, FROZEN_XID,
-    FileId, ForeignKeyId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
+    BindingId, ColumnId, ColumnObjectId, ConstraintId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID,
+    FROZEN_XID, FileId, ForeignKeyId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
     PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId, TableId, TxnId,
 };
 pub use interval::Interval;
