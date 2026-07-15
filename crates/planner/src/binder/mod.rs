@@ -287,13 +287,35 @@ fn bind_inner(
             for column in columns {
                 validate_default_value(catalog, &options.search_path, column)?;
             }
-            // Validate each CHECK against the (not-yet-created) columns: it must
-            // parse, bind, be boolean, and be constraint-safe. The bound form is
-            // discarded; the text is stored and re-bound per statement at
-            // INSERT/UPDATE (matching how expression DEFAULTs are handled).
-            let check_columns = parsed_columns_as_column_defs(columns);
+            let mut stored_columns = columns.clone();
+            for column in &mut stored_columns {
+                if let Some(ParsedDefault::Expr(sql)) = &column.default {
+                    let bound = bind_default_expr_with_options(
+                        catalog,
+                        sql,
+                        &BindOptions {
+                            search_path: options.search_path.clone(),
+                        },
+                    )?;
+                    column.default = Some(ParsedDefault::Stored(crate::store_bound_expression(
+                        &bound,
+                        sql.clone(),
+                        &[],
+                    )?));
+                }
+            }
+            let check_columns = parsed_columns_as_column_defs(columns)?;
+            let mut stored_checks = Vec::new();
+            stored_checks.try_reserve(checks.len()).map_err(|_| {
+                plan_error(SqlState::ProgramLimitExceeded, "too many CHECK constraints")
+            })?;
             for check in checks {
-                bind_check_expr(catalog, &name.name, &check_columns, check)?;
+                let bound = bind_check_expr(catalog, &name.name, &check_columns, check)?;
+                stored_checks.push(crate::store_bound_expression(
+                    &bound,
+                    check.clone(),
+                    &check_columns,
+                )?);
             }
             let schema = resolve_schema_id(catalog, name, &options.search_path)?;
             let foreign_keys = bind_create_table_foreign_keys(
@@ -310,12 +332,12 @@ fn bind_inner(
                 schema,
                 name: name.name.clone(),
                 if_not_exists: *if_not_exists,
-                columns: columns.clone(),
+                columns: stored_columns,
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
                 compression: compression.unwrap_or_default(),
                 toast: common::ToastOptions::default_new_table().apply_patch(toast),
-                checks: checks.clone(),
+                checks: stored_checks,
                 foreign_keys,
             })
         }
@@ -376,11 +398,20 @@ fn bind_inner(
                 ));
             }
             let table_schema = require_table(catalog, table, &options.search_path)?;
+            let mut column = column.clone();
+            if let Some(ParsedDefault::Expr(sql)) = &column.default {
+                let bound = bind_default_expr_with_options(catalog, sql, options)?;
+                column.default = Some(ParsedDefault::Stored(crate::store_bound_expression(
+                    &bound,
+                    sql.clone(),
+                    &[],
+                )?));
+            }
             Ok(BoundStatement::AlterTableAddColumn {
                 table: table_schema.id,
                 table_name: table.name.clone(),
                 if_not_exists: *if_not_exists,
-                column: column.clone(),
+                column,
             })
         }
         Statement::AlterTableDropColumn {
@@ -1039,6 +1070,11 @@ fn validate_default_value(
             }
             return Ok(());
         }
+        ParsedDefault::Stored(_) => {
+            return Err(DbError::internal(
+                "stored expression default reached parsed-statement validation",
+            ));
+        }
     };
     if matches!(value, Value::Null) {
         if column.nullable {
@@ -1274,7 +1310,7 @@ pub(super) fn bind_table_checks(
     table
         .checks
         .iter()
-        .map(|text| bind_check_expr(catalog, &table.name, &table.columns, text))
+        .map(|expression| crate::lower_stored_expression(catalog, expression, &table.columns))
         .collect()
 }
 
@@ -1690,18 +1726,41 @@ fn resolve_existing_column_names(table: &TableSchema, names: &[String]) -> Resul
 /// View a `CREATE TABLE`'s not-yet-created columns as `ColumnDef`s (id = declaration
 /// order) so a `CHECK` can be bound and validated before the table exists. Only the
 /// name/type/nullability matter for binding; the default is irrelevant here.
-fn parsed_columns_as_column_defs(columns: &[ParsedColumnDef]) -> Vec<ColumnDef> {
+fn parsed_columns_as_column_defs(columns: &[ParsedColumnDef]) -> Result<Vec<ColumnDef>> {
     columns
         .iter()
         .enumerate()
-        .map(|(index, column)| ColumnDef {
-            id: index as ColumnId,
-            name: column.name.clone(),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
-            max_length: column.max_length,
-            default: None,
-            pg_type: column.pg_type.clone(),
+        .map(|(index, column)| {
+            let id = ColumnId::try_from(index).map_err(|_| {
+                plan_error(
+                    SqlState::ProgramLimitExceeded,
+                    "column position exceeds the catalog limit",
+                )
+            })?;
+            let object_id = u32::try_from(index)
+                .map_err(|_| {
+                    plan_error(
+                        SqlState::ProgramLimitExceeded,
+                        "column position exceeds the catalog limit",
+                    )
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    plan_error(
+                        SqlState::ProgramLimitExceeded,
+                        "column position exceeds the catalog limit",
+                    )
+                })?;
+            Ok(ColumnDef {
+                id,
+                object_id,
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                max_length: column.max_length,
+                default: None,
+                pg_type: column.pg_type.clone(),
+            })
         })
         .collect()
 }

@@ -546,6 +546,53 @@ async fn expression_default_survives_restart() {
     assert_eq!(rows, vec![vec![Some("7".to_string())]]);
 }
 
+#[tokio::test]
+async fn coalesce_default_and_check_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query(
+                "create table coalesced (id integer primary key, \
+                 n integer default coalesce(null, 1), \
+                 check (coalesce(n > 0, true)))",
+            )
+            .await
+            .unwrap();
+        // Exercise catalog-v3 StoredExpression serialization rather than
+        // relying only on CreateTable WAL replay.
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = restart(&path).await;
+    server
+        .simple_query("insert into coalesced (id) values (1)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into coalesced values (2, null)")
+        .await
+        .unwrap();
+    let error = server
+        .simple_query("insert into coalesced values (3, -1)")
+        .await
+        .err()
+        .expect("COALESCE CHECK should reject a negative value");
+    assert!(error.message.contains("23514"));
+    assert_eq!(
+        server
+            .simple_query("select id, n from coalesced order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![
+            vec![Some("1".to_string()), Some("1".to_string())],
+            vec![Some("2".to_string()), None],
+        ]
+    );
+}
+
 /// A `CHECK` constraint — both column-level (`n INT CHECK (n > 0)`) and table-level
 /// (`CHECK (a <= b)`) — rejects a violating `INSERT` with `SqlState::CheckViolation`
 /// (`23514`) and admits a conforming row.
@@ -768,6 +815,67 @@ async fn rename_table_with_check_constraint_keeps_constraint_enforced() {
     );
 }
 
+#[tokio::test]
+async fn check_uses_stable_column_identity_after_rename_and_dense_shift() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query(
+                "create table t (id integer primary key, obsolete integer, n integer, check (n > 0))",
+            )
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("alter table t drop column obsolete")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table t rename column n to amount")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id, amount) values (1, 2)")
+            .await
+            .unwrap();
+        let error = server
+            .simple_query("insert into t (id, amount) values (2, 0)")
+            .await
+            .err()
+            .expect("stored CHECK should reject the invalid value");
+        assert!(error.message.contains("23514"));
+        // No second checkpoint: restart must replay both UpdateTableSchema
+        // records while preserving the surviving column object identity.
+    }
+
+    {
+        let server = restart(&path).await;
+        server
+            .simple_query("insert into t (id, amount) values (2, 3)")
+            .await
+            .unwrap();
+        let error = server
+            .simple_query("insert into t (id, amount) values (3, 0)")
+            .await
+            .err()
+            .expect("replayed stored CHECK should reject the invalid value");
+        assert!(error.message.contains("23514"));
+        // Persist the replayed/remapped schema and exercise the catalog-v3
+        // snapshot on one more restart.
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = restart(&path).await;
+    let error = server
+        .simple_query("insert into t (id, amount) values (3, 0)")
+        .await
+        .err()
+        .expect("checkpointed stored CHECK should reject the invalid value");
+    assert!(error.message.contains("23514"));
+}
+
 /// A `CHECK` constraint survives a restart (replayed from the durable catalog /
 /// `CreateTable` WAL record) and is still enforced for inserts after recovery.
 #[tokio::test]
@@ -908,6 +1016,46 @@ async fn drop_sequence_referenced_by_default_is_rejected() {
         .unwrap()
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
+async fn drop_sequence_referenced_inside_expression_default_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create sequence expression_default_seq")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "create table expression_defaults (id integer primary key, n integer default nextval('expression_default_seq') + 1)",
+        )
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("drop sequence expression_default_seq")
+        .await
+        .err()
+        .expect("sequence nested in an expression default should block drop");
+    assert!(
+        err.message.contains("2BP01"),
+        "expected DependentObjectsStillExist: {}",
+        err.message
+    );
+
+    server
+        .simple_query("insert into expression_defaults (id) values (1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("select n from expression_defaults")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string())]]
+    );
 }
 
 #[tokio::test]
@@ -1639,6 +1787,49 @@ async fn alter_table_add_primary_key_enforces_existing_table() {
 }
 
 #[tokio::test]
+async fn primary_key_nullability_tightening_preserves_stored_checks() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table created_with_pk (a integer, check (a > 0), primary key (a))")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into created_with_pk values (1)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("create table altered_to_pk (a integer, check (a > 0))")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into altered_to_pk values (1)")
+        .await
+        .unwrap();
+    server
+        .simple_query("alter table altered_to_pk add primary key (a)")
+        .await
+        .unwrap();
+
+    for table in ["created_with_pk", "altered_to_pk"] {
+        let check_error = server
+            .simple_query(&format!("insert into {table} values (-1)"))
+            .await
+            .err()
+            .expect("stored CHECK should remain enforced");
+        assert!(check_error.message.contains("23514"));
+
+        let null_error = server
+            .simple_query(&format!("insert into {table} values (null)"))
+            .await
+            .err()
+            .expect("primary key should make the column non-null");
+        assert!(null_error.message.contains("23502"));
+    }
+}
+
+#[tokio::test]
 async fn alter_table_add_primary_key_rejects_bad_existing_rows_without_mutating_table() {
     let server = TestServer::start().await.unwrap();
     server
@@ -1818,6 +2009,8 @@ async fn non_finite_constant_defaults_are_rejected_and_cannot_poison_the_manifes
         for sql in [
             "create table brick (x double precision default 1e400)",
             "create table brick (x double precision default -1e400)",
+            "create table brick (x double precision default abs(1e400))",
+            "create table brick (x double precision, check (x < 1e400))",
         ] {
             let outcome = conn.query(sql).await.unwrap();
             let err = outcome.result.err().expect("non-finite default rejected");

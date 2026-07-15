@@ -92,9 +92,9 @@ Binder responsibilities:
   unqualified name first matches an output column alias. All other `ORDER BY`
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
-- Validate insert/update value types and nullability. `INSERT ... VALUES`, `UPDATE SET`, and `ON CONFLICT DO UPDATE SET` expression assignments are strict except for PostgreSQL-compatible `TIMESTAMPTZ` expressions assigned to `TIMESTAMP` columns, which the binder wraps in an explicit `BoundExpr::Cast` to `TIMESTAMP`; nullability is still checked after the cast. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column with no assignment cast. A `NOT NULL` column may be omitted from an `INSERT` only when it has a non-`NULL` `ColumnDefault::Const`, a `ColumnDefault::Nextval`, or a `ColumnDefault::Expr` (an expression default may still evaluate to `NULL`, caught per row at insert time); otherwise the omission is rejected with `SqlState::NotNullViolation`. For each omitted column with a `ColumnDefault::Expr`, the binder re-parses and binds the default's text against an empty scope and attaches the bound expression to the `INSERT`, so the executor evaluates it per row.
-- Validate each `CREATE TABLE` column `DEFAULT` against the column type (no implicit casts): `ParsedDefault::Const(value)` must match the column's `DataType` (any `Numeric` value matches any `NUMERIC(p, s)` column), else `SqlState::DatatypeMismatch`; a `NULL` default is accepted only on a nullable column (else `SqlState::NotNullViolation`). `ParsedDefault::Nextval(name)` must resolve to an existing non-owned sequence (`SqlState::UndefinedTable` if missing, `SqlState::DependentObjectsStillExist` if it names an owned SERIAL sequence) and requires an `INTEGER` target column. `ParsedDefault::Serial` requires an `INTEGER` target column; the marker stays on the parsed column list (nothing extra is recorded on the bound `CREATE TABLE`), and the executor derives the SERIAL columns and chooses generated owned sequence names at execution time. `ParsedDefault::Expr(text)` is a non-constant default: the binder re-parses the text (`parser::parse_expression`) and binds it against an empty column scope (so a column reference fails as `SqlState::UndefinedColumn`), rejects aggregates/subqueries/parameters (`SqlState::FeatureNotSupported`), and requires the result type be assignable to the column (`SqlState::DatatypeMismatch`); a `NULL` result is not checked here (it is caught per row at insert). The text is stored as `ColumnDefault::Expr` and re-bound per statement at `INSERT`.
-- Validate each `CREATE TABLE` `CHECK` constraint (`Statement::CreateTable.checks`, canonical text): the binder re-parses the text (`parser::parse_expression`) and binds it against the table's not-yet-created columns registered as a single binding at slot 0 (`bind_check_expr`), so an unqualified column reference resolves (a `CHECK` may name the row's columns, unlike a `DEFAULT`), an unknown column fails as `SqlState::UndefinedColumn`, table-qualified column references are rejected with `SqlState::FeatureNotSupported` so stored check text remains table-rename-safe, aggregates/subqueries/parameters are rejected (`SqlState::FeatureNotSupported`, shared with `DEFAULT` via `reject_non_constraint_safe`), and a non-boolean result is `SqlState::DatatypeMismatch`. The bound form is discarded at `CREATE TABLE`; the text is stored on `TableSchema.checks`. At each `INSERT`/`UPDATE`, the binder re-binds the table's checks against the table's columns (`bind_table_checks`) and attaches the bound expressions to the statement, so the executor evaluates them over each affected full row.
+- Validate insert/update value types and nullability. A `NOT NULL` column may be omitted only when it has an applicable constant, sequence, or expression default. For each omitted `ColumnDefault::Expr`, the binder lowers its validated `StoredExpression` directly to `BoundExpr` and attaches it to the DML statement; stored SQL is never reparsed.
+- Validate each CREATE/ALTER column `DEFAULT` with no implicit casts. A parsed expression is bound once against an empty column scope, rejects aggregates/subqueries/parameters, and is converted to versioned `StoredExpression`; its canonical SQL is diagnostic only. The durable form uses stable function and sequence IDs and is lowered without parsing for DML.
+- Validate each `CREATE TABLE` CHECK by binding its parsed text against the proposed columns, rejecting qualified references, aggregates, subqueries, parameters, and non-boolean results. The binder converts the result to `StoredExpression` with stable `ColumnObjectId` and `FunctionId` references. Later DML lowers this typed tree against current dense slots, so renames and unrelated ordinal shifts do not require SQL parsing or expression rewriting.
 - Validate each `CREATE TABLE` foreign key against the proposed source columns
   and either an existing parent or the same proposed table. Existing targets bind
   to stable table/column IDs; self targets retain proposed column names until
@@ -161,7 +161,7 @@ pub enum BoundStatement {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
@@ -603,7 +603,7 @@ only that join's left subtree; crossing an earlier comma-join boundary is
 
 ```rust
 pub enum LogicalPlan {
-    CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String>, foreign_keys: Vec<BoundForeignKey> },
+    CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<StoredExpression>, foreign_keys: Vec<BoundForeignKey> },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
@@ -703,7 +703,7 @@ contracts above.
 pub enum PhysicalPlan {
     CreateSchema { name: String, if_not_exists: bool },
     DropSchema { name: String, if_exists: bool },
-    CreateTable { schema: SchemaId, name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String>, foreign_keys: Vec<BoundForeignKey> },
+    CreateTable { schema: SchemaId, name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<StoredExpression>, foreign_keys: Vec<BoundForeignKey> },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },

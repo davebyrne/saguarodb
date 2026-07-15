@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::{
-    DataType, DbError, POSTGRES_COMPAT_VERSION, PgType, Result, SqlState, StatementContext, Value,
+    DataType, DbError, FunctionId, POSTGRES_COMPAT_VERSION, PgType, Result, SqlState,
+    StatementContext, Value,
 };
 
 /// A bound argument as seen by a function's signature checker: its resolved type
@@ -90,6 +91,93 @@ pub fn lookup_scalar_function(name: &str) -> Option<&'static ScalarFunction> {
         })
         .get(name)
         .copied()
+}
+
+/// Resolve the durable built-in identity for an already type-checked call.
+pub fn scalar_function_id(
+    name: &str,
+    argument_types: &[DataType],
+    result_type: &DataType,
+) -> Option<FunctionId> {
+    PG_PROC_CATALOG_ENTRIES
+        .iter()
+        .find(|entry| {
+            entry.name == name
+                && PgType::from_oid_typmod(entry.ret_oid, -1)
+                    .is_some_and(|pg_type| pg_type.data_type() == *result_type)
+                && catalog_entry_accepts_arguments(entry, argument_types)
+        })
+        .and_then(|entry| FunctionId::try_from(entry.oid).ok())
+}
+
+/// Look up a registered scalar function through its durable PostgreSQL OID.
+pub fn lookup_scalar_function_by_id(
+    id: FunctionId,
+) -> Option<(&'static ScalarFunction, &'static PgProcCatalogEntry)> {
+    let oid = i64::from(id);
+    let entry = pg_proc_catalog_entry(oid)?;
+    Some((lookup_scalar_function(entry.name)?, entry))
+}
+
+/// Whether a durable built-in ID exactly describes the stored call metadata.
+pub fn scalar_function_id_matches(
+    id: FunctionId,
+    argument_types: &[DataType],
+    result_type: &DataType,
+    result_pg_type: Option<&PgType>,
+) -> bool {
+    let Some((_, entry)) = lookup_scalar_function_by_id(id) else {
+        return false;
+    };
+    let Some(entry_result) = PgType::from_oid_typmod(entry.ret_oid, -1) else {
+        return false;
+    };
+    entry_result.data_type() == *result_type
+        && result_pg_type.is_none_or(|pg_type| *pg_type == entry_result)
+        && catalog_entry_accepts_arguments(entry, argument_types)
+}
+
+fn catalog_entry_accepts_arguments(
+    entry: &PgProcCatalogEntry,
+    argument_types: &[DataType],
+) -> bool {
+    let variadic = entry.variadic_oid();
+    if variadic == 0 {
+        return entry.arg_oids.len() == argument_types.len()
+            && entry
+                .arg_oids
+                .iter()
+                .zip(argument_types)
+                .all(|(oid, data_type)| pg_oid_has_data_type(*oid, data_type));
+    }
+    let Some(fixed_count) = entry.arg_oids.len().checked_sub(1) else {
+        return false;
+    };
+    let Some(fixed_oids) = entry.arg_oids.get(..fixed_count) else {
+        return false;
+    };
+    let Some(fixed_arguments) = argument_types.get(..fixed_count) else {
+        return false;
+    };
+    if argument_types.len() < entry.arg_oids.len()
+        || !fixed_oids
+            .iter()
+            .zip(fixed_arguments)
+            .all(|(oid, data_type)| pg_oid_has_data_type(*oid, data_type))
+    {
+        return false;
+    }
+    argument_types
+        .get(fixed_count..)
+        .is_some_and(|variadic_arguments| {
+            variadic_arguments
+                .iter()
+                .all(|data_type| pg_oid_has_data_type(variadic, data_type))
+        })
+}
+
+fn pg_oid_has_data_type(oid: i64, data_type: &DataType) -> bool {
+    PgType::from_oid_typmod(oid, -1).is_some_and(|pg_type| pg_type.data_type() == *data_type)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2885,5 +2973,26 @@ mod tests {
             call("sqrt", &[Value::Integer(-1)]).unwrap_err().code,
             SqlState::NumericValueOutOfRange
         );
+    }
+
+    #[test]
+    fn durable_function_ids_validate_exact_and_variadic_signatures() {
+        let concat_args = [DataType::Text, DataType::Text, DataType::Text];
+        let concat = scalar_function_id("concat", &concat_args, &DataType::Text).unwrap();
+        assert!(scalar_function_id_matches(
+            concat,
+            &concat_args,
+            &DataType::Text,
+            Some(&PgType::Text)
+        ));
+
+        let indexdef =
+            scalar_function_id("pg_get_indexdef", &[DataType::Integer], &DataType::Text).unwrap();
+        assert!(!scalar_function_id_matches(
+            indexdef,
+            &[DataType::Integer, DataType::Integer, DataType::Boolean],
+            &DataType::Text,
+            Some(&PgType::Text)
+        ));
     }
 }

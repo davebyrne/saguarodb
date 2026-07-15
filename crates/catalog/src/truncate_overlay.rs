@@ -175,7 +175,7 @@ impl CatalogManager for TruncateCatalogOverlay {
         _primary_key: Vec<String>,
         _compression: CompressionSetting,
         _toast: ToastOptions,
-        _checks: Vec<String>,
+        _checks: Vec<common::StoredExpression>,
     ) -> Result<TableSchema> {
         Self::read_only()
     }

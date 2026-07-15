@@ -5,6 +5,11 @@ pub type SchemaId = u32;
 pub const PUBLIC_SCHEMA_ID: SchemaId = 1;
 pub const FIRST_USER_SCHEMA_ID: SchemaId = 2;
 pub type ColumnId = u16;
+/// Durable identity of a column within its containing relation. Unlike the
+/// dense [`ColumnId`] storage ordinal, this value is never renumbered or reused.
+pub type ColumnObjectId = u32;
+/// Stable PostgreSQL-compatible OID of a built-in scalar function.
+pub type FunctionId = u32;
 /// Per-table foreign-key identifier. Values are allocated monotonically and
 /// never reused.
 pub type ForeignKeyId = u16;

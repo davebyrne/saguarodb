@@ -22,6 +22,7 @@ mod params;
 mod physical;
 mod rewrite;
 mod simplify;
+mod stored_expression;
 
 pub use binder::{
     BindOptions, bind, bind_default_expr, bind_default_expr_with_options, bind_parameterized,
@@ -48,6 +49,9 @@ pub use params::{collect_param_pg_types, collect_param_types, substitute_params}
 pub use parser::SetOp;
 pub use physical::{PhysicalPlan, physical_plan};
 pub use rewrite::{rewrite_expr, rewrite_plan_exprs};
+pub use stored_expression::{
+    lower_stored_expression, store_bound_expression, validate_stored_expression,
+};
 
 pub fn mutates_sequences(statement: &BoundStatement) -> bool {
     match statement {

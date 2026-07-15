@@ -31,7 +31,7 @@ pub enum LogicalPlan {
         toast: ToastOptions,
         /// `CHECK` constraint texts, persisted with the schema (see
         /// `BoundStatement::CreateTable`).
-        checks: Vec<String>,
+        checks: Vec<common::StoredExpression>,
         foreign_keys: Vec<BoundForeignKey>,
     },
     DropTable {

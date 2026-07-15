@@ -48,7 +48,7 @@ versions are visible.
 The control record uses a versioned binary envelope:
 
 - magic: `SGMF` (4 bytes)
-- version: little-endian `u32`, current = `3`
+- version: little-endian `u32`, current = `4`
 - payload length: little-endian `u32`
 - payload checksum: little-endian CRC32 over the exact payload bytes
 - payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, `catalog`,
@@ -58,8 +58,7 @@ The four header fields form a fixed 16-byte header (`MANIFEST_HEADER_LEN = 16`)
 that precedes the payload.
 
 Decode must reject a file shorter than the 16-byte header, magic mismatch,
-unsupported versions (including the legacy full-snapshot manifest, version `1`,
-and the pre-`page_size` manifest, version `2`), length mismatch, checksum
+unsupported versions (including versions `1` through `3`), length mismatch, checksum
 mismatch, malformed payload JSON, unsorted table IDs, and duplicate table IDs.
 Development builds do not migrate older formats; an incompatible or corrupt
 control file surfaces as `SqlState::InternalError` (there is no dedicated

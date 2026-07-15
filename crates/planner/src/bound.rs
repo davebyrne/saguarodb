@@ -194,9 +194,9 @@ pub enum BoundStatement {
         /// The table's TOAST policy, resolved from `WITH (toast...)` options at
         /// bind time.
         toast: ToastOptions,
-        /// `CHECK` constraint expressions (canonical SQL text), validated against
-        /// the table's columns at bind time and persisted with the schema.
-        checks: Vec<String>,
+        /// Typed durable `CHECK` expressions, validated against the table's
+        /// columns at bind time and persisted with the schema.
+        checks: Vec<common::StoredExpression>,
         foreign_keys: Vec<BoundForeignKey>,
     },
     DropTable {

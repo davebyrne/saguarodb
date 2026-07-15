@@ -517,7 +517,7 @@ impl QueryCatalogIntrospection {
             }
             for (index, check) in table.checks.iter().enumerate() {
                 if try_check_constraint_oid(table.id, index)? == constraint_oid {
-                    return Ok(Some(format!("CHECK ({check})")));
+                    return Ok(Some(format!("CHECK ({})", check.sql)));
                 }
             }
             for foreign_key in &table.foreign_keys {
@@ -2556,7 +2556,20 @@ fn collect_bound_statement_objects(
         BoundStatement::AlterTableAlterColumnType { table, .. } => {
             record_bound_relation_version(references, *table, None)?;
         }
-        BoundStatement::CreateTable { foreign_keys, .. } => {
+        BoundStatement::CreateTable {
+            columns,
+            checks,
+            foreign_keys,
+            ..
+        } => {
+            for column in columns {
+                if let Some(ParsedDefault::Stored(expression)) = &column.default {
+                    collect_stored_expression_objects(expression, references);
+                }
+            }
+            for check in checks {
+                collect_stored_expression_objects(check, references);
+            }
             for foreign_key in foreign_keys {
                 if let BoundForeignKeyTarget::Existing { table, .. } = foreign_key.target {
                     record_bound_relation_version(references, table, None)?;
@@ -2603,6 +2616,17 @@ fn collect_bound_statement_objects(
         }
     }
     Ok(())
+}
+
+fn collect_stored_expression_objects(
+    expression: &common::StoredExpression,
+    references: &mut BoundObjectReferences,
+) {
+    expression
+        .root
+        .for_each_sequence_reference(&mut |sequence| {
+            references.sequences.insert(sequence);
+        });
 }
 
 fn bound_relation_ids(bound: &BoundStatement) -> Result<BTreeSet<TableId>> {
@@ -3217,6 +3241,10 @@ fn augment_catalog_resolved_objects(
                         search_path: vec![table.schema_id],
                     },
                 )?;
+                collect_expr_objects(&expr, references)?;
+            }
+            Some(ParsedDefault::Stored(expression)) => {
+                let expr = planner::lower_stored_expression(catalog, expression, &[])?;
                 collect_expr_objects(&expr, references)?;
             }
             Some(ParsedDefault::Const(_) | ParsedDefault::Serial) | None => {}
@@ -4355,6 +4383,42 @@ mod tests {
     }
 
     #[test]
+    fn prepared_create_table_rejects_dropped_stored_expression_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create sequence create_ids")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "create table prepared_items (\
+                 id integer default nextval('create_ids') + 0, \
+                 check (currval('create_ids') > 0))",
+                &[],
+            )
+            .unwrap();
+
+        app.query_service
+            .execute_sql("drop sequence create_ids")
+            .unwrap();
+        let error = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+
+        assert_eq!(error.code, SqlState::FeatureNotSupported);
+        assert!(error.message.contains("reprepared"));
+        assert!(
+            app.components
+                .catalog
+                .get_table_by_name("prepared_items")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn prepared_plan_rejects_changed_storage_generation() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -4858,7 +4922,7 @@ mod tests {
             primary_key: Vec<String>,
             compression: common::CompressionSetting,
             toast: common::ToastOptions,
-            checks: Vec<String>,
+            checks: Vec<common::StoredExpression>,
         ) -> Result<TableSchema> {
             self.inner.create_table_with_options(
                 name,
@@ -4878,7 +4942,7 @@ mod tests {
             primary_key: Vec<String>,
             compression: common::CompressionSetting,
             toast: common::ToastOptions,
-            checks: Vec<String>,
+            checks: Vec<common::StoredExpression>,
         ) -> Result<TableSchema> {
             self.inner.create_table_in_schema_with_options(
                 schema,

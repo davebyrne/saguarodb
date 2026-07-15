@@ -6,8 +6,9 @@ use common::{
     FIRST_USER_SCHEMA_ID, FileId, ForeignKeyConstraint, IndexConstraintKind, IndexId, IndexSchema,
     NamespaceSchema, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef, ParsedDefault,
     PgType, RelationKind, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, SqlState,
-    TableId, TableSchema, TableStatistics, ToastMode, ToastOptions, TruncateCatalogUpdate,
-    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
+    StoredExpr, StoredExpression, TableId, TableSchema, TableStatistics, ToastMode, ToastOptions,
+    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    needs_toast_relation, toast_schema,
 };
 
 use crate::{
@@ -388,6 +389,16 @@ impl CatalogManager for MemoryCatalog {
                 restored_table.next_foreign_key_id = restored_table
                     .next_foreign_key_id
                     .max(current_table.next_foreign_key_id);
+                restored_table.next_column_object_id = restored_table
+                    .next_column_object_id
+                    .max(current_table.next_column_object_id);
+            }
+        }
+        for (view_id, restored_view) in &mut snapshot.views_by_id {
+            if let Some(current_view) = current.views_by_id.get(view_id) {
+                restored_view.next_column_object_id = restored_view
+                    .next_column_object_id
+                    .max(current_view.next_column_object_id);
             }
         }
         *current = snapshot;
@@ -671,7 +682,7 @@ impl CatalogManager for MemoryCatalog {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
         require_schema(&snapshot, schema_id, "table", &name)?;
@@ -801,7 +812,11 @@ impl CatalogManager for MemoryCatalog {
                 "ADD COLUMN unexpectedly validated as a no-op",
             ));
         };
-        schema.columns.push(column);
+        schema.columns.push(*column);
+        schema.next_column_object_id = schema
+            .next_column_object_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("column object id overflow"))?;
         bump_schema_version(&mut schema.schema_version)?;
         let hidden_toast = if let Some(toast_id) = toast_table_id {
             snapshot.next_table_id = toast_id
@@ -964,15 +979,6 @@ impl CatalogManager for MemoryCatalog {
                     format!("column {old_name} does not exist"),
                 )
             })?;
-        if !schema.checks.is_empty() {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot rename column {old_name} because table {} has CHECK constraints",
-                    schema.name
-                ),
-            ));
-        }
         reject_view_column_dependency(&snapshot, id, column.id, "rename")?;
         column.name = new_name;
         bump_schema_version(&mut schema.schema_version)?;
@@ -1838,6 +1844,22 @@ impl CatalogManager for MemoryCatalog {
             .cloned()
             .ok_or_else(|| undefined_view(format!("view id {id} does not exist")))?;
         let mut schema = build_view_schema(id, old.name, columns, definition, dependencies)?;
+        let mut next_object_id = old.next_column_object_id;
+        for (position, column) in schema.columns.iter_mut().enumerate() {
+            if let Some(old_column) = old
+                .columns
+                .get(position)
+                .filter(|old_column| view_columns_are_positionally_compatible(old_column, column))
+            {
+                column.object_id = old_column.object_id;
+            } else {
+                column.object_id = next_object_id;
+                next_object_id = next_object_id
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::internal("view column object id overflow"))?;
+            }
+        }
+        schema.next_column_object_id = next_object_id;
         schema.schema_id = old.schema_id;
         schema.definition_search_path = definition_search_path;
         schema.schema_version = old.schema_version;
@@ -1850,6 +1872,14 @@ impl CatalogManager for MemoryCatalog {
     fn drop_view(&self, id: TableId) -> Result<()> {
         self.apply_drop_view(id)
     }
+}
+
+fn view_columns_are_positionally_compatible(old: &ColumnDef, replacement: &ColumnDef) -> bool {
+    old.name == replacement.name
+        && old.data_type == replacement.data_type
+        && old.nullable == replacement.nullable
+        && old.max_length == replacement.max_length
+        && old.pg_type == replacement.pg_type
 }
 
 /// Advance a monotonic id allocator's high-water mark past `id`, so a later
@@ -2381,7 +2411,7 @@ struct BuildSchemaInput {
     primary_key: Vec<String>,
     compression: CompressionSetting,
     toast: ToastOptions,
-    checks: Vec<String>,
+    checks: Vec<StoredExpression>,
 }
 
 fn user_column_id(index: usize, relation_kind: &str) -> Result<ColumnId> {
@@ -2451,6 +2481,10 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         }
         assigned_columns.push(ColumnDef {
             id: column_id,
+            object_id: u32::try_from(index)
+                .map_err(|_| DbError::plan(SqlState::ProgramLimitExceeded, "too many columns"))?
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("column object id overflow"))?,
             name: column.name,
             data_type: column.data_type,
             nullable: column.nullable,
@@ -2485,6 +2519,10 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         primary_key_ids.push(column_id);
     }
 
+    let next_column_object_id = u32::try_from(assigned_columns.len())
+        .map_err(|_| DbError::internal("column object id overflow"))?
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("column object id overflow"))?;
     Ok(TableSchema {
         id: table_id,
         schema_id,
@@ -2501,6 +2539,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         checks,
         foreign_keys: Vec::new(),
         next_foreign_key_id: 0,
+        next_column_object_id,
     })
 }
 
@@ -2520,9 +2559,10 @@ fn convert_column_default(
         Some(ParsedDefault::OwnedNextval(name)) => {
             resolve_sequence_default(snapshot, schema_id, name, true)
         }
-        // A non-constant expression default is stored as canonical SQL text; the
-        // binder validated it against the column at CREATE TABLE time.
-        Some(ParsedDefault::Expr(text)) => Ok(Some(ColumnDefault::Expr(text))),
+        Some(ParsedDefault::Stored(expression)) => Ok(Some(ColumnDefault::Expr(expression))),
+        Some(ParsedDefault::Expr(_)) => Err(DbError::internal(
+            "unresolved expression default reached catalog create_table",
+        )),
         None => Ok(None),
     }
 }
@@ -2530,7 +2570,7 @@ fn convert_column_default(
 enum AddColumnValidation {
     Noop,
     Rewrite {
-        column: ColumnDef,
+        column: Box<ColumnDef>,
         toast_table_id: Option<TableId>,
     },
 }
@@ -2571,6 +2611,7 @@ fn validate_add_table_column(
 
     let column = ColumnDef {
         id: column_id,
+        object_id: schema.next_column_object_id,
         name: column.name.clone(),
         data_type: column.data_type.clone(),
         nullable: column.nullable,
@@ -2595,7 +2636,7 @@ fn validate_add_table_column(
         None
     };
     Ok(AddColumnValidation::Rewrite {
-        column,
+        column: Box::new(column),
         toast_table_id,
     })
 }
@@ -2765,11 +2806,16 @@ fn validate_drop_table_column(
             ),
         ));
     }
-    if !schema.checks.is_empty() {
+    let column_object_id = schema.columns[position].object_id;
+    if schema
+        .checks
+        .iter()
+        .any(|check| stored_node_references_column(&check.root, column_object_id))
+    {
         return Err(DbError::plan(
             SqlState::DependentObjectsStillExist,
             format!(
-                "cannot drop column {column} because table {} has CHECK constraints",
+                "cannot drop column {column} because a CHECK constraint on table {} depends on it",
                 schema.name
             ),
         ));
@@ -2802,6 +2848,12 @@ fn build_view_schema(
         let column_id = user_column_id(index, "view")?;
         assigned_columns.push(ColumnDef {
             id: column_id,
+            object_id: u32::try_from(index)
+                .map_err(|_| {
+                    DbError::plan(SqlState::ProgramLimitExceeded, "too many view columns")
+                })?
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("view column object id overflow"))?,
             name: column.name,
             data_type: column.data_type,
             nullable: column.nullable,
@@ -2816,6 +2868,10 @@ fn build_view_schema(
             "view requires at least one output column",
         ));
     }
+    let next_column_object_id = u32::try_from(assigned_columns.len())
+        .map_err(|_| DbError::internal("view column object id overflow"))?
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("view column object id overflow"))?;
     Ok(ViewSchema {
         id,
         schema_id: common::PUBLIC_SCHEMA_ID,
@@ -2825,6 +2881,7 @@ fn build_view_schema(
         dependencies,
         schema_version: common::INITIAL_SCHEMA_VERSION,
         definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
+        next_column_object_id,
     })
 }
 
@@ -2867,7 +2924,14 @@ fn resolve_sequence_default(
 fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) -> Result<()> {
     for table in snapshot.tables_by_id.values() {
         for column in &table.columns {
-            if matches!(&column.default, Some(ColumnDefault::Nextval(id)) if *id == sequence) {
+            let references_sequence = match &column.default {
+                Some(ColumnDefault::Nextval(id)) => *id == sequence,
+                Some(ColumnDefault::Expr(expression)) => {
+                    expression.root.references_sequence(sequence)
+                }
+                Some(ColumnDefault::Const(_)) | None => false,
+            };
+            if references_sequence {
                 return Err(DbError::plan(
                     SqlState::DependentObjectsStillExist,
                     format!(
@@ -2876,6 +2940,19 @@ fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) 
                     ),
                 ));
             }
+        }
+        if table
+            .checks
+            .iter()
+            .any(|check| check.root.references_sequence(sequence))
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop sequence {sequence} because a CHECK constraint on table {} depends on it",
+                    table.name
+                ),
+            ));
         }
     }
     Ok(())
@@ -3106,6 +3183,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     validate_dictionary_ids(snapshot)?;
     validate_storage_ids(snapshot)?;
     validate_toast_relations(snapshot)?;
+    crate::serialize_catalog(snapshot)?;
     Ok(())
 }
 
@@ -3899,6 +3977,7 @@ fn validate_schema(
     validate_table_virtual_oids(schema)?;
 
     let mut column_ids = HashSet::new();
+    let mut column_object_ids = HashSet::new();
     let mut column_names = HashSet::new();
     for (expected_id, column) in schema.columns.iter().enumerate() {
         let expected_id: ColumnId = expected_id
@@ -3919,6 +3998,12 @@ fn validate_schema(
                 schema.name, column.id
             )));
         }
+        if column.object_id == 0 || !column_object_ids.insert(column.object_id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has invalid or duplicate column object id {}",
+                schema.name, column.object_id
+            )));
+        }
         if !column_names.insert(column.name.clone()) {
             return Err(DbError::internal(format!(
                 "catalog snapshot table {} has duplicate column {}",
@@ -3926,6 +4011,25 @@ fn validate_schema(
             )));
         }
         validate_column_default(&schema.name, column, sequences_by_id)?;
+    }
+    if schema.next_column_object_id == 0
+        || column_object_ids
+            .iter()
+            .any(|object_id| *object_id >= schema.next_column_object_id)
+    {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} has invalid next column object id {}",
+            schema.name, schema.next_column_object_id
+        )));
+    }
+    for check in &schema.checks {
+        if check.data_type != common::DataType::Boolean {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has non-boolean CHECK expression",
+                schema.name
+            )));
+        }
+        validate_stored_expression_references(check, &schema.columns, sequences_by_id)?;
     }
 
     let mut primary_key_ids = HashSet::new();
@@ -4022,6 +4126,7 @@ fn validate_view_columns(schema: &ViewSchema) -> Result<()> {
         )));
     }
     let mut seen_names = HashSet::new();
+    let mut seen_object_ids = HashSet::new();
     for (expected_id, column) in schema.columns.iter().enumerate() {
         let expected_id: ColumnId = expected_id
             .try_into()
@@ -4041,12 +4146,28 @@ fn validate_view_columns(schema: &ViewSchema) -> Result<()> {
                 schema.name, column.name
             )));
         }
+        if column.object_id == 0 || !seen_object_ids.insert(column.object_id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} has invalid or duplicate column object id {}",
+                schema.name, column.object_id
+            )));
+        }
         if column.default.is_some() {
             return Err(DbError::internal(format!(
                 "catalog snapshot view {} column {} has a column default",
                 schema.name, column.name
             )));
         }
+    }
+    if schema.next_column_object_id == 0
+        || seen_object_ids
+            .iter()
+            .any(|object_id| *object_id >= schema.next_column_object_id)
+    {
+        return Err(DbError::internal(format!(
+            "catalog snapshot view {} has invalid next column object id {}",
+            schema.name, schema.next_column_object_id
+        )));
     }
     Ok(())
 }
@@ -4275,6 +4396,14 @@ fn validate_column_default(
                 column.name, sequence
             )))
         }
+        Some(ColumnDefault::Const(value))
+            if !common::value_matches_type(value, &column.data_type) =>
+        {
+            Err(DbError::internal(format!(
+                "catalog snapshot table {table_name} column {} has a constant default with the wrong type",
+                column.name
+            )))
+        }
         // A non-finite constant default (e.g. `DEFAULT 1e400`, which parses
         // to Infinity) would serialize as JSON `null` in both the manifest's
         // catalog payload and the CreateTable/UpdateTableSchema WAL records —
@@ -4290,8 +4419,227 @@ fn validate_column_default(
                 column.name
             ),
         )),
+        Some(ColumnDefault::Expr(expression)) if expression.data_type != column.data_type => {
+            Err(DbError::internal(format!(
+                "catalog snapshot table {table_name} column {} has a stored default with the wrong result type",
+                column.name
+            )))
+        }
+        Some(ColumnDefault::Expr(expression)) => {
+            validate_stored_expression_references(expression, &[], sequences_by_id)
+        }
         _ => Ok(()),
     }
+}
+
+fn validate_stored_expression_references(
+    expression: &StoredExpression,
+    columns: &[ColumnDef],
+    sequences: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
+    common::validate_stored_expression_shape(expression)?;
+    validate_stored_node(&expression.root, columns, sequences)
+}
+
+fn validate_stored_node(
+    expression: &StoredExpr,
+    columns: &[ColumnDef],
+    sequences: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
+    match expression {
+        StoredExpr::Literal { .. } => {}
+        StoredExpr::Column {
+            column,
+            data_type,
+            nullable,
+        } => {
+            let Some(definition) = columns
+                .iter()
+                .find(|candidate| candidate.object_id == *column)
+            else {
+                return Err(DbError::internal(format!(
+                    "stored expression references unknown column object id {column}"
+                )));
+            };
+            // A constraint may have been bound while the column was nullable and
+            // then made NOT NULL by a primary key. That stored nullability is a
+            // safe conservative type; only claiming non-null for a nullable live
+            // column is stale metadata.
+            if definition.data_type != *data_type || (definition.nullable && !nullable) {
+                return Err(DbError::internal(format!(
+                    "stored expression column object id {column} has stale type metadata"
+                )));
+            }
+        }
+        StoredExpr::Binary { left, right, .. }
+        | StoredExpr::Any {
+            left, array: right, ..
+        } => {
+            validate_stored_node(left, columns, sequences)?;
+            validate_stored_node(right, columns, sequences)?;
+        }
+        StoredExpr::Unary { expr, .. }
+        | StoredExpr::IsNull { expr, .. }
+        | StoredExpr::IsNotNull { expr, .. }
+        | StoredExpr::Cast { expr, .. } => validate_stored_node(expr, columns, sequences)?,
+        StoredExpr::Function { args, .. } => validate_stored_list(args, columns, sequences)?,
+        StoredExpr::Array { elements, .. } => {
+            validate_stored_list(elements, columns, sequences)?;
+        }
+        StoredExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            validate_stored_node(array, columns, sequences)?;
+            validate_stored_list(subscripts, columns, sequences)?;
+        }
+        StoredExpr::Nextval { sequence, .. } | StoredExpr::Currval { sequence, .. } => {
+            require_stored_sequence(*sequence, sequences)?;
+        }
+        StoredExpr::Setval {
+            sequence,
+            value,
+            is_called,
+            ..
+        } => {
+            require_stored_sequence(*sequence, sequences)?;
+            validate_stored_node(value, columns, sequences)?;
+            if let Some(is_called) = is_called {
+                validate_stored_node(is_called, columns, sequences)?;
+            }
+        }
+        StoredExpr::InList { expr, list, .. } => {
+            validate_stored_node(expr, columns, sequences)?;
+            validate_stored_list(list, columns, sequences)?;
+        }
+        StoredExpr::Between {
+            expr, low, high, ..
+        } => {
+            validate_stored_node(expr, columns, sequences)?;
+            validate_stored_node(low, columns, sequences)?;
+            validate_stored_node(high, columns, sequences)?;
+        }
+        StoredExpr::Like { expr, pattern, .. } => {
+            validate_stored_node(expr, columns, sequences)?;
+            validate_stored_node(pattern, columns, sequences)?;
+        }
+        StoredExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_stored_node(operand, columns, sequences)?;
+            }
+            for (when, then) in when_clauses {
+                validate_stored_node(when, columns, sequences)?;
+                validate_stored_node(then, columns, sequences)?;
+            }
+            if let Some(otherwise) = else_clause {
+                validate_stored_node(otherwise, columns, sequences)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stored_node_references_column(expression: &StoredExpr, target: common::ColumnObjectId) -> bool {
+    match expression {
+        StoredExpr::Column { column, .. } => *column == target,
+        StoredExpr::Binary { left, right, .. }
+        | StoredExpr::Any {
+            left, array: right, ..
+        } => {
+            stored_node_references_column(left, target)
+                || stored_node_references_column(right, target)
+        }
+        StoredExpr::Unary { expr, .. }
+        | StoredExpr::IsNull { expr, .. }
+        | StoredExpr::IsNotNull { expr, .. }
+        | StoredExpr::Cast { expr, .. } => stored_node_references_column(expr, target),
+        StoredExpr::Function { args, .. } => args
+            .iter()
+            .any(|argument| stored_node_references_column(argument, target)),
+        StoredExpr::Array { elements, .. } => elements
+            .iter()
+            .any(|element| stored_node_references_column(element, target)),
+        StoredExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            stored_node_references_column(array, target)
+                || subscripts
+                    .iter()
+                    .any(|subscript| stored_node_references_column(subscript, target))
+        }
+        StoredExpr::Setval {
+            value, is_called, ..
+        } => {
+            stored_node_references_column(value, target)
+                || is_called
+                    .as_deref()
+                    .is_some_and(|value| stored_node_references_column(value, target))
+        }
+        StoredExpr::InList { expr, list, .. } => {
+            stored_node_references_column(expr, target)
+                || list
+                    .iter()
+                    .any(|item| stored_node_references_column(item, target))
+        }
+        StoredExpr::Between {
+            expr, low, high, ..
+        } => {
+            stored_node_references_column(expr, target)
+                || stored_node_references_column(low, target)
+                || stored_node_references_column(high, target)
+        }
+        StoredExpr::Like { expr, pattern, .. } => {
+            stored_node_references_column(expr, target)
+                || stored_node_references_column(pattern, target)
+        }
+        StoredExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|value| stored_node_references_column(value, target))
+                || when_clauses.iter().any(|(when, then)| {
+                    stored_node_references_column(when, target)
+                        || stored_node_references_column(then, target)
+                })
+                || else_clause
+                    .as_deref()
+                    .is_some_and(|value| stored_node_references_column(value, target))
+        }
+        StoredExpr::Literal { .. } | StoredExpr::Nextval { .. } | StoredExpr::Currval { .. } => {
+            false
+        }
+    }
+}
+
+fn validate_stored_list(
+    expressions: &[StoredExpr],
+    columns: &[ColumnDef],
+    sequences: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
+    for expression in expressions {
+        validate_stored_node(expression, columns, sequences)?;
+    }
+    Ok(())
+}
+
+fn require_stored_sequence(
+    sequence: SequenceId,
+    sequences: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
+    if !sequences.contains_key(&sequence) {
+        return Err(DbError::internal(format!(
+            "stored expression references unknown sequence id {sequence}"
+        )));
+    }
+    Ok(())
 }
 
 fn relation_columns(snapshot: &CatalogSnapshot, relation: TableId) -> Option<&[ColumnDef]> {

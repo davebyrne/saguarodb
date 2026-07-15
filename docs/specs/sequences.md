@@ -22,7 +22,7 @@ spec adds three things that build on each other:
 1. **Generalize column `DEFAULT`** — the stored default is the bounded
    `ColumnDefault` enum, applied through the shared `build_insert_row` funnel.
    Constants stay constant, `Nextval` advances a sequence, and `Expr` stores
-   canonical SQL text that is rebound and evaluated per omitted row.
+   typed durable IR that is lowered and evaluated per omitted row.
 2. **Sequences** — a new catalog object (`CREATE SEQUENCE` / `DROP SEQUENCE`)
    with WAL-logged advancement and crash recovery, plus the `nextval`,
    `currval`, and `setval` functions.
@@ -94,12 +94,10 @@ These were settled during design and drive the rest of the spec.
    `MAXVALUE`, `CYCLE`) are honored; `CACHE` is accepted and ignored.
 5. **Widen the durable default field.** `ColumnDef.default` becomes
    `Option<ColumnDefault>`, whose variants are `Const(Value)`,
-   `Nextval(SequenceId)`, and `Expr(String)`.
+   `Nextval(SequenceId)`, and `Expr(StoredExpression)`.
    Constant `DEFAULT` landed unreleased on this branch, so changing its on-disk
-   shape is acceptable. Forward compatibility for the catalog snapshot comes from
-   `#[serde(default)]` on the field (a pre-default catalog snapshot loads with
-   `default = None`), not a snapshot version number — the catalog snapshot is
-   plain unversioned JSON (`serialize_catalog`). `ColumnDefault` derives its serde
+   shape is acceptable. The catalog snapshot is versioned catalog-v3 JSON and
+   older formats are rejected (`serialize_catalog`). `ColumnDefault` derives its serde
    (externally tagged); no compatibility shim is kept for the brief bare-`Value`
    form it had before this enum, since dev data is resettable (runtime-data
    convention).
@@ -140,7 +138,7 @@ carrier holds the sequence *name* (a `String`, fine in the leaf crate) and the
 pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
-    Expr(String),
+    Expr(StoredExpression),
     OwnedNextval(String),
     Serial,
 }
@@ -149,7 +147,7 @@ pub enum ParsedDefault {
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
-    Expr(String),
+    Expr(StoredExpression),
 }
 ```
 
@@ -158,7 +156,7 @@ the SERIAL family; execution replaces it with internal
 `ParsedDefault::OwnedNextval(name)` after creating the owned sequence. User
 defaults use `Nextval(name)` and may not borrow an owned sequence. Keeping
 `Const(Value)` as a variant preserves the existing constant behavior unchanged;
-`Expr(String)` stores non-constant defaults as canonical SQL text. See Decision 5
+`Expr(StoredExpression)` stores typed durable IR plus canonical SQL for display. See Decision 5
 for the on-disk migration.
 
 ### 3.3 Parser
@@ -185,9 +183,9 @@ for the on-disk migration.
   - `Serial` → require `INTEGER` (the parser has already normalized the type)
     and carry the SERIAL column name and ordinal on the bound `CREATE TABLE`;
     execution chooses the owned sequence name from the then-current catalog.
-  - `Expr(text)` → re-parse and bind against an empty column scope, reject
+  - `Expr(text)` → parse and bind once against an empty column scope, reject
     aggregates/subqueries/parameters, require the result type to be assignable to
-    the column, and persist the canonical text as `ColumnDefault::Expr`.
+    the column, and persist typed IR as `ColumnDefault::Expr`.
 - `validate_insert_omissions`: `has_usable_default` treats `Nextval` and `Expr`
   defaults as usable, so an omitted `NOT NULL` SERIAL/`nextval`/expression-default
   column is not rejected up front. An expression default that evaluates to `NULL`
@@ -198,7 +196,7 @@ for the on-disk migration.
 - `build_insert_row` fills omitted columns by **evaluating a `ColumnDefault`**:
   `Const(v)` → `v`; `Nextval(seq_id)` → call the sequence manager's `nextval`
   (advance + `SequenceAdvance` WAL + update session `currval` state);
-  `Expr(text)` → evaluate the binder-attached `BoundExpr` over an empty row;
+  `Expr(stored)` → lower typed IR directly and evaluate it over an empty row;
   absent default → `NULL`. Because this is the shared funnel, `INSERT`,
   `ON CONFLICT`, and `COPY ... FROM` all get sequence-backed and expression
   defaults with no per-path work — see §12 for the ordering consequences.
@@ -241,7 +239,7 @@ object), mirroring the existing `reserve_table_id`/`reserve_index_id`.
 
 The manifest catalog snapshot (serialized as JSON into the control record) gains
 a `sequences` field. This is an additive change carried by `#[serde(default)]` on
-the field (the snapshot is unversioned JSON): an old snapshot deserializes with an
+the catalog-v3 field; older catalog formats are rejected, so a current snapshot deserializes with an
 empty sequence set.
 
 ### 4.2 Runtime: `SequenceManager` (`storage`)
@@ -443,10 +441,9 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 | `nextval` past MAXVALUE / below MINVALUE, `NO CYCLE` | sequence-exhausted (`2200H`) / `NumericValueOutOfRange` |
 | `currval` before `nextval`/`setval(..., true)` in this session | object-not-in-prerequisite-state (`55000`) |
 | `SERIAL` outside a `CREATE TABLE` column def, `SERIAL` with explicit `DEFAULT`, or unsupported type modifiers | bind/parse error (`FeatureNotSupported`/`SyntaxError`) |
-| `DEFAULT` expr beyond literal/`nextval` | `FeatureNotSupported` |
 | `DEFAULT nextval('missing')` at `CREATE TABLE` | `42P01` UndefinedTable |
 | Explicit `DEFAULT nextval('<owned-serial-sequence>')` | `2BP01` DependentObjectsStillExist |
-| `DROP SEQUENCE` of a sequence referenced by a column default | `2BP01` DependentObjectsStillExist |
+| `DROP SEQUENCE` of a sequence referenced directly or inside a typed default/CHECK expression | `2BP01` DependentObjectsStillExist |
 | `INCREMENT BY 0`, or `MINVALUE > MAXVALUE`, etc. | `22023` InvalidParameterValue |
 
 ## 9. Testing
@@ -480,11 +477,11 @@ A single implementation plan, sequenced as independently testable commits:
 1. **Generalize the default field (no sequences yet).** Introduce
    `ColumnDefault`/`ParsedDefault` enums, migrate `ParsedColumnDef.default` and
    `ColumnDef.default` to them with `Const` preserving today's constant behavior
-   and `Expr` carrying non-constant defaults as canonical SQL text, update
+   and `Expr` carrying non-constant defaults as `StoredExpression`, update
    `convert_column_default`, `validate_default_value`, the catalog snapshot
-   (`#[serde(default)]` on the field for additive compatibility — the snapshot is
-   unversioned JSON), and the `build_insert_row` fill step to evaluate the bound
-   default. Existing DEFAULT tests stay green; `Nextval` has no producer yet.
+   (the snapshot is catalog-v3 JSON), and the `build_insert_row` fill step to
+   lower and evaluate the stored default. Existing DEFAULT tests stay green;
+   `Nextval` has no producer yet.
 2. **Sequence catalog object + DDL.** `SequenceId`/`SequenceSchema`, catalog
    map + allocator + recovery hooks, manifest field, `CreateSequence`/
    `DropSequence` WAL records, `CREATE`/`DROP SEQUENCE` parsing and server DDL

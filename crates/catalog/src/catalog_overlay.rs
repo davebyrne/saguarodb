@@ -8,7 +8,9 @@ use common::{
     SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, ViewSchema,
 };
 
-use crate::{CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog};
+use crate::{
+    CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog, serialize_catalog,
+};
 
 #[derive(Clone, Default)]
 struct CatalogDelta {
@@ -69,6 +71,10 @@ impl CatalogOverlay {
         let catalog = MemoryCatalog::try_from_snapshot(before.clone())?;
         let result = mutation(&catalog)?;
         let after = catalog.snapshot()?;
+        // Reject an oversized transaction-local catalog before recording its
+        // delta, so a successful DDL statement can always be checkpointed and
+        // reopened under the durable decoder's matching limit.
+        serialize_catalog(&after)?;
         let desired = CatalogAllocatorState::from_snapshot(&after);
         if !self.base.claim_allocators(expected, desired)? {
             return Err(DbError::plan(
@@ -241,7 +247,11 @@ mod tests {
         thread,
     };
 
-    use common::{CompressionSetting, DataType, ParsedColumnDef, ViewColumn};
+    use common::{
+        CompressionSetting, DataType, MAX_STORED_EXPRESSION_SQL_BYTES, ParsedColumnDef,
+        STORED_EXPRESSION_VERSION, SqlState, StoredExpr, StoredExpression, ToastOptions, Value,
+        ViewColumn,
+    };
 
     use super::*;
 
@@ -484,5 +494,41 @@ mod tests {
             })
             .unwrap();
         assert!(next.id > created.id);
+    }
+
+    #[test]
+    fn oversized_catalog_is_rejected_before_recording_overlay_delta() {
+        let base: Arc<dyn CatalogManager> = Arc::new(MemoryCatalog::empty());
+        let overlay = CatalogOverlay::new(base.clone());
+        let check = StoredExpression {
+            version: STORED_EXPRESSION_VERSION,
+            sql: "x".repeat(MAX_STORED_EXPRESSION_SQL_BYTES),
+            root: StoredExpr::Literal {
+                value: Value::Boolean(true),
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+            data_type: DataType::Boolean,
+            pg_type: None,
+            nullable: false,
+        };
+        let checks = (0..65).map(|_| check.clone()).collect();
+
+        let error = overlay
+            .apply(|catalog| {
+                catalog.create_table_with_options(
+                    "too_large".to_string(),
+                    vec![column()],
+                    Vec::new(),
+                    CompressionSetting::None,
+                    ToastOptions::legacy_catalog_default(),
+                    checks,
+                )
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+        assert!(overlay.is_empty().unwrap());
+        assert!(base.get_table_by_name("too_large").unwrap().is_none());
     }
 }

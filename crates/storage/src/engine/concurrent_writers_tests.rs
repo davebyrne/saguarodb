@@ -93,6 +93,7 @@ fn users_schema() -> TableSchema {
         columns: vec![
             ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -102,6 +103,7 @@ fn users_schema() -> TableSchema {
             },
             ColumnDef {
                 id: 1,
+                object_id: 2,
                 name: "name".to_string(),
                 data_type: DataType::Text,
                 nullable: true,
@@ -120,6 +122,7 @@ fn users_schema() -> TableSchema {
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         next_foreign_key_id: 0,
+        next_column_object_id: u32::MAX,
     }
 }
 

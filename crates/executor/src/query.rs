@@ -12,9 +12,8 @@ use common::{
     TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, Value, ViewColumn,
 };
 use planner::{
-    BindOptions, BoundExpr, BoundForeignKey, BoundForeignKeyTarget, BoundOnConflict,
-    BoundReturning, DropTableTarget, ExplainAnalysis, PhysicalPlan, PlanNodeLayout,
-    bind_default_expr_with_options,
+    BoundExpr, BoundForeignKey, BoundForeignKeyTarget, BoundOnConflict, BoundReturning,
+    DropTableTarget, ExplainAnalysis, PhysicalPlan, PlanNodeLayout,
 };
 use storage::{
     LockRowResult, LockedRow, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
@@ -2067,7 +2066,7 @@ fn execute_create_table(
     unique: &[Vec<String>],
     compression: CompressionSetting,
     toast: ToastOptions,
-    checks: &[String],
+    checks: &[common::StoredExpression],
     foreign_keys: &[BoundForeignKey],
 ) -> Result<ExecutionResult> {
     if if_not_exists {
@@ -2501,7 +2500,7 @@ fn execute_alter_table_add_column(
         .columns
         .last()
         .ok_or_else(|| DbError::internal("ALTER TABLE ADD COLUMN produced no column"))?;
-    let default_exprs = expression_default_for_column(ctx, schema.schema_id, added_column)?;
+    let default_exprs = expression_default_for_column(ctx, added_column)?;
     ctx.schema_ops
         .update_table_schema(&ctx.statement, &schema, &indexes)?;
     let rewrite_relations = ctx.storage.capture_relation_snapshot()?;
@@ -2872,19 +2871,12 @@ fn execute_drop_view(
 
 fn expression_default_for_column(
     ctx: &ExecutionContext<'_>,
-    schema: SchemaId,
     column: &common::ColumnDef,
 ) -> Result<Vec<(ColumnId, BoundExpr)>> {
     match &column.default {
-        Some(ColumnDefault::Expr(text)) => Ok(vec![(
+        Some(ColumnDefault::Expr(expression)) => Ok(vec![(
             column.id,
-            bind_default_expr_with_options(
-                ctx.catalog.as_ref(),
-                text,
-                &BindOptions {
-                    search_path: vec![schema],
-                },
-            )?,
+            planner::lower_stored_expression(ctx.catalog.as_ref(), expression, &[])?,
         )]),
         _ => Ok(Vec::new()),
     }
@@ -3120,19 +3112,28 @@ fn validate_check_constraints(
         identity: None,
     };
     for (index, expr) in check_exprs.iter().enumerate() {
-        if matches!(eval_expr(statement, expr, &row)?, Value::Boolean(false)) {
-            let text = schema
-                .checks
-                .get(index)
-                .map(String::as_str)
-                .unwrap_or("check constraint");
-            return Err(DbError::execute(
-                SqlState::CheckViolation,
-                format!(
-                    "new row for relation \"{}\" violates check constraint ({text})",
+        match eval_expr(statement, expr, &row)? {
+            Value::Boolean(false) => {
+                let text = schema
+                    .checks
+                    .get(index)
+                    .map(|expression| expression.sql.as_str())
+                    .unwrap_or("check constraint");
+                return Err(DbError::execute(
+                    SqlState::CheckViolation,
+                    format!(
+                        "new row for relation \"{}\" violates check constraint ({text})",
+                        schema.name
+                    ),
+                ));
+            }
+            Value::Boolean(true) | Value::Null => {}
+            value => {
+                return Err(DbError::internal(format!(
+                    "CHECK expression on relation {} returned non-boolean value {value:?}",
                     schema.name
-                ),
-            ));
+                )));
+            }
         }
     }
     Ok(())

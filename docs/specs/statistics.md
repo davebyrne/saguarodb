@@ -119,7 +119,8 @@ independently of them:
   TableStatistics>` — the same backward-compatible evolution used when views,
   secondary indexes, sequences, and dictionaries were added
   (`crates/catalog/src/memory.rs`). Old manifests deserialize with empty
-  statistics; no manifest (`SGMF`) version bump.
+  statistics. The current typed-catalog release uses catalog v3 inside manifest
+  (`SGMF`) v4; older development formats are not migrated.
 - Catalog API: `get_table_statistics(TableId)` and
   `set_table_statistics(TableId, TableStatistics)` (set validates the table is
   a live user relation and every statistics column id exists). Schema-change

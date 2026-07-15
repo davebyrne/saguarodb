@@ -279,6 +279,7 @@ pub struct ParsedColumnDef {
 /// The authoritative schema definition for an existing table.
 pub struct ColumnDef {
     pub id: ColumnId,
+    pub object_id: ColumnObjectId,
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -306,7 +307,10 @@ pub struct ViewColumn {
 }
 ```
 
-`ParsedColumnDef` → catalog assigns IDs → `ColumnDef`. `ColumnInfo` is derived from `ColumnDef` for result set descriptions. `ViewColumn` carries planner-derived view output metadata, including nullability, before the catalog persists it as dense `ColumnDef` values.
+`ParsedColumnDef` → catalog assigns identities → `ColumnDef`. `ColumnId` is the
+dense row/storage ordinal; `ColumnObjectId` is the durable, never-reused
+relation-local identity used by stored expressions. `ColumnInfo` is derived from
+`ColumnDef`; `ViewColumn` carries output metadata before both identities exist.
 
 #### Error Types
 
@@ -1082,7 +1086,7 @@ pub enum BoundStatement {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
@@ -1377,7 +1381,7 @@ pub enum LogicalPlan {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
@@ -1488,7 +1492,7 @@ pub enum PhysicalPlan {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     },
     DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { schema: SchemaId, name: String, table: String, columns: Vec<String>, unique: bool },
@@ -2203,7 +2207,7 @@ pub trait ControlStore: Send + Sync {
 
 `store` writes `data/manifest.dat` via temp file + fsync + rename + directory fsync. The rename is the checkpoint commit point: the caller must fsync the heap (`PageStore::sync_all`) **before** `store`, and truncate the WAL only **after** it.
 
-The control record uses a versioned binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and `catalog`. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. The legacy full-snapshot manifest (version `1`) is rejected, not migrated.
+The control record uses the version-4 binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and catalog-v3 bytes. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. Older manifests and catalogs are rejected, not migrated.
 
 ### checkpoint_lsn
 
@@ -2517,6 +2521,8 @@ pub struct TableSchema {
     pub schema_version: u64,
     pub foreign_keys: Vec<ForeignKeyConstraint>,
     pub next_foreign_key_id: u32,
+    pub checks: Vec<StoredExpression>,
+    pub next_column_object_id: ColumnObjectId,
 }
 
 pub struct ViewDependency {
@@ -2526,14 +2532,24 @@ pub struct ViewDependency {
 }
 ```
 
-`ColumnDef`, `DataType`, `ToastOptions`, relation/index/view/sequence schemas, and their input forms are defined in `common`. Column IDs are dense row slots within a schema version; rewrite DDL may renumber them and must remap surviving index/view metadata before publication. Logical table/index IDs remain stable while `storage_id` identifies the current physical generation and changes on TRUNCATE or rewrite. Public schema changes increment `schema_version`, which prepared execution revalidates after table-lock acquisition. Tables and views share the public relation-name namespace; hidden TOAST relations are stored only by ID and are never user-resolvable. ADD/DROP column preflight is read-only and repeated after the server holds the catalog publication gate plus target `AccessExclusive`, because an earlier conditional no-op decision may race another DDL. Catalog loading validates identifiers, storage-id uniqueness, TOAST bounds/cross-links, view dependencies, and table/view namespace collisions; unchecked snapshot installation remains crate-private.
+`ColumnDef`, `DataType`, `ToastOptions`, relation/index/view/sequence schemas, and
+their input forms are defined in `common`. Dense `ColumnId`s are row slots within
+a schema version and may be renumbered by rewrite DDL. Stable
+`ColumnObjectId`s are allocated monotonically per table/view, never reused, and
+remain unchanged for surviving columns. CHECK/default execution uses versioned
+`StoredExpression` trees whose stable column/function/sequence references are
+validated at catalog load; canonical SQL is retained for display and diagnostics.
+Logical table/index IDs remain stable while `storage_id` identifies the current
+physical generation and changes on TRUNCATE or rewrite. Public schema changes
+increment `schema_version`, which prepared execution revalidates after table-lock
+acquisition.
 
 Foreign keys are stored as ordered, ID-resolved per-table metadata. Their IDs
 are allocated monotonically in `0..=4095` (`4096` is the exhausted sentinel),
 and each constraint retains the exact declared parent constraint-index ID chosen
-at attachment. Old catalog/WAL table-schema payloads default the list and
-allocator to empty/zero; a legacy missing referenced-index field is resolved
-during validated loading. The executor enforces installed metadata on every write path as
+at attachment. Specialized WAL table-schema payloads default the list and
+allocator to empty/zero; a missing referenced-index field is resolved while
+applying that schema record. Older catalog envelopes are rejected. The executor enforces installed metadata on every write path as
 specified above. Server object discovery adds the related parents and children
 to DML relation locks and prepared schema identities, and recomputes that set
 during lock convergence so an FK published after initial discovery cannot be
@@ -2611,7 +2627,7 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     ) -> Result<TableSchema>;
 
     /// Remove a table

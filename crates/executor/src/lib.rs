@@ -768,7 +768,7 @@ mod tests {
             .execute(
                 "create table constraint_probe (\
                  id integer primary key default 7, \
-                 explicit_id integer default nextval('explicit_seq'), \
+                 explicit_id integer default nextval('explicit_seq') + 1, \
                  serial_id serial, \
                  name text, \
                  check (id > 0))",
@@ -895,7 +895,7 @@ mod tests {
                 Row {
                     values: vec![
                         Value::Integer(2),
-                        Value::Text("nextval('explicit_seq')".to_string()),
+                        Value::Text("nextval('explicit_seq') + 1".to_string()),
                     ],
                 },
                 Row {
@@ -1057,6 +1057,32 @@ mod tests {
                     Value::Text("saguarodb".to_string()),
                     Value::Boolean(true),
                 ],
+            }]
+        );
+    }
+
+    #[test]
+    fn pg_depend_exposes_sequence_references_nested_in_checks() {
+        let harness = ExecutorHarness::with_users();
+        harness.execute("create sequence check_dep_seq").unwrap();
+        harness
+            .execute("create table check_dep (id integer, check (nextval('check_dep_seq') > 0))")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select s.relname \
+                 from pg_catalog.pg_depend d \
+                 join pg_catalog.pg_constraint k on d.objid = k.oid \
+                 join pg_catalog.pg_class s on d.refobjid = s.oid \
+                 where k.conname = 'check_dep_check' \
+                   and s.relname = 'check_dep_seq'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("check_dep_seq".to_string())],
             }]
         );
     }
@@ -1625,6 +1651,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -1642,6 +1669,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
 
         let row = crate::query::build_insert_row(
@@ -1685,6 +1713,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -1702,6 +1731,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
 
         let row = crate::query::build_insert_row(&statement, &schema, &[], vec![], &[]).unwrap();

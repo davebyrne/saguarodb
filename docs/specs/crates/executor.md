@@ -207,6 +207,12 @@ flags, and `NO ACTION`/`RESTRICT` action codes. Their `pg_depend` rows cover the
 child table and source columns, parent table and referenced columns, and
 referenced constraint index. Unsupported foreign-key operator arrays are `NULL`;
 no additional `information_schema` view is synthesized.
+Column defaults contribute `pg_depend` edges for every sequence reference in
+their durable expression tree, including a reference nested below arithmetic,
+CASE, or another supported scalar form. CHECK constraints likewise contribute a
+normal edge to each referenced sequence. Repeated references to the same
+sequence in one expression produce one edge. Built-in functions remain virtual,
+immutable registry entries and do not gain catalog dependency rows.
 `pg_attribute` includes common
 PostgreSQL 16 metadata columns used by table-description probes, with harmless
 constants for unsupported features (no inheritance, missing values, ACLs, or
@@ -326,7 +332,7 @@ in `docs/specs/subqueries.md`.
 `INSERT` (from `VALUES` or `SELECT`):
 
 - Materialize the source plan fully before inserting any row, so that `INSERT ... SELECT` reading the target table observes only pre-insert rows.
-- For each source row, build row values in table column order. Omitted columns use their bound table schema default: `ColumnDefault::Const(value)` clones the constant, `ColumnDefault::Nextval(sequence_id)` advances the sequence through `StatementContext.sequence_manager` and records the value for `currval`, and `ColumnDefault::Expr` evaluates the bound default expression the binder attached to the INSERT over an empty row (the expression cannot reference columns); no default yields `NULL`. (COPY FROM supplies the same bound table schema and expression defaults — the binder attaches them to `BoundStatement::Copy` for the omitted columns — so an omitted `ColumnDefault::Expr` column is evaluated per row under COPY too.)
+- For each source row, build values in table-column order. Constant and sequence defaults retain their existing behavior; a `ColumnDefault::Expr(StoredExpression)` is lowered directly to the bound expression attached to INSERT/COPY and evaluated over an empty row. Runtime execution never parses the stored canonical SQL.
 - Validate runtime values match destination column types. `NULL` is accepted at this step and checked by row-constraint validation.
 - Coerce `NUMERIC(p, s)` column values to the column scale (`coerce_numeric_columns`): each `Value::Numeric` is rounded to `s` (half away from zero) and rejected with `SqlState::NumericValueOutOfRange` when the integer part exceeds `p - s` digits. Bare `NUMERIC` columns and non-numeric values are unchanged. Runs before constraint validation, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, and `COPY ... FROM`.
 - Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
@@ -536,7 +542,9 @@ not diverge between ALTER validation and later DML.
 - `RENAME COLUMN` and `RENAME TO` are metadata updates: mutate catalog schema,
   then call `SchemaOperations::update_table_schema` with the updated table and
   current secondary-index schemas. Catalog rejects these renames when dependent
-  views or stored CHECK expressions would leave SQL text stale.
+  views still rely on their stored SQL. Stored CHECK/default canonical SQL may
+  become textually stale, but rename remains valid because execution follows its
+  stable typed column references.
 - `ADD COLUMN` and `DROP COLUMN` are logical rewrites. Target `AccessExclusive`
   drains users of the old generation before the executor runs these plans. The executor first
   calls the catalog preflight helper, returning no-op/error outcomes before

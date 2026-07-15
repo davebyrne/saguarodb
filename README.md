@@ -289,7 +289,7 @@ crates/
   spill/     query-local memory accounting, spill tapes, external sorting
   compress/  compression codecs, page envelopes, TOAST helpers, dictionaries
   parser/    SQL text to SaguaroDB AST
-  catalog/   table metadata, stable IDs, schema snapshots
+  catalog/   table metadata, dense ordinals + stable column IDs, schema snapshots
   planner/   binding, logical plans, physical plans, EXPLAIN formatting
   executor/  expression evaluation and volcano-style operators
   storage/   page-backed MVCC storage, B-tree indexes, TOAST, VACUUM, recovery

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    ColumnId, DbError, FileId, ForeignKeyId, IndexId, PUBLIC_SCHEMA_ID, PgType, SchemaId,
-    SequenceId, SqlState, TableId, Value,
+    ColumnId, ColumnObjectId, DbError, FileId, ForeignKeyId, IndexId, PUBLIC_SCHEMA_ID, PgType,
+    SchemaId, SequenceId, SqlState, StoredExpression, TableId, Value,
 };
 
 pub const INITIAL_SCHEMA_VERSION: u64 = 1;
@@ -304,9 +304,11 @@ pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
     /// A non-constant `DEFAULT` expression carried as canonical SQL text. The
-    /// binder re-parses and binds it at `CREATE TABLE` (to validate) and at each
-    /// `INSERT` (to evaluate per row); it may not reference table columns.
+    /// binder resolves it once during DDL and replaces it with `Stored`; it may
+    /// not reference table columns.
     Expr(String),
+    /// Binder-resolved internal form passed to catalog mutation APIs.
+    Stored(StoredExpression),
     /// Internal form used while executing `SERIAL` desugaring. Explicit user
     /// defaults use `Nextval` and may not borrow a serial-owned sequence.
     OwnedNextval(String),
@@ -316,20 +318,14 @@ pub enum ParsedDefault {
 }
 
 /// A resolved column `DEFAULT`, persisted in the catalog snapshot. The
-/// externally-tagged serde form (`{"Const": ...}` / `{"Nextval": id}`) is durable;
-/// the enclosing `ColumnDef.default` is `#[serde(default)]`, so a pre-default
-/// catalog snapshot still loads (the field reads as `None`). The constant-`DEFAULT`
-/// shape landed unreleased on this branch, so no compatibility shim is kept for the
-/// brief bare-`Value` form it had before this enum (dev data is resettable per the
-/// runtime-data convention).
+/// externally-tagged serde form is part of catalog v3.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
-    /// A non-constant `DEFAULT` expression, persisted as canonical SQL text. The
-    /// binder re-parses and binds it against an empty column scope at each
-    /// `INSERT`; the executor evaluates the bound form per row.
-    Expr(String),
+    /// A non-constant `DEFAULT` expression persisted as typed durable IR, with
+    /// canonical SQL retained for introspection and diagnostics.
+    Expr(StoredExpression),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +354,9 @@ pub struct ParsedColumnDef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub id: ColumnId,
+    /// Durable per-relation identity. Zero is reserved for transient query-only
+    /// columns that are never serialized into a catalog relation.
+    pub object_id: ColumnObjectId,
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -480,13 +479,12 @@ pub struct TableSchema {
     /// User table vs. hidden toast relation metadata.
     #[serde(default)]
     pub relation_kind: RelationKind,
-    /// `CHECK` constraint expressions, held as canonical SQL text (column-level
-    /// and table-level checks are flattened here, as in PostgreSQL). The binder
-    /// re-parses and binds each against the table's columns at `CREATE TABLE` (to
-    /// validate) and at each `INSERT`/`UPDATE` (to enforce per row); the executor
-    /// rejects a row whose check evaluates to `false` (a `NULL` result passes).
+    /// Typed durable `CHECK` expressions (column-level and table-level checks are
+    /// flattened here, as in PostgreSQL). DML lowers the stored expressions
+    /// directly; a row whose check evaluates to `false` is rejected while a
+    /// `NULL` result passes.
     #[serde(default)]
-    pub checks: Vec<String>,
+    pub checks: Vec<StoredExpression>,
     /// Ordered outgoing foreign-key constraints owned by this table.
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyConstraint>,
@@ -494,6 +492,8 @@ pub struct TableSchema {
     /// sentinel; live ids are restricted to `0..=4095`.
     #[serde(default)]
     pub next_foreign_key_id: u32,
+    /// Next never-reused durable column identity within this relation.
+    pub next_column_object_id: ColumnObjectId,
 }
 
 /// A durable dependency from a view to another relation. `columns` tracks specific
@@ -546,6 +546,8 @@ pub struct ViewSchema {
     pub schema_version: u64,
     #[serde(default = "default_view_search_path")]
     pub definition_search_path: Vec<SchemaId>,
+    /// Next never-reused durable output-column identity within this view.
+    pub next_column_object_id: ColumnObjectId,
 }
 
 fn default_view_search_path() -> Vec<SchemaId> {
@@ -575,6 +577,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
         columns: vec![
             ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "value_id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -584,6 +587,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
             },
             ColumnDef {
                 id: 1,
+                object_id: 2,
                 name: "seq".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -593,6 +597,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
             },
             ColumnDef {
                 id: 2,
+                object_id: 3,
                 name: "data".to_string(),
                 data_type: DataType::Bytea,
                 nullable: false,
@@ -613,6 +618,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         next_foreign_key_id: 0,
+        next_column_object_id: 4,
     }
 }
 
@@ -726,6 +732,7 @@ mod tests {
     fn column_def_wire_type_resolves_unlabeled_columns() {
         let unlabeled = ColumnDef {
             id: 0,
+            object_id: 1,
             name: "n".to_string(),
             data_type: DataType::Integer,
             nullable: true,
@@ -746,12 +753,13 @@ mod tests {
 
     #[test]
     fn table_schema_without_compression_fields_deserializes_to_defaults() {
-        // A pre-compression snapshot/WAL payload must keep loading.
+        // Current schemas still default optional compression metadata.
         let json = r#"{
             "id": 1,
             "name": "users",
             "columns": [],
-            "primary_key": []
+            "primary_key": [],
+            "next_column_object_id": 1
         }"#;
         let schema: TableSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.compression, CompressionSetting::None);

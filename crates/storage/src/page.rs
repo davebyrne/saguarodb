@@ -763,6 +763,7 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     id: 0,
+                    object_id: 1,
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -772,6 +773,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 1,
+                    object_id: 2,
                     name: "note".to_string(),
                     data_type: DataType::Text,
                     nullable: true,
@@ -790,6 +792,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         }
     }
 

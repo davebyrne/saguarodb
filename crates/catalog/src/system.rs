@@ -565,6 +565,7 @@ fn oid_payload(id: u32) -> Result<i64> {
 fn col(id: u16, name: &str, data_type: DataType, pg_type: PgType, nullable: bool) -> ColumnDef {
     ColumnDef {
         id,
+        object_id: u32::from(id) + 1,
         name: name.to_string(),
         data_type,
         nullable,

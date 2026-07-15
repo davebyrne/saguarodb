@@ -236,12 +236,22 @@ pub enum ParsedDefault {
     OwnedNextval(String),
     Serial,
     Expr(String),  // non-constant default, as canonical SQL text
+    Stored(StoredExpression), // binder-resolved internal handoff to the catalog
 }
 
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
-    Expr(String),  // non-constant default, as canonical SQL text
+    Expr(StoredExpression),
+}
+
+pub struct StoredExpression {
+    pub version: u32,
+    pub sql: String,
+    pub root: StoredExpr,
+    pub data_type: DataType,
+    pub pg_type: Option<PgType>,
+    pub nullable: bool,
 }
 
 pub struct ParsedColumnDef {
@@ -255,6 +265,7 @@ pub struct ParsedColumnDef {
 
 pub struct ColumnDef {
     pub id: ColumnId,
+    pub object_id: ColumnObjectId,
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
@@ -283,9 +294,10 @@ pub struct TableSchema {
     pub toast: ToastOptions,
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
-    pub checks: Vec<String>,  // CHECK constraint expressions, canonical SQL text
+    pub checks: Vec<StoredExpression>,
     pub foreign_keys: Vec<ForeignKeyConstraint>,
     pub next_foreign_key_id: u32,
+    pub next_column_object_id: ColumnObjectId,
 }
 
 pub type ForeignKeyId = u16;
@@ -376,11 +388,18 @@ pub struct TruncateCatalogUpdate {
 }
 ```
 
-`ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned
-and has dense IDs within a specific `TableSchema.schema_version`: IDs match the
-row slot order and may be renumbered by rewrite-style schema evolution such as
-`DROP COLUMN`. Metadata that survives a schema version change must be remapped
-by the catalog instead of treating `ColumnId` as a cross-version identity.
+Stored-expression format version `1` admits at most 16,384 nodes, 128 levels,
+4,096 items in any node list, and 1 MiB of retained canonical SQL. List and SQL
+limits are enforced by bounded serde visitors while decoding, before an
+oversized collection is allocated; catalog validation enforces the aggregate
+node/depth limits and all stable references.
+
+`ParsedColumnDef` is parser output and never has IDs. `ColumnDef` has two
+identities: `ColumnId` is the dense row-slot ordinal within one schema version
+and may be renumbered by `DROP COLUMN`; `ColumnObjectId` is the durable,
+never-reused relation-local identity used by stored expressions.
+`next_column_object_id` is persisted on tables and views, so removing an earlier
+column cannot retarget a surviving reference.
 `ColumnInfo` describes result columns and may be derived from expressions, so
 table/column IDs are optional. `TableSchema.schema_version` and
 `ViewSchema.schema_version` start at `1` and increment on public schema metadata
@@ -395,25 +414,22 @@ vector/array identities (`int2vector`, `oidvector`, `int2[]`/`_int2`,
 
 `TableSchema.id` and `IndexSchema.id` are stable logical catalog identities.
 `storage_id` is the current physical relation-generation id used by storage to
-derive heap, primary-index, and secondary-index file ids. The field is durable
-and serde-defaulted for compatibility; `storage_id == 0` means a legacy catalog
-snapshot omitted the field and must be migrated by the catalog load path before
-validation or use. Live schemas must never retain `storage_id == 0`. Legacy
-catalog migration preserves existing file names by allowing a table relation and
-a secondary index to keep the same raw storage id when their old logical ids
-matched; storage file-kind bits still make the actual heap/primary/secondary
-file ids distinct. Fresh allocations come from one monotonic allocator and do
-not intentionally create those cross-kind raw collisions.
+derive heap, primary-index, and secondary-index file ids. It is durable and
+nonzero in catalog v3. Older catalog payloads are rejected rather than migrated.
+Fresh allocations come from one monotonic allocator.
 
-`ViewColumn` is the catalog input shape for view output columns before dense
-`ColumnId`s are assigned. Stored `ViewSchema.columns` use `ColumnDef` with dense
-column IDs and no defaults. `ViewDependency.columns` lists referenced column IDs;
+`ViewColumn` is the catalog input shape for view output columns before identities
+are assigned. Stored view columns use dense `ColumnId`s, stable
+`ColumnObjectId`s, and no defaults. Replacement positions retain their stable
+IDs only when name, logical type, nullability, length, and PostgreSQL type
+metadata remain compatible; an incompatible position receives a new monotonic
+ID. `ViewDependency.columns` lists referenced dense column IDs;
 `all_columns = true` represents relation-wide dependencies such as `SELECT *`;
 neither specific columns nor `all_columns` represents relation-existence-only
-dependencies such as `count(*)`. For compatibility with snapshots written before
-`all_columns` existed, deserializing a dependency with the field absent and
-`columns = []` treats it as `all_columns = true`; newly serialized
-relation-existence dependencies always include `all_columns = false`.
+dependencies such as `count(*)`. The type-level decoder still defaults an absent
+`all_columns` paired with `columns = []` to `true`, but catalog formats older
+than v3 are rejected at the snapshot envelope rather than migrated. Newly
+serialized relation-existence dependencies include `all_columns = false`.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and
@@ -469,12 +485,22 @@ is the catalog-owned durable sequence metadata. `last_value`/`is_called` are the
 checkpoint baseline for the storage runtime's current sequence state.
 `ColumnDefault::Nextval(SequenceId)` is the stored form of
 `DEFAULT nextval('<sequence>')` and is evaluated by the executor through the
-statement's sequence manager. `ColumnDefault::Expr(String)` / `ParsedDefault::Expr(String)`
-are the stored form of a non-constant `DEFAULT` expression, held as canonical SQL
-text: the binder re-parses it (`parser::parse_expression`) and binds it against an
-empty column scope both at `CREATE TABLE` (to validate its type and reject column
-references, aggregates, subqueries, and parameters) and at each `INSERT` (to
-evaluate it per omitted row). `ParsedDefault::Serial` is the parse-time marker
+statement's sequence manager. `ParsedDefault::Expr(String)` is parser output for
+a non-constant default. The binder parses and resolves it once during
+CREATE/ALTER, producing `ParsedDefault::Stored(StoredExpression)` for the catalog,
+which persists it as `ColumnDefault::Expr(StoredExpression)`. Canonical SQL
+remains for display and diagnostics, while the typed tree is authoritative for
+execution; DML lowers it directly to `BoundExpr` without reparsing. Stable
+references use `ColumnObjectId`, `FunctionId`, and `SequenceId`; parameters,
+aggregates, subqueries, planner slots, and runtime sets are excluded.
+Every stored literal must be finite because the JSON catalog/WAL boundary cannot
+round-trip NaN or infinity. A stored column reference may conservatively remain
+nullable after a primary key makes the live column non-null, but it may never
+claim non-nullability for a nullable live column.
+CASE result nullability is the binder's durable value because flow-sensitive
+forms such as desugared `COALESCE` cannot be reconstructed from branch metadata
+alone.
+`ParsedDefault::Serial` is the parse-time marker
 for a `SERIAL` family column during `CREATE TABLE`; the executor replaces it with
 the internal `ParsedDefault::OwnedNextval(name)` after creating the owned
 sequence, and the catalog resolves that internal form to
@@ -572,11 +598,10 @@ granted immediately.
 `SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
 table's `CHECK` constraint — the constraint expression evaluated to `false` for
 the row (a `NULL`/unknown result passes, matching PostgreSQL). `TableSchema.checks`
-holds each `CHECK` expression as canonical SQL text (column-level and table-level
-checks flattened together); the binder re-parses and binds each against the table's
-columns at `CREATE TABLE` (to validate: boolean result, resolvable columns, no
-aggregates/subqueries/parameters) and at each `INSERT`/`UPDATE` (to enforce per
-row).
+holds each `CHECK` as a `StoredExpression` (column-level and table-level checks
+flattened together). The binder parses and resolves it once at `CREATE TABLE`;
+INSERT/UPDATE/COPY lower the durable typed tree directly. Its canonical `sql`
+field remains the diagnostic and introspection text.
 
 `SqlState::UndefinedObject` maps to SQLSTATE `42704`: an object-like name is not
 recognized when no more specific relation/column SQLSTATE applies. The server

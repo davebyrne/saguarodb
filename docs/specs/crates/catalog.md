@@ -113,10 +113,10 @@ RESTRICT semantics: it rejects a schema containing objects or referenced by a
 stored view definition search path.
 
 The catalog JSON payload has its own format version, independently of the outer
-control-record version. Version 2 stores schemas, tables, views, indexes, and
-sequences as id-sorted arrays plus allocator high-water marks; runtime name maps
-are rebuilt while decoding. An unversioned legacy payload is migrated by placing
-all objects in `public`. Unknown catalog payload versions are rejected.
+control-record version. Version 3 stores schemas, tables, views, indexes, and
+sequences as id-sorted arrays plus allocator high-water marks, stable column
+identities, and typed stored CHECK/default expressions; runtime name maps are
+rebuilt while decoding. Unversioned, version-2, and unknown payloads are rejected.
 
 Table IDs, index IDs, sequence IDs, and storage IDs are independent namespaces;
 all are monotonically increasing and never reused. `next_index_id` starts at
@@ -299,7 +299,7 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<StoredExpression>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
     fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema>;
@@ -517,9 +517,9 @@ first and mutate the startup-only write-locked snapshot in place, avoiding a
 full catalog clone per WAL record; live `drop_tables` retains atomic
 clone-and-swap publication.
 
-Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them before scanning rows and repeats preflight under the server catalog publication gate plus target `AccessExclusive` lock. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, foreign-key source or referenced columns, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `ALTER COLUMN TYPE` likewise rejects foreign-key source or referenced columns unless the requested type is already identical. `preflight_table_primary_key_change` performs the read-only dependency check before maintenance WAL commit; dropping or changing a primary key referenced by a foreign key is rejected with `SqlState::DependentObjectsStillExist`. Table and column renames remain allowed for foreign-key metadata because it stores IDs; the existing view/CHECK text restrictions still apply. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
+Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `add_table_column` assigns both the next dense `ColumnId` and the table's next never-reused `ColumnObjectId`. `drop_table_column` may renumber dense ordinals but preserves every surviving stable ID; a CHECK blocks the drop only when its typed tree references the target stable column. Existing index, FK, view, primary-key, and owned-sequence restrictions remain. Table and column renames change names without rewriting stored CHECK/default IR. Public changes increment `schema_version`, and preflight is repeated under the publication and relation locks.
 
-`create_view`, `replace_view`, `apply_create_view`, `apply_replace_view`, `drop_view`, and `apply_drop_view` manage durable user-view metadata. Creating a view allocates from `next_table_id`, rejects relation-name/id collisions with tables or views, stores dense output columns from `ViewColumn` (including result nullability and wire type), stores canonical SQL text, validates dependencies, and starts `schema_version = 1`. View dependencies may target user tables only; dependencies on views or hidden TOAST relations are rejected to avoid dependency cycles while view expansion remains single-level for stored view definitions. `replace_view` keeps the existing id/name and increments `schema_version`. Dropping a view is rejected while another view depends on it. `list_views` returns views ordered by id.
+`create_view` assigns dense and stable output-column identities. A `replace_view` position preserves its `ColumnObjectId` only when its name, logical type, nullability, length, and PostgreSQL type metadata remain compatible. Incompatible or newly permitted output positions allocate monotonically, and removed IDs are never reused. The relation ID/name and existing dependency/search-path behavior remain unchanged.
 
 `create_index` resolves the table and column names, assigns an `IndexId` plus a
 fresh `storage_id`, and returns the stored `IndexSchema`; duplicate names
@@ -570,10 +570,9 @@ overflow-guarded and rejecting ids that collide with the file-kind high-bit
 space. `reserve_storage_id(id)` advances the same high-water mark past `id`
 without installing a schema. Storage ids are used by table heaps, hidden TOAST
 heaps, and secondary indexes. Fresh allocation uses one high-water mark and
-therefore avoids raw cross-kind collisions, but legacy snapshot migration may
-preserve a table and secondary index with the same raw storage id so existing
-`.heap`/`.idx`/`.sidx` files remain reachable; file-kind high bits still keep
-the actual file ids distinct.
+therefore avoids raw cross-kind collisions. Catalog formats older than v3 are
+rejected rather than migrated; file-kind high bits keep actual file ids
+distinct.
 
 `prepare_truncate_table(table)` validates that `table` exists and is a user
 table, allocates fresh storage ids for the base table, its hidden TOAST relation
@@ -622,12 +621,11 @@ snapshot fencing for harmless conditional statements. ADD/DROP column rewrites
 use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as
 part of the logical schema change, then storage publishes the matching
 `UpdateTableSchema` record. Renames are metadata-only and keep existing storage
-ids. Table/column renames reject dependent views. Table rename allows stored
-CHECK constraints because the binder rejects table-qualified CHECK references at
-CREATE time; column rename and drop reject stored CHECK constraints so stored
-SQL text cannot become stale. Dropping a column also rejects primary-key, indexed,
-view-dependent, and
-owned-sequence-default columns.
+ids. Table/column renames reject dependent views. Table and column renames allow
+stored CHECK constraints because typed stable-column references, rather than
+canonical SQL, are execution authority. A column drop is blocked only by CHECKs
+that reference that stable column. Dropping a column also rejects primary-key,
+indexed, view-dependent, and owned-sequence-default columns.
 
 ## Create Table Rules
 
@@ -647,7 +645,7 @@ owned-sequence-default columns.
   beyond that limit returns `SqlState::ProgramLimitExceeded` (`54000`). Invalid
   persisted snapshots continue to return `InternalError` as catalog corruption.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
-- A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. User-written `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`, but cannot reference a sequence marked `owned`. Internal `ParsedDefault::OwnedNextval(name)` is accepted only for an owned sequence created by `SERIAL` desugaring. A remaining `ParsedDefault::Serial` marker is an internal error because execution must replace it before calling the catalog. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time. A constant default must be a **finite** number: a non-finite `DOUBLE PRECISION`/`REAL` constant (e.g. `DEFAULT 1e400`, which parses to Infinity) is rejected with `SqlState::NumericValueOutOfRange`, because the JSON catalog/WAL encodings cannot round-trip NaN/±Infinity — an accepted one would make the next startup unable to load the catalog.
+- A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. User-written `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`, but cannot reference a sequence marked `owned`. Internal `ParsedDefault::OwnedNextval(name)` is accepted only for an owned sequence created by `SERIAL` desugaring. A remaining `ParsedDefault::Serial` marker is an internal error because execution must replace it before calling the catalog. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time. Every constant default and literal nested in a stored default/CHECK tree must be **finite**: a non-finite `DOUBLE PRECISION`/`REAL` value (for example `DEFAULT 1e400` or `DEFAULT abs(1e400)`) is rejected with `SqlState::NumericValueOutOfRange`, because the JSON catalog/WAL encodings cannot round-trip NaN/±Infinity — an accepted one would make the next startup unable to load the catalog.
 - Empty catalogs start with `next_table_id = 1` and `next_storage_id = 1`;
   `TableId` is assigned from `next_table_id`, and a user table's physical
   generation is assigned from `next_storage_id`.
@@ -690,6 +688,8 @@ owned-sequence-default columns.
   `DROP SEQUENCE` rejects owned sequences with
   `SqlState::DependentObjectsStillExist`; `DROP TABLE` removes the table and its
   owned sequences in the same statement.
+- `DROP SEQUENCE` also rejects a sequence referenced anywhere in a typed
+  expression default or CHECK tree, not only a direct `ColumnDefault::Nextval`.
 
 ## Create Index Rules
 
@@ -707,7 +707,7 @@ owned-sequence-default columns.
 
 ## Catalog Persistence
 
-The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index and sequence fields carry `#[serde(default)]`, so absent fields deserialize as empty maps and initial allocator values; validated startup still rejects any user table that declares a primary key without a matching primary-key constraint index. `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`; the brief legacy bare-`Value` default form deserializes as `ColumnDefault::Const(value)`. `TableSchema.compression` and `TableSchema.active_dict_id` carry `#[serde(default)]` too (`compression` defaults to `CompressionSetting::None`, `active_dict_id` to `None`), and `CatalogSnapshot.next_dictionary_id` carries `#[serde(default = "default_next_dictionary_id")]` (`= 1`), so a catalog persisted before compression existed deserializes with every table dict-less and the dictionary-id allocator starting fresh. `TableSchema.storage_id`, `IndexSchema.storage_id`, and `CatalogSnapshot.next_storage_id` are also serde-defaulted. The validated load path treats `storage_id == 0` as a legacy-missing value, assigns missing table storage ids from the logical table id when that id is valid and unused among table/TOAST relations, assigns missing index storage ids from the logical index id when valid and unused among secondary indexes, otherwise assigns fresh ids, and sets `next_storage_id` above every live or migrated storage id.
+The catalog snapshot is deterministic JSON format version `3` inside the control record. Unversioned and older catalog formats are rejected explicitly; development data directories are rebuilt rather than migrated. Catalog input and output are capped at 64 MiB. Transaction-local catalog mutation rejects growth past that durable limit with `ProgramLimitExceeded` before recording or publishing its overlay, so every successful catalog mutation remains checkpointable and reopenable. Validation requires unique nonzero stable column IDs below each relation's allocator, validates every stored-expression version/shape/reference and its bounded lists, requires each constant or stored-expression default to match its owning column type, and rejects unknown column, function, or sequence identities as catalog corruption. Canonical expression SQL is retained but is not execution authority.
 
 The schema maps and `next_schema_id` also carry serde defaults for snapshots
 written before namespaces existed: loading supplies the mandatory `public`
@@ -716,12 +716,11 @@ requires `public` to retain its fixed id/name, schema name/id maps to be
 bidirectionally consistent with unique names and ids, and `next_schema_id` to be
 greater than every installed schema id.
 
-`TableSchema.foreign_keys` and `next_foreign_key_id` are serde-defaulted to an
-empty list and zero. Catalog v2 and legacy unversioned payloads written before
-foreign-key metadata therefore remain readable without a format-version bump.
-The exact referenced constraint-index ID is also serde-defaulted; a zero legacy
-value is resolved once from the referenced columns during validated loading or
-schema-record application. New metadata always persists the nonzero actual
+`TableSchema.foreign_keys` and `next_foreign_key_id` remain durable fields in
+catalog v3. Older payload compatibility is intentionally not provided.
+The exact referenced constraint-index ID is also serde-defaulted for specialized
+schema-record decoding; a zero value is resolved from the referenced columns
+during schema-record application. New metadata always persists the nonzero actual
 constraint-index ID, including for primary keys.
 
 On startup:
@@ -740,6 +739,10 @@ Transactional catalog mutations update the private overlay immediately; only
 allocator high-water reservations update the live catalog before commit. WAL
 records provide durability until the next checkpoint, and durable top-level
 commit precedes public overlay publication.
+
+Snapshot validation also traverses every stored default/CHECK tree and rejects
+non-finite literals; this extends the constant-default finiteness rule described
+below to all durable scalar IR.
 
 `restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every table name index entry to point at an existing user-table schema with the same name and ID, every user-table schema to have a reverse name index entry, every hidden TOAST relation to be stored by ID only (not in the name index), every view name index entry to point at an existing view schema with the same name and ID, no table and view to share a relation name or relation id, nonzero table/view schema versions, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, every primary-key column ID to exist, every primary-key column to be non-null, no duplicate primary-key column, every constant column default to be finite (non-finite constants cannot round-trip the JSON encodings; unreachable from any real durable artifact for the same reason), table IDs/default-column IDs/CHECK counts to fit the virtual catalog OID encoding limits, and `next_table_id >= max(table_or_view_id) + 1`. View validation additionally requires at least one output column, dense output column IDs, unique output column names, no column defaults on view output columns, non-empty SQL definition text, no self-dependency, no duplicate dependency entries, every dependency relation to exist, no dependency on a view or hidden TOAST relation, no dependency with both `all_columns = true` and named columns, and every named dependency column to exist. TOAST policy validation requires every table's `toast.tuple_target` to be in `ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET`, `toast.min_value_size >= ToastOptions::MIN_TOAST_MIN_VALUE_SIZE`, every user table with TOAST enabled to name an existing hidden TOAST relation, every hidden TOAST relation to point back to the owning user table without recursively naming another TOAST relation, and every hidden TOAST relation to match `common::toast_schema(base, toast_id)` exactly except for its storage id (name, columns, primary key, compression disabled, no nested TOAST metadata). Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, primary-key constraint indexes to be unique and to match the table's primary-key column list, every user table with a non-empty primary key to have exactly one primary-key constraint index, and `next_index_id >= max(index_id) + 1`. Storage-id validation requires every live table and secondary index to have a nonzero storage id, no storage id to contain file-kind high bits, no duplicate storage ids among live table/TOAST relations, no duplicate storage ids among live secondary indexes, and `next_storage_id` to be greater than every live storage id (or equal to the one-past-end sentinel after exhaustion). Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. After per-kind validation succeeds, the same public relation namespace rule used by runtime DDL is enforced across user table names, user view names, user-visible index names, public sequence names, and primary-key auto-names; hidden TOAST names and their helper names remain outside that namespace. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)` or `toast.active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id` and `next_storage_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
 
@@ -782,8 +785,8 @@ Recovery apply methods must update catalog state consistently with storage state
   snapshot remains `InternalError` corruption.
 - Storage-id assignment is overflow-guarded and rejects ids in the file-kind
   high-bit range. Freshly allocated table, TOAST, and secondary-index physical
-  objects have distinct raw storage ids; legacy loaded catalogs may retain a raw
-  table/index collision when that is needed to keep old files addressable.
+  objects have distinct raw storage ids. Catalog formats older than v3 are
+  rejected rather than migrated.
 - Index id `PRIMARY_KEY_INDEX_ID` is reserved for storage's per-table identity index and never assigned to a catalog index.
 - Dictionary id `0` is reserved to mean "no dictionary" and is never assigned to a real dictionary or accepted as a table's `active_dict_id`.
 - Every secondary index references an existing table and existing columns on it; dropping a table removes its indexes.

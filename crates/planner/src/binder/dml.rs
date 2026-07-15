@@ -113,16 +113,10 @@ fn bind_omitted_expr_defaults(
         if provided.contains(&column.id) {
             continue;
         }
-        if let Some(ColumnDefault::Expr(text)) = &column.default {
+        if let Some(ColumnDefault::Expr(expression)) = &column.default {
             defaults.push((
                 column.id,
-                super::bind_default_expr_with_options(
-                    catalog,
-                    text,
-                    &super::BindOptions {
-                        search_path: vec![table.schema_id],
-                    },
-                )?,
+                crate::lower_stored_expression(catalog, expression, &[])?,
             ));
         }
     }

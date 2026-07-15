@@ -32,6 +32,7 @@ pub mod pg_type;
 pub mod row;
 pub mod schema;
 pub mod statistics;
+pub mod stored_expression;
 pub mod uuid;
 pub mod value;
 
@@ -60,13 +61,14 @@ pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};
 pub use functions::{
     ArgType, NullHandling, PgProcCatalogEntry, ScalarFunction, format_type_oid,
-    lookup_scalar_function, pg_proc_catalog_entries, pg_proc_catalog_entry,
-    scalar_function_arg_hint, scalar_function_arg_pg_type, scalar_function_result_pg_type,
+    lookup_scalar_function, lookup_scalar_function_by_id, pg_proc_catalog_entries,
+    pg_proc_catalog_entry, scalar_function_arg_hint, scalar_function_arg_pg_type,
+    scalar_function_id, scalar_function_id_matches, scalar_function_result_pg_type,
 };
 pub use ids::{
-    BindingId, ColumnId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID, FROZEN_XID, FileId, ForeignKeyId,
-    INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId,
-    SequenceId, TableId, TxnId,
+    BindingId, ColumnId, ColumnObjectId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID, FROZEN_XID,
+    FileId, ForeignKeyId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
+    PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId, TableId, TxnId,
 };
 pub use interval::Interval;
 pub use locking::{
@@ -90,4 +92,9 @@ pub use schema::{
     ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name, toast_schema,
 };
 pub use statistics::{ColumnStatistics, NDistinct, TableStatistics, value_is_finite};
+pub use stored_expression::{
+    MAX_STORED_EXPRESSION_DEPTH, MAX_STORED_EXPRESSION_LIST_ITEMS, MAX_STORED_EXPRESSION_NODES,
+    MAX_STORED_EXPRESSION_SQL_BYTES, STORED_EXPRESSION_VERSION, StoredBinOp, StoredExpr,
+    StoredExpression, StoredUnaryOp, validate_stored_expression_shape,
+};
 pub use value::{Value, parse_bool_text};

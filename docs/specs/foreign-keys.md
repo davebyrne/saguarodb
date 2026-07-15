@@ -92,14 +92,14 @@ SIREAD, and dependent scans a child relation SIREAD.
 
 ## Durability and dependencies
 
-`TableSchema.foreign_keys` and `next_foreign_key_id` are durable and serde-defaulted
-for old manifests/WAL. Each constraint durably stores the exact declared
+`TableSchema.foreign_keys` and `next_foreign_key_id` are durable in catalog v3.
+Each constraint durably stores the exact declared
 PK/UNIQUE constraint-index ID selected at attachment, so duplicate eligible keys
-cannot change its identity and that index cannot be dropped while referenced. A
-legacy missing index-ID field is resolved once while loading and then persisted
-normally. IDs are monotonic `u16` values `0..=4095`; `4096` means exhausted and
+cannot change its identity and that index cannot be dropped while referenced.
+Older catalog formats are rejected rather than normalized. IDs are monotonic
+`u16` values `0..=4095`; `4096` means exhausted and
 dropped IDs are never reused. Recovery installs the complete schema from
-committed `UpdateTableSchema`; pre-FK payloads decode with empty metadata.
+committed `UpdateTableSchema`.
 
 ## Catalog introspection
 

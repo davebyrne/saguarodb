@@ -13,7 +13,7 @@ use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
-const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_VERSION: u32 = 4;
 const MANIFEST_HEADER_LEN: usize = 16;
 
 /// The durable control record. It is the checkpoint commit point: the redo

@@ -568,7 +568,7 @@ fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 update_action: "a",
                 delete_action: "a",
                 referenced_columns: None,
-                expression: Some(check.clone()),
+                expression: Some(check.sql.clone()),
             }));
         }
         for foreign_key in &table.foreign_keys {
@@ -655,6 +655,7 @@ fn pg_attrdef_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
 
 fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
+    let sequences = catalog.list_sequences()?;
     for table in catalog.list_tables()? {
         if table.relation_kind != RelationKind::User {
             continue;
@@ -670,16 +671,30 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 "a",
             ));
         }
-        for (index, _) in table.checks.iter().enumerate() {
+        for (index, check) in table.checks.iter().enumerate() {
+            let constraint_oid = try_check_constraint_oid(table.id, index)?;
             rows.push(pg_depend_row(
                 SystemView::PgConstraint.relation_oid(),
-                try_check_constraint_oid(table.id, index)?,
+                constraint_oid,
                 0,
                 SystemView::PgClass.relation_oid(),
                 table_oid(table.id)?,
                 0,
                 "a",
             ));
+            for sequence in &sequences {
+                if check.root.references_sequence(sequence.id) {
+                    rows.push(pg_depend_row(
+                        SystemView::PgConstraint.relation_oid(),
+                        constraint_oid,
+                        0,
+                        SystemView::PgClass.relation_oid(),
+                        sequence_oid(sequence.id)?,
+                        0,
+                        "n",
+                    ));
+                }
+            }
         }
         for foreign_key in &table.foreign_keys {
             let constraint_oid = foreign_key_constraint_oid(table.id, foreign_key.id)?;
@@ -753,28 +768,34 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                 attnum,
                 "a",
             ));
-            if let ColumnDefault::Nextval(sequence_id) = default {
-                let sequence_owned = catalog
-                    .get_sequence(*sequence_id)?
-                    .as_ref()
-                    .is_some_and(|sequence| sequence.owned);
+            for sequence in &sequences {
+                let references_sequence = match default {
+                    ColumnDefault::Nextval(sequence_id) => *sequence_id == sequence.id,
+                    ColumnDefault::Expr(expression) => {
+                        expression.root.references_sequence(sequence.id)
+                    }
+                    ColumnDefault::Const(_) => false,
+                };
+                if !references_sequence {
+                    continue;
+                }
                 rows.push(pg_depend_row(
                     SystemView::PgAttrdef.relation_oid(),
                     attrdef,
                     0,
                     SystemView::PgClass.relation_oid(),
-                    sequence_oid(*sequence_id)?,
+                    sequence_oid(sequence.id)?,
                     0,
                     "n",
                 ));
                 rows.push(pg_depend_row(
                     SystemView::PgClass.relation_oid(),
-                    sequence_oid(*sequence_id)?,
+                    sequence_oid(sequence.id)?,
                     0,
                     SystemView::PgClass.relation_oid(),
                     table_oid(table.id)?,
                     attnum,
-                    if sequence_owned { "a" } else { "n" },
+                    if sequence.owned { "a" } else { "n" },
                 ));
             }
         }
@@ -1233,9 +1254,9 @@ fn render_default(catalog: &dyn CatalogManager, default: &ColumnDefault) -> Resu
                 .unwrap_or_else(|| format!("<missing sequence {sequence}>"));
             Ok(Some(format!("nextval('{}')", quote_sql_text(&name))))
         }
-        // A non-constant default is stored as canonical SQL text, which is exactly
+        // Typed IR is authoritative, while its retained canonical SQL is exactly
         // what `column_default` should report.
-        ColumnDefault::Expr(text) => Ok(Some(text.clone())),
+        ColumnDefault::Expr(expression) => Ok(Some(expression.sql.clone())),
     }
 }
 

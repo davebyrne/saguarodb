@@ -297,7 +297,7 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<common::StoredExpression>,
     ) -> Result<TableSchema> {
         self.create_table_in_schema_with_options(
             common::PUBLIC_SCHEMA_ID,
@@ -318,7 +318,7 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
-        checks: Vec<String>,
+        checks: Vec<common::StoredExpression>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
     /// Validate a complete DROP TABLE target set without mutating it.
@@ -627,8 +627,9 @@ mod tests {
     use common::{
         ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, ForeignKeyAction,
         ForeignKeyConstraint, IndexConstraintKind, IndexSchema, ParsedColumnDef, PgType,
-        RelationKind, SequenceOptions, SequenceSchema, SqlState, TableSchema, ToastCompression,
-        ToastMode, ToastOptions, ViewColumn, ViewDependency, toast_schema,
+        RelationKind, SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredExpr,
+        StoredExpression, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
+        ViewDependency, toast_schema,
     };
 
     use crate::{
@@ -666,6 +667,7 @@ mod tests {
             name: name.to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -683,6 +685,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         }
     }
 
@@ -814,6 +817,9 @@ mod tests {
 
         assert_eq!(schema.id, 1);
         assert_eq!(schema.columns[0].id, 0);
+        assert_eq!(schema.columns[0].object_id, 1);
+        assert_eq!(schema.columns[1].object_id, 2);
+        assert_eq!(schema.next_column_object_id, 3);
         assert!(!schema.columns[0].nullable);
         assert_eq!(schema.primary_key, vec![0]);
     }
@@ -1094,6 +1100,94 @@ mod tests {
         );
     }
 
+    fn stored_boolean(root: StoredExpr) -> StoredExpression {
+        StoredExpression {
+            version: common::STORED_EXPRESSION_VERSION,
+            sql: "stored test expression".to_string(),
+            root,
+            data_type: DataType::Boolean,
+            pg_type: None,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_stored_expression_references() {
+        let invalid_expressions = [
+            StoredExpression {
+                version: common::STORED_EXPRESSION_VERSION + 1,
+                ..stored_boolean(StoredExpr::Literal {
+                    value: common::Value::Boolean(true),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                })
+            },
+            stored_boolean(StoredExpr::IsNotNull {
+                expr: Box::new(StoredExpr::Column {
+                    column: 999,
+                    data_type: DataType::Integer,
+                    nullable: false,
+                }),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+            stored_boolean(StoredExpr::Function {
+                function: u32::MAX,
+                args: Vec::new(),
+                data_type: DataType::Boolean,
+                pg_type: None,
+                nullable: false,
+            }),
+            stored_boolean(StoredExpr::IsNotNull {
+                expr: Box::new(StoredExpr::Nextval {
+                    sequence: u32::MAX,
+                    data_type: DataType::Integer,
+                    nullable: false,
+                }),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+            stored_boolean(StoredExpr::Literal {
+                value: common::Value::Integer(1),
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
+        ];
+
+        for expression in invalid_expressions {
+            let mut table = stored_id_table(1, "items");
+            table.checks.push(expression);
+            let snapshot = CatalogSnapshot {
+                tables_by_name: HashMap::from([("items".to_string(), table.id)]),
+                tables_by_id: HashMap::from([(table.id, table)]),
+                next_table_id: 2,
+                ..MemoryCatalog::empty().snapshot().unwrap()
+            };
+            assert!(MemoryCatalog::try_from_snapshot(snapshot).is_err());
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_stored_default_with_wrong_result_type() {
+        let mut table = stored_id_table(1, "items");
+        table.columns[0].default = Some(common::ColumnDefault::Expr(stored_boolean(
+            StoredExpr::Literal {
+                value: common::Value::Boolean(true),
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+        )));
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("items".to_string(), table.id)]),
+            tables_by_id: HashMap::from([(table.id, table)]),
+            next_table_id: 2,
+            ..MemoryCatalog::empty().snapshot().unwrap()
+        };
+
+        let error = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(error.message.contains("wrong result type"));
+    }
+
     #[test]
     fn duplicate_column_is_rejected() {
         let catalog = MemoryCatalog::empty();
@@ -1213,14 +1307,26 @@ mod tests {
             renamed_column.schema_version + 1
         );
         assert_eq!(dropped_column.columns.len(), 2);
+        let replacement = catalog
+            .add_table_column(
+                users.id,
+                ParsedColumnDef {
+                    name: "replacement".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Text),
+                },
+            )
+            .unwrap();
+        assert_eq!(replacement.columns[2].object_id, 4);
+        assert_eq!(replacement.next_column_object_id, 5);
 
         let renamed_table = catalog
             .rename_table(users.id, "people".to_string())
             .unwrap();
-        assert_eq!(
-            renamed_table.schema_version,
-            dropped_column.schema_version + 1
-        );
+        assert_eq!(renamed_table.schema_version, replacement.schema_version + 1);
         assert!(catalog.get_table_by_name("users").unwrap().is_none());
         assert_eq!(
             catalog.get_table_by_name("people").unwrap().unwrap().id,
@@ -1231,6 +1337,28 @@ mod tests {
     #[test]
     fn rename_table_allows_stored_check_constraints() {
         let catalog = MemoryCatalog::empty();
+        let check = StoredExpression {
+            version: common::STORED_EXPRESSION_VERSION,
+            sql: "id > 0".to_string(),
+            root: StoredExpr::Binary {
+                left: Box::new(StoredExpr::Column {
+                    column: 1,
+                    data_type: DataType::Integer,
+                    nullable: false,
+                }),
+                op: StoredBinOp::Gt,
+                right: Box::new(StoredExpr::Literal {
+                    value: common::Value::Integer(0),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                }),
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+            data_type: DataType::Boolean,
+            pg_type: None,
+            nullable: false,
+        };
         let accounts = catalog
             .create_table_with_options(
                 "accounts".to_string(),
@@ -1238,7 +1366,7 @@ mod tests {
                 Vec::new(),
                 CompressionSetting::None,
                 ToastOptions::legacy_catalog_default(),
-                vec!["id > 0".to_string()],
+                vec![check.clone()],
             )
             .unwrap();
 
@@ -1247,7 +1375,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(renamed.name, "customers");
-        assert_eq!(renamed.checks, vec!["id > 0".to_string()]);
+        assert_eq!(renamed.checks, vec![check]);
         assert!(catalog.get_table_by_name("accounts").unwrap().is_none());
         assert_eq!(
             catalog.get_table_by_name("customers").unwrap().unwrap().id,
@@ -1322,6 +1450,53 @@ mod tests {
         assert_eq!(replacement.id, view.id);
         assert_eq!(replacement.schema_version, view.schema_version + 1);
         assert_eq!(replacement.columns.len(), 1);
+        assert_eq!(replacement.columns[0].object_id, view.columns[0].object_id);
+
+        let extended = restored
+            .replace_view(
+                view.id,
+                vec![
+                    view_column("id", DataType::Integer, false),
+                    view_column("display_name", DataType::Text, true),
+                ],
+                "SELECT id, name FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![0, 1],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(extended.columns[0].object_id, view.columns[0].object_id);
+        assert_eq!(extended.columns[1].object_id, view.next_column_object_id);
+        assert_eq!(
+            extended.next_column_object_id,
+            view.next_column_object_id + 1
+        );
+
+        let incompatible = restored
+            .replace_view(
+                view.id,
+                vec![
+                    view_column("id", DataType::Text, false),
+                    view_column("display_name", DataType::Text, true),
+                ],
+                "SELECT name, name FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![1],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            incompatible.columns[0].object_id,
+            extended.next_column_object_id
+        );
+        assert_eq!(
+            incompatible.columns[1].object_id,
+            extended.columns[1].object_id
+        );
     }
 
     #[test]
@@ -1733,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_missing_storage_ids_preserves_file_ids_by_kind() {
+    fn legacy_snapshot_missing_storage_ids_is_rejected() {
         let json = r#"{
             "tables_by_name": {"users": 1},
             "tables_by_id": {"1": {
@@ -1754,15 +1929,12 @@ mod tests {
             "next_index_id": 2
         }"#;
 
-        let catalog =
-            MemoryCatalog::try_from_snapshot(deserialize_catalog(json.as_bytes()).unwrap())
-                .unwrap();
-
-        let table = catalog.get_table_by_name("users").unwrap().unwrap();
-        let index = catalog.get_index_by_name("users_id").unwrap().unwrap();
-        assert_eq!(table.storage_id, 1);
-        assert_eq!(index.storage_id, 1);
-        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 2);
+        let error = deserialize_catalog(json.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported unversioned catalog format")
+        );
     }
 
     #[test]
@@ -2187,6 +2359,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -2204,6 +2377,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
@@ -2311,6 +2485,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -2328,6 +2503,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             schemas_by_name: HashMap::from([("public".to_string(), common::PUBLIC_SCHEMA_ID)]),
@@ -2372,6 +2548,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -2389,6 +2566,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
 
         let err = catalog.apply_create_table(schema).unwrap_err();
@@ -2530,6 +2708,7 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     id: 0,
+                    object_id: 1,
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -2539,6 +2718,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 1,
+                    object_id: 2,
                     name: "tenant".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -2557,6 +2737,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2600,6 +2781,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -2617,6 +2799,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2639,6 +2822,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: true,
@@ -2656,6 +2840,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -2680,6 +2865,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 1,
+                object_id: 2,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -2697,6 +2883,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -3010,6 +3197,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -3027,6 +3215,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
 
         catalog.apply_create_table(schema.clone()).unwrap();
@@ -3579,6 +3768,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -3596,6 +3786,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -3632,6 +3823,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -3649,6 +3841,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -3677,8 +3870,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_without_index_fields_deserializes_to_empty_indexes() {
-        // A catalog persisted before secondary indexes and sequences existed.
+    fn unversioned_snapshot_without_index_fields_is_rejected() {
         let json = r#"{
             "tables_by_name": {"users": 1},
             "tables_by_id": {"1": {
@@ -3690,22 +3882,12 @@ mod tests {
             "next_table_id": 2
         }"#;
 
-        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
-        assert!(snapshot.indexes_by_id.is_empty());
-        assert!(snapshot.indexes_by_name.is_empty());
-        assert_eq!(snapshot.next_index_id, 1);
-        assert!(snapshot.sequences_by_id.is_empty());
-        assert!(snapshot.sequences_by_name.is_empty());
-        assert_eq!(snapshot.next_sequence_id, 1);
-
-        // A column persisted before the pg_type field loads as unlabeled and
-        // resolves to the collapsed default wire type (Integer => int8).
-        let column = &snapshot.tables_by_id[&1].columns[0];
-        assert_eq!(column.pg_type, None);
-        assert_eq!(column.wire_type(), PgType::Int8);
-
-        // The validated load path accepts it.
-        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        let error = deserialize_catalog(json.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported unversioned catalog format")
+        );
     }
 
     #[test]
@@ -4025,9 +4207,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_without_dictionary_field_defaults_next_id_to_one() {
-        // Mirror snapshot_without_index_fields_deserializes_to_empty_indexes:
-        // a catalog persisted before compression/dictionary ids existed.
+    fn unversioned_snapshot_without_dictionary_field_is_rejected() {
         let json = r#"{
             "tables_by_name": {"users": 1},
             "tables_by_id": {"1": {
@@ -4039,15 +4219,16 @@ mod tests {
             "next_table_id": 2
         }"#;
 
-        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
-        assert_eq!(snapshot.next_dictionary_id, 1);
-
-        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
-        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 1);
+        let error = deserialize_catalog(json.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported unversioned catalog format")
+        );
     }
 
     #[test]
-    fn catalog_v2_persists_schemas_deterministically_and_migrates_legacy_objects() {
+    fn catalog_v3_persists_schemas_deterministically_and_rejects_legacy_objects() {
         let catalog = MemoryCatalog::empty();
         catalog
             .apply_create_schema(common::NamespaceSchema {
@@ -4057,7 +4238,7 @@ mod tests {
             .unwrap();
         let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["schemas"][0]["name"], "public");
         assert_eq!(value["schemas"][1]["name"], "app");
         assert_eq!(
@@ -4070,12 +4251,12 @@ mod tests {
             "tables_by_id": {},
             "next_table_id": 1
         });
-        let migrated = deserialize_catalog(&serde_json::to_vec(&legacy).unwrap()).unwrap();
-        assert_eq!(
-            migrated.schemas_by_name.get("public"),
-            Some(&common::PUBLIC_SCHEMA_ID)
+        let error = deserialize_catalog(&serde_json::to_vec(&legacy).unwrap()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported unversioned catalog format")
         );
-        assert_eq!(migrated.next_schema_id, common::FIRST_USER_SCHEMA_ID);
     }
 
     #[test]
@@ -4130,7 +4311,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_v2_rejects_duplicate_object_ids() {
+    fn catalog_v3_rejects_duplicate_object_ids() {
         let snapshot = MemoryCatalog::empty().snapshot().unwrap();
         let bytes = serialize_catalog(&snapshot).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

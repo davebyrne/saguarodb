@@ -483,6 +483,7 @@ pub(super) fn derive_alias_columns(
         .enumerate()
         .map(|(index, column)| ColumnDef {
             id: index as ColumnId,
+            object_id: 0,
             name: column_aliases
                 .get(index)
                 .cloned()
@@ -1100,6 +1101,7 @@ fn bind_table_function(
         .unwrap_or_else(|| name.to_string());
     let columns = vec![ColumnDef {
         id: 0,
+        object_id: 0,
         name: column_name,
         data_type: data_type.clone(),
         nullable,

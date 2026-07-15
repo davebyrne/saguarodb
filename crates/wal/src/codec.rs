@@ -599,6 +599,7 @@ mod tests {
                     columns: vec![
                         common::ColumnDef {
                             id: 0,
+                            object_id: 1,
                             name: "id".to_string(),
                             data_type: common::DataType::Integer,
                             nullable: false,
@@ -608,6 +609,7 @@ mod tests {
                         },
                         common::ColumnDef {
                             id: 1,
+                            object_id: 2,
                             name: "code".to_string(),
                             data_type: common::DataType::Integer,
                             nullable: true,
@@ -626,6 +628,7 @@ mod tests {
                     checks: Vec::new(),
                     foreign_keys: Vec::new(),
                     next_foreign_key_id: 0,
+                    next_column_object_id: u32::MAX,
                 },
                 indexes: vec![common::IndexSchema {
                     id: 3,
@@ -662,6 +665,7 @@ mod tests {
                     name: "active_users".to_string(),
                     columns: vec![common::ColumnDef {
                         id: 0,
+                        object_id: 1,
                         name: "id".to_string(),
                         data_type: common::DataType::Integer,
                         nullable: true,
@@ -677,6 +681,7 @@ mod tests {
                     }],
                     schema_version: 1,
                     definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
+                    next_column_object_id: u32::MAX,
                 },
             },
             WalRecordKind::ReplaceView {
@@ -686,6 +691,7 @@ mod tests {
                     name: "active_users".to_string(),
                     columns: vec![common::ColumnDef {
                         id: 0,
+                        object_id: 1,
                         name: "id".to_string(),
                         data_type: common::DataType::Integer,
                         nullable: true,
@@ -701,6 +707,7 @@ mod tests {
                     }],
                     schema_version: 2,
                     definition_search_path: vec![common::PUBLIC_SCHEMA_ID],
+                    next_column_object_id: u32::MAX,
                 },
             },
             WalRecordKind::DropView { view: 5 },
@@ -923,6 +930,7 @@ mod tests {
             name: "legacy".to_string(),
             columns: vec![common::ColumnDef {
                 id: 0,
+                object_id: 1,
                 name: "id".to_string(),
                 data_type: common::DataType::Integer,
                 nullable: false,
@@ -940,6 +948,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         for (type_id, kind_name, kind) in [
             (

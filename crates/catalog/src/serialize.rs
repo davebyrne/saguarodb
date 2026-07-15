@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::CatalogSnapshot;
 
-const CATALOG_FORMAT_VERSION: u32 = 2;
+const CATALOG_FORMAT_VERSION: u32 = 3;
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize)]
-struct CatalogV2<'a> {
+struct CatalogV3<'a> {
     version: u32,
     schemas: Vec<&'a NamespaceSchema>,
     tables: Vec<&'a TableSchema>,
@@ -26,8 +27,9 @@ struct CatalogV2<'a> {
 }
 
 #[derive(Deserialize)]
-struct OwnedCatalogV2 {
-    version: u32,
+struct OwnedCatalogV3 {
+    #[serde(rename = "version")]
+    _version: u32,
     schemas: Vec<NamespaceSchema>,
     tables: Vec<TableSchema>,
     views: Vec<ViewSchema>,
@@ -41,6 +43,11 @@ struct OwnedCatalogV2 {
     next_sequence_id: SequenceId,
     next_dictionary_id: u32,
     next_storage_id: FileId,
+}
+
+#[derive(Deserialize)]
+struct CatalogHeader {
+    version: Option<u32>,
 }
 
 pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
@@ -61,7 +68,7 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         .collect();
     statistics.sort_by_key(|(table, _)| *table);
 
-    serde_json::to_vec(&CatalogV2 {
+    let bytes = serde_json::to_vec(&CatalogV3 {
         version: CATALOG_FORMAT_VERSION,
         schemas,
         tables,
@@ -76,25 +83,33 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         next_dictionary_id: snapshot.next_dictionary_id,
         next_storage_id: snapshot.next_storage_id,
     })
-    .map_err(|err| DbError::internal(format!("failed to serialize catalog: {err}")))
+    .map_err(|err| DbError::internal(format!("failed to serialize catalog: {err}")))?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(DbError::plan(
+            common::SqlState::ProgramLimitExceeded,
+            "catalog snapshot exceeds the 64 MiB durable size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")))?;
-    if value.get("version").is_none() {
-        return serde_json::from_value(value)
-            .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")));
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(DbError::internal("catalog snapshot exceeds size limit"));
     }
-
-    let catalog: OwnedCatalogV2 = serde_json::from_value(value)
+    let header: CatalogHeader = serde_json::from_slice(bytes)
         .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")))?;
-    if catalog.version != CATALOG_FORMAT_VERSION {
+    let Some(version) = header.version else {
+        return Err(DbError::internal("unsupported unversioned catalog format"));
+    };
+    if version != CATALOG_FORMAT_VERSION {
         return Err(DbError::internal(format!(
             "unsupported catalog format version {}",
-            catalog.version
+            version
         )));
     }
+    let catalog: OwnedCatalogV3 = serde_json::from_slice(bytes)
+        .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")))?;
 
     let schemas_by_name = catalog
         .schemas

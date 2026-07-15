@@ -5221,6 +5221,7 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     id: 0,
+                    object_id: 1,
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -5230,6 +5231,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 1,
+                    object_id: 2,
                     name: "name".to_string(),
                     data_type: DataType::Text,
                     nullable: true,
@@ -5239,6 +5241,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 2,
+                    object_id: 3,
                     name: "active".to_string(),
                     data_type: DataType::Boolean,
                     nullable: true,
@@ -5248,6 +5251,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 3,
+                    object_id: 4,
                     name: "note".to_string(),
                     data_type: DataType::Text,
                     nullable: true,
@@ -5266,6 +5270,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         }
     }
 
@@ -5350,6 +5355,7 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     id: 0,
+                    object_id: 1,
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -5359,6 +5365,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 1,
+                    object_id: 2,
                     name: "payload".to_string(),
                     data_type: DataType::Text,
                     nullable: true,
@@ -5368,6 +5375,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 2,
+                    object_id: 3,
                     name: "note".to_string(),
                     data_type: DataType::Text,
                     nullable: true,
@@ -5386,6 +5394,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         }
     }
 
@@ -5415,6 +5424,7 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     id: 0,
+                    object_id: 1,
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
@@ -5424,6 +5434,7 @@ mod tests {
                 },
                 ColumnDef {
                     id: 1,
+                    object_id: 2,
                     name: "payload".to_string(),
                     data_type: DataType::Bytea,
                     nullable: true,
@@ -5442,6 +5453,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -5492,6 +5504,7 @@ mod tests {
         let (mut base, _) = bytea_base_and_toast_schema();
         base.columns.push(ColumnDef {
             id: 2,
+            object_id: 3,
             name: "payload2".to_string(),
             data_type: DataType::Bytea,
             nullable: true,
@@ -5508,6 +5521,7 @@ mod tests {
         for index in 0..column_count {
             columns.push(ColumnDef {
                 id: index as u16,
+                object_id: u32::from(index as u16) + 1,
                 name: format!("c{index}"),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -5532,6 +5546,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         }
     }
 
@@ -5540,6 +5555,7 @@ mod tests {
         for index in 0..integer_column_count {
             columns.push(ColumnDef {
                 id: index as u16,
+                object_id: u32::from(index as u16) + 1,
                 name: format!("c{index}"),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -5550,6 +5566,7 @@ mod tests {
         }
         columns.push(ColumnDef {
             id: integer_column_count as u16,
+            object_id: u32::from(integer_column_count as u16) + 1,
             name: "payload".to_string(),
             data_type: DataType::Bytea,
             nullable: false,
@@ -5573,6 +5590,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -5582,6 +5600,7 @@ mod tests {
     fn dict_external_base_and_toast_schema() -> (TableSchema, TableSchema) {
         let mut columns = vec![ColumnDef {
             id: 0,
+            object_id: 1,
             name: "id".to_string(),
             data_type: DataType::Integer,
             nullable: false,
@@ -5592,6 +5611,7 @@ mod tests {
         for index in 0..40 {
             columns.push(ColumnDef {
                 id: index + 1,
+                object_id: u32::from(index + 1) + 1,
                 name: format!("fixed{index}"),
                 data_type: DataType::Integer,
                 nullable: false,
@@ -5602,6 +5622,7 @@ mod tests {
         }
         columns.push(ColumnDef {
             id: 41,
+            object_id: 42,
             name: "body".to_string(),
             data_type: DataType::Text,
             nullable: false,
@@ -5625,6 +5646,7 @@ mod tests {
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             next_foreign_key_id: 0,
+            next_column_object_id: u32::MAX,
         };
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
         base.toast.min_value_size = 128;
