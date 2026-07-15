@@ -1564,7 +1564,7 @@ mod tests {
             name: "accounts_name".to_string(),
             columns: vec![1],
             unique: false,
-            constraint: common::IndexConstraintKind::None,
+            constraint: None,
         };
 
         harness.storage.create_table(&ctx, &schema).unwrap();
@@ -4770,7 +4770,7 @@ mod tests {
             name: "users_name".to_string(),
             columns: vec![1],
             unique,
-            constraint: common::IndexConstraintKind::None,
+            constraint: None,
         }
     }
 
@@ -5289,9 +5289,6 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         }
     }
@@ -5413,9 +5410,6 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         }
     }
@@ -5472,9 +5466,6 @@ mod tests {
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         base.toast.min_value_size = 128;
@@ -5565,9 +5556,6 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         }
     }
@@ -5609,9 +5597,6 @@ mod tests {
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         base.toast.min_value_size = 128;
@@ -5665,9 +5650,6 @@ mod tests {
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;

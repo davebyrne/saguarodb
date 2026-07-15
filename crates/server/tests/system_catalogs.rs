@@ -3,6 +3,126 @@ mod support;
 use support::{Connection, TestServer, first_row_description};
 
 #[tokio::test]
+async fn pg_depend_public_schema_references_join_to_pg_namespace() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table public_dependency_probe (id integer primary key)")
+        .await;
+
+    assert_eq!(
+        conn.ok("select n.nspname from pg_catalog.pg_depend d \
+                 join pg_catalog.pg_namespace n on n.oid = d.refobjid \
+                 where d.objid = to_regclass('public_dependency_probe') \
+                   and d.refclassid = to_regclass('pg_catalog.pg_namespace')")
+            .await
+            .rows(),
+        vec![vec![Some("public".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn pg_index_primary_flag_uses_constraint_kind_for_duplicate_key_shapes() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table primary_kind_probe (id integer unique)")
+        .await;
+    conn.ok("alter table primary_kind_probe add primary key (id)")
+        .await;
+
+    assert_eq!(
+        conn.ok(
+            "select c.relname, i.indisprimary from pg_catalog.pg_index i \
+                 join pg_catalog.pg_class c on c.oid = i.indexrelid \
+                 where i.indrelid = to_regclass('primary_kind_probe') \
+                 order by c.relname"
+        )
+        .await
+        .rows(),
+        vec![
+            vec![
+                Some("primary_kind_probe_id_key".to_string()),
+                Some("f".to_string()),
+            ],
+            vec![
+                Some("primary_kind_probe_pkey".to_string()),
+                Some("t".to_string()),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pg_depend_uses_attrdef_identity_and_omits_virtual_functions() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create sequence attrdef_dependency_seq").await;
+    conn.ok("create table attrdef_dependency_probe (\
+             id integer default nextval('attrdef_dependency_seq'), \
+             checked integer default abs(-1), check (abs(checked) > 0))")
+        .await;
+
+    assert_eq!(
+        conn.ok("select referenced.relname from pg_catalog.pg_depend d \
+                 join pg_catalog.pg_attrdef a on a.oid = d.objid \
+                 join pg_catalog.pg_class referenced on referenced.oid = d.refobjid \
+                 where a.adrelid = to_regclass('attrdef_dependency_probe') \
+                   and referenced.relname = 'attrdef_dependency_seq'")
+            .await
+            .rows(),
+        vec![vec![Some("attrdef_dependency_seq".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select count(*) from pg_catalog.pg_depend \
+                 where refclassid = to_regclass('pg_catalog.pg_proc')")
+            .await
+            .rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn constraint_oids_survive_renames_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let before = {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table constraint_oid_probe (\
+             id integer primary key, code integer unique, check (code > 0))")
+            .await;
+        let before = conn
+            .ok("select conname, oid from pg_catalog.pg_constraint \
+                 where conrelid = to_regclass('constraint_oid_probe') order by conname")
+            .await
+            .rows();
+        assert_eq!(before.len(), 3);
+        conn.ok("alter table constraint_oid_probe rename column code to renamed_code")
+            .await;
+        conn.ok("alter table constraint_oid_probe rename to renamed_constraint_oid_probe")
+            .await;
+        assert_eq!(
+            conn.ok("select conname, oid from pg_catalog.pg_constraint \
+                     where conrelid = to_regclass('renamed_constraint_oid_probe') order by conname")
+                .await
+                .rows(),
+            before
+        );
+        server.force_checkpoint().await.unwrap();
+        before
+    };
+
+    let server = TestServer::start_with_data_dir(&path).await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    assert_eq!(
+        conn.ok("select conname, oid from pg_catalog.pg_constraint \
+                 where conrelid = to_regclass('renamed_constraint_oid_probe') order by conname")
+            .await
+            .rows(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn pg_type_exposes_real_array_element_and_companion_oids() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

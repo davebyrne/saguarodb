@@ -87,6 +87,33 @@ async fn setup_basic() -> (TestServer, Connection) {
     (server, setup)
 }
 
+#[tokio::test]
+async fn dropping_child_supporting_index_keeps_foreign_key_enforced() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table drop_support_parent (id integer primary key)")
+        .await;
+    conn.ok("create table drop_support_child (id integer primary key, parent_id integer)")
+        .await;
+    conn.ok("create index drop_support_child_parent_idx on drop_support_child (parent_id)")
+        .await;
+    conn.ok("alter table drop_support_child add foreign key (parent_id) references drop_support_parent (id)")
+        .await;
+    conn.ok("drop index drop_support_child_parent_idx").await;
+    conn.ok("insert into drop_support_parent values (1)").await;
+    conn.ok("insert into drop_support_child values (1, 1)")
+        .await;
+
+    let error = conn
+        .query("delete from drop_support_parent where id = 1")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("foreign key remains enforced after dropping its access-path hint");
+    assert!(error.message.contains("C=23503"), "{error}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_insert_and_parent_delete_or_key_update_honor_both_winner_orders() {
     let (server, _setup) = setup_basic().await;
@@ -648,8 +675,23 @@ async fn checkpoint_restart_preserves_foreign_keys_and_allocator_high_water() {
         .get_table_by_name("cp_child")
         .unwrap()
         .unwrap();
-    assert_eq!(child.foreign_keys[0].id, 1);
-    assert_eq!(child.next_foreign_key_id, 2);
+    let foreign_keys = server
+        .app()
+        .components
+        .catalog
+        .list_outgoing_foreign_keys(child.id)
+        .unwrap();
+    assert_eq!(foreign_keys.len(), 1);
+    assert_eq!(
+        server
+            .app()
+            .components
+            .catalog
+            .snapshot()
+            .unwrap()
+            .next_constraint_id,
+        foreign_keys[0].id + 1
+    );
     let error = server
         .simple_query("insert into cp_child values (1, 99)")
         .await

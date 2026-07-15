@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, CompressionSetting, DataType, FileId, IndexConstraintKind, IndexSchema, Key,
-    KeyRange, Lsn, PageFlushInfo, RelationKind, Row, Snapshot, SqlState, StatementContext,
-    TableSchema, ToastCompression, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId,
-    TxnStatus, TxnStatusView, Value, toast_schema,
+    ColumnDef, CompressionSetting, DataType, FileId, IndexSchema, Key, KeyRange, Lsn,
+    PageFlushInfo, RelationKind, Row, Snapshot, SqlState, StatementContext, TableSchema,
+    ToastCompression, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId, TxnStatus,
+    TxnStatusView, Value, toast_schema,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -325,9 +325,6 @@ fn users_schema(storage_id: FileId) -> TableSchema {
         active_dict_id: None,
         toast,
         schema_version: common::INITIAL_SCHEMA_VERSION,
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: u32::MAX,
         toast_table_id: Some(TOAST_TABLE_ID),
         relation_kind: RelationKind::User,
@@ -349,7 +346,7 @@ fn name_index(storage_id: FileId) -> IndexSchema {
         name: "users_name_key".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: IndexConstraintKind::Unique,
+        constraint: Some(1),
     }
 }
 
@@ -362,7 +359,7 @@ fn note_index(storage_id: FileId) -> IndexSchema {
         name: "users_note_idx".to_string(),
         columns: vec![2],
         unique: false,
-        constraint: IndexConstraintKind::None,
+        constraint: None,
     }
 }
 

@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use catalog::{
     CatalogManager, INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemView,
-    attrdef_oid, foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, schema_oid,
-    sequence_oid, synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
+    attrdef_oid, constraint_oid, index_oid, schema_oid, sequence_oid, synthetic_primary_key_oid,
+    table_oid,
 };
 use common::{
-    ColumnDef, ColumnDefault, DbError, ForeignKeyAction, GucSetting, IndexConstraintKind,
-    IsolationLevel, OrderedF32, PgProcCatalogEntry, PgType, RelationKind, Result, Row,
-    SequenceSchema, SessionActivityRow, StatementContext, TableId, TableSchema, Value, ViewSchema,
-    bytea, datetime, float, interval, numeric, pg_proc_catalog_entries, uuid,
+    CatalogObjectId, ColumnDef, ColumnDefault, ConstraintKind, DbError, DependencyType,
+    ForeignKeyAction, GucSetting, IsolationLevel, OrderedF32, PgProcCatalogEntry, PgType,
+    RelationKind, Result, Row, SequenceSchema, SessionActivityRow, StatementContext, TableId,
+    TableSchema, Value, ViewSchema, bytea, datetime, float, interval, numeric,
+    pg_proc_catalog_entries, uuid,
 };
 
 const OWNER_OID: i64 = 10;
@@ -91,11 +92,17 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         let indexes = catalog.list_indexes_for_table(table.id)?;
         let has_primary_key_index = indexes
             .iter()
-            .any(|index| index.constraint == IndexConstraintKind::PrimaryKey);
+            .any(|index| index.constraint.is_some() && index.columns == table.primary_key);
+        let check_count = catalog
+            .list_constraints_for_table(table.id)?
+            .into_iter()
+            .filter(|constraint| matches!(constraint.kind, ConstraintKind::Check { .. }))
+            .count();
         rows.push(pg_class_table_row(
             table,
             catalog.get_table_statistics(table.id)?.as_ref(),
             !indexes.is_empty() || (!table.primary_key.is_empty() && !has_primary_key_index),
+            check_count,
         )?);
         for index in indexes {
             rows.push(pg_class_index_row(
@@ -138,6 +145,7 @@ fn pg_class_table_row(
     table: &TableSchema,
     statistics: Option<&common::TableStatistics>,
     relhasindex: bool,
+    check_count: usize,
 ) -> Result<Row> {
     let oid = table_oid(table.id)?;
     let relpages = statistics.map_or(0, |stats| stats.page_count as i64);
@@ -163,7 +171,7 @@ fn pg_class_table_row(
             RelationKind::Toast { .. } => "t",
         }),
         int(table.columns.len() as i64),
-        int(table.checks.len() as i64),
+        int(check_count as i64),
         bool_value(false),
         bool_value(false),
         bool_value(false),
@@ -392,6 +400,14 @@ fn pg_type_rows() -> Result<Vec<Row>> {
 
 fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     let tables = catalog.list_tables()?;
+    let primary_indexes: BTreeSet<_> = catalog
+        .list_constraints()?
+        .into_iter()
+        .filter_map(|constraint| match constraint.kind {
+            ConstraintKind::PrimaryKey { index, .. } => Some(index),
+            _ => None,
+        })
+        .collect();
     let table_by_id: BTreeMap<TableId, TableSchema> = tables
         .iter()
         .map(|table| (table.id, table.clone()))
@@ -405,7 +421,7 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         let indexes = catalog.list_indexes_for_table(table.id)?;
         let has_primary_key_index = indexes
             .iter()
-            .any(|index| index.constraint == IndexConstraintKind::PrimaryKey);
+            .any(|index| primary_indexes.contains(&index.id));
         if !has_primary_key_index && !table.primary_key.is_empty() {
             rows.push(pg_index_row(
                 synthetic_primary_key_oid(table.id)?,
@@ -433,7 +449,7 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                     table_oid(index.table)?,
                     &index.columns,
                     index.unique,
-                    index.constraint == IndexConstraintKind::PrimaryKey,
+                    primary_indexes.contains(&index.id),
                 ));
             }
         }
@@ -523,76 +539,76 @@ fn pg_proc_row(entry: &PgProcCatalogEntry) -> Row {
 
 fn pg_constraint_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for table in catalog.list_tables()? {
-        if table.relation_kind != RelationKind::User {
-            continue;
-        }
-        if !table.primary_key.is_empty() {
-            let primary_key_index = catalog
-                .list_indexes_for_table(table.id)?
-                .into_iter()
-                .find(|index| index.constraint == IndexConstraintKind::PrimaryKey);
-            let (name, index_oid_value, key_columns) = match primary_key_index {
-                Some(index) => (index.name, index_oid(index.id)?, index.columns),
-                None => (
-                    primary_key_index_name(&table),
-                    synthetic_primary_key_oid(table.id)?,
-                    table.primary_key.clone(),
-                ),
-            };
-            rows.push(pg_constraint_row(ConstraintRow {
-                oid: primary_key_constraint_oid(table.id)?,
-                name,
-                namespace_oid: namespace_oid(table.schema_id)?,
-                kind: "p",
-                table_oid: table_oid(table.id)?,
-                index_oid: index_oid_value,
-                key_columns: Some(attnums_array_text(&key_columns)),
-                referenced_table_oid: 0,
-                update_action: "a",
-                delete_action: "a",
-                referenced_columns: None,
-                expression: None,
-            }));
-        }
-        for (index, check) in table.checks.iter().enumerate() {
-            rows.push(pg_constraint_row(ConstraintRow {
-                oid: try_check_constraint_oid(table.id, index)?,
-                name: check_constraint_name(&table, index),
-                namespace_oid: namespace_oid(table.schema_id)?,
-                kind: "c",
-                table_oid: table_oid(table.id)?,
-                index_oid: 0,
-                key_columns: None,
-                referenced_table_oid: 0,
-                update_action: "a",
-                delete_action: "a",
-                referenced_columns: None,
-                expression: Some(check.sql.clone()),
-            }));
-        }
-        for foreign_key in &table.foreign_keys {
-            let parent = catalog
-                .get_table(foreign_key.referenced_table)?
-                .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
-            if parent.relation_kind != RelationKind::User {
-                return Err(DbError::internal("foreign key references a non-user table"));
+    for constraint in catalog.list_constraints()? {
+        let table = catalog
+            .get_table(constraint.table)?
+            .ok_or_else(|| DbError::internal("constraint references a missing table"))?;
+        let mut row_data = ConstraintRow {
+            oid: constraint_oid(constraint.id)?,
+            name: constraint.name,
+            namespace_oid: namespace_oid(table.schema_id)?,
+            kind: "c",
+            table_oid: table_oid(table.id)?,
+            index_oid: 0,
+            key_columns: None,
+            referenced_table_oid: 0,
+            update_action: "a",
+            delete_action: "a",
+            referenced_columns: None,
+            expression: None,
+        };
+        match constraint.kind {
+            ConstraintKind::Check { expression } => row_data.expression = Some(expression.sql),
+            ConstraintKind::PrimaryKey { columns, index } => {
+                row_data.kind = "p";
+                row_data.index_oid = index_oid(index)?;
+                row_data.key_columns = Some(attnums_array_text(&stable_attnums(&table, &columns)?));
             }
-            rows.push(pg_constraint_row(ConstraintRow {
-                oid: foreign_key_constraint_oid(table.id, foreign_key.id)?,
-                name: foreign_key.name.clone(),
-                namespace_oid: namespace_oid(table.schema_id)?,
-                kind: "f",
-                table_oid: table_oid(table.id)?,
-                index_oid: index_oid(foreign_key.referenced_index)?,
-                key_columns: Some(attnums_array_text(&foreign_key.columns)),
-                referenced_table_oid: table_oid(parent.id)?,
-                update_action: foreign_key_action_code(foreign_key.on_update),
-                delete_action: foreign_key_action_code(foreign_key.on_delete),
-                referenced_columns: Some(attnums_array_text(&foreign_key.referenced_columns)),
-                expression: None,
-            }));
+            ConstraintKind::Unique { columns, index } => {
+                row_data.kind = "u";
+                row_data.index_oid = index_oid(index)?;
+                row_data.key_columns = Some(attnums_array_text(&stable_attnums(&table, &columns)?));
+            }
+            ConstraintKind::ForeignKey {
+                columns,
+                referenced_table,
+                referenced_constraint,
+                referenced_columns,
+                on_update,
+                on_delete,
+                ..
+            } => {
+                let parent = catalog
+                    .get_table(referenced_table)?
+                    .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
+                let referenced =
+                    catalog
+                        .get_constraint(referenced_constraint)?
+                        .ok_or_else(|| {
+                            DbError::internal("foreign key references a missing constraint")
+                        })?;
+                let backing_index = match referenced.kind {
+                    ConstraintKind::PrimaryKey { index, .. }
+                    | ConstraintKind::Unique { index, .. } => index,
+                    _ => {
+                        return Err(DbError::internal(
+                            "foreign key references a non-key constraint",
+                        ));
+                    }
+                };
+                row_data.kind = "f";
+                row_data.index_oid = index_oid(backing_index)?;
+                row_data.key_columns = Some(attnums_array_text(&stable_attnums(&table, &columns)?));
+                row_data.referenced_table_oid = table_oid(parent.id)?;
+                row_data.update_action = foreign_key_action_code(on_update);
+                row_data.delete_action = foreign_key_action_code(on_delete);
+                row_data.referenced_columns = Some(attnums_array_text(&stable_attnums(
+                    &parent,
+                    &referenced_columns,
+                )?));
+            }
         }
+        rows.push(pg_constraint_row(row_data));
     }
     sort_rows_by_key(&mut rows, |row| integer_at(row, 0))?;
     Ok(rows)
@@ -655,150 +671,30 @@ fn pg_attrdef_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
 
 fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let sequences = catalog.list_sequences()?;
-    for table in catalog.list_tables()? {
-        if table.relation_kind != RelationKind::User {
+    for dependency in catalog.list_dependencies()? {
+        let Some((classid, objid, objsubid)) = dependency_object(catalog, dependency.dependent)?
+        else {
             continue;
-        }
-        if !table.primary_key.is_empty() {
-            rows.push(pg_depend_row(
-                SystemView::PgConstraint.relation_oid(),
-                primary_key_constraint_oid(table.id)?,
-                0,
-                SystemView::PgClass.relation_oid(),
-                table_oid(table.id)?,
-                0,
-                "a",
-            ));
-        }
-        for (index, check) in table.checks.iter().enumerate() {
-            let constraint_oid = try_check_constraint_oid(table.id, index)?;
-            rows.push(pg_depend_row(
-                SystemView::PgConstraint.relation_oid(),
-                constraint_oid,
-                0,
-                SystemView::PgClass.relation_oid(),
-                table_oid(table.id)?,
-                0,
-                "a",
-            ));
-            for sequence in &sequences {
-                if check.root.references_sequence(sequence.id) {
-                    rows.push(pg_depend_row(
-                        SystemView::PgConstraint.relation_oid(),
-                        constraint_oid,
-                        0,
-                        SystemView::PgClass.relation_oid(),
-                        sequence_oid(sequence.id)?,
-                        0,
-                        "n",
-                    ));
-                }
-            }
-        }
-        for foreign_key in &table.foreign_keys {
-            let constraint_oid = foreign_key_constraint_oid(table.id, foreign_key.id)?;
-            let parent = catalog
-                .get_table(foreign_key.referenced_table)?
-                .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
-            let child_oid = table_oid(table.id)?;
-            let parent_oid = table_oid(parent.id)?;
-            rows.push(pg_depend_row(
-                SystemView::PgConstraint.relation_oid(),
-                constraint_oid,
-                0,
-                SystemView::PgClass.relation_oid(),
-                child_oid,
-                0,
-                "a",
-            ));
-            for column in &foreign_key.columns {
-                rows.push(pg_depend_row(
-                    SystemView::PgConstraint.relation_oid(),
-                    constraint_oid,
-                    0,
-                    SystemView::PgClass.relation_oid(),
-                    child_oid,
-                    i64::from(*column) + 1,
-                    "a",
-                ));
-            }
-            rows.push(pg_depend_row(
-                SystemView::PgConstraint.relation_oid(),
-                constraint_oid,
-                0,
-                SystemView::PgClass.relation_oid(),
-                parent_oid,
-                0,
-                "n",
-            ));
-            for column in &foreign_key.referenced_columns {
-                rows.push(pg_depend_row(
-                    SystemView::PgConstraint.relation_oid(),
-                    constraint_oid,
-                    0,
-                    SystemView::PgClass.relation_oid(),
-                    parent_oid,
-                    i64::from(*column) + 1,
-                    "n",
-                ));
-            }
-            rows.push(pg_depend_row(
-                SystemView::PgConstraint.relation_oid(),
-                constraint_oid,
-                0,
-                SystemView::PgClass.relation_oid(),
-                index_oid(foreign_key.referenced_index)?,
-                0,
-                "n",
-            ));
-        }
-        for column in &table.columns {
-            let Some(default) = column.default.as_ref() else {
-                continue;
-            };
-            let attrdef = attrdef_oid(table.id, column.id)?;
-            let attnum = i64::from(column.id) + 1;
-            rows.push(pg_depend_row(
-                SystemView::PgAttrdef.relation_oid(),
-                attrdef,
-                0,
-                SystemView::PgClass.relation_oid(),
-                table_oid(table.id)?,
-                attnum,
-                "a",
-            ));
-            for sequence in &sequences {
-                let references_sequence = match default {
-                    ColumnDefault::Nextval(sequence_id) => *sequence_id == sequence.id,
-                    ColumnDefault::Expr(expression) => {
-                        expression.root.references_sequence(sequence.id)
-                    }
-                    ColumnDefault::Const(_) => false,
-                };
-                if !references_sequence {
-                    continue;
-                }
-                rows.push(pg_depend_row(
-                    SystemView::PgAttrdef.relation_oid(),
-                    attrdef,
-                    0,
-                    SystemView::PgClass.relation_oid(),
-                    sequence_oid(sequence.id)?,
-                    0,
-                    "n",
-                ));
-                rows.push(pg_depend_row(
-                    SystemView::PgClass.relation_oid(),
-                    sequence_oid(sequence.id)?,
-                    0,
-                    SystemView::PgClass.relation_oid(),
-                    table_oid(table.id)?,
-                    attnum,
-                    if sequence.owned { "a" } else { "n" },
-                ));
-            }
-        }
+        };
+        let Some((refclassid, refobjid, refobjsubid)) =
+            dependency_object(catalog, dependency.referenced)?
+        else {
+            continue;
+        };
+        let dependency_type = match dependency.dependency_type {
+            DependencyType::Normal => "n",
+            DependencyType::Auto => "a",
+            DependencyType::Internal => "i",
+        };
+        rows.push(pg_depend_row(
+            classid,
+            objid,
+            objsubid,
+            refclassid,
+            refobjid,
+            refobjsubid,
+            dependency_type,
+        ));
     }
     sort_rows_by_key(&mut rows, |row| {
         Ok((
@@ -808,6 +704,63 @@ fn pg_depend_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
         ))
     })?;
     Ok(rows)
+}
+
+fn dependency_object(
+    catalog: &dyn CatalogManager,
+    object: CatalogObjectId,
+) -> Result<Option<(i64, i64, i64)>> {
+    let value = match object {
+        CatalogObjectId::Schema(id) => (
+            SystemView::PgNamespace.relation_oid(),
+            namespace_oid(id)?,
+            0,
+        ),
+        CatalogObjectId::Table(id) | CatalogObjectId::View(id) => {
+            (SystemView::PgClass.relation_oid(), table_oid(id)?, 0)
+        }
+        CatalogObjectId::Index(id) => (SystemView::PgClass.relation_oid(), index_oid(id)?, 0),
+        CatalogObjectId::Sequence(id) => (SystemView::PgClass.relation_oid(), sequence_oid(id)?, 0),
+        CatalogObjectId::Constraint(id) => (
+            SystemView::PgConstraint.relation_oid(),
+            constraint_oid(id)?,
+            0,
+        ),
+        CatalogObjectId::Function(_) => return Ok(None),
+        CatalogObjectId::Column { relation, column } => {
+            let dense = if let Some(table) = catalog.get_table(relation)? {
+                table.dense_column_id(column)
+            } else if let Some(view) = catalog.get_view(relation)? {
+                view.columns
+                    .iter()
+                    .find(|candidate| candidate.object_id == column)
+                    .map(|candidate| candidate.id)
+            } else {
+                None
+            }
+            .ok_or_else(|| DbError::internal("dependency references a missing column"))?;
+            (
+                SystemView::PgClass.relation_oid(),
+                table_oid(relation)?,
+                i64::from(dense) + 1,
+            )
+        }
+        CatalogObjectId::ColumnDefault { relation, column } => {
+            let dense = catalog
+                .get_table(relation)?
+                .and_then(|table| table.dense_column_id(column))
+                .ok_or_else(|| {
+                    DbError::internal("dependency references a missing column default")
+                })?;
+            (
+                SystemView::PgAttrdef.relation_oid(),
+                attrdef_oid(relation, dense)?,
+                0,
+            )
+        }
+        CatalogObjectId::Statistics(_) => return Ok(None),
+    };
+    Ok(Some(value))
 }
 
 fn pg_depend_row(
@@ -1400,12 +1353,21 @@ fn attnums_array_text(columns: &[u16]) -> String {
     format!("{{{attnums}}}")
 }
 
-fn check_constraint_name(table: &TableSchema, index: usize) -> String {
-    if index == 0 {
-        format!("{}_check", relation_name(table))
-    } else {
-        format!("{}_check_{}", relation_name(table), index + 1)
-    }
+fn stable_attnums(
+    table: &TableSchema,
+    columns: &[common::ColumnObjectId],
+) -> Result<Vec<common::ColumnId>> {
+    columns
+        .iter()
+        .map(|column| {
+            table.dense_column_id(*column).ok_or_else(|| {
+                DbError::internal(format!(
+                    "constraint references missing stable column id {column} on table {}",
+                    table.name
+                ))
+            })
+        })
+        .collect()
 }
 
 fn primary_key_index_name(table: &TableSchema) -> String {

@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use common::{
-    ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
-    NamespaceSchema, ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions,
-    SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate,
-    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    ColumnId, CompressionSetting, DbError, FileId, IndexId, IndexSchema, NamespaceSchema,
+    ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, TableId,
+    TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewDependency, ViewSchema,
 };
 
 use crate::{
@@ -160,10 +160,6 @@ impl CatalogManager for TruncateCatalogOverlay {
     }
 
     fn apply_drop_table(&self, _id: TableId) -> Result<()> {
-        Self::read_only()
-    }
-
-    fn apply_drop_table_in_batch(&self, _id: TableId, _batch: &[TableId]) -> Result<()> {
         Self::read_only()
     }
 
@@ -366,14 +362,33 @@ impl CatalogManager for TruncateCatalogOverlay {
         Self::read_only()
     }
 
-    fn create_index_in_schema_with_constraint(
+    fn create_index_in_schema(
         &self,
         _schema: SchemaId,
         _name: String,
         _table: TableId,
         _columns: &[String],
         _unique: bool,
-        _constraint: IndexConstraintKind,
+    ) -> Result<IndexSchema> {
+        Self::read_only()
+    }
+
+    fn create_primary_key_index(
+        &self,
+        _schema: SchemaId,
+        _name: String,
+        _table: TableId,
+        _columns: &[String],
+    ) -> Result<IndexSchema> {
+        Self::read_only()
+    }
+
+    fn create_unique_constraint_index(
+        &self,
+        _schema: SchemaId,
+        _name: String,
+        _table: TableId,
+        _columns: &[String],
     ) -> Result<IndexSchema> {
         Self::read_only()
     }

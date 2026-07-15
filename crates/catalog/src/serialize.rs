@@ -1,6 +1,7 @@
 use common::{
-    DbError, FileId, IndexId, IndexSchema, NamespaceSchema, RelationKind, Result, SchemaId,
-    SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics, ViewSchema,
+    ConstraintSchema, DbError, DependencyEdge, FileId, IndexId, IndexSchema, NamespaceSchema,
+    RelationKind, Result, SchemaId, SequenceId, SequenceSchema, TableId, TableSchema,
+    TableStatistics, ViewSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,8 @@ struct CatalogV3<'a> {
     views: Vec<&'a ViewSchema>,
     indexes: Vec<&'a IndexSchema>,
     sequences: Vec<&'a SequenceSchema>,
+    constraints: Vec<&'a ConstraintSchema>,
+    dependencies: Vec<&'a DependencyEdge>,
     statistics: Vec<(TableId, &'a TableStatistics)>,
     next_schema_id: SchemaId,
     next_table_id: TableId,
@@ -36,6 +39,8 @@ struct OwnedCatalogV3 {
     views: Vec<ViewSchema>,
     indexes: Vec<IndexSchema>,
     sequences: Vec<SequenceSchema>,
+    constraints: Vec<ConstraintSchema>,
+    dependencies: Vec<DependencyEdge>,
     #[serde(default)]
     statistics: Vec<(TableId, TableStatistics)>,
     next_schema_id: SchemaId,
@@ -64,6 +69,9 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
     indexes.sort_by_key(|index| index.id);
     let mut sequences: Vec<_> = snapshot.sequences_by_id.values().collect();
     sequences.sort_by_key(|sequence| sequence.id);
+    let mut constraints: Vec<_> = snapshot.constraints_by_id.values().collect();
+    constraints.sort_by_key(|constraint| constraint.id);
+    let dependencies: Vec<_> = snapshot.dependencies.iter().collect();
     let mut statistics: Vec<_> = snapshot
         .statistics
         .iter()
@@ -78,6 +86,8 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         views,
         indexes,
         sequences,
+        constraints,
+        dependencies,
         statistics,
         next_schema_id: snapshot.next_schema_id,
         next_table_id: snapshot.next_table_id,
@@ -155,6 +165,11 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         .map(|sequence| (sequence.name.clone(), sequence.id))
         .collect();
     let sequences_by_id = collect_unique(catalog.sequences, |sequence| sequence.id, "sequence")?;
+    let constraints_by_id = collect_unique(
+        catalog.constraints,
+        |constraint| constraint.id,
+        "constraint",
+    )?;
     let statistics = collect_unique(catalog.statistics, |(table, _)| *table, "statistics")?
         .into_iter()
         .map(|(table, (_, statistics))| (table, statistics))
@@ -178,6 +193,8 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         next_dictionary_id: catalog.next_dictionary_id,
         next_storage_id: catalog.next_storage_id,
         next_constraint_id: catalog.next_constraint_id,
+        constraints_by_id,
+        dependencies: catalog.dependencies.into_iter().collect(),
         statistics,
     })
 }

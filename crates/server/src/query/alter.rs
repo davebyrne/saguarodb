@@ -2,10 +2,9 @@ use std::sync::{Arc, RwLockWriteGuard, atomic::Ordering};
 
 use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
-    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema,
-    IsolationLevel, QualifiedName, QueryCancel, RelationKind, Result, SqlState, StatementContext,
-    TableId, TableOptionPatch, TableSchema, ToastCompression, WriteGuard, needs_toast_relation,
-    toast_schema,
+    ColumnId, CompressionSetting, DbError, IndexId, IndexSchema, IsolationLevel, QualifiedName,
+    QueryCancel, RelationKind, Result, SqlState, StatementContext, TableId, TableOptionPatch,
+    TableSchema, ToastCompression, WriteGuard, needs_toast_relation, toast_schema,
 };
 use executor::{ExecutionContext, ExecutionResult, validate_existing_foreign_keys};
 use parser::{ParsedForeignKey, Statement};
@@ -864,7 +863,7 @@ impl QueryService {
                     name: index_name,
                     columns: primary_key.clone(),
                     unique: true,
-                    constraint: IndexConstraintKind::PrimaryKey,
+                    constraint: None,
                 };
                 Ok::<_, DbError>((primary_key, new_schema, gc_horizon, index, catalog_snapshot))
             })();
@@ -1589,16 +1588,25 @@ fn primary_key_constraint_index(
     catalog: &dyn catalog::CatalogManager,
     schema: &TableSchema,
 ) -> Result<IndexSchema> {
-    catalog
-        .list_indexes_for_table(schema.id)?
+    let index_id = catalog
+        .list_constraints_for_table(schema.id)?
         .into_iter()
-        .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+        .find_map(|constraint| match constraint.kind {
+            common::ConstraintKind::PrimaryKey { index, .. } => Some(index),
+            _ => None,
+        })
         .ok_or_else(|| {
             DbError::internal(format!(
                 "table {} has primary-key metadata but no primary-key constraint index",
                 schema.name
             ))
-        })
+        })?;
+    catalog.get_index(index_id)?.ok_or_else(|| {
+        DbError::internal(format!(
+            "table {} primary-key constraint references missing index {index_id}",
+            schema.name
+        ))
+    })
 }
 
 fn classify_drop_constraint(
@@ -1606,30 +1614,21 @@ fn classify_drop_constraint(
     schema: &TableSchema,
     constraint_name: &str,
 ) -> Result<DropConstraintKind> {
-    let indexes = catalog.list_indexes_for_table(schema.id)?;
-    if !schema.primary_key.is_empty() {
-        let primary = indexes
-            .iter()
-            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
-            .ok_or_else(|| {
-                DbError::internal(format!(
-                    "table {} has primary-key metadata but no primary-key constraint index",
-                    schema.name
-                ))
-            })?;
-        if primary.name == constraint_name {
-            return Ok(DropConstraintKind::PrimaryKey);
+    if let Some(constraint) = catalog.get_constraint_by_name(schema.id, constraint_name)? {
+        match constraint.kind {
+            common::ConstraintKind::PrimaryKey { .. } => {
+                return Ok(DropConstraintKind::PrimaryKey);
+            }
+            common::ConstraintKind::Unique { .. } => {
+                return Ok(DropConstraintKind::UnsupportedUnique);
+            }
+            _ => {}
         }
     }
-    if indexes.iter().any(|index| {
-        index.constraint == IndexConstraintKind::Unique && index.name == constraint_name
-    }) {
-        return Ok(DropConstraintKind::UnsupportedUnique);
-    }
-    Ok(schema
-        .foreign_keys
-        .iter()
-        .find(|foreign_key| foreign_key.name == constraint_name)
-        .cloned()
-        .map_or(DropConstraintKind::Missing, DropConstraintKind::ForeignKey))
+    let foreign_key = catalog
+        .get_constraint_by_name(schema.id, constraint_name)?
+        .filter(|constraint| matches!(constraint.kind, common::ConstraintKind::ForeignKey { .. }))
+        .map(|constraint| catalog.resolve_foreign_key_constraint(&constraint))
+        .transpose()?;
+    Ok(foreign_key.map_or(DropConstraintKind::Missing, DropConstraintKind::ForeignKey))
 }

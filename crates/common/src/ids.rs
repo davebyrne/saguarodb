@@ -14,7 +14,6 @@ pub type FunctionId = u32;
 pub type ConstraintId = u32;
 /// Per-table foreign-key identifier. Values are allocated monotonically and
 /// never reused.
-pub type ForeignKeyId = u16;
 pub type IndexId = u32;
 pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;

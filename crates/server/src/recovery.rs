@@ -54,9 +54,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
         .map(|control| control.checkpoint_lsn)
         .unwrap_or(0);
     let catalog: Arc<dyn CatalogManager> = match &loaded {
-        Some(control) => Arc::new(MemoryCatalog::try_from_snapshot(deserialize_catalog(
-            &control.catalog,
-        )?)?),
+        Some(control) => Arc::new(MemoryCatalog::try_from_durable_snapshot(
+            deserialize_catalog(&control.catalog)?,
+        )?),
         None => Arc::new(MemoryCatalog::empty()),
     };
 
@@ -657,16 +657,13 @@ mod tests {
                 default: None,
                 pg_type: None,
             }],
-            primary_key: vec![0],
+            primary_key: Vec::new(),
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: common::CompressionSetting::None,
             active_dict_id: None,
             toast: common::ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: common::RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         }
     }
@@ -782,7 +779,7 @@ mod tests {
             name: "legacy_table_id_idx".to_string(),
             columns: vec![0],
             unique: false,
-            constraint: common::IndexConstraintKind::None,
+            constraint: None,
         };
         super::apply_redo(
             &catalog,

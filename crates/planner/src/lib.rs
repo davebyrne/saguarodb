@@ -301,8 +301,8 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog, SystemView};
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        IndexConstraintKind, ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression,
-        ToastMode, ToastOptions, Value,
+        ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression, ToastMode,
+        ToastOptions, Value,
     };
     use parser::parse;
 
@@ -340,16 +340,16 @@ mod tests {
     }
 
     fn create_primary_key_index(catalog: &MemoryCatalog, table: &str, columns: &[&str]) {
+        let table_id = catalog.get_table_by_name(table).unwrap().unwrap().id;
         catalog
-            .create_index_with_constraint(
+            .create_primary_key_index(
+                common::PUBLIC_SCHEMA_ID,
                 format!("{table}_pkey"),
-                table,
+                table_id,
                 &columns
                     .iter()
                     .map(|column| (*column).to_string())
                     .collect::<Vec<_>>(),
-                true,
-                IndexConstraintKind::PrimaryKey,
             )
             .unwrap();
     }
@@ -2173,13 +2173,11 @@ mod tests {
             )
             .unwrap();
         catalog
-            .create_index_in_schema_with_constraint(
+            .create_primary_key_index(
                 first.id,
                 "child_pkey".to_string(),
                 parent.id,
                 &["id".to_string()],
-                true,
-                IndexConstraintKind::PrimaryKey,
             )
             .unwrap();
         let statement = parse(

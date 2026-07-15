@@ -227,9 +227,6 @@ fn users_schema() -> TableSchema {
         toast_table_id: None,
         relation_kind: RelationKind::User,
         schema_version: common::INITIAL_SCHEMA_VERSION,
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: u32::MAX,
     }
 }
@@ -254,7 +251,7 @@ fn name_index() -> IndexSchema {
         name: "users_name".to_string(),
         columns: vec![1],
         unique: false,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     }
 }
 

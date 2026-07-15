@@ -1,7 +1,7 @@
 use catalog::CatalogManager;
 use common::{
-    ColumnId, DbError, ForeignKeyConstraint, IndexConstraintKind, IndexId, Key,
-    PRIMARY_KEY_INDEX_ID, Result, RowIdentity, SqlState, TableId, TableSchema, Value,
+    ColumnId, DbError, ForeignKeyConstraint, IndexId, Key, PRIMARY_KEY_INDEX_ID, Result,
+    RowIdentity, SqlState, TableId, TableSchema, Value,
 };
 use storage::DependentRowProbe;
 
@@ -37,8 +37,9 @@ pub(crate) struct ReferentialIntegrity<'a> {
 
 impl<'a> ReferentialIntegrity<'a> {
     pub(crate) fn new(ctx: &'a ExecutionContext<'a>, target: TableSchema) -> Result<Self> {
-        let mut outgoing = Vec::with_capacity(target.foreign_keys.len());
-        for constraint in &target.foreign_keys {
+        let constraints = ctx.catalog.list_outgoing_foreign_keys(target.id)?;
+        let mut outgoing = Vec::with_capacity(constraints.len());
+        for constraint in &constraints {
             let parent = require_table(ctx.catalog.as_ref(), constraint.referenced_table)?;
             let referenced_index = ctx
                 .catalog
@@ -49,15 +50,10 @@ impl<'a> ReferentialIntegrity<'a> {
                         constraint.name
                     ))
                 })?;
-            let access_index = match referenced_index.constraint {
-                IndexConstraintKind::PrimaryKey => PRIMARY_KEY_INDEX_ID,
-                IndexConstraintKind::Unique => referenced_index.id,
-                IndexConstraintKind::None => {
-                    return Err(DbError::internal(format!(
-                        "foreign key {} references a non-constraint index",
-                        constraint.name
-                    )));
-                }
+            let access_index = if parent.primary_key == constraint.referenced_columns {
+                PRIMARY_KEY_INDEX_ID
+            } else {
+                referenced_index.id
             };
             outgoing.push(OutgoingForeignKey {
                 constraint: constraint.clone(),

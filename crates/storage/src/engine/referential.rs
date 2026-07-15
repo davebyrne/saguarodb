@@ -216,7 +216,7 @@ impl PageBackedStorageEngine {
             (schema.primary_key.clone(), None)
         } else {
             let index = self.index_handle(relations, table, access_index)?.schema;
-            if index.constraint != common::IndexConstraintKind::Unique {
+            if !index.unique {
                 return Err(storage_internal(format!(
                     "foreign-key referenced probe selected non-constraint index {}",
                     index.id

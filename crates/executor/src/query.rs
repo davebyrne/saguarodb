@@ -6,10 +6,10 @@ use std::time::Instant;
 use catalog::{CatalogAllocatorState, CatalogManager, ResolvedForeignKey, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
-    ExecRow, IndexConstraintKind, IndexId, IsolationLevel, Key, KeyRange, ParsedColumnDef,
-    ParsedDefault, QueryCancel, Result, Row, RowIdentity, SchemaId, SequenceOptions,
-    SequenceSchema, SqlState, StatementContext, StoredRow, TableId, TableSchema, ToastOptions,
-    TruncateCatalogUpdate, TupleLockMode, TupleLockWaitPolicy, Value, ViewColumn,
+    ExecRow, IndexId, IsolationLevel, Key, KeyRange, ParsedColumnDef, ParsedDefault, QueryCancel,
+    Result, Row, RowIdentity, SchemaId, SequenceOptions, SequenceSchema, SqlState,
+    StatementContext, StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate,
+    TupleLockMode, TupleLockWaitPolicy, Value, ViewColumn,
 };
 use planner::{
     BoundExpr, BoundForeignKey, BoundForeignKeyTarget, BoundOnConflict, BoundReturning,
@@ -2172,13 +2172,11 @@ fn execute_create_table(
     };
     let mut created_indexes = Vec::new();
     if !primary_key.is_empty() {
-        let index = ctx.catalog.create_index_in_schema_with_constraint(
+        let index = ctx.catalog.create_primary_key_index(
             schema.schema_id,
             format!("{}_pkey", schema.name),
             schema.id,
             primary_key,
-            true,
-            IndexConstraintKind::PrimaryKey,
         )?;
         created_indexes.push(index);
     }
@@ -2187,13 +2185,11 @@ fn execute_create_table(
     // cascades to every index created so far in the catalog — and return; the
     // autocommit unit also rolls back the storage-side DDL state.
     for columns in unique {
-        let index = ctx.catalog.create_index_in_schema_with_constraint(
+        let index = ctx.catalog.create_unique_constraint_index(
             schema.schema_id,
             format!("{}_{}_key", schema.name, columns.join("_")),
             schema.id,
             columns,
-            true,
-            IndexConstraintKind::Unique,
         )?;
         created_indexes.push(index);
     }
@@ -2438,11 +2434,6 @@ fn execute_drop_tables(
     ctx.catalog.preflight_drop_tables(&table_ids)?;
     mutate_catalog(ctx, || {
         ctx.catalog.drop_tables(&table_ids)?;
-        for (_, owned_sequences) in &resolved {
-            for sequence in owned_sequences {
-                ctx.catalog.apply_drop_sequence(sequence.id)?;
-            }
-        }
         Ok(())
     })?;
     for (table, owned_sequences) in &resolved {
@@ -2933,14 +2924,8 @@ fn execute_create_index(
             )
         })?;
     let schema = mutate_catalog(ctx, || {
-        ctx.catalog.create_index_in_schema_with_constraint(
-            namespace,
-            name.to_string(),
-            schema.id,
-            columns,
-            unique,
-            IndexConstraintKind::None,
-        )
+        ctx.catalog
+            .create_index_in_schema(namespace, name.to_string(), schema.id, columns, unique)
     })?;
     if let Err(err) = ctx
         .schema_ops
@@ -2956,16 +2941,6 @@ fn execute_create_index(
 }
 
 fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<ExecutionResult> {
-    if ctx
-        .catalog
-        .get_index(index)?
-        .is_some_and(|index| index.constraint == IndexConstraintKind::PrimaryKey)
-    {
-        return Err(DbError::plan(
-            common::SqlState::DependentObjectsStillExist,
-            "cannot drop index backing a primary key constraint",
-        ));
-    }
     mutate_catalog(ctx, || ctx.catalog.drop_index(index))?;
     ctx.schema_ops.drop_index(&ctx.statement, index)?;
     Ok(ExecutionResult::Modified {
@@ -3103,10 +3078,6 @@ fn coerce_numeric_columns(schema: &TableSchema, values: &mut [Value]) -> Result<
 /// A constraint that evaluates to `false` violates; `true` or `NULL` (unknown)
 /// passes, matching PostgreSQL's three-valued semantics.
 ///
-/// Enforcement is driven by `check_exprs` (the binder's bound form of the table's
-/// checks, in the same order as `schema.checks`), so no check can be skipped by a
-/// length mismatch; `schema.checks` supplies the constraint's text for the error
-/// message when the two arrays line up, with a generic fallback otherwise.
 fn validate_check_constraints(
     statement: &StatementContext,
     schema: &TableSchema,
@@ -3122,18 +3093,13 @@ fn validate_check_constraints(
         },
         identity: None,
     };
-    for (index, expr) in check_exprs.iter().enumerate() {
+    for expr in check_exprs {
         match eval_expr(statement, expr, &row)? {
             Value::Boolean(false) => {
-                let text = schema
-                    .checks
-                    .get(index)
-                    .map(|expression| expression.sql.as_str())
-                    .unwrap_or("check constraint");
                 return Err(DbError::execute(
                     SqlState::CheckViolation,
                     format!(
-                        "new row for relation \"{}\" violates check constraint ({text})",
+                        "new row for relation \"{}\" violates check constraint",
                         schema.name
                     ),
                 ));

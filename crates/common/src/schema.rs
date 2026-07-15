@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    ColumnId, ColumnObjectId, DbError, FileId, ForeignKeyId, IndexId, PUBLIC_SCHEMA_ID, PgType,
+    ColumnId, ColumnObjectId, ConstraintId, DbError, FileId, IndexId, PUBLIC_SCHEMA_ID, PgType,
     SchemaId, SequenceId, SqlState, StoredExpression, TableId, Value,
 };
 
@@ -430,20 +430,52 @@ pub enum ForeignKeyAction {
     Restrict,
 }
 
-/// A resolved, durable foreign-key constraint owned by one child table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyConstraint {
-    pub id: ForeignKeyId,
+    pub id: ConstraintId,
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub referenced_table: TableId,
     pub referenced_columns: Vec<ColumnId>,
-    /// The declared PRIMARY KEY or UNIQUE constraint index selected when the
-    /// foreign key was attached. Zero is reserved for legacy payload migration.
     #[serde(default)]
     pub referenced_index: IndexId,
     pub on_update: ForeignKeyAction,
     pub on_delete: ForeignKeyAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstraintKind {
+    Check {
+        expression: StoredExpression,
+    },
+    PrimaryKey {
+        columns: Vec<ColumnObjectId>,
+        index: IndexId,
+    },
+    Unique {
+        columns: Vec<ColumnObjectId>,
+        index: IndexId,
+    },
+    ForeignKey {
+        columns: Vec<ColumnObjectId>,
+        referenced_table: TableId,
+        referenced_constraint: ConstraintId,
+        referenced_columns: Vec<ColumnObjectId>,
+        on_update: ForeignKeyAction,
+        on_delete: ForeignKeyAction,
+        supporting_index: Option<IndexId>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstraintSchema {
+    pub id: ConstraintId,
+    pub table: TableId,
+    pub name: String,
+    pub kind: ConstraintKind,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    pub validated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,21 +511,27 @@ pub struct TableSchema {
     /// User table vs. hidden toast relation metadata.
     #[serde(default)]
     pub relation_kind: RelationKind,
-    /// Typed durable `CHECK` expressions (column-level and table-level checks are
-    /// flattened here, as in PostgreSQL). DML lowers the stored expressions
-    /// directly; a row whose check evaluates to `false` is rejected while a
-    /// `NULL` result passes.
-    #[serde(default)]
-    pub checks: Vec<StoredExpression>,
-    /// Ordered outgoing foreign-key constraints owned by this table.
-    #[serde(default)]
-    pub foreign_keys: Vec<ForeignKeyConstraint>,
-    /// Monotonic per-table foreign-key id allocator. `4096` is the exhausted
-    /// sentinel; live ids are restricted to `0..=4095`.
-    #[serde(default)]
-    pub next_foreign_key_id: u32,
     /// Next never-reused durable column identity within this relation.
     pub next_column_object_id: ColumnObjectId,
+}
+
+impl TableSchema {
+    pub fn column_by_object_id(&self, object_id: ColumnObjectId) -> Option<&ColumnDef> {
+        self.columns
+            .iter()
+            .find(|column| column.object_id == object_id)
+    }
+
+    pub fn dense_column_id(&self, object_id: ColumnObjectId) -> Option<ColumnId> {
+        self.column_by_object_id(object_id).map(|column| column.id)
+    }
+
+    pub fn stable_column_id(&self, column_id: ColumnId) -> Option<ColumnObjectId> {
+        self.columns
+            .iter()
+            .find(|column| column.id == column_id)
+            .map(|column| column.object_id)
+    }
 }
 
 /// A durable dependency from a view to another relation. `columns` tracks specific
@@ -615,9 +653,6 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
         relation_kind: RelationKind::Toast {
             base_table: base.id,
         },
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: 4,
     }
 }
@@ -659,15 +694,6 @@ pub struct SequenceSchema {
     pub is_called: bool,
 }
 
-/// Catalog-visible constraint semantics carried by an index.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IndexConstraintKind {
-    #[default]
-    None,
-    Unique,
-    PrimaryKey,
-}
-
 /// A secondary index over one or more columns of a table. `unique` rejects
 /// duplicate indexed values; the B-tree stores the heap TID as a value tiebreaker
 /// so duplicate non-unique keys can coexist.
@@ -685,8 +711,7 @@ pub struct IndexSchema {
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub unique: bool,
-    #[serde(default)]
-    pub constraint: IndexConstraintKind,
+    pub constraint: Option<ConstraintId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

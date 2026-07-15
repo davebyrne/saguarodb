@@ -693,7 +693,19 @@ mod tests {
     }
 
     #[test]
-    fn catalog_change_codec_rejects_reserved_constraint_objects() {
+    fn catalog_change_codec_round_trips_constraint_objects() {
+        let constraint = common::ConstraintSchema {
+            id: 1,
+            table: 2,
+            name: "items_key".to_string(),
+            kind: common::ConstraintKind::Unique {
+                columns: vec![3],
+                index: 4,
+            },
+            deferrable: false,
+            initially_deferred: false,
+            validated: true,
+        };
         let record = WalRecord {
             lsn: 1,
             txn_id: 1,
@@ -702,20 +714,14 @@ mod tests {
                     version: common::CATALOG_CHANGE_SET_VERSION,
                     mutations: vec![common::CatalogMutation {
                         before: None,
-                        after: Some(common::CatalogObject::Constraint(1)),
+                        after: Some(common::CatalogObject::Constraint(constraint)),
                     }],
                     allocator_high_water: common::CatalogAllocatorHighWater::default(),
                 },
             },
         };
-        let error = encode_record(&record).unwrap_err();
-        assert!(
-            error
-                .message
-                .contains("constraint objects are not supported"),
-            "{}",
-            error.message
-        );
+        let encoded = encode_record(&record).unwrap();
+        assert_eq!(decode_record(&encoded).unwrap(), record);
     }
 
     #[test]

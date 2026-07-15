@@ -1977,6 +1977,23 @@ async fn alter_table_primary_key_survives_restart() {
         .expect("DROP PRIMARY KEY should survive restart");
 }
 
+#[tokio::test]
+async fn primary_key_drop_uses_constraint_identity_when_unique_columns_match() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table duplicate_key_shape (id integer unique)")
+        .await
+        .unwrap();
+    server
+        .simple_query("alter table duplicate_key_shape add primary key (id)")
+        .await
+        .unwrap();
+    server
+        .simple_query("alter table duplicate_key_shape drop constraint duplicate_key_shape_pkey")
+        .await
+        .expect("the primary-key constraint is identified by kind, not matching columns");
+}
+
 /// An explicit `NULL` for a `NOT NULL` column is rejected on both INSERT and
 /// UPDATE.
 #[tokio::test]

@@ -13,6 +13,7 @@
 
 mod catalog_overlay;
 mod change_set;
+mod dependencies;
 mod memory;
 mod serialize;
 pub mod system;
@@ -23,22 +24,24 @@ pub use change_set::{
     apply_catalog_change_set, catalog_change_set_between, merge_allocator_high_water,
     reserve_change_allocators,
 };
-pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
+pub use memory::{
+    CatalogSnapshot, MemoryCatalog, reconcile_snapshot_derived_metadata,
+    validate_create_table_definition,
+};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
-    attrdef_oid, check_constraint_oid, foreign_key_constraint_oid, index_oid, is_system_schema,
-    primary_key_constraint_oid, resolve_system_view, schema_oid, sequence_oid,
-    synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
+    attrdef_oid, constraint_oid, index_oid, is_system_schema, resolve_system_view, schema_oid,
+    sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 pub use truncate_overlay::TruncateCatalogOverlay;
 
 use common::{
-    ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, ForeignKeyAction,
-    ForeignKeyConstraint, IndexConstraintKind, IndexId, IndexSchema, NamespaceSchema,
-    ParsedColumnDef, PgType, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema,
-    SqlState, TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate,
-    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    ColumnDefault, ColumnId, CompressionSetting, ConstraintId, ConstraintSchema, DataType, DbError,
+    DependencyEdge, FileId, ForeignKeyAction, ForeignKeyConstraint, IndexId, IndexSchema,
+    NamespaceSchema, ParsedColumnDef, PgType, Result, SchemaId, SequenceId, SequenceOptions,
+    SequenceSchema, SqlState, TableId, TableSchema, TableStatistics, ToastOptions,
+    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
 
 /// A name-optional but otherwise fully resolved foreign-key definition passed
@@ -181,6 +184,34 @@ pub trait CatalogManager: Send + Sync {
     }
     fn get_view(&self, id: TableId) -> Result<Option<ViewSchema>>;
     fn list_views(&self) -> Result<Vec<ViewSchema>>;
+    fn get_constraint(&self, id: ConstraintId) -> Result<Option<ConstraintSchema>> {
+        Ok(self.snapshot()?.constraints_by_id.get(&id).cloned())
+    }
+    fn list_constraints(&self) -> Result<Vec<ConstraintSchema>> {
+        let mut constraints: Vec<_> = self.snapshot()?.constraints_by_id.into_values().collect();
+        constraints.sort_by_key(|constraint| constraint.id);
+        Ok(constraints)
+    }
+    fn list_constraints_for_table(&self, table: TableId) -> Result<Vec<ConstraintSchema>> {
+        Ok(self
+            .list_constraints()?
+            .into_iter()
+            .filter(|constraint| constraint.table == table)
+            .collect())
+    }
+    fn get_constraint_by_name(
+        &self,
+        table: TableId,
+        name: &str,
+    ) -> Result<Option<ConstraintSchema>> {
+        Ok(self
+            .list_constraints_for_table(table)?
+            .into_iter()
+            .find(|constraint| constraint.name == name))
+    }
+    fn list_dependencies(&self) -> Result<Vec<DependencyEdge>> {
+        Ok(self.snapshot()?.dependencies.into_iter().collect())
+    }
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
     fn reserve_table_id(&self, id: TableId) -> Result<()>;
@@ -192,10 +223,6 @@ pub trait CatalogManager: Send + Sync {
         indexes: &[IndexSchema],
     ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
-    /// Recovery-only single-record drop with the complete committed statement's
-    /// table set. Implementations may remove FK edges between still-present batch
-    /// members so cyclic drops replay in WAL-record order.
-    fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()>;
     /// Atomically attaches a batch of fully ID/column-resolved foreign keys to
     /// one child table. IDs must continue that table's monotonic allocator.
     fn attach_foreign_keys(
@@ -205,14 +232,6 @@ pub trait CatalogManager: Send + Sync {
     ) -> Result<TableSchema> {
         Err(DbError::internal(
             "catalog does not support foreign-key mutation",
-        ))
-    }
-    /// Advances one live table's foreign-key allocator to at least `next_id`
-    /// without installing a constraint. Recovery uses this for aborted or skipped
-    /// schema records so an ID exposed in WAL is never reused after restart.
-    fn reserve_foreign_key_allocator(&self, _table: TableId, _next_id: u32) -> Result<()> {
-        Err(DbError::internal(
-            "catalog does not support foreign-key allocator reservation",
         ))
     }
     /// Removes one foreign key by its table-local constraint name. A missing
@@ -233,15 +252,90 @@ pub trait CatalogManager: Send + Sync {
         referenced_table: TableId,
     ) -> Result<Vec<(TableSchema, ForeignKeyConstraint)>> {
         let mut incoming = Vec::new();
-        for table in self.list_tables()? {
-            for foreign_key in &table.foreign_keys {
-                if foreign_key.referenced_table == referenced_table {
-                    incoming.push((table.clone(), foreign_key.clone()));
-                }
+        for constraint in self.list_constraints()? {
+            if let common::ConstraintKind::ForeignKey {
+                referenced_table: parent,
+                ..
+            } = constraint.kind
+                && parent == referenced_table
+            {
+                let child = self
+                    .get_table(constraint.table)?
+                    .ok_or_else(|| DbError::internal("foreign-key constraint table is missing"))?;
+                incoming.push((child, self.resolve_foreign_key_constraint(&constraint)?));
             }
         }
         incoming.sort_by_key(|(table, foreign_key)| (table.id, foreign_key.id));
         Ok(incoming)
+    }
+    fn list_outgoing_foreign_keys(&self, table: TableId) -> Result<Vec<ForeignKeyConstraint>> {
+        let mut outgoing = Vec::new();
+        for constraint in self.list_constraints_for_table(table)? {
+            if matches!(constraint.kind, common::ConstraintKind::ForeignKey { .. }) {
+                outgoing.push(self.resolve_foreign_key_constraint(&constraint)?);
+            }
+        }
+        outgoing.sort_by_key(|constraint| constraint.id);
+        Ok(outgoing)
+    }
+    fn resolve_foreign_key_constraint(
+        &self,
+        constraint: &ConstraintSchema,
+    ) -> Result<ForeignKeyConstraint> {
+        let common::ConstraintKind::ForeignKey {
+            columns,
+            referenced_table,
+            referenced_constraint,
+            referenced_columns,
+            on_update,
+            on_delete,
+            ..
+        } = &constraint.kind
+        else {
+            return Err(DbError::internal("constraint is not a foreign key"));
+        };
+        let child = self
+            .get_table(constraint.table)?
+            .ok_or_else(|| DbError::internal("foreign-key child table is missing"))?;
+        let parent = self
+            .get_table(*referenced_table)?
+            .ok_or_else(|| DbError::internal("foreign-key parent table is missing"))?;
+        let referenced = self
+            .get_constraint(*referenced_constraint)?
+            .ok_or_else(|| DbError::internal("foreign key references a missing key constraint"))?;
+        let referenced_index = match referenced.kind {
+            common::ConstraintKind::PrimaryKey { index, .. }
+            | common::ConstraintKind::Unique { index, .. } => index,
+            _ => {
+                return Err(DbError::internal(
+                    "foreign key references a non-key constraint",
+                ));
+            }
+        };
+        Ok(ForeignKeyConstraint {
+            id: constraint.id,
+            name: constraint.name.clone(),
+            columns: columns
+                .iter()
+                .map(|column| {
+                    child.dense_column_id(*column).ok_or_else(|| {
+                        DbError::internal("foreign key references a missing child column")
+                    })
+                })
+                .collect::<Result<_>>()?,
+            referenced_table: *referenced_table,
+            referenced_columns: referenced_columns
+                .iter()
+                .map(|column| {
+                    parent.dense_column_id(*column).ok_or_else(|| {
+                        DbError::internal("foreign key references a missing parent column")
+                    })
+                })
+                .collect::<Result<_>>()?,
+            referenced_index,
+            on_update: *on_update,
+            on_delete: *on_delete,
+        })
     }
     /// Resolves an eligible referenced PK/UNIQUE constraint to its storage
     /// access index. Primary keys use the reserved storage identity index id.
@@ -260,8 +354,9 @@ pub trait CatalogManager: Send + Sync {
             .list_indexes_for_table(referenced_table)?
             .into_iter()
             .filter(|index| {
-                index.constraint == IndexConstraintKind::Unique
+                index.constraint.is_some()
                     && index.columns == referenced_columns
+                    && index.columns != table.primary_key
             })
             .min_by_key(|index| index.id)
             .map(|index| index.id))
@@ -281,9 +376,7 @@ pub trait CatalogManager: Send + Sync {
         Ok(self
             .list_indexes_for_table(child_table)?
             .into_iter()
-            .filter(|index| {
-                index.constraint != IndexConstraintKind::PrimaryKey && index.columns == columns
-            })
+            .filter(|index| index.columns == columns && index.columns != table.primary_key)
             .min_by_key(|index| index.id)
             .map(|index| index.id))
     }
@@ -431,7 +524,7 @@ pub trait CatalogManager: Send + Sync {
         let primary_key_index = self
             .list_indexes_for_table(table)?
             .into_iter()
-            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .find(|index| index.constraint.is_some() && index.columns == schema.primary_key)
             .ok_or_else(|| {
                 DbError::internal(
                     "table has primary-key metadata but no primary-key constraint index",
@@ -523,39 +616,35 @@ pub trait CatalogManager: Send + Sync {
         columns: &[String],
         unique: bool,
     ) -> Result<IndexSchema> {
-        self.create_index_with_constraint(name, table, columns, unique, IndexConstraintKind::None)
-    }
-    fn create_index_with_constraint(
-        &self,
-        name: String,
-        table: &str,
-        columns: &[String],
-        unique: bool,
-        constraint: IndexConstraintKind,
-    ) -> Result<IndexSchema> {
         let table = self.get_table_by_name(table)?.ok_or_else(|| {
             DbError::plan(
                 common::SqlState::UndefinedTable,
                 format!("table {table} does not exist"),
             )
         })?;
-        self.create_index_in_schema_with_constraint(
-            common::PUBLIC_SCHEMA_ID,
-            name,
-            table.id,
-            columns,
-            unique,
-            constraint,
-        )
+        self.create_index_in_schema(common::PUBLIC_SCHEMA_ID, name, table.id, columns, unique)
     }
-    fn create_index_in_schema_with_constraint(
+    fn create_index_in_schema(
         &self,
         schema: SchemaId,
         name: String,
         table: TableId,
         columns: &[String],
         unique: bool,
-        constraint: IndexConstraintKind,
+    ) -> Result<IndexSchema>;
+    fn create_primary_key_index(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
+    ) -> Result<IndexSchema>;
+    fn create_unique_constraint_index(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
 
@@ -645,19 +734,100 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, ForeignKeyAction,
-        ForeignKeyConstraint, IndexConstraintKind, IndexSchema, ParsedColumnDef, PgType,
-        RelationKind, SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredExpr,
-        StoredExpression, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
-        ViewDependency, toast_schema,
+        ColumnDef, ColumnDefault, CompressionSetting, ConstraintKind, DataType, ErrorKind,
+        ForeignKeyAction, ForeignKeyConstraint, IndexSchema, ParsedColumnDef, PgType, RelationKind,
+        SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredExpr, StoredExpression,
+        TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn, ViewDependency,
+        toast_schema,
     };
 
     use crate::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, check_constraint_oid,
-        deserialize_catalog, foreign_key_constraint_oid, serialize_catalog,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, constraint_oid,
+        deserialize_catalog, serialize_catalog,
         system::{MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
         validate_create_table_definition,
     };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestConstraintIndexKind {
+        None,
+        PrimaryKey,
+        Unique,
+    }
+
+    trait TestConstraintIndexes {
+        fn create_index_with_constraint(
+            &self,
+            name: String,
+            table: &str,
+            columns: &[String],
+            unique: bool,
+            constraint: TestConstraintIndexKind,
+        ) -> common::Result<IndexSchema>;
+
+        fn create_index_in_schema_with_constraint(
+            &self,
+            schema: common::SchemaId,
+            name: String,
+            table: common::TableId,
+            columns: &[String],
+            unique: bool,
+            constraint: TestConstraintIndexKind,
+        ) -> common::Result<IndexSchema>;
+    }
+
+    impl TestConstraintIndexes for MemoryCatalog {
+        fn create_index_with_constraint(
+            &self,
+            name: String,
+            table: &str,
+            columns: &[String],
+            unique: bool,
+            constraint: TestConstraintIndexKind,
+        ) -> common::Result<IndexSchema> {
+            let table = self.get_table_by_name(table)?.ok_or_else(|| {
+                common::DbError::plan(
+                    common::SqlState::UndefinedTable,
+                    format!("table {table} does not exist"),
+                )
+            })?;
+            self.create_index_in_schema_with_constraint(
+                common::PUBLIC_SCHEMA_ID,
+                name,
+                table.id,
+                columns,
+                unique,
+                constraint,
+            )
+        }
+
+        fn create_index_in_schema_with_constraint(
+            &self,
+            schema: common::SchemaId,
+            name: String,
+            table: common::TableId,
+            columns: &[String],
+            unique: bool,
+            constraint: TestConstraintIndexKind,
+        ) -> common::Result<IndexSchema> {
+            if constraint != TestConstraintIndexKind::None && !unique {
+                return Err(common::DbError::internal(
+                    "catalog constraint index must be unique",
+                ));
+            }
+            match constraint {
+                TestConstraintIndexKind::None => {
+                    self.create_index_in_schema(schema, name, table, columns, unique)
+                }
+                TestConstraintIndexKind::PrimaryKey => {
+                    self.create_primary_key_index(schema, name, table, columns)
+                }
+                TestConstraintIndexKind::Unique => {
+                    self.create_unique_constraint_index(schema, name, table, columns)
+                }
+            }
+        }
+    }
 
     fn id_column(nullable: bool) -> ParsedColumnDef {
         ParsedColumnDef {
@@ -702,9 +872,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         }
     }
@@ -725,7 +892,7 @@ mod tests {
                 "parents",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
         let child = catalog
@@ -755,6 +922,10 @@ mod tests {
             on_update: ForeignKeyAction::NoAction,
             on_delete: ForeignKeyAction::Restrict,
         }
+    }
+
+    fn outgoing_foreign_keys(catalog: &MemoryCatalog, table: u32) -> Vec<ForeignKeyConstraint> {
+        catalog.list_outgoing_foreign_keys(table).unwrap()
     }
 
     /// A `users(id INTEGER PRIMARY KEY, name TEXT)` table for index tests.
@@ -1024,7 +1195,7 @@ mod tests {
             name: "users".to_string(),
             columns: vec![0],
             unique: false,
-            constraint: IndexConstraintKind::None,
+            constraint: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1175,15 +1346,19 @@ mod tests {
         ];
 
         for expression in invalid_expressions {
-            let mut table = stored_id_table(1, "items");
-            table.checks.push(expression);
-            let snapshot = CatalogSnapshot {
-                tables_by_name: HashMap::from([("items".to_string(), table.id)]),
-                tables_by_id: HashMap::from([(table.id, table)]),
-                next_table_id: 2,
-                ..MemoryCatalog::empty().snapshot().unwrap()
-            };
-            assert!(MemoryCatalog::try_from_snapshot(snapshot).is_err());
+            let catalog = MemoryCatalog::empty();
+            assert!(
+                catalog
+                    .create_table_with_options(
+                        "items".to_string(),
+                        vec![id_column(false)],
+                        Vec::new(),
+                        CompressionSetting::None,
+                        ToastOptions::legacy_catalog_default(),
+                        vec![expression],
+                    )
+                    .is_err()
+            );
         }
     }
 
@@ -1244,7 +1419,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
         let before_failed_ddl = catalog.snapshot().unwrap();
@@ -1400,7 +1575,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(renamed.name, "customers");
-        assert_eq!(renamed.checks, vec![check]);
+        assert!(
+            catalog
+                .list_constraints_for_table(renamed.id)
+                .unwrap()
+                .into_iter()
+                .any(|constraint| matches!(
+                    constraint.kind,
+                    common::ConstraintKind::Check { expression } if expression == check
+                ))
+        );
         assert!(catalog.get_table_by_name("accounts").unwrap().is_none());
         assert_eq!(
             catalog.get_table_by_name("customers").unwrap().unwrap().id,
@@ -1680,6 +1864,36 @@ mod tests {
     }
 
     #[test]
+    fn apply_update_index_rejects_constraint_identity_changes() {
+        let catalog = catalog_with_users();
+        let index = catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                TestConstraintIndexKind::PrimaryKey,
+            )
+            .unwrap();
+
+        let mut renamed = index.clone();
+        renamed.name = "renamed_users_pkey".to_string();
+        assert!(catalog.apply_update_index_schema(renamed).is_err());
+
+        let mut detached = index.clone();
+        detached.constraint = None;
+        assert!(catalog.apply_update_index_schema(detached).is_err());
+
+        let mut rewritten = index.clone();
+        rewritten.storage_id = 50;
+        catalog
+            .apply_update_index_schema(rewritten.clone())
+            .unwrap();
+        assert_eq!(catalog.get_index(index.id).unwrap(), Some(rewritten));
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 51);
+    }
+
+    #[test]
     fn apply_update_table_and_index_schemas_validates_primary_key_against_replayed_table() {
         let catalog = MemoryCatalog::empty();
         let accounts = catalog
@@ -1706,7 +1920,7 @@ mod tests {
                 "accounts",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
         assert_eq!(primary_key.columns, vec![1]);
@@ -2399,9 +2613,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2525,9 +2736,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2552,6 +2760,8 @@ mod tests {
             next_dictionary_id: 1,
             next_storage_id: 4,
             next_constraint_id: 1,
+            constraints_by_id: HashMap::new(),
+            dependencies: std::collections::BTreeSet::new(),
             views_by_name: HashMap::new(),
             views_by_id: HashMap::new(),
             statistics: HashMap::new(),
@@ -2589,9 +2799,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
 
@@ -2760,9 +2967,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2780,10 +2984,26 @@ mod tests {
                     name: "users_pkey".to_string(),
                     columns: vec![0, 1],
                     unique: true,
-                    constraint: common::IndexConstraintKind::PrimaryKey,
+                    constraint: Some(1),
                 },
             )]),
             next_index_id: 2,
+            next_constraint_id: 2,
+            constraints_by_id: HashMap::from([(
+                1,
+                common::ConstraintSchema {
+                    id: 1,
+                    table: 3,
+                    name: "users_pkey".to_string(),
+                    kind: ConstraintKind::PrimaryKey {
+                        columns: vec![1, 2],
+                        index: 1,
+                    },
+                    deferrable: false,
+                    initially_deferred: false,
+                    validated: true,
+                },
+            )]),
             ..CatalogSnapshot::default()
         };
 
@@ -2822,9 +3042,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2863,9 +3080,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2906,9 +3120,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -2959,7 +3170,7 @@ mod tests {
     }
 
     #[test]
-    fn set_table_primary_key_updates_columns_and_can_clear_key() {
+    fn set_table_primary_key_rejects_standalone_projection_changes() {
         let catalog = MemoryCatalog::empty();
 
         let schema = catalog
@@ -2972,20 +3183,14 @@ mod tests {
             .unwrap();
         assert!(schema.columns[0].nullable);
 
-        let updated = catalog.set_table_primary_key(schema.id, vec![0]).unwrap();
-        assert_eq!(updated.primary_key, vec![0]);
-        assert!(!updated.columns[0].nullable);
-        assert_eq!(updated.schema_version, schema.schema_version + 1);
-
-        let cleared = catalog
+        let error = catalog
+            .set_table_primary_key(schema.id, vec![0])
+            .unwrap_err();
+        assert!(error.message.contains("first-class constraint"));
+        let unchanged = catalog
             .set_table_primary_key(schema.id, Vec::new())
             .unwrap();
-        assert!(cleared.primary_key.is_empty());
-        assert_eq!(cleared.schema_version, updated.schema_version + 1);
-        assert!(
-            !cleared.columns[0].nullable,
-            "dropping a primary key does not restore prior nullability"
-        );
+        assert_eq!(unchanged, schema);
     }
 
     #[test]
@@ -3008,7 +3213,7 @@ mod tests {
             name: "users_pkey".to_string(),
             columns: vec![0],
             unique: true,
-            constraint: IndexConstraintKind::PrimaryKey,
+            constraint: None,
         };
 
         let updated = catalog
@@ -3018,7 +3223,9 @@ mod tests {
         assert_eq!(updated.primary_key, vec![0]);
         assert!(!updated.columns[0].nullable);
         assert_eq!(updated.schema_version, schema.schema_version + 1);
-        assert_eq!(catalog.get_index(index.id).unwrap(), Some(index));
+        let installed = catalog.get_index(index.id).unwrap().unwrap();
+        assert_eq!(installed.name, index.name);
+        assert!(installed.constraint.is_some());
         assert_eq!(catalog.snapshot().unwrap().next_storage_id, 8);
         assert_eq!(
             catalog.get_table(schema.id).unwrap().unwrap().primary_key,
@@ -3027,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    fn add_table_primary_key_index_rejects_plain_index_metadata() {
+    fn add_table_primary_key_index_rejects_preowned_index_metadata() {
         let catalog = MemoryCatalog::empty();
 
         let schema = catalog
@@ -3046,7 +3253,7 @@ mod tests {
             name: "users_pkey".to_string(),
             columns: vec![0],
             unique: true,
-            constraint: IndexConstraintKind::None,
+            constraint: Some(99),
         };
 
         let err = catalog
@@ -3082,7 +3289,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
 
@@ -3232,19 +3439,22 @@ mod tests {
                 default: None,
                 pg_type: None,
             }],
-            primary_key: vec![0],
+            primary_key: Vec::new(),
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
 
+        let mut incomplete_primary_key = schema.clone();
+        incomplete_primary_key.primary_key = vec![0];
+        let err = catalog
+            .apply_create_table(incomplete_primary_key)
+            .unwrap_err();
+        assert!(err.message.contains("first-class constraint"));
         catalog.apply_create_table(schema.clone()).unwrap();
         assert_eq!(catalog.get_table_by_name("users").unwrap(), Some(schema));
 
@@ -3336,7 +3546,7 @@ mod tests {
             name: "users_pkey".to_string(),
             columns: vec![1],
             unique: false,
-            constraint: IndexConstraintKind::None,
+            constraint: None,
         };
         let err = catalog.apply_create_index(schema).unwrap_err();
         assert_eq!(err.code, SqlState::DuplicateTable);
@@ -3531,13 +3741,73 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
 
         let err = catalog.drop_index(index.id).unwrap_err();
         assert_eq!(err.code, SqlState::DependentObjectsStillExist);
         assert!(catalog.get_index(index.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn drop_child_supporting_index_clears_foreign_key_hint() {
+        let catalog = MemoryCatalog::empty();
+        let parent = catalog
+            .create_table(
+                "support_parent".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .create_index_with_constraint(
+                "support_parent_pkey".to_string(),
+                "support_parent",
+                &["id".to_string()],
+                true,
+                TestConstraintIndexKind::PrimaryKey,
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "support_child".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let supporting = catalog
+            .create_index(
+                "support_child_id_idx".to_string(),
+                "support_child",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap();
+        catalog
+            .attach_foreign_keys(
+                child.id,
+                vec![resolved_foreign_key(Some("support_child_fkey"), parent.id)],
+            )
+            .unwrap();
+
+        catalog.drop_index(supporting.id).unwrap();
+
+        let constraint = catalog
+            .list_constraints_for_table(child.id)
+            .unwrap()
+            .into_iter()
+            .find(|constraint| constraint.name == "support_child_fkey")
+            .unwrap();
+        assert!(matches!(
+            constraint.kind,
+            ConstraintKind::ForeignKey {
+                supporting_index: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3550,7 +3820,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 false,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap_err();
         assert_eq!(not_unique.code, SqlState::InternalError);
@@ -3562,7 +3832,7 @@ mod tests {
                 "users",
                 &["name".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap_err();
         assert_eq!(wrong_columns.code, SqlState::InternalError);
@@ -3574,7 +3844,7 @@ mod tests {
                 "users",
                 &["name".to_string()],
                 false,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap_err();
         assert_eq!(unique_constraint_not_unique.code, SqlState::InternalError);
@@ -3590,7 +3860,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
 
@@ -3600,7 +3870,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap_err();
 
@@ -3646,7 +3916,7 @@ mod tests {
             name: "users_name".to_string(),
             columns: vec![1],
             unique: false,
-            constraint: common::IndexConstraintKind::None,
+            constraint: None,
         };
 
         catalog.apply_create_index(schema.clone()).unwrap();
@@ -3680,7 +3950,7 @@ mod tests {
             name: "bad_pkey".to_string(),
             columns: vec![1],
             unique: true,
-            constraint: common::IndexConstraintKind::PrimaryKey,
+            constraint: Some(1),
         };
 
         let err = catalog.apply_create_index(schema).unwrap_err();
@@ -3698,7 +3968,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
 
@@ -3710,7 +3980,7 @@ mod tests {
             name: "users_second_pkey".to_string(),
             columns: vec![0],
             unique: true,
-            constraint: common::IndexConstraintKind::PrimaryKey,
+            constraint: Some(1),
         };
 
         let err = catalog.apply_create_index(schema).unwrap_err();
@@ -3730,7 +4000,7 @@ mod tests {
                 "users",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::PrimaryKey,
+                TestConstraintIndexKind::PrimaryKey,
             )
             .unwrap();
         catalog
@@ -3774,7 +4044,7 @@ mod tests {
                     name: "orphan".to_string(),
                     columns: vec![0],
                     unique: false,
-                    constraint: common::IndexConstraintKind::None,
+                    constraint: None,
                 },
             )]),
             next_index_id: 2,
@@ -3810,9 +4080,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -3830,7 +4097,7 @@ mod tests {
                     name: "bad".to_string(),
                     columns: vec![0],
                     unique: false,
-                    constraint: common::IndexConstraintKind::None,
+                    constraint: None,
                 },
             )]),
             next_index_id: 1,
@@ -3865,9 +4132,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
         let snapshot = CatalogSnapshot {
@@ -3885,7 +4149,7 @@ mod tests {
                     name: "users_id".to_string(),
                     columns: vec![0],
                     unique: false,
-                    constraint: common::IndexConstraintKind::None,
+                    constraint: None,
                 },
             )]),
             next_index_id: 1,
@@ -4216,8 +4480,8 @@ mod tests {
         catalog.apply_create_table(toast).unwrap();
         let err = catalog.apply_drop_table(2).unwrap_err();
 
-        assert_eq!(err.code, SqlState::InternalError);
-        assert!(err.message.contains("cannot drop hidden TOAST relation"));
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert!(err.message.contains("internally owned catalog object"));
         MemoryCatalog::try_from_snapshot(catalog.snapshot().unwrap()).unwrap();
     }
 
@@ -4377,6 +4641,69 @@ mod tests {
     }
 
     #[test]
+    fn constraint_creation_and_snapshot_load_reject_oversized_virtual_oids() {
+        let catalog = catalog_with_users();
+        catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                TestConstraintIndexKind::PrimaryKey,
+            )
+            .unwrap();
+        let mut exhausted = catalog.snapshot().unwrap();
+        exhausted.next_constraint_id = MAX_VIRTUAL_OID_PAYLOAD + 1;
+        catalog.restore(exhausted).unwrap();
+        assert!(
+            catalog
+                .create_index_with_constraint(
+                    "users_name_key".to_string(),
+                    "users",
+                    &["name".to_string()],
+                    true,
+                    TestConstraintIndexKind::Unique,
+                )
+                .is_err()
+        );
+
+        let valid = MemoryCatalog::empty();
+        valid
+            .create_table(
+                "oversized_constraint".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let index = valid
+            .create_index_with_constraint(
+                "oversized_constraint_pkey".to_string(),
+                "oversized_constraint",
+                &["id".to_string()],
+                true,
+                TestConstraintIndexKind::PrimaryKey,
+            )
+            .unwrap();
+        let mut malformed = valid.snapshot().unwrap();
+        let mut constraint = malformed
+            .constraints_by_id
+            .remove(&index.constraint.unwrap())
+            .unwrap();
+        constraint.id = MAX_VIRTUAL_OID_PAYLOAD + 1;
+        malformed
+            .constraints_by_id
+            .insert(constraint.id, constraint);
+        malformed
+            .indexes_by_id
+            .get_mut(&index.id)
+            .unwrap()
+            .constraint = Some(MAX_VIRTUAL_OID_PAYLOAD + 1);
+        malformed.next_constraint_id = MAX_VIRTUAL_OID_PAYLOAD + 2;
+        assert!(MemoryCatalog::try_from_snapshot(malformed).is_err());
+    }
+
+    #[test]
     fn apply_paths_reject_missing_object_schemas_and_view_moves() {
         let catalog = MemoryCatalog::empty();
         let missing_schema = 99;
@@ -4511,7 +4838,7 @@ mod tests {
                 app_table.id,
                 &["id".to_string()],
                 false,
-                IndexConstraintKind::None,
+                TestConstraintIndexKind::None,
             )
             .unwrap();
         assert_eq!(
@@ -4585,7 +4912,8 @@ mod tests {
     #[test]
     fn foreign_keys_attach_generate_names_list_incoming_and_drop_without_reusing_ids() {
         let (catalog, parent, child) = foreign_key_catalog();
-        let schema = catalog
+        let first_id = catalog.snapshot().unwrap().next_constraint_id;
+        catalog
             .attach_foreign_keys(
                 child,
                 vec![
@@ -4594,11 +4922,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(schema.next_foreign_key_id, 2);
-        assert_eq!(schema.foreign_keys[0].id, 0);
-        assert_eq!(schema.foreign_keys[0].name, "children_parent_id_fkey");
-        assert_eq!(schema.foreign_keys[1].id, 1);
-        assert_eq!(schema.foreign_keys[1].name, "children_parent_id_fkey1");
+        let foreign_keys = outgoing_foreign_keys(&catalog, child);
+        assert_eq!(foreign_keys[0].id, first_id);
+        assert_eq!(foreign_keys[0].name, "children_parent_id_fkey");
+        assert_eq!(foreign_keys[1].id, first_id + 1);
+        assert_eq!(foreign_keys[1].name, "children_parent_id_fkey1");
         assert_eq!(
             catalog.resolve_foreign_key_index(parent, &[0]).unwrap(),
             Some(common::PRIMARY_KEY_INDEX_ID)
@@ -4606,14 +4934,14 @@ mod tests {
         let incoming = catalog.list_incoming_foreign_keys(parent).unwrap();
         assert_eq!(incoming.len(), 2);
         assert_eq!(incoming[0].0.id, child);
-        assert_eq!(incoming[0].1.id, 0);
+        assert_eq!(incoming[0].1.id, first_id);
 
-        let dropped = catalog
+        catalog
             .drop_foreign_key(child, "children_parent_id_fkey", false)
             .unwrap()
             .unwrap();
-        assert_eq!(dropped.next_foreign_key_id, 2);
-        assert_eq!(dropped.foreign_keys.len(), 1);
+        assert_eq!(outgoing_foreign_keys(&catalog, child).len(), 1);
+        assert_eq!(catalog.snapshot().unwrap().next_constraint_id, first_id + 2);
         assert!(
             catalog
                 .drop_foreign_key(child, "missing", true)
@@ -4641,28 +4969,17 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, SqlState::UndefinedColumn);
-        let unchanged = catalog.get_table(child).unwrap().unwrap();
-        assert!(unchanged.foreign_keys.is_empty());
-        assert_eq!(unchanged.next_foreign_key_id, 0);
+        assert!(outgoing_foreign_keys(&catalog, child).is_empty());
 
         let mut snapshot = catalog.snapshot().unwrap();
-        snapshot
-            .tables_by_id
-            .get_mut(&child)
-            .unwrap()
-            .next_foreign_key_id = 4095;
+        snapshot.next_constraint_id = u32::MAX;
         let exhausted = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
-        let last = exhausted
-            .attach_foreign_keys(child, vec![resolved_foreign_key(Some("last"), parent)])
-            .unwrap();
-        assert_eq!(last.foreign_keys[0].id, 4095);
-        assert_eq!(last.next_foreign_key_id, 4096);
         assert_eq!(
             exhausted
-                .attach_foreign_keys(child, vec![resolved_foreign_key(Some("too_many"), parent)])
+                .attach_foreign_keys(child, vec![resolved_foreign_key(Some("last"), parent)])
                 .unwrap_err()
                 .code,
-            SqlState::ProgramLimitExceeded
+            SqlState::InternalError
         );
     }
 
@@ -4695,7 +5012,7 @@ mod tests {
                 "parents",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap();
         assert_eq!(
@@ -4750,7 +5067,7 @@ mod tests {
                 "identity_parent",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap();
         let alternative = catalog
@@ -4759,7 +5076,7 @@ mod tests {
                 "identity_parent",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap();
         let child = catalog
@@ -4770,27 +5087,33 @@ mod tests {
                 CompressionSetting::None,
             )
             .unwrap();
-        let attached = catalog
+        catalog
             .attach_foreign_keys(
                 child.id,
                 vec![resolved_foreign_key(Some("identity_fkey"), parent.id)],
             )
             .unwrap();
-        assert_eq!(attached.foreign_keys[0].referenced_index, selected.id);
+        assert_eq!(
+            outgoing_foreign_keys(&catalog, child.id)[0].referenced_index,
+            selected.id
+        );
 
         assert_eq!(
             catalog.drop_index(selected.id).unwrap_err().code,
             SqlState::DependentObjectsStillExist
         );
-        catalog.drop_index(alternative.id).unwrap();
         assert_eq!(
-            catalog.get_table(child.id).unwrap().unwrap().foreign_keys[0].referenced_index,
+            catalog.drop_index(alternative.id).unwrap_err().code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            outgoing_foreign_keys(&catalog, child.id)[0].referenced_index,
             selected.id
         );
     }
 
     #[test]
-    fn malformed_foreign_key_snapshot_is_rejected_and_legacy_metadata_defaults_empty() {
+    fn malformed_foreign_key_snapshot_is_rejected() {
         let (catalog, parent, child) = foreign_key_catalog();
         catalog
             .attach_foreign_keys(
@@ -4799,101 +5122,61 @@ mod tests {
             )
             .unwrap();
         let mut malformed = catalog.snapshot().unwrap();
-        malformed
-            .tables_by_id
-            .get_mut(&child)
-            .unwrap()
-            .next_foreign_key_id = 0;
+        let foreign_key = malformed
+            .constraints_by_id
+            .values_mut()
+            .find(|constraint| constraint.table == child)
+            .unwrap();
+        let ConstraintKind::ForeignKey {
+            referenced_table, ..
+        } = &mut foreign_key.kind
+        else {
+            unreachable!()
+        };
+        *referenced_table = u32::MAX;
         let err = MemoryCatalog::try_from_snapshot(malformed).unwrap_err();
         assert_eq!(err.code, SqlState::InternalError);
-
-        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let foreign_key = value
-            .get_mut("tables")
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|tables| {
-                tables.iter_mut().find(|table| {
-                    table.get("name").and_then(serde_json::Value::as_str) == Some("children")
-                })
-            })
-            .and_then(|table| table.get_mut("foreign_keys"))
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|foreign_keys| foreign_keys.first_mut())
-            .and_then(serde_json::Value::as_object_mut)
-            .unwrap();
-        foreign_key.remove("referenced_index");
-        let decoded = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap();
-        let loaded = MemoryCatalog::try_from_snapshot(decoded).unwrap();
-        assert_ne!(
-            loaded.get_table(child).unwrap().unwrap().foreign_keys[0].referenced_index,
-            common::PRIMARY_KEY_INDEX_ID
-        );
-
-        let legacy = MemoryCatalog::empty();
-        legacy
-            .create_table(
-                "legacy".to_string(),
-                vec![id_column(false)],
-                Vec::new(),
-                CompressionSetting::None,
-            )
-            .unwrap();
-        let bytes = serialize_catalog(&legacy.snapshot().unwrap()).unwrap();
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let table = value
-            .get_mut("tables")
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|tables| tables.first_mut())
-            .and_then(serde_json::Value::as_object_mut)
-            .unwrap();
-        table.remove("foreign_keys");
-        table.remove("next_foreign_key_id");
-        let decoded = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap();
-        let loaded = MemoryCatalog::try_from_snapshot(decoded).unwrap();
-        let schema = loaded.get_table_by_name("legacy").unwrap().unwrap();
-        assert!(schema.foreign_keys.is_empty());
-        assert_eq!(schema.next_foreign_key_id, 0);
     }
 
     #[test]
-    fn foreign_key_oid_uses_a_dedicated_stable_namespace() {
-        let oid = foreign_key_constraint_oid(42, 7).unwrap();
-        assert_eq!(oid, foreign_key_constraint_oid(42, 7).unwrap());
-        assert_ne!(oid, check_constraint_oid(42, 7).unwrap());
-        assert_ne!(oid, crate::primary_key_constraint_oid(42).unwrap());
-        assert!(foreign_key_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1, 0).is_err());
+    fn constraint_oid_is_derived_from_the_stable_constraint_id() {
+        let oid = constraint_oid(42).unwrap();
+        assert_eq!(oid, constraint_oid(42).unwrap());
+        assert_ne!(oid, constraint_oid(43).unwrap());
+        assert!(constraint_oid(MAX_VIRTUAL_OID_PAYLOAD + 1).is_err());
     }
 
     #[test]
-    fn restore_preserves_foreign_key_allocator_high_water() {
+    fn restore_preserves_constraint_allocator_high_water() {
         let (catalog, parent, child) = foreign_key_catalog();
         let before = catalog.snapshot().unwrap();
+        let allocated = before.next_constraint_id;
         catalog
             .attach_foreign_keys(child, vec![resolved_foreign_key(Some("first"), parent)])
             .unwrap();
         catalog.drop_foreign_key(child, "first", false).unwrap();
         catalog.restore(before).unwrap();
-        let restored = catalog.get_table(child).unwrap().unwrap();
-        assert_eq!(restored.next_foreign_key_id, 1);
-        let attached = catalog
+        assert_eq!(
+            catalog.snapshot().unwrap().next_constraint_id,
+            allocated + 1
+        );
+        catalog
             .attach_foreign_keys(child, vec![resolved_foreign_key(Some("second"), parent)])
             .unwrap();
-        assert_eq!(attached.foreign_keys[0].id, 1);
+        assert_eq!(outgoing_foreign_keys(&catalog, child)[0].id, allocated + 1);
     }
 
     #[test]
-    fn reservation_preserves_foreign_key_allocator_without_installing_metadata() {
+    fn restoring_reserved_constraint_allocator_does_not_install_metadata() {
         let (catalog, parent, child) = foreign_key_catalog();
-        catalog.reserve_foreign_key_allocator(child, 2).unwrap();
-        let reserved = catalog.get_table(child).unwrap().unwrap();
-        assert!(reserved.foreign_keys.is_empty());
-        assert_eq!(reserved.next_foreign_key_id, 2);
-        let attached = catalog
+        let mut reserved = catalog.snapshot().unwrap();
+        reserved.next_constraint_id = 42;
+        catalog.restore(reserved).unwrap();
+        assert!(outgoing_foreign_keys(&catalog, child).is_empty());
+        catalog
             .attach_foreign_keys(child, vec![resolved_foreign_key(Some("third"), parent)])
             .unwrap();
-        assert_eq!(attached.foreign_keys[0].id, 2);
-        assert!(catalog.reserve_foreign_key_allocator(child, 4097).is_err());
+        assert_eq!(outgoing_foreign_keys(&catalog, child)[0].id, 42);
     }
 
     #[test]
@@ -4913,7 +5196,7 @@ mod tests {
                 "parents",
                 &["id".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap();
         let child = catalog
@@ -4960,7 +5243,7 @@ mod tests {
                     name,
                     &["id".to_string()],
                     true,
-                    IndexConstraintKind::Unique,
+                    TestConstraintIndexKind::Unique,
                 )
                 .unwrap();
             catalog.get_table(table.id).unwrap().unwrap()
@@ -5002,7 +5285,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_batch_drop_removes_cycle_edges_in_wal_record_order() {
+    fn batch_drop_removes_foreign_key_cycle_atomically() {
         let catalog = MemoryCatalog::empty();
         let make_table = |name: &str| {
             let table = catalog
@@ -5019,7 +5302,7 @@ mod tests {
                     name,
                     &["id".to_string()],
                     true,
-                    IndexConstraintKind::Unique,
+                    TestConstraintIndexKind::Unique,
                 )
                 .unwrap();
             catalog.get_table(table.id).unwrap().unwrap()
@@ -5042,24 +5325,13 @@ mod tests {
             .unwrap();
 
         let batch = [first.id, second.id];
-        catalog.apply_drop_table_in_batch(first.id, &batch).unwrap();
+        catalog.drop_tables(&batch).unwrap();
         assert!(catalog.get_table(first.id).unwrap().is_none());
-        assert!(
-            catalog
-                .get_table(second.id)
-                .unwrap()
-                .unwrap()
-                .foreign_keys
-                .is_empty()
-        );
-        catalog
-            .apply_drop_table_in_batch(second.id, &batch)
-            .unwrap();
         assert!(catalog.get_table(second.id).unwrap().is_none());
     }
 
     #[test]
-    fn recovery_batch_first_drop_removes_every_internal_cycle_edge() {
+    fn batch_drop_removes_multiple_foreign_key_cycles() {
         let catalog = MemoryCatalog::empty();
         let make_table = |name: &str| {
             let table = catalog
@@ -5076,7 +5348,7 @@ mod tests {
                     name,
                     &["id".to_string()],
                     true,
-                    IndexConstraintKind::Unique,
+                    TestConstraintIndexKind::Unique,
                 )
                 .unwrap();
             catalog.get_table(table.id).unwrap().unwrap()
@@ -5107,24 +5379,14 @@ mod tests {
         }
 
         let batch = tables.iter().map(|table| table.id).collect::<Vec<_>>();
-        catalog
-            .apply_drop_table_in_batch(tables[0].id, &batch)
-            .unwrap();
-        for table in &tables[1..] {
-            assert!(
-                catalog
-                    .get_table(table.id)
-                    .unwrap()
-                    .unwrap()
-                    .foreign_keys
-                    .is_empty()
-            );
-            catalog.apply_drop_table(table.id).unwrap();
+        catalog.drop_tables(&batch).unwrap();
+        for table in &tables {
+            assert!(catalog.get_table(table.id).unwrap().is_none());
         }
     }
 
     #[test]
-    fn dropping_earlier_child_column_remaps_source_but_parent_renumbering_is_rejected() {
+    fn dropping_unrelated_earlier_columns_remaps_foreign_key_dense_projections() {
         let catalog = MemoryCatalog::empty();
         let two_columns = || {
             vec![
@@ -5160,7 +5422,7 @@ mod tests {
                 "parents",
                 &["key".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap();
         let child = catalog
@@ -5180,15 +5442,13 @@ mod tests {
 
         catalog.drop_table_column(child.id, "unused").unwrap();
         assert_eq!(
-            catalog.get_table(child.id).unwrap().unwrap().foreign_keys[0].columns,
+            outgoing_foreign_keys(&catalog, child.id)[0].columns,
             vec![0]
         );
-        let child_before_parent_drop = catalog.get_table(child.id).unwrap().unwrap();
-        let err = catalog.drop_table_column(parent.id, "unused").unwrap_err();
-        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        catalog.drop_table_column(parent.id, "unused").unwrap();
         assert_eq!(
-            catalog.get_table(child.id).unwrap().unwrap(),
-            child_before_parent_drop
+            outgoing_foreign_keys(&catalog, child.id)[0].referenced_columns,
+            vec![0]
         );
     }
 
@@ -5207,7 +5467,7 @@ mod tests {
                 "children",
                 &["parent_id".to_string()],
                 true,
-                IndexConstraintKind::Unique,
+                TestConstraintIndexKind::Unique,
             )
             .unwrap_err();
         assert_eq!(err.code, SqlState::DuplicateObject);
@@ -5246,7 +5506,7 @@ mod tests {
             .list_indexes_for_table(parent)
             .unwrap()
             .into_iter()
-            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .find(|index| index.constraint.is_some() && index.columns == vec![0])
             .unwrap();
         assert_eq!(
             catalog
@@ -5258,30 +5518,6 @@ mod tests {
         assert_eq!(
             catalog.get_table(parent).unwrap().unwrap().primary_key,
             vec![0]
-        );
-    }
-
-    #[test]
-    fn recovery_create_rejects_malformed_embedded_foreign_key_metadata_atomically() {
-        let catalog = MemoryCatalog::empty();
-        let mut schema = stored_id_table(99, "bad_child");
-        schema.foreign_keys.push(ForeignKeyConstraint {
-            id: 0,
-            name: "bad_child_parent_fkey".to_string(),
-            columns: vec![0],
-            referenced_table: 999,
-            referenced_columns: vec![0],
-            referenced_index: 1,
-            on_update: ForeignKeyAction::NoAction,
-            on_delete: ForeignKeyAction::NoAction,
-        });
-        schema.next_foreign_key_id = 1;
-        let before = catalog.snapshot().unwrap();
-        let err = catalog.apply_create_table(schema).unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
-        assert_eq!(
-            catalog.snapshot().unwrap().tables_by_id,
-            before.tables_by_id
         );
     }
 

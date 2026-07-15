@@ -616,9 +616,6 @@ fn legacy_schema_without_toast() -> TableSchema {
         toast: ToastOptions::legacy_catalog_default(),
         toast_table_id: None,
         relation_kind: RelationKind::User,
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: u32::MAX,
     }
 }

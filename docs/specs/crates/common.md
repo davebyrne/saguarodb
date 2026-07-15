@@ -9,7 +9,7 @@
 
 ## Owns
 
-- Stable identifiers: `SchemaId`, `TableId`, `ColumnObjectId`, `ConstraintId`, `FunctionId`, `ForeignKeyId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`; `ColumnId` remains the dense runtime/storage ordinal.
+- Stable identifiers: `SchemaId`, `TableId`, `ColumnObjectId`, `ConstraintId`, `FunctionId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`; `ColumnId` remains the dense runtime/storage ordinal.
 - Generic catalog durability types: `CatalogObjectId`, `CatalogObject`, `CatalogMutation`, `CatalogAllocatorHighWater`, and versioned `CatalogChangeSet`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
 - The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
@@ -104,14 +104,17 @@ pub enum Value {
 ```
 
 `CatalogObjectId` addresses schemas, tables/hidden relations, views, indexes,
-sequences, reserved constraint identities, statistics, and nested stable columns.
+sequences, first-class constraints, virtual functions, statistics, nested stable
+columns, and nested column-default objects. A column default uses its owning
+relation and stable column identity while remaining physically nested in the
+relation schema.
 `CatalogObject` carries complete replaceable object values; columns remain nested
 inside table/view schemas. `CatalogChangeSet::between` produces deterministic,
 object-ID-sorted before/after mutations and carries global plus per-relation
-stable-column and legacy foreign-key allocator high-water. `validate_shape`
+stable-column and global constraint allocator high-water. `validate_shape`
 rejects unknown versions, empty/no-op or mismatched mutations,
-unsorted/duplicate identities, non-finite statistics, reserved constraint
-objects, and over-limit mutation/column-allocator collections. Durable decoding
+unsorted/duplicate identities, non-finite statistics, and over-limit
+mutation/column-allocator collections. Durable decoding
 applies those collection limits before growing the decoded vectors/maps.
 
 `SqlArray::new` validates rectangular shape, scalar element types, signed
@@ -309,18 +312,15 @@ pub struct TableSchema {
     pub toast: ToastOptions,
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
-    pub checks: Vec<StoredExpression>,
-    pub foreign_keys: Vec<ForeignKeyConstraint>,
-    pub next_foreign_key_id: u32,
     pub next_column_object_id: ColumnObjectId,
 }
 
-pub type ForeignKeyId = u16;
+pub type ConstraintId = u32;
 
 pub enum ForeignKeyAction { NoAction, Restrict }
 
 pub struct ForeignKeyConstraint {
-    pub id: ForeignKeyId,
+    pub id: ConstraintId,
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub referenced_table: TableId,
@@ -330,6 +330,31 @@ pub struct ForeignKeyConstraint {
     pub on_delete: ForeignKeyAction,
 }
 
+pub struct ConstraintSchema {
+    pub id: ConstraintId,
+    pub table: TableId,
+    pub name: String,
+    pub kind: ConstraintKind,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    pub validated: bool,
+}
+
+pub enum ConstraintKind {
+    Check { expression: StoredExpression },
+    PrimaryKey { columns: Vec<ColumnObjectId>, index: IndexId },
+    Unique { columns: Vec<ColumnObjectId>, index: IndexId },
+    ForeignKey {
+        columns: Vec<ColumnObjectId>,
+        referenced_table: TableId,
+        referenced_constraint: ConstraintId,
+        referenced_columns: Vec<ColumnObjectId>,
+        on_update: ForeignKeyAction,
+        on_delete: ForeignKeyAction,
+        supporting_index: Option<IndexId>,
+    },
+}
+
 pub struct IndexSchema {
     pub id: IndexId,
     pub storage_id: FileId,
@@ -337,13 +362,15 @@ pub struct IndexSchema {
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub unique: bool,
-    pub constraint: IndexConstraintKind,
+    pub constraint: Option<ConstraintId>,
 }
 
-pub enum IndexConstraintKind {
-    None,
-    Unique,
-    PrimaryKey,
+pub enum DependencyType { Normal, Auto, Internal }
+
+pub struct DependencyEdge {
+    pub dependent: CatalogObjectId,
+    pub referenced: CatalogObjectId,
+    pub dependency_type: DependencyType,
 }
 
 pub struct ViewColumn {
@@ -485,8 +512,9 @@ non-unique index admits duplicates. On disk every index entry is disambiguated b
 the heap TID it points at (see `storage` Secondary Indexes), so no metadata
 distinguishes the two beyond the `unique` flag. Secondary indexes have their own
 `storage_id`; it is independent of the index's logical `id`.
-`constraint` records whether the index backs no SQL constraint, a `UNIQUE`
-constraint, or a `PRIMARY KEY` constraint.
+`constraint` names the first-class `PRIMARY KEY`/`UNIQUE` constraint that owns
+the index, or is `None` for a standalone index. `unique` remains the physical
+enforcement flag.
 
 `TruncateTablePlan` is the catalog-produced allocation plan for a future
 relation-generation swap: it names the logical table plus the fresh physical
@@ -611,12 +639,11 @@ open in the current session.
 granted immediately.
 
 `SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
-table's `CHECK` constraint — the constraint expression evaluated to `false` for
-the row (a `NULL`/unknown result passes, matching PostgreSQL). `TableSchema.checks`
-holds each `CHECK` as a `StoredExpression` (column-level and table-level checks
-flattened together). The binder parses and resolves it once at `CREATE TABLE`;
-INSERT/UPDATE/COPY lower the durable typed tree directly. Its canonical `sql`
-field remains the diagnostic and introspection text.
+table's first-class `CHECK` constraint — the constraint expression evaluated to
+`false` for the row (a `NULL`/unknown result passes, matching PostgreSQL).
+`ConstraintKind::Check` owns the `StoredExpression`. The binder parses and
+resolves it once at `CREATE TABLE`; INSERT/UPDATE/COPY lower the durable typed
+tree directly. Its canonical `sql` field remains diagnostic/introspection text.
 
 `SqlState::UndefinedObject` maps to SQLSTATE `42704`: an object-like name is not
 recognized when no more specific relation/column SQLSTATE applies. The server

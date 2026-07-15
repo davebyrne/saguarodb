@@ -92,26 +92,29 @@ SIREAD, and dependent scans a child relation SIREAD.
 
 ## Durability and dependencies
 
-`TableSchema.foreign_keys` and `next_foreign_key_id` are durable in catalog v3.
-Each constraint durably stores the exact declared
-PK/UNIQUE constraint-index ID selected at attachment, so duplicate eligible keys
-cannot change its identity and that index cannot be dropped while referenced.
-Older catalog formats are rejected rather than normalized. IDs are monotonic
-`u16` values `0..=4095`; `4096` means exhausted and
-dropped IDs are never reused. Recovery installs the complete schema from
-committed `CatalogChange`.
+Foreign keys are first-class `ConstraintSchema` objects in catalog v3. They use
+the global monotonic `ConstraintId: u32` allocator shared with CHECK, primary-key,
+and UNIQUE constraints; dropped and aborted IDs are never reused, and live IDs
+must fit the 28-bit virtual-OID payload. Each foreign
+key stores stable child/parent column IDs and the exact referenced PK/UNIQUE
+`ConstraintId`, so duplicate eligible keys cannot change its identity. It may
+also store an exact child supporting-index hint selected at creation; dropping
+that optional index clears the hint atomically, and enforcement dynamically uses
+another exact index or a heap scan. Recovery reserves allocator high-water from
+every `CatalogChange`, including aborted or in-flight changes, and applies only
+committed objects.
 
 ## Catalog introspection
 
-Each foreign key has a deterministic virtual OID derived from its child table ID
-and monotonic foreign-key ID. `pg_constraint` exposes it with `contype = 'f'`,
+Each foreign key has a deterministic virtual OID derived from its stable global
+`ConstraintId`. `pg_constraint` exposes it with `contype = 'f'`,
 the child and parent relation OIDs, the referenced declared PK/UNIQUE constraint
 index OID, ordered child/parent attnum arrays, `MATCH SIMPLE`, immediate validated
 flags, and `a`/`r` action codes for `NO ACTION`/`RESTRICT`. Unsupported operator
 arrays remain `NULL`.
 
-`pg_depend` records the foreign key's dependencies on its child table and source
-columns, parent table and referenced columns, and referenced constraint index.
+`pg_depend` records graph-derived dependencies on the child table/source columns,
+parent table/referenced columns, and referenced PK/UNIQUE constraint.
 `pg_get_constraintdef` resolves current relation and column names, so table and
 column renames preserve the OID while changing rendered text. It omits default
 `NO ACTION` clauses and emits explicit `ON UPDATE RESTRICT` and `ON DELETE

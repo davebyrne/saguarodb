@@ -200,16 +200,17 @@ storage-private and are omitted from PostgreSQL-facing relation rows (`pg_class`
 `pg_attribute`, `pg_index`, `pg_constraint`, `pg_attrdef`, and `pg_depend`).
 User table rows report `reltoastrelid = 0` rather than exposing an OID for an
 omitted hidden relation.
-Foreign keys contribute `pg_constraint` rows with `contype = 'f'`, stable
-foreign-key OIDs, child/parent relation OIDs, the referenced constraint-index
+Every first-class constraint contributes exactly one `pg_constraint` row with a
+stable `ConstraintId`-derived OID. Foreign keys use `contype = 'f'`, child/parent
+relation OIDs, the referenced PK/UNIQUE backing-index
 OID, ordered child/parent attnum arrays, `MATCH SIMPLE`, immediate validated
 flags, and `NO ACTION`/`RESTRICT` action codes. Their `pg_depend` rows cover the
-child table and source columns, parent table and referenced columns, and
-referenced constraint index. Unsupported foreign-key operator arrays are `NULL`;
+child table and source columns, parent table and referenced columns, and the
+referenced constraint object. Unsupported foreign-key operator arrays are `NULL`;
 no additional `information_schema` view is synthesized.
-Column defaults contribute `pg_depend` edges for every sequence reference in
-their durable expression tree, including a reference nested below arithmetic,
-CASE, or another supported scalar form. CHECK constraints likewise contribute a
+Column defaults appear as `pg_attrdef` dependents in `pg_depend` for every
+sequence reference in their durable expression tree, including a reference
+nested below arithmetic, CASE, or another supported scalar form. CHECK constraints likewise contribute a
 normal edge to each referenced sequence. Repeated references to the same
 sequence in one expression produce one edge. Built-in functions remain virtual,
 immutable registry entries and do not gain catalog dependency rows.

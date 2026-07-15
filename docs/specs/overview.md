@@ -2510,9 +2510,6 @@ pub struct TableSchema {
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
     pub schema_version: u64,
-    pub foreign_keys: Vec<ForeignKeyConstraint>,
-    pub next_foreign_key_id: u32,
-    pub checks: Vec<StoredExpression>,
     pub next_column_object_id: ColumnObjectId,
 }
 
@@ -2535,17 +2532,13 @@ physical generation and changes on TRUNCATE or rewrite. Public schema changes
 increment `schema_version`, which prepared execution revalidates after table-lock
 acquisition.
 
-Foreign keys are stored as ordered, ID-resolved per-table metadata. Their IDs
-are allocated monotonically in `0..=4095` (`4096` is the exhausted sentinel),
-and each constraint retains the exact declared parent constraint-index ID chosen
-at attachment. Specialized WAL table-schema payloads default the list and
-allocator to empty/zero; a missing referenced-index field is resolved while
-applying that schema record. Older catalog envelopes are rejected. The executor enforces installed metadata on every write path as
-specified above. Server object discovery adds the related parents and children
-to DML relation locks and prepared schema identities, and recomputes that set
-during lock convergence so an FK published after initial discovery cannot be
-bypassed. CREATE TABLE resolves and persists this metadata after installing the
-referenced PK/UNIQUE constraint indexes; see `docs/specs/foreign-keys.md`.
+CHECK, PK, UNIQUE, and FK definitions are first-class `ConstraintSchema` objects
+with globally monotonic `ConstraintId: u32` identities. PK/UNIQUE own stable
+ordered columns and a backing index; FK owns stable source/target columns and the
+exact referenced constraint. The executor discovers enforcement metadata through
+catalog constraint lookup on every write path. Server object discovery adds
+related parents and children to DML relation locks and prepared identities and
+recomputes that set during convergence; see `docs/specs/foreign-keys.md`.
 
 `create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
 metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;
@@ -2560,11 +2553,8 @@ table/index collision allowed by file-kind bits. Older view dependencies with no
 `all_columns` field and no columns retain `all_columns = true` compatibility.
 
 User table/view column assignment is limited to the 65,536 values in the
-`ColumnId` space, and stored CHECK lists are limited to the 4,095 compound
-virtual-OID sub-IDs available after reserving the primary-key constraint slot;
-user DDL exceeding either limit returns `ProgramLimitExceeded` (`54000`).
-System-catalog CHECK OID construction is fallible and propagates invalid catalog
-indices as `InternalError` rather than truncating them into colliding OIDs.
+`ColumnId` space. Constraint identities use a checked global `u32` allocator;
+constraint virtual OIDs derive directly from the stable ID.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, catalog-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for storage's per-table identity index). User tables, user views, user-visible indexes, public sequences, and primary-key auto-names share the public relation-name namespace exposed through `pg_class`/`to_regclass`; duplicate names across those kinds are rejected. Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable relation/index IDs plus schema-version-local column IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
@@ -2701,13 +2691,19 @@ pub trait CatalogManager: Send + Sync {
         columns: &[String],
         unique: bool,
     ) -> Result<IndexSchema>;
-    fn create_index_with_constraint(
+    fn create_primary_key_index(
         &self,
+        schema: SchemaId,
         name: String,
-        table: &str,
+        table: TableId,
         columns: &[String],
-        unique: bool,
-        constraint: IndexConstraintKind,
+    ) -> Result<IndexSchema>;
+    fn create_unique_constraint_index(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
 

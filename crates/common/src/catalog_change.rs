@@ -8,8 +8,9 @@ use serde::{
 };
 
 use crate::{
-    ColumnObjectId, ConstraintId, FileId, IndexId, IndexSchema, NamespaceSchema, SchemaId,
-    SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics, ViewSchema,
+    ColumnObjectId, ConstraintId, ConstraintSchema, FileId, FunctionId, IndexId, IndexSchema,
+    NamespaceSchema, SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics,
+    ViewSchema,
 };
 
 pub const CATALOG_CHANGE_SET_VERSION: u16 = 1;
@@ -27,11 +28,30 @@ pub enum CatalogObjectId {
     Index(IndexId),
     Sequence(SequenceId),
     Constraint(ConstraintId),
+    Function(FunctionId),
     Statistics(TableId),
     Column {
         relation: TableId,
         column: ColumnObjectId,
     },
+    ColumnDefault {
+        relation: TableId,
+        column: ColumnObjectId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DependencyType {
+    Normal,
+    Auto,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DependencyEdge {
+    pub dependent: CatalogObjectId,
+    pub referenced: CatalogObjectId,
+    pub dependency_type: DependencyType,
 }
 
 /// Complete durable value of an independently replaceable catalog object.
@@ -42,8 +62,7 @@ pub enum CatalogObject {
     View(ViewSchema),
     Index(IndexSchema),
     Sequence(SequenceSchema),
-    /// Reserved until first-class constraint schemas are introduced.
-    Constraint(ConstraintId),
+    Constraint(ConstraintSchema),
     Statistics {
         table: TableId,
         statistics: TableStatistics,
@@ -58,7 +77,7 @@ impl CatalogObject {
             Self::View(schema) => CatalogObjectId::View(schema.id),
             Self::Index(schema) => CatalogObjectId::Index(schema.id),
             Self::Sequence(schema) => CatalogObjectId::Sequence(schema.id),
-            Self::Constraint(id) => CatalogObjectId::Constraint(*id),
+            Self::Constraint(schema) => CatalogObjectId::Constraint(schema.id),
             Self::Statistics { table, .. } => CatalogObjectId::Statistics(*table),
         }
     }
@@ -93,8 +112,6 @@ pub struct CatalogAllocatorHighWater {
     pub next_constraint_id: ConstraintId,
     #[serde(deserialize_with = "deserialize_column_high_water")]
     pub next_column_object_ids: BTreeMap<TableId, ColumnObjectId>,
-    #[serde(deserialize_with = "deserialize_foreign_key_high_water")]
-    pub next_foreign_key_ids: BTreeMap<TableId, u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,53 +217,6 @@ where
     deserializer.deserialize_map(HighWaterVisitor)
 }
 
-fn deserialize_foreign_key_high_water<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<TableId, u32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct HighWaterVisitor;
-
-    impl<'de> Visitor<'de> for HighWaterVisitor {
-        type Value = BTreeMap<TableId, u32>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a bounded foreign-key allocator map")
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: MapAccess<'de>,
-        {
-            if map
-                .size_hint()
-                .is_some_and(|hint| hint > MAX_CATALOG_CHANGE_MUTATIONS)
-            {
-                return Err(A::Error::custom(
-                    "catalog change set has too many foreign-key allocators",
-                ));
-            }
-            let mut high_water = BTreeMap::new();
-            while let Some((relation, next_foreign_key)) = map.next_entry()? {
-                if high_water.len() == MAX_CATALOG_CHANGE_MUTATIONS {
-                    return Err(A::Error::custom(
-                        "catalog change set has too many foreign-key allocators",
-                    ));
-                }
-                if high_water.insert(relation, next_foreign_key).is_some() {
-                    return Err(A::Error::custom(
-                        "catalog change set repeats a foreign-key allocator",
-                    ));
-                }
-            }
-            Ok(high_water)
-        }
-    }
-
-    deserializer.deserialize_map(HighWaterVisitor)
-}
-
 impl CatalogChangeSet {
     /// Builds a deterministic object-id-sorted change set from complete object maps.
     pub fn between(
@@ -289,9 +259,6 @@ impl CatalogChangeSet {
         if self.allocator_high_water.next_column_object_ids.len() > MAX_CATALOG_CHANGE_MUTATIONS {
             return Err("catalog change set has too many column allocators");
         }
-        if self.allocator_high_water.next_foreign_key_ids.len() > MAX_CATALOG_CHANGE_MUTATIONS {
-            return Err("catalog change set has too many foreign-key allocators");
-        }
         let mut previous = None;
         for mutation in &self.mutations {
             let Some(id) = mutation.id() else {
@@ -318,14 +285,6 @@ impl CatalogChangeSet {
                 .any(|object| matches!(object, CatalogObject::Statistics { statistics, .. } if !statistics.is_finite()))
             {
                 return Err("catalog change contains non-finite statistics");
-            }
-            if mutation
-                .before
-                .iter()
-                .chain(mutation.after.iter())
-                .any(|object| matches!(object, CatalogObject::Constraint(_)))
-            {
-                return Err("catalog constraint objects are not supported by this format version");
             }
             if previous.is_some_and(|candidate| candidate >= id) {
                 return Err("catalog mutations are not strictly object-id sorted");

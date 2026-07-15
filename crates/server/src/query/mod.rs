@@ -4,15 +4,14 @@ use std::sync::{Arc, OnceLock};
 
 use catalog::{
     CatalogManager, CatalogOverlay, CatalogOverlaySavepoint, MemoryCatalog, TruncateCatalogOverlay,
-    foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, resolve_system_view,
-    sequence_oid, synthetic_primary_key_oid, table_oid, try_check_constraint_oid,
+    index_oid, resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 use common::{
-    CatalogIntrospectionProvider, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, DataType,
-    DbError, ForeignKeyAction, GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID,
-    ParsedDefault, PgType, QualifiedName, QueryCancel, RelationKind, Result, SchemaId, SequenceId,
-    SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider,
-    TableId, TruncateCatalogUpdate, Value, WriteGuard,
+    CatalogIntrospectionProvider, ColumnDefault, ColumnId, ColumnInfo, ConstraintKind,
+    CopyDirection, DataType, DbError, ForeignKeyAction, GucSetting, IsolationLevel,
+    PUBLIC_SCHEMA_ID, ParsedDefault, PgType, QualifiedName, QueryCancel, RelationKind, Result,
+    SchemaId, SequenceId, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot,
+    SqlState, SystemStateProvider, TableId, TruncateCatalogUpdate, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -386,7 +385,8 @@ impl QueryCatalogIntrospection {
             }
             let mut has_primary_key_index = false;
             for index in self.catalog()?.list_indexes_for_table(table.id)? {
-                has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
+                has_primary_key_index |=
+                    index.constraint.is_some() && index.columns == table.primary_key;
                 if index_oid(index.id)? == relation_oid {
                     return Ok(Some(index.name));
                 }
@@ -465,7 +465,8 @@ impl QueryCatalogIntrospection {
             }
             let mut has_primary_key_index = false;
             for index in self.catalog()?.list_indexes_for_table(table.id)? {
-                has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
+                has_primary_key_index |=
+                    index.constraint.is_some() && index.columns == table.primary_key;
                 if index_oid(index.id)? == index_oid_value {
                     let schema = self
                         .catalog()?
@@ -503,57 +504,76 @@ impl QueryCatalogIntrospection {
     }
 
     fn constraint_definition(&self, constraint_oid: i64) -> Result<Option<String>> {
-        for table in self.catalog()?.list_tables()? {
-            if table.relation_kind != RelationKind::User {
+        for constraint in self.catalog()?.list_constraints()? {
+            if catalog::constraint_oid(constraint.id)? != constraint_oid {
                 continue;
             }
-            if !table.primary_key.is_empty()
-                && primary_key_constraint_oid(table.id)? == constraint_oid
-            {
-                return Ok(Some(format!(
-                    "PRIMARY KEY ({})",
-                    column_names(&table, &table.primary_key).join(", ")
-                )));
-            }
-            for (index, check) in table.checks.iter().enumerate() {
-                if try_check_constraint_oid(table.id, index)? == constraint_oid {
-                    return Ok(Some(format!("CHECK ({})", check.sql)));
+            let table = self
+                .catalog()?
+                .get_table(constraint.table)?
+                .ok_or_else(|| DbError::internal("constraint table is missing"))?;
+            return match constraint.kind {
+                ConstraintKind::Check { expression } => {
+                    Ok(Some(format!("CHECK ({})", expression.sql)))
                 }
-            }
-            for foreign_key in &table.foreign_keys {
-                if foreign_key_constraint_oid(table.id, foreign_key.id)? != constraint_oid {
-                    continue;
+                ConstraintKind::PrimaryKey { columns, .. } => {
+                    let dense = stable_column_ids(&table, &columns)?;
+                    Ok(Some(format!(
+                        "PRIMARY KEY ({})",
+                        column_names(&table, &dense).join(", ")
+                    )))
                 }
-                let parent = self
-                    .catalog()?
-                    .get_table(foreign_key.referenced_table)?
-                    .ok_or_else(|| DbError::internal("foreign key references a missing table"))?;
-                let parent_schema = self
-                    .catalog()?
-                    .get_schema(parent.schema_id)?
-                    .ok_or_else(|| DbError::internal("foreign-key parent schema is missing"))?;
-                let child_columns =
-                    required_column_names(&table, &foreign_key.columns, "foreign-key source")?;
-                let parent_columns = required_column_names(
-                    &parent,
-                    &foreign_key.referenced_columns,
-                    "foreign-key referenced",
-                )?;
-                let mut definition = format!(
-                    "FOREIGN KEY ({}) REFERENCES {}.{} ({})",
-                    child_columns.join(", "),
-                    parent_schema.name,
-                    parent.name,
-                    parent_columns.join(", ")
-                );
-                if foreign_key.on_update == ForeignKeyAction::Restrict {
-                    definition.push_str(" ON UPDATE RESTRICT");
+                ConstraintKind::Unique { columns, .. } => {
+                    let dense = stable_column_ids(&table, &columns)?;
+                    Ok(Some(format!(
+                        "UNIQUE ({})",
+                        column_names(&table, &dense).join(", ")
+                    )))
                 }
-                if foreign_key.on_delete == ForeignKeyAction::Restrict {
-                    definition.push_str(" ON DELETE RESTRICT");
+                ConstraintKind::ForeignKey {
+                    columns,
+                    referenced_table,
+                    referenced_columns,
+                    on_update,
+                    on_delete,
+                    ..
+                } => {
+                    let parent = self
+                        .catalog()?
+                        .get_table(referenced_table)?
+                        .ok_or_else(|| {
+                            DbError::internal("foreign key references a missing table")
+                        })?;
+                    let parent_schema = self
+                        .catalog()?
+                        .get_schema(parent.schema_id)?
+                        .ok_or_else(|| DbError::internal("foreign-key parent schema is missing"))?;
+                    let child_columns = required_column_names(
+                        &table,
+                        &stable_column_ids(&table, &columns)?,
+                        "foreign-key source",
+                    )?;
+                    let parent_columns = required_column_names(
+                        &parent,
+                        &stable_column_ids(&parent, &referenced_columns)?,
+                        "foreign-key referenced",
+                    )?;
+                    let mut definition = format!(
+                        "FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                        child_columns.join(", "),
+                        parent_schema.name,
+                        parent.name,
+                        parent_columns.join(", ")
+                    );
+                    if on_update == ForeignKeyAction::Restrict {
+                        definition.push_str(" ON UPDATE RESTRICT");
+                    }
+                    if on_delete == ForeignKeyAction::Restrict {
+                        definition.push_str(" ON DELETE RESTRICT");
+                    }
+                    Ok(Some(definition))
                 }
-                return Ok(Some(definition));
-            }
+            };
         }
         Ok(None)
     }
@@ -654,6 +674,23 @@ fn column_names(table: &common::TableSchema, columns: &[u16]) -> Vec<String> {
                 .iter()
                 .find(|candidate| candidate.id == *column)
                 .map(|definition| definition.name.clone())
+        })
+        .collect()
+}
+
+fn stable_column_ids(
+    table: &common::TableSchema,
+    columns: &[common::ColumnObjectId],
+) -> Result<Vec<common::ColumnId>> {
+    columns
+        .iter()
+        .map(|column| {
+            table.dense_column_id(*column).ok_or_else(|| {
+                DbError::internal(format!(
+                    "constraint references missing stable column id {column} on table {}",
+                    table.name
+                ))
+            })
         })
         .collect()
 }
@@ -2352,14 +2389,14 @@ fn prepared_maintenance_schema_versions(
                     format!("table {table} does not exist"),
                 )
             })?;
-        if let Some(foreign_key) = child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| foreign_key.name == *constraint_name)
+        if let Some(constraint) = catalog.get_constraint_by_name(child.id, constraint_name)?
+            && let ConstraintKind::ForeignKey {
+                referenced_table, ..
+            } = constraint.kind
         {
-            let identity = relation_schema_identity(catalog, foreign_key.referenced_table)?
+            let identity = relation_schema_identity(catalog, referenced_table)?
                 .ok_or_else(prepared_schema_changed_error)?;
-            versions.push((foreign_key.referenced_table, identity.0, identity.1));
+            versions.push((referenced_table, identity.0, identity.1));
         }
     }
     versions.sort_unstable_by_key(|version| version.0);
@@ -3375,10 +3412,10 @@ fn record_outgoing_foreign_key_objects(
     references: &mut BoundObjectReferences,
     table: TableId,
 ) -> Result<()> {
-    let schema = catalog
-        .get_table(table)?
-        .ok_or_else(prepared_schema_changed_error)?;
-    for foreign_key in schema.foreign_keys {
+    if catalog.get_table(table)?.is_none() {
+        return Err(prepared_schema_changed_error());
+    }
+    for foreign_key in catalog.list_outgoing_foreign_keys(table)? {
         record_bound_relation_version(references, foreign_key.referenced_table, None)?;
     }
     Ok(())
@@ -3886,16 +3923,15 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use catalog::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, check_constraint_oid,
-        foreign_key_constraint_oid, index_oid, primary_key_constraint_oid, sequence_oid, table_oid,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, ResolvedForeignKey, constraint_oid,
+        index_oid, sequence_oid, table_oid,
     };
     use common::{
         CancelReason, CatalogIntrospectionProvider, ColumnDefault, ConcurrencyController, DbError,
-        FlushPolicy, ForeignKeyAction, IndexConstraintKind, IndexId, IndexSchema, IsolationLevel,
-        Lsn, PageFlushInfo, ParsedColumnDef, PgType, QueryCancel, RelationKind, Result,
-        RwLockConcurrencyController, SequenceId, SequenceOptions, SequenceSchema, SessionInfo,
-        SessionSequenceState, SqlState, TableId, TableSchema, ToastCompression, ToastMode, TxnId,
-        TxnStatus, TxnStatusView, Value,
+        FlushPolicy, ForeignKeyAction, IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo,
+        ParsedColumnDef, PgType, QueryCancel, RelationKind, Result, RwLockConcurrencyController,
+        SequenceId, SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState,
+        TableId, TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -4901,10 +4937,6 @@ mod tests {
             self.inner.apply_drop_table(id)
         }
 
-        fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()> {
-            self.inner.apply_drop_table_in_batch(id, batch)
-        }
-
         fn create_table(
             &self,
             name: String,
@@ -5138,30 +5170,38 @@ mod tests {
             self.inner.create_index(name, table, columns, unique)
         }
 
-        fn create_index_with_constraint(
-            &self,
-            name: String,
-            table: &str,
-            columns: &[String],
-            unique: bool,
-            constraint: common::IndexConstraintKind,
-        ) -> Result<IndexSchema> {
-            self.inner
-                .create_index_with_constraint(name, table, columns, unique, constraint)
-        }
-
-        fn create_index_in_schema_with_constraint(
+        fn create_index_in_schema(
             &self,
             schema: common::SchemaId,
             name: String,
             table: TableId,
             columns: &[String],
             unique: bool,
-            constraint: common::IndexConstraintKind,
         ) -> Result<IndexSchema> {
-            self.inner.create_index_in_schema_with_constraint(
-                schema, name, table, columns, unique, constraint,
-            )
+            self.inner
+                .create_index_in_schema(schema, name, table, columns, unique)
+        }
+
+        fn create_primary_key_index(
+            &self,
+            schema: common::SchemaId,
+            name: String,
+            table: TableId,
+            columns: &[String],
+        ) -> Result<IndexSchema> {
+            self.inner
+                .create_primary_key_index(schema, name, table, columns)
+        }
+
+        fn create_unique_constraint_index(
+            &self,
+            schema: common::SchemaId,
+            name: String,
+            table: TableId,
+            columns: &[String],
+        ) -> Result<IndexSchema> {
+            self.inner
+                .create_unique_constraint_index(schema, name, table, columns)
         }
 
         fn drop_index(&self, id: IndexId) -> Result<()> {
@@ -5643,7 +5683,7 @@ mod tests {
             .list_indexes_for_table(table.id)
             .unwrap()
             .into_iter()
-            .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+            .find(|index| index.constraint.is_some() && index.columns == table.primary_key)
             .expect("primary-key index");
         assert_ne!(index.storage_id, planned_storage_id);
     }
@@ -7272,7 +7312,19 @@ mod tests {
             .unwrap()
             .unwrap();
         let users_pkey_oid = index_oid(users_pkey.id).unwrap();
-        let users_pkey_constraint_oid = primary_key_constraint_oid(users.id).unwrap();
+        let users_pkey_constraint_oid = constraint_oid(
+            app.components
+                .catalog
+                .list_constraints_for_table(users.id)
+                .unwrap()
+                .into_iter()
+                .find(|constraint| {
+                    matches!(constraint.kind, common::ConstraintKind::PrimaryKey { .. })
+                })
+                .unwrap()
+                .id,
+        )
+        .unwrap();
         let users_id_lookup = app
             .components
             .catalog
@@ -7285,7 +7337,17 @@ mod tests {
             .get_table_by_name("constrained")
             .unwrap()
             .unwrap();
-        let constrained_check_oid = check_constraint_oid(constrained.id, 0).unwrap();
+        let constrained_check_oid = constraint_oid(
+            app.components
+                .catalog
+                .list_constraints_for_table(constrained.id)
+                .unwrap()
+                .into_iter()
+                .find(|constraint| matches!(constraint.kind, common::ConstraintKind::Check { .. }))
+                .unwrap()
+                .id,
+        )
+        .unwrap();
         let shadow_pg_class = app
             .components
             .catalog
@@ -7384,8 +7446,13 @@ mod tests {
             .get_table_by_name("fk_def_child")
             .unwrap()
             .unwrap();
-        let foreign_key = child.foreign_keys.first().unwrap();
-        let oid = foreign_key_constraint_oid(child.id, foreign_key.id).unwrap();
+        let foreign_keys = app
+            .components
+            .catalog
+            .list_outgoing_foreign_keys(child.id)
+            .unwrap();
+        let foreign_key = foreign_keys.first().unwrap();
+        let oid = constraint_oid(foreign_key.id).unwrap();
         assert_eq!(
             result_values(app.query_service.execute_sql(&format!(
                 "select oid, pg_get_constraintdef(oid), pg_get_constraintdef(oid, true) \
@@ -7405,12 +7472,11 @@ mod tests {
                 ),
             ]]
         );
-        let delete_foreign_key = child
-            .foreign_keys
+        let delete_foreign_key = foreign_keys
             .iter()
             .find(|foreign_key| foreign_key.name == "fk_delete_definition")
             .unwrap();
-        let delete_oid = foreign_key_constraint_oid(child.id, delete_foreign_key.id).unwrap();
+        let delete_oid = constraint_oid(delete_foreign_key.id).unwrap();
         assert_eq!(
             result_values(app.query_service.execute_sql(&format!(
                 "select pg_get_constraintdef(oid) from pg_catalog.pg_constraint \
@@ -8952,6 +9018,12 @@ mod tests {
         app.query_service
             .execute_sql("insert into alter_fk_child values (1, 99)")
             .unwrap();
+        let next_constraint_id = app
+            .components
+            .catalog
+            .snapshot()
+            .unwrap()
+            .next_constraint_id;
         assert_eq!(
             app.query_service
                 .execute_sql(
@@ -8961,14 +9033,28 @@ mod tests {
                 .code,
             SqlState::ForeignKeyViolation
         );
-        let child = app
-            .components
-            .catalog
-            .get_table_by_name("alter_fk_child")
-            .unwrap()
-            .unwrap();
-        assert!(child.foreign_keys.is_empty());
-        assert_eq!(child.next_foreign_key_id, 0);
+        assert!(
+            app.components
+                .catalog
+                .list_outgoing_foreign_keys(
+                    app.components
+                        .catalog
+                        .get_table_by_name("alter_fk_child")
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            app.components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_constraint_id,
+            next_constraint_id
+        );
     }
 
     #[test]
@@ -8999,6 +9085,12 @@ mod tests {
             .get_table_by_name("rollback_fk_child")
             .unwrap()
             .unwrap();
+        let next_constraint_id = app
+            .components
+            .catalog
+            .snapshot()
+            .unwrap()
+            .next_constraint_id;
         add_wal.fail_next_commit();
         assert!(
             app.query_service
@@ -9014,8 +9106,21 @@ mod tests {
             .get_table_by_name("rollback_fk_child")
             .unwrap()
             .unwrap();
-        assert!(child_after.foreign_keys.is_empty());
-        assert_eq!(child_after.next_foreign_key_id, 1);
+        assert!(
+            app.components
+                .catalog
+                .list_outgoing_foreign_keys(child_after.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            app.components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_constraint_id,
+            next_constraint_id + 1
+        );
         assert_eq!(child_after.schema_version, child_before.schema_version);
         assert_eq!(
             app.components
@@ -9039,8 +9144,23 @@ mod tests {
             .get_table_by_name("rollback_fk_child")
             .unwrap()
             .unwrap();
-        assert!(recovered_child.foreign_keys.is_empty());
-        assert_eq!(recovered_child.next_foreign_key_id, 1);
+        assert!(
+            recovered
+                .components
+                .catalog
+                .list_outgoing_foreign_keys(recovered_child.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            recovered
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_constraint_id,
+            next_constraint_id + 1
+        );
 
         let drop_dir = tempfile::tempdir().unwrap();
         let drop_wal = Arc::new(FailingCommitWal::open(&drop_dir.path().join("wal.dat")));
@@ -9074,6 +9194,11 @@ mod tests {
             .get_table_by_name("rollback_drop_child")
             .unwrap()
             .unwrap();
+        let foreign_keys_before = app
+            .components
+            .catalog
+            .list_outgoing_foreign_keys(child_before.id)
+            .unwrap();
         drop_wal.fail_next_flush();
         assert!(
             app.query_service
@@ -9086,7 +9211,13 @@ mod tests {
             .get_table_by_name("rollback_drop_child")
             .unwrap()
             .unwrap();
-        assert_eq!(child_after.foreign_keys, child_before.foreign_keys);
+        assert_eq!(
+            app.components
+                .catalog
+                .list_outgoing_foreign_keys(child_after.id)
+                .unwrap(),
+            foreign_keys_before
+        );
         assert_eq!(child_after.schema_version, child_before.schema_version);
         assert_eq!(
             app.components
@@ -9110,7 +9241,14 @@ mod tests {
             .get_table_by_name("rollback_drop_child")
             .unwrap()
             .unwrap();
-        assert_eq!(recovered_child.foreign_keys, child_before.foreign_keys);
+        assert_eq!(
+            recovered
+                .components
+                .catalog
+                .list_outgoing_foreign_keys(recovered_child.id)
+                .unwrap(),
+            foreign_keys_before
+        );
     }
 
     #[tokio::test]

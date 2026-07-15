@@ -477,9 +477,6 @@ fn users_schema() -> TableSchema {
         toast_table_id: None,
         relation_kind: RelationKind::User,
         schema_version: common::INITIAL_SCHEMA_VERSION,
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: u32::MAX,
     }
 }
@@ -500,7 +497,7 @@ fn name_index() -> IndexSchema {
         name: "users_name".to_string(),
         columns: vec![1],
         unique: false,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     }
 }
 
@@ -842,7 +839,7 @@ fn unique_secondary_aborted_creator_does_not_conflict() {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
     fixture
         .engine
@@ -1000,7 +997,7 @@ fn fixture_with_unique_name_index() -> Fixture {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
     fixture
         .engine
@@ -1025,7 +1022,7 @@ fn fixture_with_declared_unique_name() -> Fixture {
         name: "users_name_key".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::Unique,
+        constraint: Some(1),
     };
     fixture
         .engine
@@ -1904,7 +1901,7 @@ fn foreign_key_indexed_probes_reject_locations_in_another_heap() {
         name: "users_name_key".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::Unique,
+        constraint: Some(1),
     };
     let name_key = Key(vec![Value::Text("foreign".to_string())]);
     fixture
@@ -1968,7 +1965,7 @@ fn foreign_key_indexed_probes_reject_live_rows_with_a_different_index_key() {
         name: "users_name_key".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::Unique,
+        constraint: Some(1),
     };
     let wrong_name = Key(vec![Value::Text("wrong".to_string())]);
     fixture
@@ -2082,7 +2079,7 @@ fn foreign_key_probes_preserve_hidden_identity_across_hot_successor() {
         name: "users_id_key".to_string(),
         columns: vec![0],
         unique: true,
-        constraint: common::IndexConstraintKind::Unique,
+        constraint: Some(1),
     };
     let setup = ctx(100, snapshot(101, vec![]));
     fixture.engine.create_table(&setup, &schema).unwrap();
@@ -2485,7 +2482,7 @@ fn committed_update_is_visible_via_seq_and_both_secondary_scans() {
         name: "users_id".to_string(),
         columns: vec![0],
         unique: false,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
     fixture.engine.create_index(&setup, &name_idx, 0).unwrap();
     fixture.engine.create_index(&setup, &id_idx, 0).unwrap();
@@ -2681,7 +2678,7 @@ fn update_unique_secondary_conflicts_only_with_other_live_rows() {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
     fixture
         .engine
@@ -3465,9 +3462,6 @@ fn hot_schema() -> TableSchema {
         toast_table_id: None,
         relation_kind: RelationKind::User,
         schema_version: common::INITIAL_SCHEMA_VERSION,
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id: u32::MAX,
     }
 }
@@ -4734,7 +4728,7 @@ fn create_index_over_a_broken_live_hot_chain_aborts_retryable() {
         name: "users_note".to_string(),
         columns: vec![2], // the `note` column
         unique: false,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
 
     // Horizon 15 (below the deleter xmax = 20): the root version (note "v1") is
@@ -4811,7 +4805,7 @@ fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder()
         name: "users_note".to_string(),
         columns: vec![2],
         unique: false,
-        constraint: common::IndexConstraintKind::None,
+        constraint: None,
     };
 
     // Horizon 50: the root (xmax=20 < 50, committed) is dead_to_all, but the

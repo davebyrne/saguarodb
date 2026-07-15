@@ -265,6 +265,16 @@ pub enum StoredUnaryOp {
 }
 
 impl StoredExpr {
+    /// Visits every stable column identity embedded in this durable expression.
+    pub fn for_each_column_reference(&self, visitor: &mut impl FnMut(ColumnObjectId)) {
+        self.for_each_catalog_reference(visitor, &mut |_| {}, &mut |_| {});
+    }
+
+    /// Visits every built-in function identity embedded in this durable expression.
+    pub fn for_each_function_reference(&self, visitor: &mut impl FnMut(FunctionId)) {
+        self.for_each_catalog_reference(&mut |_| {}, visitor, &mut |_| {});
+    }
+
     pub fn data_type(&self) -> &DataType {
         match self {
             Self::Literal { data_type, .. }
@@ -320,37 +330,49 @@ impl StoredExpr {
 
     /// Visits every sequence identity embedded in this durable expression.
     pub fn for_each_sequence_reference(&self, visitor: &mut impl FnMut(SequenceId)) {
+        self.for_each_catalog_reference(&mut |_| {}, &mut |_| {}, visitor);
+    }
+
+    fn for_each_catalog_reference(
+        &self,
+        columns: &mut impl FnMut(ColumnObjectId),
+        functions: &mut impl FnMut(FunctionId),
+        sequences: &mut impl FnMut(SequenceId),
+    ) {
         match self {
             Self::Nextval { sequence, .. } | Self::Currval { sequence, .. } => {
-                visitor(*sequence);
+                sequences(*sequence);
             }
             Self::Binary { left, right, .. }
             | Self::Any {
                 left, array: right, ..
             } => {
-                left.for_each_sequence_reference(visitor);
-                right.for_each_sequence_reference(visitor);
+                left.for_each_catalog_reference(columns, functions, sequences);
+                right.for_each_catalog_reference(columns, functions, sequences);
             }
             Self::Unary { expr, .. }
             | Self::IsNull { expr, .. }
             | Self::IsNotNull { expr, .. }
-            | Self::Cast { expr, .. } => expr.for_each_sequence_reference(visitor),
-            Self::Function { args, .. } => {
+            | Self::Cast { expr, .. } => {
+                expr.for_each_catalog_reference(columns, functions, sequences);
+            }
+            Self::Function { function, args, .. } => {
+                functions(*function);
                 for argument in args {
-                    argument.for_each_sequence_reference(visitor);
+                    argument.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
             Self::Array { elements, .. } => {
                 for element in elements {
-                    element.for_each_sequence_reference(visitor);
+                    element.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
             Self::ArraySubscript {
                 array, subscripts, ..
             } => {
-                array.for_each_sequence_reference(visitor);
+                array.for_each_catalog_reference(columns, functions, sequences);
                 for subscript in subscripts {
-                    subscript.for_each_sequence_reference(visitor);
+                    subscript.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
             Self::Setval {
@@ -359,28 +381,28 @@ impl StoredExpr {
                 is_called,
                 ..
             } => {
-                visitor(*sequence);
-                value.for_each_sequence_reference(visitor);
+                sequences(*sequence);
+                value.for_each_catalog_reference(columns, functions, sequences);
                 if let Some(is_called) = is_called {
-                    is_called.for_each_sequence_reference(visitor);
+                    is_called.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
             Self::InList { expr, list, .. } => {
-                expr.for_each_sequence_reference(visitor);
+                expr.for_each_catalog_reference(columns, functions, sequences);
                 for item in list {
-                    item.for_each_sequence_reference(visitor);
+                    item.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
             Self::Between {
                 expr, low, high, ..
             } => {
-                expr.for_each_sequence_reference(visitor);
-                low.for_each_sequence_reference(visitor);
-                high.for_each_sequence_reference(visitor);
+                expr.for_each_catalog_reference(columns, functions, sequences);
+                low.for_each_catalog_reference(columns, functions, sequences);
+                high.for_each_catalog_reference(columns, functions, sequences);
             }
             Self::Like { expr, pattern, .. } => {
-                expr.for_each_sequence_reference(visitor);
-                pattern.for_each_sequence_reference(visitor);
+                expr.for_each_catalog_reference(columns, functions, sequences);
+                pattern.for_each_catalog_reference(columns, functions, sequences);
             }
             Self::Case {
                 operand,
@@ -389,17 +411,18 @@ impl StoredExpr {
                 ..
             } => {
                 if let Some(operand) = operand {
-                    operand.for_each_sequence_reference(visitor);
+                    operand.for_each_catalog_reference(columns, functions, sequences);
                 }
                 for (when, then) in when_clauses {
-                    when.for_each_sequence_reference(visitor);
-                    then.for_each_sequence_reference(visitor);
+                    when.for_each_catalog_reference(columns, functions, sequences);
+                    then.for_each_catalog_reference(columns, functions, sequences);
                 }
                 if let Some(else_clause) = else_clause {
-                    else_clause.for_each_sequence_reference(visitor);
+                    else_clause.for_each_catalog_reference(columns, functions, sequences);
                 }
             }
-            Self::Literal { .. } | Self::Column { .. } => {}
+            Self::Column { column, .. } => columns(*column),
+            Self::Literal { .. } => {}
         }
     }
 

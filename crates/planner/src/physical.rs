@@ -2,8 +2,8 @@ use std::ops::Bound;
 
 use catalog::SystemView;
 use common::{
-    ColumnId, ColumnInfo, CompressionSetting, DataType, IndexConstraintKind, IndexId, Key,
-    KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SchemaId, SequenceOptions, TableId,
+    ColumnId, ColumnInfo, CompressionSetting, DataType, IndexId, Key, KeyRange,
+    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SchemaId, SequenceOptions, TableId,
     ToastOptions, Value, ViewDependency,
 };
 
@@ -936,23 +936,23 @@ fn best_index_scan(
     filter: &BoundExpr,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<Option<(IndexId, KeyCandidate)>> {
-    let mut candidates: Vec<(IndexId, IndexConstraintKind, KeyCandidate)> = Vec::new();
+    let mut candidates: Vec<(IndexId, bool, KeyCandidate)> = Vec::new();
 
     if let Some(leading) = schema.primary_key.first().copied()
         && let Some(candidate) = best_key_candidate(filter, leading)
     {
-        candidates.push((
-            PRIMARY_KEY_INDEX_ID,
-            IndexConstraintKind::PrimaryKey,
-            candidate,
-        ));
+        candidates.push((PRIMARY_KEY_INDEX_ID, true, candidate));
     }
 
     for index in catalog.list_indexes_for_table(table)? {
         if let Some(leading) = index.columns.first().copied()
             && let Some(candidate) = best_key_candidate(filter, leading)
         {
-            candidates.push((index.id, index.constraint, candidate));
+            candidates.push((
+                index.id,
+                index.constraint.is_some() && index.columns == schema.primary_key,
+                candidate,
+            ));
         }
     }
 
@@ -961,10 +961,7 @@ fn best_index_scan(
         .max_by(|(a_id, a_constraint, a), (b_id, b_constraint, b)| {
             a.exact
                 .cmp(&b.exact)
-                .then_with(|| {
-                    (*a_constraint == IndexConstraintKind::PrimaryKey)
-                        .cmp(&(*b_constraint == IndexConstraintKind::PrimaryKey))
-                })
+                .then_with(|| a_constraint.cmp(b_constraint))
                 .then_with(|| b_id.cmp(a_id))
         })
         .map(|(id, _constraint, candidate)| (id, candidate)))

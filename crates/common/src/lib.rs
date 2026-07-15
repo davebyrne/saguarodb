@@ -48,7 +48,7 @@ pub use array::{
 pub use cancel::{CancelReason, QueryCancel};
 pub use catalog_change::{
     CATALOG_CHANGE_SET_VERSION, CatalogAllocatorHighWater, CatalogChangeSet, CatalogMutation,
-    CatalogObject, CatalogObjectId, MAX_CATALOG_CHANGE_MUTATIONS,
+    CatalogObject, CatalogObjectId, DependencyEdge, DependencyType, MAX_CATALOG_CHANGE_MUTATIONS,
 };
 pub use checked_bytes::{CheckedSliceReader, SliceReadError, SliceReadErrorKind};
 pub use concurrency::{
@@ -72,7 +72,7 @@ pub use functions::{
 };
 pub use ids::{
     BindingId, ColumnId, ColumnObjectId, ConstraintId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID,
-    FROZEN_XID, FileId, ForeignKeyId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
+    FROZEN_XID, FileId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
     PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId, TableId, TxnId,
 };
 pub use interval::Interval;
@@ -89,8 +89,8 @@ pub use numeric::{Decimal, RoundingStrategy};
 pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
-    ArrayType, ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType,
-    ForeignKeyAction, ForeignKeyConstraint, INITIAL_SCHEMA_VERSION, IndexConstraintKind,
+    ArrayType, ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, ConstraintKind,
+    ConstraintSchema, DataType, ForeignKeyAction, ForeignKeyConstraint, INITIAL_SCHEMA_VERSION,
     IndexSchema, NamespaceSchema, ParsedColumnDef, ParsedDefault, QualifiedName, RelationKind,
     SequenceOptions, SequenceSchema, TableOptionPatch, TableSchema, ToastCompression, ToastMode,
     ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,

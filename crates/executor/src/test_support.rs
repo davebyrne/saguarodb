@@ -1,10 +1,10 @@
 use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
     ColumnId, ColumnInfo, ConflictWaiter, CopyOptions, DataType, DbError, ForeignKeyAction,
-    IndexConstraintKind, IndexId, IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result,
-    Row, RowId, RowIdentity, SqlState, SsiTracker, StatementContext, StoredRow, TableId,
-    TableSchema, TupleLockAcquire, TupleLockManager, TupleLockMode, TupleLockTag,
-    TupleLockWaitPolicy, TxnStatus, Value,
+    IndexId, IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result, Row, RowId,
+    RowIdentity, SqlState, SsiTracker, StatementContext, StoredRow, TableId, TableSchema,
+    TupleLockAcquire, TupleLockManager, TupleLockMode, TupleLockTag, TupleLockWaitPolicy,
+    TxnStatus, Value,
 };
 use planner::{ExplainAnalysis, PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
@@ -98,12 +98,11 @@ impl ExecutorHarness {
             .create_table(&memory_statement_context(0), &schema)
             .unwrap();
         let primary_key = catalog
-            .create_index_with_constraint(
+            .create_primary_key_index(
+                common::PUBLIC_SCHEMA_ID,
                 "users_pkey".to_string(),
-                "users",
+                schema.id,
                 &["id".to_string()],
-                true,
-                IndexConstraintKind::PrimaryKey,
             )
             .unwrap();
         storage
@@ -151,15 +150,14 @@ impl ExecutorHarness {
         if !primary_key.is_empty() {
             let index = self
                 .catalog
-                .create_index_with_constraint(
+                .create_primary_key_index(
+                    common::PUBLIC_SCHEMA_ID,
                     format!("{name}_pkey"),
-                    name,
+                    schema.id,
                     &primary_key
                         .iter()
                         .map(|column| (*column).to_string())
                         .collect::<Vec<_>>(),
-                    true,
-                    IndexConstraintKind::PrimaryKey,
                 )
                 .unwrap();
             self.storage
@@ -170,17 +168,17 @@ impl ExecutorHarness {
     }
 
     pub fn add_unique_constraint(&self, table: &str, columns: &[&str]) -> IndexSchema {
+        let table_id = self.catalog.get_table_by_name(table).unwrap().unwrap().id;
         let index = self
             .catalog
-            .create_index_with_constraint(
+            .create_unique_constraint_index(
+                common::PUBLIC_SCHEMA_ID,
                 format!("{}_{}_key", table, columns.join("_")),
-                table,
+                table_id,
                 &columns
                     .iter()
                     .map(|column| (*column).to_string())
                     .collect::<Vec<_>>(),
-                true,
-                IndexConstraintKind::Unique,
             )
             .unwrap();
         self.storage
@@ -1052,9 +1050,7 @@ impl MemoryStorage {
                     let index = state
                         .indexes
                         .get(&access_index)
-                        .filter(|index| {
-                            index.table == table && index.constraint == IndexConstraintKind::Unique
-                        })
+                        .filter(|index| index.table == table && index.constraint.is_some())
                         .ok_or_else(|| undefined_index(access_index))?;
                     index.columns.clone()
                 };
@@ -1839,7 +1835,7 @@ fn validate_unique_indexes(
             if index_key(schema, index, &stored.row)? == candidate_key {
                 return Err(DbError::storage(
                     SqlState::UniqueViolation,
-                    if index.constraint == IndexConstraintKind::PrimaryKey {
+                    if index.columns == schema.primary_key {
                         "duplicate primary key"
                     } else {
                         "duplicate key value violates unique index"
@@ -2644,7 +2640,7 @@ mod memory_storage_identity_tests {
             name: "users_name_key".to_string(),
             columns: vec![1],
             unique: true,
-            constraint: IndexConstraintKind::Unique,
+            constraint: Some(1),
         };
         storage
             .create_index(&memory_statement_context(0), &index, 0)
@@ -3087,7 +3083,7 @@ mod memory_storage_identity_tests {
             name: "users_name_key".to_string(),
             columns: vec![1],
             unique: true,
-            constraint: IndexConstraintKind::Unique,
+            constraint: Some(1),
         };
         storage
             .create_index(&memory_statement_context(0), &index, 0)

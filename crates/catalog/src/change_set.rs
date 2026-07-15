@@ -5,6 +5,7 @@ use common::{
     SqlState,
 };
 
+use crate::dependencies::reconcile_constraints_and_dependencies;
 use crate::{CatalogSnapshot, MemoryCatalog};
 
 pub fn catalog_change_set_between(
@@ -47,6 +48,7 @@ pub fn apply_catalog_change_set(
     reserve_change_allocators(&mut result, &change_set.allocator_high_water);
     reserve_change_allocators(&mut result, &existing_high_water);
     rebuild_name_indexes(&mut result);
+    reconcile_constraints_and_dependencies(&mut result)?;
     MemoryCatalog::try_from_snapshot(result.clone())?;
     Ok(result)
 }
@@ -74,11 +76,6 @@ pub fn reserve_change_allocators(
             view.next_column_object_id = view.next_column_object_id.max(*next_column);
         }
     }
-    for (relation, next_foreign_key) in &high_water.next_foreign_key_ids {
-        if let Some(table) = snapshot.tables_by_id.get_mut(relation) {
-            table.next_foreign_key_id = table.next_foreign_key_id.max(*next_foreign_key);
-        }
-    }
 }
 
 pub fn merge_allocator_high_water(
@@ -98,13 +95,6 @@ pub fn merge_allocator_high_water(
             .entry(*relation)
             .or_insert(*next_column);
         *reserved = (*reserved).max(*next_column);
-    }
-    for (relation, next_foreign_key) in &source.next_foreign_key_ids {
-        let reserved = target
-            .next_foreign_key_ids
-            .entry(*relation)
-            .or_insert(*next_foreign_key);
-        *reserved = (*reserved).max(*next_foreign_key);
     }
 }
 
@@ -140,6 +130,12 @@ fn snapshot_objects(snapshot: &CatalogSnapshot) -> BTreeMap<CatalogObjectId, Cat
             CatalogObject::Sequence(schema),
         )
     }));
+    objects.extend(snapshot.constraints_by_id.values().cloned().map(|schema| {
+        (
+            CatalogObjectId::Constraint(schema.id),
+            CatalogObject::Constraint(schema),
+        )
+    }));
     objects.extend(snapshot.statistics.iter().map(|(table, statistics)| {
         (
             CatalogObjectId::Statistics(*table),
@@ -164,11 +160,6 @@ fn snapshot_allocator_high_water(snapshot: &CatalogSnapshot) -> CatalogAllocator
                 .map(|(id, view)| (*id, view.next_column_object_id)),
         )
         .collect();
-    let next_foreign_key_ids = snapshot
-        .tables_by_id
-        .iter()
-        .map(|(id, table)| (*id, table.next_foreign_key_id))
-        .collect();
     CatalogAllocatorHighWater {
         next_schema_id: snapshot.next_schema_id,
         next_table_id: snapshot.next_table_id,
@@ -178,7 +169,6 @@ fn snapshot_allocator_high_water(snapshot: &CatalogSnapshot) -> CatalogAllocator
         next_storage_id: snapshot.next_storage_id,
         next_constraint_id: snapshot.next_constraint_id,
         next_column_object_ids,
-        next_foreign_key_ids,
     }
 }
 
@@ -209,17 +199,6 @@ fn allocator_high_water_between(
                 .map(|(id, view)| (*id, view.next_column_object_id)),
         )
         .collect();
-    let next_foreign_key_ids = after
-        .tables_by_id
-        .iter()
-        .filter(|(id, table)| {
-            before
-                .tables_by_id
-                .get(id)
-                .is_none_or(|old| old.next_foreign_key_id < table.next_foreign_key_id)
-        })
-        .map(|(id, table)| (*id, table.next_foreign_key_id))
-        .collect();
     CatalogAllocatorHighWater {
         next_schema_id: after.next_schema_id,
         next_table_id: after.next_table_id,
@@ -229,7 +208,6 @@ fn allocator_high_water_between(
         next_storage_id: after.next_storage_id,
         next_constraint_id: after.next_constraint_id,
         next_column_object_ids,
-        next_foreign_key_ids,
     }
 }
 
@@ -265,7 +243,14 @@ fn object(snapshot: &CatalogSnapshot, id: CatalogObjectId) -> Option<CatalogObje
             .get(&table)
             .cloned()
             .map(|statistics| CatalogObject::Statistics { table, statistics }),
-        CatalogObjectId::Constraint(_) | CatalogObjectId::Column { .. } => None,
+        CatalogObjectId::Constraint(id) => snapshot
+            .constraints_by_id
+            .get(&id)
+            .cloned()
+            .map(CatalogObject::Constraint),
+        CatalogObjectId::Function(_)
+        | CatalogObjectId::Column { .. }
+        | CatalogObjectId::ColumnDefault { .. } => None,
     }
 }
 
@@ -332,7 +317,18 @@ fn apply_object(
             },
         ),
         CatalogObjectId::Statistics(id) => apply_statistics(snapshot, id, after),
-        CatalogObjectId::Constraint(_) | CatalogObjectId::Column { .. } => Err(DbError::internal(
+        CatalogObjectId::Constraint(id) => replace(
+            &mut snapshot.constraints_by_id,
+            id,
+            after,
+            |object| match object {
+                CatalogObject::Constraint(value) => Some(value.clone()),
+                _ => None,
+            },
+        ),
+        CatalogObjectId::Function(_)
+        | CatalogObjectId::Column { .. }
+        | CatalogObjectId::ColumnDefault { .. } => Err(DbError::internal(
             "catalog change references a non-replaceable object",
         )),
     }
@@ -521,11 +517,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![changed.id]
         );
-        assert!(
-            !change_set
-                .allocator_high_water
-                .next_foreign_key_ids
-                .contains_key(&unchanged.id)
-        );
+        assert_eq!(unchanged.next_column_object_id, 2);
     }
 }

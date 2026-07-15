@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use catalog::serialize_catalog;
+use catalog::{reconcile_snapshot_derived_metadata, serialize_catalog};
 use common::{Result, TableId};
 use wal::{WalRecord, WalRecordKind};
 
@@ -151,6 +151,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
             }
         }
     }
+    reconcile_snapshot_derived_metadata(&mut snapshot)?;
     let catalog_bytes = serialize_catalog(&snapshot)?;
     components
         .control

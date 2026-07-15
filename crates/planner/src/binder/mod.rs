@@ -1307,10 +1307,14 @@ pub(super) fn bind_table_checks(
     catalog: &dyn CatalogManager,
     table: &TableSchema,
 ) -> Result<Vec<BoundExpr>> {
-    table
-        .checks
-        .iter()
-        .map(|expression| crate::lower_stored_expression(catalog, expression, &table.columns))
+    catalog
+        .list_constraints_for_table(table.id)?
+        .into_iter()
+        .filter_map(|constraint| match constraint.kind {
+            common::ConstraintKind::Check { expression } => Some(expression),
+            _ => None,
+        })
+        .map(|expression| crate::lower_stored_expression(catalog, &expression, &table.columns))
         .collect()
 }
 

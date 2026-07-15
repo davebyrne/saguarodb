@@ -1,26 +1,28 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError,
-    FIRST_USER_SCHEMA_ID, FileId, ForeignKeyConstraint, IndexConstraintKind, IndexId, IndexSchema,
-    NamespaceSchema, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef, ParsedDefault,
-    PgType, RelationKind, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, SqlState,
-    StoredExpr, StoredExpression, TableId, TableSchema, TableStatistics, ToastMode, ToastOptions,
-    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
-    needs_toast_relation, toast_schema,
+    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, ConstraintId, ConstraintKind,
+    ConstraintSchema, DataType, DbError, DependencyEdge, FIRST_USER_SCHEMA_ID, FileId, IndexId,
+    IndexSchema, NamespaceSchema, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef,
+    ParsedDefault, PgType, RelationKind, Result, SchemaId, SequenceId, SequenceOptions,
+    SequenceSchema, SqlState, StoredExpr, StoredExpression, TableId, TableSchema, TableStatistics,
+    ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency,
+    ViewSchema, needs_toast_relation, toast_schema,
 };
 
 use crate::{
     CatalogAllocatorState, CatalogManager, ResolvedForeignKey, TableColumnAlteration,
+    dependencies::{
+        build_dependencies, dependency_drop_closure, reconcile_constraints_and_dependencies,
+        validate_constraints_and_dependencies,
+    },
     system::{MAX_COMPOUND_OID_SUB_ID, MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
 };
 
 const STORAGE_ID_KIND_BITS: FileId = 0xC000_0000;
 const MAX_STORAGE_ID: FileId = !STORAGE_ID_KIND_BITS;
 const STORAGE_ID_EXHAUSTED: FileId = MAX_STORAGE_ID + 1;
-const MAX_FOREIGN_KEY_ID: u32 = 4095;
-const FOREIGN_KEY_ID_EXHAUSTED: u32 = MAX_FOREIGN_KEY_ID + 1;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CatalogSnapshot {
@@ -65,6 +67,8 @@ pub struct CatalogSnapshot {
     /// Reserved global constraint allocator used by generic catalog changes.
     #[serde(default = "default_next_constraint_id")]
     pub next_constraint_id: common::ConstraintId,
+    pub constraints_by_id: HashMap<common::ConstraintId, ConstraintSchema>,
+    pub dependencies: BTreeSet<DependencyEdge>,
     // Optimizer statistics per analyzed user table (docs/specs/statistics.md).
     // Defaults so catalogs written before ANALYZE existed still deserialize.
     #[serde(default)]
@@ -91,6 +95,8 @@ impl Default for CatalogSnapshot {
             next_dictionary_id: default_next_dictionary_id(),
             next_storage_id: default_next_storage_id(),
             next_constraint_id: default_next_constraint_id(),
+            constraints_by_id: HashMap::new(),
+            dependencies: BTreeSet::new(),
             statistics: HashMap::new(),
         }
     }
@@ -157,7 +163,16 @@ impl MemoryCatalog {
 
     pub fn try_from_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
         normalize_snapshot_storage_ids(&mut snapshot)?;
-        normalize_foreign_key_referenced_indexes(&mut snapshot)?;
+        prune_orphan_statistics(&mut snapshot);
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        validate_snapshot(&snapshot)?;
+        Ok(Self::from_snapshot(snapshot))
+    }
+
+    /// Installs a decoded durable snapshot without repairing its persisted
+    /// constraint or dependency metadata.
+    pub fn try_from_durable_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
+        normalize_snapshot_storage_ids(&mut snapshot)?;
         prune_orphan_statistics(&mut snapshot);
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
@@ -404,13 +419,59 @@ impl CatalogManager for MemoryCatalog {
         Ok(views)
     }
 
+    fn get_constraint(&self, id: ConstraintId) -> Result<Option<ConstraintSchema>> {
+        Ok(self.read_snapshot()?.constraints_by_id.get(&id).cloned())
+    }
+
+    fn list_constraints(&self) -> Result<Vec<ConstraintSchema>> {
+        let mut constraints: Vec<_> = self
+            .read_snapshot()?
+            .constraints_by_id
+            .values()
+            .cloned()
+            .collect();
+        constraints.sort_by_key(|constraint| constraint.id);
+        Ok(constraints)
+    }
+
+    fn list_constraints_for_table(&self, table: TableId) -> Result<Vec<ConstraintSchema>> {
+        let mut constraints: Vec<_> = self
+            .read_snapshot()?
+            .constraints_by_id
+            .values()
+            .filter(|constraint| constraint.table == table)
+            .cloned()
+            .collect();
+        constraints.sort_by_key(|constraint| constraint.id);
+        Ok(constraints)
+    }
+
+    fn get_constraint_by_name(
+        &self,
+        table: TableId,
+        name: &str,
+    ) -> Result<Option<ConstraintSchema>> {
+        Ok(self
+            .read_snapshot()?
+            .constraints_by_id
+            .values()
+            .find(|constraint| constraint.table == table && constraint.name == name)
+            .cloned())
+    }
+
+    fn list_dependencies(&self) -> Result<Vec<DependencyEdge>> {
+        Ok(self.read_snapshot()?.dependencies.iter().copied().collect())
+    }
+
     fn snapshot(&self) -> Result<CatalogSnapshot> {
-        Ok(self.read_snapshot()?.clone())
+        let mut snapshot = self.read_snapshot()?.clone();
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        Ok(snapshot)
     }
 
     fn restore(&self, mut snapshot: CatalogSnapshot) -> Result<()> {
         normalize_snapshot_storage_ids(&mut snapshot)?;
-        normalize_foreign_key_referenced_indexes(&mut snapshot)?;
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         let mut current = self.write_snapshot()?;
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
@@ -422,9 +483,6 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_constraint_id = snapshot.next_constraint_id.max(current.next_constraint_id);
         for (table_id, restored_table) in &mut snapshot.tables_by_id {
             if let Some(current_table) = current.tables_by_id.get(table_id) {
-                restored_table.next_foreign_key_id = restored_table
-                    .next_foreign_key_id
-                    .max(current_table.next_foreign_key_id);
                 restored_table.next_column_object_id = restored_table
                     .next_column_object_id
                     .max(current_table.next_column_object_id);
@@ -463,6 +521,11 @@ impl CatalogManager for MemoryCatalog {
         reject_duplicate_relation_id(&snapshot, schema.id)?;
         validate_storage_id("table", schema.storage_id)?;
         reject_duplicate_table_storage_id(&snapshot, schema.storage_id, "table storage id")?;
+        if schema.relation_kind == RelationKind::User && !schema.primary_key.is_empty() {
+            return Err(DbError::internal(
+                "cannot apply a user table primary-key projection without its first-class constraint and backing index",
+            ));
+        }
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog table id overflow while applying create table")
@@ -477,7 +540,6 @@ impl CatalogManager for MemoryCatalog {
         candidate.next_table_id = candidate.next_table_id.max(next_after_schema);
         reserve_storage_id_value(&mut candidate.next_storage_id, schema.storage_id)?;
         candidate.tables_by_id.insert(schema.id, schema);
-        validate_foreign_keys(&candidate, true)?;
         *snapshot = candidate;
         Ok(())
     }
@@ -503,25 +565,8 @@ impl CatalogManager for MemoryCatalog {
 
     fn apply_drop_table(&self, id: TableId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        validate_drop_table_dependencies(&snapshot, &[id], true)?;
-        remove_drop_table_targets(&mut snapshot, &[id])
-    }
-
-    fn apply_drop_table_in_batch(&self, id: TableId, batch: &[TableId]) -> Result<()> {
-        let mut snapshot = self.write_snapshot()?;
-        validate_drop_table_dependencies(&snapshot, batch, false)?;
-        let mut batch_ids = HashSet::new();
-        batch_ids.try_reserve(batch.len()).map_err(|_| {
-            DbError::internal("could not allocate recovery DROP TABLE batch membership")
-        })?;
-        batch_ids.extend(batch.iter().copied());
-        for table in snapshot.tables_by_id.values_mut() {
-            if batch_ids.contains(&table.id) {
-                table
-                    .foreign_keys
-                    .retain(|foreign_key| !batch_ids.contains(&foreign_key.referenced_table));
-            }
-        }
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        dependency_drop_closure(&snapshot, [common::CatalogObjectId::Table(id)])?;
         remove_drop_table_targets(&mut snapshot, &[id])
     }
 
@@ -530,7 +575,8 @@ impl CatalogManager for MemoryCatalog {
         table: TableId,
         foreign_keys: Vec<ResolvedForeignKey>,
     ) -> Result<TableSchema> {
-        let mut snapshot = self.write_snapshot()?;
+        let mut guard = self.write_snapshot()?;
+        let mut snapshot = guard.clone();
         let mut schema = snapshot
             .tables_by_id
             .get(&table)
@@ -541,28 +587,13 @@ impl CatalogManager for MemoryCatalog {
         if foreign_keys.is_empty() {
             return Ok(schema);
         }
-        let mut next_id = schema.next_foreign_key_id;
-        let mut resolved = Vec::new();
         for foreign_key in foreign_keys {
-            if next_id > MAX_FOREIGN_KEY_ID {
-                return Err(DbError::plan(
-                    SqlState::ProgramLimitExceeded,
-                    format!(
-                        "foreign key id allocator is exhausted for table {}",
-                        schema.name
-                    ),
-                ));
-            }
-            let id = u16::try_from(next_id).map_err(|_| {
-                DbError::internal("validated foreign key id does not fit the durable u16 field")
-            })?;
             let name = match foreign_key.name {
                 Some(name) => name,
                 None => generate_foreign_key_name_from_snapshot(
                     &snapshot,
                     &schema,
                     &foreign_key.columns,
-                    &resolved,
                 )?,
             };
             let referenced_index = resolve_foreign_key_constraint_index_in_snapshot(
@@ -576,45 +607,55 @@ impl CatalogManager for MemoryCatalog {
                     "there is no eligible unique constraint matching referenced columns",
                 )
             })?;
-            resolved.push(ForeignKeyConstraint {
+            let referenced_constraint = snapshot
+                .indexes_by_id
+                .get(&referenced_index)
+                .and_then(|index| index.constraint)
+                .ok_or_else(|| DbError::internal("referenced key constraint is missing"))?;
+            if snapshot
+                .constraints_by_id
+                .values()
+                .any(|constraint| constraint.table == table && constraint.name == name)
+            {
+                return Err(DbError::plan(
+                    SqlState::DuplicateObject,
+                    format!("constraint {name} on table {} already exists", schema.name),
+                ));
+            }
+            let id = allocate_constraint_id(&mut snapshot)?;
+            let supporting_index = find_supporting_index(&snapshot, table, &foreign_key.columns);
+            let parent = snapshot
+                .tables_by_id
+                .get(&foreign_key.referenced_table)
+                .ok_or_else(|| DbError::internal("foreign-key parent table is missing"))?;
+            let referenced_columns = stable_column_ids(parent, &foreign_key.referenced_columns)?;
+            snapshot.constraints_by_id.insert(
                 id,
-                name,
-                columns: foreign_key.columns,
-                referenced_table: foreign_key.referenced_table,
-                referenced_columns: foreign_key.referenced_columns,
-                referenced_index,
-                on_update: foreign_key.on_update,
-                on_delete: foreign_key.on_delete,
-            });
-            next_id = next_id.checked_add(1).ok_or_else(|| {
-                DbError::internal("foreign key id allocator overflow while attaching constraints")
-            })?;
+                ConstraintSchema {
+                    id,
+                    name,
+                    table,
+                    kind: ConstraintKind::ForeignKey {
+                        columns: stable_column_ids(&schema, &foreign_key.columns)?,
+                        referenced_table: foreign_key.referenced_table,
+                        referenced_constraint,
+                        referenced_columns,
+                        on_update: foreign_key.on_update,
+                        on_delete: foreign_key.on_delete,
+                        supporting_index,
+                    },
+                    deferrable: false,
+                    initially_deferred: false,
+                    validated: true,
+                },
+            );
         }
-        schema.foreign_keys.extend(resolved);
-        schema.next_foreign_key_id = next_id;
         bump_schema_version(&mut schema.schema_version)?;
-
-        let mut candidate = snapshot.clone();
-        candidate.tables_by_id.insert(table, schema.clone());
-        validate_foreign_keys(&candidate, false)?;
-        replace_table_schema(&mut snapshot, schema.clone())?;
+        snapshot.tables_by_id.insert(table, schema.clone());
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        validate_constraints_and_dependencies(&snapshot)?;
+        *guard = snapshot;
         Ok(schema)
-    }
-
-    fn reserve_foreign_key_allocator(&self, table: TableId, next_id: u32) -> Result<()> {
-        if next_id > FOREIGN_KEY_ID_EXHAUSTED {
-            return Err(DbError::internal(format!(
-                "foreign-key allocator reservation {next_id} exceeds exhausted sentinel {FOREIGN_KEY_ID_EXHAUSTED}",
-            )));
-        }
-        let mut snapshot = self.write_snapshot()?;
-        let schema = snapshot.tables_by_id.get_mut(&table).ok_or_else(|| {
-            DbError::internal(format!(
-                "cannot reserve foreign-key allocator for missing table id {table}",
-            ))
-        })?;
-        schema.next_foreign_key_id = schema.next_foreign_key_id.max(next_id);
-        Ok(())
     }
 
     fn drop_foreign_key(
@@ -630,11 +671,16 @@ impl CatalogManager for MemoryCatalog {
             .cloned()
             .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
         ensure_user_table(&schema)?;
-        let Some(position) = schema
-            .foreign_keys
-            .iter()
-            .position(|foreign_key| foreign_key.name == name)
-        else {
+        let constraint = snapshot
+            .constraints_by_id
+            .values()
+            .find(|constraint| {
+                constraint.table == table
+                    && constraint.name == name
+                    && matches!(constraint.kind, ConstraintKind::ForeignKey { .. })
+            })
+            .map(|constraint| constraint.id);
+        let Some(constraint) = constraint else {
             if if_exists {
                 return Ok(None);
             }
@@ -646,9 +692,10 @@ impl CatalogManager for MemoryCatalog {
                 ),
             ));
         };
-        schema.foreign_keys.remove(position);
+        snapshot.constraints_by_id.remove(&constraint);
         bump_schema_version(&mut schema.schema_version)?;
-        replace_table_schema(&mut snapshot, schema.clone())?;
+        snapshot.tables_by_id.insert(table, schema.clone());
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
         Ok(Some(schema))
     }
 
@@ -659,7 +706,7 @@ impl CatalogManager for MemoryCatalog {
             .get(&table)
             .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
         ensure_user_table(schema)?;
-        generate_foreign_key_name_from_snapshot(&snapshot, schema, columns, &[])
+        generate_foreign_key_name_from_snapshot(&snapshot, schema, columns)
     }
 
     fn resolve_foreign_key_index(
@@ -679,7 +726,7 @@ impl CatalogManager for MemoryCatalog {
             .values()
             .filter(|index| {
                 index.table == referenced_table
-                    && index.constraint == IndexConstraintKind::Unique
+                    && is_unique_constraint_index(&snapshot, index)
                     && index.columns == referenced_columns
             })
             .min_by_key(|index| index.id)
@@ -703,7 +750,7 @@ impl CatalogManager for MemoryCatalog {
             .values()
             .filter(|index| {
                 index.table == child_table
-                    && index.constraint != IndexConstraintKind::PrimaryKey
+                    && !is_primary_key_constraint_index(&snapshot, index)
                     && index.columns == columns
             })
             .min_by_key(|index| index.id)
@@ -721,6 +768,7 @@ impl CatalogManager for MemoryCatalog {
         checks: Vec<StoredExpression>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
+        let constraint_checks = checks.clone();
         require_schema(&snapshot, schema_id, "table", &name)?;
         reject_duplicate_relation_name_in_schema(&snapshot, schema_id, "table", &name)?;
 
@@ -777,8 +825,11 @@ impl CatalogManager for MemoryCatalog {
             snapshot.tables_by_id.insert(hidden_toast.id, hidden_toast);
         }
         snapshot.tables_by_id.insert(schema.id, schema.clone());
+        install_check_constraints(&mut snapshot, schema.id, &constraint_checks)?;
         snapshot.next_table_id = next_table_id;
         snapshot.next_storage_id = next_storage_id;
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        validate_constraints_and_dependencies(&snapshot)?;
         Ok(schema)
     }
 
@@ -910,7 +961,6 @@ impl CatalogManager for MemoryCatalog {
         schema.columns.remove(position);
         remap_columns_after_drop(&mut schema, column_id);
         remap_indexes_after_drop(&mut snapshot, id, column_id);
-        remap_foreign_keys_after_drop(&mut schema, column_id);
         bump_schema_version(&mut schema.schema_version)?;
         replace_table_schema(&mut snapshot, schema.clone())?;
         Ok(schema)
@@ -963,12 +1013,6 @@ impl CatalogManager for MemoryCatalog {
         };
         target.default = converted_default;
         bump_schema_version(&mut schema.schema_version)?;
-
-        let mut validation_candidate = snapshot.clone();
-        validation_candidate
-            .tables_by_id
-            .insert(schema.id, schema.clone());
-        validate_foreign_keys(&validation_candidate, false)?;
 
         if schema.toast_table_id.is_none() && needs_toast_relation(&schema) {
             let toast_id = snapshot.next_table_id;
@@ -1093,7 +1137,7 @@ impl CatalogManager for MemoryCatalog {
         table: TableId,
         primary_key: Vec<ColumnId>,
     ) -> Result<TableSchema> {
-        let mut snapshot = self.write_snapshot()?;
+        let snapshot = self.write_snapshot()?;
         let mut schema = snapshot
             .tables_by_id
             .get(&table)
@@ -1115,9 +1159,12 @@ impl CatalogManager for MemoryCatalog {
             &old_primary_key,
             &schema.primary_key,
         )?;
-        bump_schema_version(&mut schema.schema_version)?;
-        snapshot.tables_by_id.insert(table, schema.clone());
-        Ok(schema)
+        if schema.primary_key == old_primary_key {
+            return Ok(schema);
+        }
+        Err(DbError::internal(
+            "primary-key metadata must be changed with its first-class constraint and backing index",
+        ))
     }
 
     fn preflight_table_primary_key_change(
@@ -1137,7 +1184,7 @@ impl CatalogManager for MemoryCatalog {
         &self,
         table: TableId,
         primary_key: Vec<ColumnId>,
-        index: IndexSchema,
+        mut index: IndexSchema,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
         let mut schema = snapshot
@@ -1167,7 +1214,7 @@ impl CatalogManager for MemoryCatalog {
                 index.name, index.table
             )));
         }
-        if index.constraint != IndexConstraintKind::PrimaryKey || !index.unique {
+        if !index.unique || index.constraint.is_some() {
             return Err(DbError::internal(format!(
                 "primary-key index {} must be a unique primary-key constraint index",
                 index.name
@@ -1176,6 +1223,7 @@ impl CatalogManager for MemoryCatalog {
         reject_duplicate_index_name(&snapshot, &index.name)?;
         reject_duplicate_index_id(&snapshot, index.id)?;
         validate_index_schema_for_table(&index, &schema)?;
+        install_key_constraint(&mut snapshot, &mut index, true)?;
         reject_duplicate_primary_key_constraint_index(&snapshot, &index)?;
 
         let next_after_index = index.id.checked_add(1).ok_or_else(|| {
@@ -1209,7 +1257,7 @@ impl CatalogManager for MemoryCatalog {
             .get(&index)
             .cloned()
             .ok_or_else(|| undefined_index(format!("index id {index} does not exist")))?;
-        if index_schema.table != table || index_schema.constraint != IndexConstraintKind::PrimaryKey
+        if index_schema.table != table || !is_primary_key_constraint_index(&snapshot, &index_schema)
         {
             return Err(DbError::internal(format!(
                 "index {} is not the primary-key constraint index for table {}",
@@ -1228,6 +1276,9 @@ impl CatalogManager for MemoryCatalog {
         )?;
         bump_schema_version(&mut schema.schema_version)?;
         snapshot.indexes_by_id.remove(&index);
+        if let Some(constraint) = index_schema.constraint {
+            snapshot.constraints_by_id.remove(&constraint);
+        }
         if index_schema.schema_id == PUBLIC_SCHEMA_ID {
             snapshot.indexes_by_name.remove(&index_schema.name);
         }
@@ -1490,7 +1541,8 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn apply_create_index(&self, mut schema: IndexSchema) -> Result<()> {
-        let mut snapshot = self.write_snapshot()?;
+        let mut guard = self.write_snapshot()?;
+        let mut snapshot = guard.clone();
         normalize_index_storage_id(&mut schema, &snapshot)?;
         reject_duplicate_index_id(&snapshot, schema.id)?;
         validate_storage_id("index", schema.storage_id)?;
@@ -1512,12 +1564,16 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_index_id = snapshot.next_index_id.max(next_after_schema);
         reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
         snapshot.indexes_by_id.insert(schema.id, schema);
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        validate_constraints_and_dependencies(&snapshot)?;
+        *guard = snapshot;
         Ok(())
     }
 
     fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        let old = snapshot
+        let mut candidate = snapshot.clone();
+        let old = candidate
             .indexes_by_id
             .get(&schema.id)
             .cloned()
@@ -1528,51 +1584,84 @@ impl CatalogManager for MemoryCatalog {
                 schema.id
             )));
         }
-        validate_index_schema(&schema, &snapshot.tables_by_id)?;
-        reject_duplicate_constraint_name_with_foreign_key(&snapshot, &schema)?;
-        reject_referenced_unique_index_update(&snapshot, &old, &schema)?;
+        if old.constraint != schema.constraint {
+            return Err(DbError::internal(format!(
+                "cannot change constraint ownership for index id {}",
+                schema.id
+            )));
+        }
+        if old.constraint.is_some()
+            && (old.name != schema.name
+                || old.columns != schema.columns
+                || old.unique != schema.unique)
+        {
+            return Err(DbError::internal(format!(
+                "cannot change identity metadata for constraint-owned index id {}",
+                schema.id
+            )));
+        }
+        validate_index_schema(&schema, &candidate.tables_by_id)?;
+        reject_duplicate_constraint_name_with_foreign_key(&candidate, &schema)?;
+        reject_referenced_unique_index_update(&candidate, &old, &schema)?;
         if old.name != schema.name {
             reject_duplicate_relation_name_in_schema(
-                &snapshot,
+                &candidate,
                 schema.schema_id,
                 "index",
                 &schema.name,
             )?;
             if schema.schema_id == PUBLIC_SCHEMA_ID {
-                snapshot.indexes_by_name.remove(&old.name);
-                snapshot
+                candidate.indexes_by_name.remove(&old.name);
+                candidate
                     .indexes_by_name
                     .insert(schema.name.clone(), schema.id);
             }
         }
-        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
-        snapshot.indexes_by_id.insert(schema.id, schema);
+        reserve_storage_id_value(&mut candidate.next_storage_id, schema.storage_id)?;
+        candidate.indexes_by_id.insert(schema.id, schema);
+        reconcile_constraints_and_dependencies(&mut candidate)?;
+        validate_constraints_and_dependencies(&candidate)?;
+        *snapshot = candidate;
         Ok(())
     }
 
     fn apply_drop_index(&self, id: IndexId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        let schema = snapshot
+        let mut candidate = snapshot.clone();
+        for constraint in candidate.constraints_by_id.values_mut() {
+            if let ConstraintKind::ForeignKey {
+                supporting_index, ..
+            } = &mut constraint.kind
+                && *supporting_index == Some(id)
+            {
+                *supporting_index = None;
+            }
+        }
+        reconcile_constraints_and_dependencies(&mut candidate)?;
+        dependency_drop_closure(&candidate, [common::CatalogObjectId::Index(id)])?;
+        let schema = candidate
             .indexes_by_id
             .get(&id)
             .cloned()
             .ok_or_else(|| undefined_index(format!("index id {id} does not exist")))?;
-        reject_referenced_unique_index_drop(&snapshot, &schema)?;
-        snapshot.indexes_by_id.remove(&id);
+        reject_referenced_unique_index_drop(&candidate, &schema)?;
+        candidate.indexes_by_id.remove(&id);
         if schema.schema_id == PUBLIC_SCHEMA_ID {
-            snapshot.indexes_by_name.remove(&schema.name);
+            candidate.indexes_by_name.remove(&schema.name);
         }
+        reconcile_constraints_and_dependencies(&mut candidate)?;
+        validate_constraints_and_dependencies(&candidate)?;
+        *snapshot = candidate;
         Ok(())
     }
 
-    fn create_index_in_schema_with_constraint(
+    fn create_index_in_schema(
         &self,
         schema_id: SchemaId,
         name: String,
         table: TableId,
         columns: &[String],
         unique: bool,
-        constraint: IndexConstraintKind,
     ) -> Result<IndexSchema> {
         let mut snapshot = self.write_snapshot()?;
         require_schema(&snapshot, schema_id, "index", &name)?;
@@ -1595,15 +1684,8 @@ impl CatalogManager for MemoryCatalog {
                     "index and table must be in the same schema",
                 ));
             }
-            let mut schema = build_index_schema(
-                index_id,
-                storage_id,
-                name,
-                table_schema,
-                columns,
-                unique,
-                constraint,
-            )?;
+            let mut schema =
+                build_index_schema(index_id, storage_id, name, table_schema, columns, unique)?;
             schema.schema_id = schema_id;
             schema
         };
@@ -1623,16 +1705,27 @@ impl CatalogManager for MemoryCatalog {
         Ok(schema)
     }
 
+    fn create_primary_key_index(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
+    ) -> Result<IndexSchema> {
+        create_key_constraint_index(self, schema, name, table, columns, true)
+    }
+
+    fn create_unique_constraint_index(
+        &self,
+        schema: SchemaId,
+        name: String,
+        table: TableId,
+        columns: &[String],
+    ) -> Result<IndexSchema> {
+        create_key_constraint_index(self, schema, name, table, columns, false)
+    }
+
     fn drop_index(&self, id: IndexId) -> Result<()> {
-        if self
-            .get_index(id)?
-            .is_some_and(|index| index.constraint == IndexConstraintKind::PrimaryKey)
-        {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                "cannot drop index backing a primary key constraint",
-            ));
-        }
         self.apply_drop_index(id)
     }
 
@@ -2127,43 +2220,6 @@ fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> 
     Ok(())
 }
 
-fn normalize_foreign_key_referenced_indexes(snapshot: &mut CatalogSnapshot) -> Result<()> {
-    let mut replacements = Vec::new();
-    for child in snapshot.tables_by_id.values() {
-        for foreign_key in &child.foreign_keys {
-            if foreign_key.referenced_index != PRIMARY_KEY_INDEX_ID {
-                continue;
-            }
-            let referenced_index = resolve_foreign_key_constraint_index_in_snapshot(
-                snapshot,
-                foreign_key.referenced_table,
-                &foreign_key.referenced_columns,
-            )
-            .ok_or_else(|| {
-                DbError::internal(format!(
-                    "legacy foreign key {} on table {} has no eligible referenced constraint index",
-                    foreign_key.name, child.name
-                ))
-            })?;
-            replacements.push((child.id, foreign_key.id, referenced_index));
-        }
-    }
-    for (child_id, foreign_key_id, referenced_index) in replacements {
-        let child = snapshot.tables_by_id.get_mut(&child_id).ok_or_else(|| {
-            DbError::internal("foreign-key child disappeared during catalog normalization")
-        })?;
-        let foreign_key = child
-            .foreign_keys
-            .iter_mut()
-            .find(|foreign_key| foreign_key.id == foreign_key_id)
-            .ok_or_else(|| {
-                DbError::internal("foreign key disappeared during catalog normalization")
-            })?;
-        foreign_key.referenced_index = referenced_index;
-    }
-    Ok(())
-}
-
 fn explicit_table_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
     snapshot
         .tables_by_id
@@ -2573,9 +2629,6 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         toast,
         toast_table_id: None,
         relation_kind: RelationKind::User,
-        checks,
-        foreign_keys: Vec::new(),
-        next_foreign_key_id: 0,
         next_column_object_id,
     })
 }
@@ -2698,46 +2751,7 @@ fn validate_alter_column_type(
     if target.wire_type() == *pg_type {
         return Ok(TableColumnAlteration::Noop);
     }
-    if let Some(foreign_key) = schema
-        .foreign_keys
-        .iter()
-        .find(|foreign_key| foreign_key.columns.contains(&target.id))
-    {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot alter column {column} type because foreign key constraint {} depends on it",
-                foreign_key.name
-            ),
-        ));
-    }
-    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| {
-                foreign_key.referenced_table == schema.id
-                    && foreign_key.referenced_columns.contains(&target.id)
-            })
-            .map(|foreign_key| (child, foreign_key))
-    }) {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot alter column {column} type because constraint {} on table {} depends on it",
-                foreign_key.name, child.name
-            ),
-        ));
-    }
-    if !schema.checks.is_empty() {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot alter column {column} type because table {} has CHECK constraints",
-                schema.name
-            ),
-        ));
-    }
+    reject_stable_column_dependents(snapshot, schema.id, target.object_id, "alter type")?;
     reject_view_column_dependency(snapshot, schema.id, target.id, "alter type")?;
     if matches!(target.default, Some(ColumnDefault::Expr(_))) {
         return Err(DbError::plan(
@@ -2791,72 +2805,8 @@ fn validate_drop_table_column(
             format!("cannot drop primary key column {column}"),
         ));
     }
-    if schema
-        .foreign_keys
-        .iter()
-        .any(|foreign_key| foreign_key.columns.contains(&column_id))
-    {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!("cannot drop foreign key column {column}"),
-        ));
-    }
-    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| {
-                foreign_key.referenced_table == schema.id
-                    && foreign_key.referenced_columns.contains(&column_id)
-            })
-            .map(|foreign_key| (child, foreign_key))
-    }) {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot drop column {column} because constraint {} on table {} depends on it",
-                foreign_key.name, child.name
-            ),
-        ));
-    }
-    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        if child.id == schema.id {
-            return None;
-        }
-        child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| {
-                foreign_key.referenced_table == schema.id
-                    && foreign_key
-                        .referenced_columns
-                        .iter()
-                        .any(|referenced_column| *referenced_column > column_id)
-            })
-            .map(|foreign_key| (child, foreign_key))
-    }) {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot drop column {column} because it would renumber columns used by constraint {} on table {}",
-                foreign_key.name, child.name
-            ),
-        ));
-    }
     let column_object_id = schema.columns[position].object_id;
-    if schema
-        .checks
-        .iter()
-        .any(|check| stored_node_references_column(&check.root, column_object_id))
-    {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot drop column {column} because a CHECK constraint on table {} depends on it",
-                schema.name
-            ),
-        ));
-    }
+    reject_stable_column_dependents(snapshot, schema.id, column_object_id, "drop")?;
     reject_index_dependency(snapshot, schema.id, column_id, "drop")?;
     reject_view_column_dependency(snapshot, schema.id, column_id, "drop")?;
     reject_owned_sequence_default_drop(snapshot, &schema.columns[position])?;
@@ -2978,19 +2928,18 @@ fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) 
                 ));
             }
         }
-        if table
-            .checks
-            .iter()
-            .any(|check| check.root.references_sequence(sequence))
-        {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot drop sequence {sequence} because a CHECK constraint on table {} depends on it",
-                    table.name
-                ),
-            ));
-        }
+    }
+    if snapshot.constraints_by_id.values().any(|constraint| {
+        matches!(
+            &constraint.kind,
+            ConstraintKind::Check { expression }
+                if expression.root.references_sequence(sequence)
+        )
+    }) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!("cannot drop sequence {sequence} because a CHECK constraint depends on it"),
+        ));
     }
     Ok(())
 }
@@ -3084,15 +3033,7 @@ pub fn validate_create_table_definition(
                 format!("index {index_name} already exists"),
             ));
         }
-        build_index_schema(
-            0,
-            2,
-            index_name,
-            &schema,
-            columns,
-            true,
-            IndexConstraintKind::None,
-        )?;
+        build_index_schema(0, 2, index_name, &schema, columns, true)?;
     }
     Ok(())
 }
@@ -3101,6 +3042,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     validate_namespaces(snapshot)?;
     let mut max_relation_id = 0;
     validate_sequences(snapshot)?;
+    validate_constraints_and_dependencies(snapshot)?;
 
     for (name, id) in &snapshot.tables_by_name {
         let schema = snapshot.tables_by_id.get(id).ok_or_else(|| {
@@ -3215,13 +3157,19 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     }
 
     validate_indexes(snapshot)?;
-    validate_foreign_keys(snapshot, true)?;
     validate_public_relation_namespace(snapshot)?;
     validate_dictionary_ids(snapshot)?;
     validate_storage_ids(snapshot)?;
     validate_toast_relations(snapshot)?;
     crate::serialize_catalog(snapshot)?;
     Ok(())
+}
+
+/// Rebuilds catalog metadata derived from the durable object maps and validates
+/// the resulting snapshot before an external caller persists it.
+pub fn reconcile_snapshot_derived_metadata(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    reconcile_constraints_and_dependencies(snapshot)?;
+    validate_snapshot(snapshot)
 }
 
 fn validate_namespaces(snapshot: &CatalogSnapshot) -> Result<()> {
@@ -3590,23 +3538,12 @@ fn validate_index_schema_for_table(schema: &IndexSchema, table: &TableSchema) ->
             schema.name
         )));
     }
-    if matches!(
-        schema.constraint,
-        IndexConstraintKind::Unique | IndexConstraintKind::PrimaryKey
-    ) && !schema.unique
-    {
+    if schema.constraint.is_some() && !schema.unique {
         return Err(DbError::internal(format!(
             "catalog constraint index {} is not unique",
             schema.name
         )));
     }
-    if schema.constraint == IndexConstraintKind::PrimaryKey && schema.columns != table.primary_key {
-        return Err(DbError::internal(format!(
-            "catalog primary-key index {} does not match table {} primary key",
-            schema.name, table.name
-        )));
-    }
-
     let mut seen = HashSet::new();
     for column_id in &schema.columns {
         if !table.columns.iter().any(|column| column.id == *column_id) {
@@ -3629,7 +3566,7 @@ fn validate_index_schema_for_table(schema: &IndexSchema, table: &TableSchema) ->
 fn validate_user_primary_key_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
     let mut counts_by_table: HashMap<TableId, usize> = HashMap::new();
     for index in snapshot.indexes_by_id.values() {
-        if index.constraint == IndexConstraintKind::PrimaryKey {
+        if is_primary_key_constraint_index(snapshot, index) {
             *counts_by_table.entry(index.table).or_default() += 1;
         }
     }
@@ -3658,224 +3595,6 @@ fn validate_user_primary_key_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn validate_foreign_keys(snapshot: &CatalogSnapshot, durable_snapshot: bool) -> Result<()> {
-    for child in snapshot.tables_by_id.values() {
-        if child.relation_kind != RelationKind::User {
-            if !child.foreign_keys.is_empty() || child.next_foreign_key_id != 0 {
-                return Err(foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::InvalidForeignKey,
-                    format!(
-                        "hidden TOAST relation {} must not carry foreign-key metadata",
-                        child.name
-                    ),
-                ));
-            }
-            continue;
-        }
-        if child.next_foreign_key_id > FOREIGN_KEY_ID_EXHAUSTED {
-            return Err(foreign_key_validation_error(
-                durable_snapshot,
-                SqlState::ProgramLimitExceeded,
-                format!(
-                    "table {} next_foreign_key_id {} exceeds exhausted sentinel {FOREIGN_KEY_ID_EXHAUSTED}",
-                    child.name, child.next_foreign_key_id
-                ),
-            ));
-        }
-
-        let mut ids = HashSet::new();
-        let mut names: HashSet<&str> = snapshot
-            .indexes_by_id
-            .values()
-            .filter(|index| {
-                index.table == child.id && index.constraint != IndexConstraintKind::None
-            })
-            .map(|index| index.name.as_str())
-            .collect();
-        let mut greatest_id = None;
-        for foreign_key in &child.foreign_keys {
-            if u32::from(foreign_key.id) > MAX_FOREIGN_KEY_ID {
-                return Err(foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::ProgramLimitExceeded,
-                    format!(
-                        "foreign key {} on table {} has id {} above {MAX_FOREIGN_KEY_ID}",
-                        foreign_key.name, child.name, foreign_key.id
-                    ),
-                ));
-            }
-            if !ids.insert(foreign_key.id) {
-                return Err(foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::DuplicateObject,
-                    format!(
-                        "table {} has duplicate foreign-key id {}",
-                        child.name, foreign_key.id
-                    ),
-                ));
-            }
-            if foreign_key.name.is_empty() || !names.insert(foreign_key.name.as_str()) {
-                return Err(foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::DuplicateObject,
-                    format!(
-                        "constraint {} on table {} already exists",
-                        foreign_key.name, child.name
-                    ),
-                ));
-            }
-            greatest_id = Some(
-                greatest_id.map_or(foreign_key.id, |greatest: u16| greatest.max(foreign_key.id)),
-            );
-            validate_foreign_key_columns(snapshot, child, foreign_key, durable_snapshot)?;
-        }
-        if let Some(greatest_id) = greatest_id
-            && child.next_foreign_key_id <= u32::from(greatest_id)
-        {
-            return Err(foreign_key_validation_error(
-                durable_snapshot,
-                SqlState::InvalidForeignKey,
-                format!(
-                    "table {} next_foreign_key_id {} does not exceed live id {greatest_id}",
-                    child.name, child.next_foreign_key_id
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_foreign_key_columns(
-    snapshot: &CatalogSnapshot,
-    child: &TableSchema,
-    foreign_key: &ForeignKeyConstraint,
-    durable_snapshot: bool,
-) -> Result<()> {
-    if foreign_key.columns.is_empty()
-        || foreign_key.columns.len() != foreign_key.referenced_columns.len()
-    {
-        return Err(foreign_key_validation_error(
-            durable_snapshot,
-            SqlState::InvalidForeignKey,
-            format!(
-                "foreign key {} on table {} must have equal non-empty column lists",
-                foreign_key.name, child.name
-            ),
-        ));
-    }
-    let parent = snapshot
-        .tables_by_id
-        .get(&foreign_key.referenced_table)
-        .ok_or_else(|| {
-            foreign_key_validation_error(
-                durable_snapshot,
-                SqlState::UndefinedTable,
-                format!(
-                    "foreign key {} on table {} references missing table {}",
-                    foreign_key.name, child.name, foreign_key.referenced_table
-                ),
-            )
-        })?;
-    if parent.relation_kind != RelationKind::User {
-        return Err(foreign_key_validation_error(
-            durable_snapshot,
-            SqlState::InvalidForeignKey,
-            format!(
-                "foreign key {} on table {} references non-user table {}",
-                foreign_key.name, child.name, parent.name
-            ),
-        ));
-    }
-    let mut source_seen = HashSet::new();
-    let mut target_seen = HashSet::new();
-    for (source_id, target_id) in foreign_key
-        .columns
-        .iter()
-        .zip(&foreign_key.referenced_columns)
-    {
-        if !source_seen.insert(*source_id) || !target_seen.insert(*target_id) {
-            return Err(foreign_key_validation_error(
-                durable_snapshot,
-                SqlState::InvalidForeignKey,
-                format!(
-                    "foreign key {} on table {} contains duplicate columns",
-                    foreign_key.name, child.name
-                ),
-            ));
-        }
-        let source = child
-            .columns
-            .iter()
-            .find(|column| column.id == *source_id)
-            .ok_or_else(|| {
-                foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::UndefinedColumn,
-                    format!(
-                        "foreign key {} references missing child column {} on table {}",
-                        foreign_key.name, source_id, child.name
-                    ),
-                )
-            })?;
-        let target = parent
-            .columns
-            .iter()
-            .find(|column| column.id == *target_id)
-            .ok_or_else(|| {
-                foreign_key_validation_error(
-                    durable_snapshot,
-                    SqlState::UndefinedColumn,
-                    format!(
-                        "foreign key {} references missing parent column {} on table {}",
-                        foreign_key.name, target_id, parent.name
-                    ),
-                )
-            })?;
-        if source.data_type != target.data_type
-            || source.wire_type() != target.wire_type()
-            || source.max_length != target.max_length
-        {
-            return Err(foreign_key_validation_error(
-                durable_snapshot,
-                SqlState::DatatypeMismatch,
-                format!(
-                    "foreign key {} columns {}.{} and {}.{} have incompatible declared types",
-                    foreign_key.name, child.name, source.name, parent.name, target.name
-                ),
-            ));
-        }
-    }
-    let Some(referenced_index) = snapshot.indexes_by_id.get(&foreign_key.referenced_index) else {
-        return Err(foreign_key_validation_error(
-            durable_snapshot,
-            SqlState::InvalidForeignKey,
-            format!(
-                "foreign key {} references missing constraint index {}",
-                foreign_key.name, foreign_key.referenced_index
-            ),
-        ));
-    };
-    let eligible = referenced_index.table == parent.id
-        && referenced_index.columns == foreign_key.referenced_columns
-        && match referenced_index.constraint {
-            IndexConstraintKind::PrimaryKey => parent.primary_key == referenced_index.columns,
-            IndexConstraintKind::Unique => true,
-            IndexConstraintKind::None => false,
-        };
-    if !eligible {
-        return Err(foreign_key_validation_error(
-            durable_snapshot,
-            SqlState::InvalidForeignKey,
-            format!(
-                "foreign key {} does not reference an eligible declared constraint index",
-                foreign_key.name
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn resolve_foreign_key_constraint_index_in_snapshot(
     snapshot: &CatalogSnapshot,
     parent: TableId,
@@ -3888,7 +3607,7 @@ fn resolve_foreign_key_constraint_index_in_snapshot(
             .values()
             .find(|index| {
                 index.table == parent
-                    && index.constraint == IndexConstraintKind::PrimaryKey
+                    && is_primary_key_constraint_index(snapshot, index)
                     && index.columns == columns
             })
             .map(|index| index.id);
@@ -3898,23 +3617,11 @@ fn resolve_foreign_key_constraint_index_in_snapshot(
         .values()
         .filter(|index| {
             index.table == parent
-                && index.constraint == IndexConstraintKind::Unique
+                && is_unique_constraint_index(snapshot, index)
                 && index.columns == columns
         })
         .min_by_key(|index| index.id)
         .map(|index| index.id)
-}
-
-fn foreign_key_validation_error(
-    durable_snapshot: bool,
-    code: SqlState,
-    message: impl Into<String>,
-) -> DbError {
-    if durable_snapshot {
-        DbError::internal(message)
-    } else {
-        DbError::plan(code, message)
-    }
 }
 
 fn validate_sequences(snapshot: &CatalogSnapshot) -> Result<()> {
@@ -4059,16 +3766,6 @@ fn validate_schema(
             schema.name, schema.next_column_object_id
         )));
     }
-    for check in &schema.checks {
-        if check.data_type != common::DataType::Boolean {
-            return Err(DbError::internal(format!(
-                "catalog snapshot table {} has non-boolean CHECK expression",
-                schema.name
-            )));
-        }
-        validate_stored_expression_references(check, &schema.columns, sequences_by_id)?;
-    }
-
     let mut primary_key_ids = HashSet::new();
     for column_id in &schema.primary_key {
         let Some(column) = schema.columns.iter().find(|column| column.id == *column_id) else {
@@ -4228,14 +3925,6 @@ fn validate_table_virtual_oids(schema: &TableSchema) -> Result<()> {
         )));
     }
 
-    if schema.checks.len() > usize::from(MAX_COMPOUND_OID_SUB_ID) {
-        return Err(DbError::internal(format!(
-            "catalog snapshot table {} has {} CHECK constraints, exceeding compound virtual OID sub-id limit {}",
-            schema.name,
-            schema.checks.len(),
-            MAX_COMPOUND_OID_SUB_ID
-        )));
-    }
     Ok(())
 }
 
@@ -4580,82 +4269,6 @@ fn validate_stored_node(
     Ok(())
 }
 
-fn stored_node_references_column(expression: &StoredExpr, target: common::ColumnObjectId) -> bool {
-    match expression {
-        StoredExpr::Column { column, .. } => *column == target,
-        StoredExpr::Binary { left, right, .. }
-        | StoredExpr::Any {
-            left, array: right, ..
-        } => {
-            stored_node_references_column(left, target)
-                || stored_node_references_column(right, target)
-        }
-        StoredExpr::Unary { expr, .. }
-        | StoredExpr::IsNull { expr, .. }
-        | StoredExpr::IsNotNull { expr, .. }
-        | StoredExpr::Cast { expr, .. } => stored_node_references_column(expr, target),
-        StoredExpr::Function { args, .. } => args
-            .iter()
-            .any(|argument| stored_node_references_column(argument, target)),
-        StoredExpr::Array { elements, .. } => elements
-            .iter()
-            .any(|element| stored_node_references_column(element, target)),
-        StoredExpr::ArraySubscript {
-            array, subscripts, ..
-        } => {
-            stored_node_references_column(array, target)
-                || subscripts
-                    .iter()
-                    .any(|subscript| stored_node_references_column(subscript, target))
-        }
-        StoredExpr::Setval {
-            value, is_called, ..
-        } => {
-            stored_node_references_column(value, target)
-                || is_called
-                    .as_deref()
-                    .is_some_and(|value| stored_node_references_column(value, target))
-        }
-        StoredExpr::InList { expr, list, .. } => {
-            stored_node_references_column(expr, target)
-                || list
-                    .iter()
-                    .any(|item| stored_node_references_column(item, target))
-        }
-        StoredExpr::Between {
-            expr, low, high, ..
-        } => {
-            stored_node_references_column(expr, target)
-                || stored_node_references_column(low, target)
-                || stored_node_references_column(high, target)
-        }
-        StoredExpr::Like { expr, pattern, .. } => {
-            stored_node_references_column(expr, target)
-                || stored_node_references_column(pattern, target)
-        }
-        StoredExpr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-            ..
-        } => {
-            operand
-                .as_deref()
-                .is_some_and(|value| stored_node_references_column(value, target))
-                || when_clauses.iter().any(|(when, then)| {
-                    stored_node_references_column(when, target)
-                        || stored_node_references_column(then, target)
-                })
-                || else_clause
-                    .as_deref()
-                    .is_some_and(|value| stored_node_references_column(value, target))
-        }
-        StoredExpr::Literal { .. } | StoredExpr::Nextval { .. } | StoredExpr::Currval { .. } => {
-            false
-        }
-    }
-}
-
 fn validate_stored_list(
     expressions: &[StoredExpr],
     columns: &[ColumnDef],
@@ -4706,7 +4319,6 @@ fn generate_foreign_key_name_from_snapshot(
     snapshot: &CatalogSnapshot,
     schema: &TableSchema,
     columns: &[ColumnId],
-    pending: &[ForeignKeyConstraint],
 ) -> Result<String> {
     if columns.is_empty() {
         return Err(DbError::plan(
@@ -4739,16 +4351,16 @@ fn generate_foreign_key_name_from_snapshot(
         column_names.push(column.name.as_str());
     }
     let base = format!("{}_{}_fkey", schema.name, column_names.join("_"));
-    let mut names: HashSet<&str> = schema
-        .foreign_keys
-        .iter()
-        .chain(pending)
-        .map(|foreign_key| foreign_key.name.as_str())
+    let mut names: HashSet<&str> = snapshot
+        .constraints_by_id
+        .values()
+        .filter(|constraint| constraint.table == schema.id)
+        .map(|constraint| constraint.name.as_str())
         .collect();
     for index in snapshot
         .indexes_by_id
         .values()
-        .filter(|index| index.table == schema.id && index.constraint != IndexConstraintKind::None)
+        .filter(|index| index.table == schema.id && index.constraint.is_some())
     {
         names.insert(index.name.as_str());
     }
@@ -4863,7 +4475,7 @@ fn replace_table_and_index_schemas(
         }
         candidate.indexes_by_id.insert(index.id, index.clone());
     }
-    normalize_foreign_key_referenced_indexes(&mut candidate)?;
+    reconcile_constraints_and_dependencies(&mut candidate)?;
     validate_snapshot(&candidate)?;
     *snapshot = candidate;
     Ok(())
@@ -5166,28 +4778,11 @@ fn remap_indexes_after_drop(snapshot: &mut CatalogSnapshot, table: TableId, drop
     }
 }
 
-fn remap_foreign_keys_after_drop(schema: &mut TableSchema, dropped: ColumnId) {
-    for foreign_key in &mut schema.foreign_keys {
-        for column_id in &mut foreign_key.columns {
-            if *column_id > dropped {
-                *column_id -= 1;
-            }
-        }
-        if foreign_key.referenced_table == schema.id {
-            for column_id in &mut foreign_key.referenced_columns {
-                if *column_id > dropped {
-                    *column_id -= 1;
-                }
-            }
-        }
-    }
-}
-
 fn reject_duplicate_constraint_name_with_foreign_key(
     snapshot: &CatalogSnapshot,
     index: &IndexSchema,
 ) -> Result<()> {
-    if index.constraint == IndexConstraintKind::None {
+    if index.constraint.is_none() {
         return Ok(());
     }
     let table = snapshot.tables_by_id.get(&index.table).ok_or_else(|| {
@@ -5196,11 +4791,11 @@ fn reject_duplicate_constraint_name_with_foreign_key(
             index.name, index.table
         ))
     })?;
-    if table
-        .foreign_keys
-        .iter()
-        .any(|foreign_key| foreign_key.name == index.name)
-    {
+    if snapshot.constraints_by_id.values().any(|constraint| {
+        Some(constraint.id) != index.constraint
+            && constraint.table == table.id
+            && constraint.name == index.name
+    }) {
         return Err(DbError::plan(
             SqlState::DuplicateObject,
             format!(
@@ -5216,21 +4811,21 @@ fn reject_referenced_unique_index_drop(
     snapshot: &CatalogSnapshot,
     index: &IndexSchema,
 ) -> Result<()> {
-    if index.constraint != IndexConstraintKind::Unique {
+    let Some(constraint_id) = index.constraint else {
         return Ok(());
-    }
-    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| foreign_key.referenced_index == index.id)
-            .map(|foreign_key| (child, foreign_key))
+    };
+    if let Some(foreign_key) = snapshot.constraints_by_id.values().find(|constraint| {
+        matches!(
+            constraint.kind,
+            ConstraintKind::ForeignKey { referenced_constraint, .. }
+                if referenced_constraint == constraint_id
+        )
     }) {
         return Err(DbError::plan(
             SqlState::DependentObjectsStillExist,
             format!(
-                "cannot drop index {} because constraint {} on table {} depends on it",
-                index.name, foreign_key.name, child.name
+                "cannot drop index {} because constraint {} depends on it",
+                index.name, foreign_key.name
             ),
         ));
     }
@@ -5242,8 +4837,7 @@ fn reject_referenced_unique_index_update(
     old: &IndexSchema,
     new: &IndexSchema,
 ) -> Result<()> {
-    if old.constraint != IndexConstraintKind::Unique
-        || (new.constraint == IndexConstraintKind::Unique && new.columns == old.columns)
+    if old.constraint.is_none() || (new.constraint == old.constraint && new.columns == old.columns)
     {
         return Ok(());
     }
@@ -5259,35 +4853,38 @@ fn reject_referenced_primary_key_change(
     if old_primary_key.is_empty() || old_primary_key == new_primary_key {
         return Ok(());
     }
-    if !snapshot.tables_by_id.values().any(|child| {
-        child
-            .foreign_keys
-            .iter()
-            .any(|foreign_key| foreign_key.referenced_table == table)
+    if !snapshot.constraints_by_id.values().any(|constraint| {
+        matches!(
+            constraint.kind,
+            ConstraintKind::ForeignKey { referenced_table, .. } if referenced_table == table
+        )
     }) {
         return Ok(());
     }
     let primary_key_index = snapshot
         .indexes_by_id
         .values()
-        .find(|index| index.table == table && index.constraint == IndexConstraintKind::PrimaryKey);
+        .find(|index| index.table == table && is_primary_key_constraint_index(snapshot, index));
     let Some(primary_key_index) = primary_key_index else {
         return Err(DbError::internal(
             "table has primary-key metadata but no primary-key constraint index",
         ));
     };
-    if let Some((child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        child
-            .foreign_keys
-            .iter()
-            .find(|foreign_key| foreign_key.referenced_index == primary_key_index.id)
-            .map(|foreign_key| (child, foreign_key))
+    let primary_constraint = primary_key_index
+        .constraint
+        .ok_or_else(|| DbError::internal("primary-key index has no owning constraint"))?;
+    if let Some(foreign_key) = snapshot.constraints_by_id.values().find(|constraint| {
+        matches!(
+            constraint.kind,
+            ConstraintKind::ForeignKey { referenced_constraint, .. }
+                if referenced_constraint == primary_constraint
+        )
     }) {
         return Err(DbError::plan(
             SqlState::DependentObjectsStillExist,
             format!(
-                "cannot change primary key because constraint {} on table {} depends on it",
-                foreign_key.name, child.name
+                "cannot change primary key because constraint {} depends on it",
+                foreign_key.name
             ),
         ));
     }
@@ -5341,7 +4938,6 @@ fn build_index_schema(
     table: &TableSchema,
     columns: &[String],
     unique: bool,
-    constraint: IndexConstraintKind,
 ) -> Result<IndexSchema> {
     if columns.is_empty() {
         return Err(DbError::plan(
@@ -5381,10 +4977,219 @@ fn build_index_schema(
         name,
         columns: column_ids,
         unique,
-        constraint,
+        constraint: None,
     };
     validate_index_schema_for_table(&schema, table)?;
     Ok(schema)
+}
+
+fn install_key_constraint(
+    snapshot: &mut CatalogSnapshot,
+    index: &mut IndexSchema,
+    primary: bool,
+) -> Result<()> {
+    if index.constraint.is_some() {
+        return Err(DbError::internal(
+            "new constraint index already carries a constraint id",
+        ));
+    }
+    let table = snapshot.tables_by_id.get(&index.table).ok_or_else(|| {
+        DbError::internal(format!("constraint index {} table is missing", index.name))
+    })?;
+    let columns = index
+        .columns
+        .iter()
+        .map(|column| {
+            table.stable_column_id(*column).ok_or_else(|| {
+                DbError::internal(format!(
+                    "constraint index {} references a missing column",
+                    index.name
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let table_id = table.id;
+    let id = allocate_constraint_id(snapshot)?;
+    let constraint_kind = if primary {
+        ConstraintKind::PrimaryKey {
+            columns,
+            index: index.id,
+        }
+    } else {
+        ConstraintKind::Unique {
+            columns,
+            index: index.id,
+        }
+    };
+    index.constraint = Some(id);
+    snapshot.constraints_by_id.insert(
+        id,
+        ConstraintSchema {
+            id,
+            table: table_id,
+            name: index.name.clone(),
+            kind: constraint_kind,
+            deferrable: false,
+            initially_deferred: false,
+            validated: true,
+        },
+    );
+    Ok(())
+}
+
+fn create_key_constraint_index(
+    catalog: &MemoryCatalog,
+    schema_id: SchemaId,
+    name: String,
+    table: TableId,
+    columns: &[String],
+    primary: bool,
+) -> Result<IndexSchema> {
+    let mut guard = catalog.write_snapshot()?;
+    let mut snapshot = guard.clone();
+    require_schema(&snapshot, schema_id, "index", &name)?;
+    let index_id = snapshot.next_index_id;
+    let storage_id = snapshot.next_storage_id;
+    let mut index = {
+        let table_schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+        if table_schema.schema_id != schema_id {
+            return Err(DbError::plan(
+                SqlState::InvalidSchemaName,
+                "index and table must be in the same schema",
+            ));
+        }
+        let mut index =
+            build_index_schema(index_id, storage_id, name, table_schema, columns, true)?;
+        index.schema_id = schema_id;
+        index
+    };
+    validate_index_schema(&index, &snapshot.tables_by_id)?;
+    install_key_constraint(&mut snapshot, &mut index, primary)?;
+    reject_duplicate_index_name_for_schema(&snapshot, &index)?;
+    reject_duplicate_primary_key_constraint_index(&snapshot, &index)?;
+    reject_duplicate_constraint_name_with_foreign_key(&snapshot, &index)?;
+    snapshot.next_index_id = index_id
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog index id overflow"))?;
+    snapshot.next_storage_id = next_storage_id_after(storage_id, "catalog storage id overflow")?;
+    if schema_id == PUBLIC_SCHEMA_ID {
+        snapshot
+            .indexes_by_name
+            .insert(index.name.clone(), index.id);
+    }
+    snapshot.indexes_by_id.insert(index.id, index.clone());
+    reconcile_constraints_and_dependencies(&mut snapshot)?;
+    validate_constraints_and_dependencies(&snapshot)?;
+    *guard = snapshot;
+    Ok(index)
+}
+
+fn install_check_constraints(
+    snapshot: &mut CatalogSnapshot,
+    table: TableId,
+    checks: &[StoredExpression],
+) -> Result<()> {
+    let table_name = snapshot
+        .tables_by_id
+        .get(&table)
+        .map(|schema| schema.name.clone())
+        .ok_or_else(|| DbError::internal("CHECK constraint table is missing"))?;
+    for (position, expression) in checks.iter().enumerate() {
+        let id = allocate_constraint_id(snapshot)?;
+        let name = if position == 0 {
+            format!("{table_name}_check")
+        } else {
+            format!("{table_name}_check_{}", position + 1)
+        };
+        snapshot.constraints_by_id.insert(
+            id,
+            ConstraintSchema {
+                id,
+                table,
+                name,
+                kind: ConstraintKind::Check {
+                    expression: expression.clone(),
+                },
+                deferrable: false,
+                initially_deferred: false,
+                validated: true,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn stable_column_ids(
+    table: &TableSchema,
+    columns: &[ColumnId],
+) -> Result<Vec<common::ColumnObjectId>> {
+    columns
+        .iter()
+        .map(|column| {
+            table.stable_column_id(*column).ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!(
+                        "constraint references missing column {column} on table {}",
+                        table.name
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn allocate_constraint_id(snapshot: &mut CatalogSnapshot) -> Result<common::ConstraintId> {
+    let id = snapshot.next_constraint_id;
+    crate::system::constraint_oid(id)?;
+    snapshot.next_constraint_id = id
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog constraint id allocator overflow"))?;
+    Ok(id)
+}
+
+fn reject_stable_column_dependents(
+    snapshot: &CatalogSnapshot,
+    relation: TableId,
+    column: common::ColumnObjectId,
+    operation: &str,
+) -> Result<()> {
+    let target = common::CatalogObjectId::Column { relation, column };
+    let dependencies = build_dependencies(snapshot)?;
+    if let Some(dependency) = dependencies.iter().find(|edge| {
+        edge.referenced == target
+            && !(operation == "alter type"
+                && matches!(edge.dependent, common::CatalogObjectId::Index(_)))
+            && matches!(
+                edge.dependency_type,
+                common::DependencyType::Normal | common::DependencyType::Internal
+            )
+    }) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot {operation} column because {:?} depends on it",
+                dependency.dependent
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn find_supporting_index(
+    snapshot: &CatalogSnapshot,
+    table: TableId,
+    columns: &[ColumnId],
+) -> Option<IndexId> {
+    snapshot
+        .indexes_by_id
+        .values()
+        .filter(|index| index.table == table && index.columns == columns)
+        .min_by_key(|index| index.id)
+        .map(|index| index.id)
 }
 
 fn drop_table_batch_from_snapshot(
@@ -5453,30 +5258,21 @@ fn validate_drop_table_dependencies(
         reject_dependent_views(snapshot, *table, None)?;
     }
 
-    if let Some((parent, child, foreign_key)) = snapshot.tables_by_id.values().find_map(|child| {
-        child.foreign_keys.iter().find_map(|foreign_key| {
-            if targets.contains(&foreign_key.referenced_table) && !targets.contains(&child.id) {
-                snapshot
-                    .tables_by_id
-                    .get(&foreign_key.referenced_table)
-                    .map(|parent| (parent, child, foreign_key))
-            } else {
-                None
-            }
-        })
-    }) {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot drop table {} because constraint {} on table {} depends on it",
-                parent.name, foreign_key.name, child.name
-            ),
-        ));
-    }
+    let mut candidate = snapshot.clone();
+    reconcile_constraints_and_dependencies(&mut candidate)?;
+    dependency_drop_closure(
+        &candidate,
+        targets.into_iter().map(common::CatalogObjectId::Table),
+    )?;
     Ok(())
 }
 
 fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId]) -> Result<()> {
+    reconcile_constraints_and_dependencies(snapshot)?;
+    let closure = dependency_drop_closure(
+        snapshot,
+        tables.iter().copied().map(common::CatalogObjectId::Table),
+    )?;
     for table in tables {
         let schema = snapshot
             .tables_by_id
@@ -5501,9 +5297,38 @@ fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId])
                 snapshot.tables_by_name.remove(&removed.name);
             }
             drop_indexes_for_table(snapshot, table_id);
+            snapshot
+                .constraints_by_id
+                .retain(|_, constraint| constraint.table != table_id);
             snapshot.statistics.remove(&table_id);
         }
     }
+    for object in closure {
+        match object {
+            common::CatalogObjectId::Constraint(id) => {
+                snapshot.constraints_by_id.remove(&id);
+            }
+            common::CatalogObjectId::Index(id) => {
+                if let Some(index) = snapshot.indexes_by_id.remove(&id)
+                    && index.schema_id == PUBLIC_SCHEMA_ID
+                {
+                    snapshot.indexes_by_name.remove(&index.name);
+                }
+            }
+            common::CatalogObjectId::Sequence(id) => {
+                if let Some(sequence) = snapshot.sequences_by_id.remove(&id)
+                    && sequence.schema_id == PUBLIC_SCHEMA_ID
+                {
+                    snapshot.sequences_by_name.remove(&sequence.name);
+                }
+            }
+            common::CatalogObjectId::Statistics(id) => {
+                snapshot.statistics.remove(&id);
+            }
+            _ => {}
+        }
+    }
+    reconcile_constraints_and_dependencies(snapshot)?;
     Ok(())
 }
 
@@ -5550,7 +5375,7 @@ fn is_matching_primary_key_constraint_index(
     snapshot: &CatalogSnapshot,
     schema: &IndexSchema,
 ) -> bool {
-    if schema.constraint != IndexConstraintKind::PrimaryKey || !schema.unique {
+    if !is_primary_key_constraint_index(snapshot, schema) || !schema.unique {
         return false;
     }
     snapshot
@@ -5685,13 +5510,13 @@ fn reject_duplicate_primary_key_constraint_index(
     snapshot: &CatalogSnapshot,
     schema: &IndexSchema,
 ) -> Result<()> {
-    if schema.constraint != IndexConstraintKind::PrimaryKey {
+    if !is_primary_key_constraint_index(snapshot, schema) {
         return Ok(());
     }
     if let Some(existing) = snapshot.indexes_by_id.values().find(|index| {
         index.id != schema.id
             && index.table == schema.table
-            && index.constraint == IndexConstraintKind::PrimaryKey
+            && is_primary_key_constraint_index(snapshot, index)
     }) {
         let table = snapshot
             .tables_by_id
@@ -5704,6 +5529,30 @@ fn reject_duplicate_primary_key_constraint_index(
         )));
     }
     Ok(())
+}
+
+fn index_constraint_kind<'a>(
+    snapshot: &'a CatalogSnapshot,
+    index: &IndexSchema,
+) -> Option<&'a ConstraintKind> {
+    snapshot
+        .constraints_by_id
+        .get(&index.constraint?)
+        .map(|constraint| &constraint.kind)
+}
+
+fn is_primary_key_constraint_index(snapshot: &CatalogSnapshot, index: &IndexSchema) -> bool {
+    matches!(
+        index_constraint_kind(snapshot, index),
+        Some(ConstraintKind::PrimaryKey { index: backing, .. }) if *backing == index.id
+    )
+}
+
+fn is_unique_constraint_index(snapshot: &CatalogSnapshot, index: &IndexSchema) -> bool {
+    matches!(
+        index_constraint_kind(snapshot, index),
+        Some(ConstraintKind::Unique { index: backing, .. }) if *backing == index.id
+    )
 }
 
 #[cfg(test)]

@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![Row {
-                values: vec![Value::Integer(7)],
+                values: vec![Value::Integer(15)],
             }]
         );
 
@@ -934,20 +934,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            vec![
-                Row {
-                    values: vec![
-                        Value::Text("constraint_probe_serial_id_seq".to_string()),
-                        Value::Text("a".to_string()),
-                    ],
-                },
-                Row {
-                    values: vec![
-                        Value::Text("explicit_seq".to_string()),
-                        Value::Text("n".to_string()),
-                    ],
-                },
-            ]
+            vec![Row {
+                values: vec![
+                    Value::Text("constraint_probe_serial_id_seq".to_string()),
+                    Value::Text("a".to_string()),
+                ],
+            }]
         );
 
         let rows = harness
@@ -1203,29 +1195,22 @@ mod tests {
                 catalog::SystemView::PgConstraint.relation_oid()
             ))
             .unwrap();
-        assert_eq!(rows.len(), 14);
+        assert_eq!(rows.len(), 12);
         assert_eq!(
             rows,
             vec![
                 dependency_row("child_parent_pk", "fk_catalog_child", 0, "a"),
-                dependency_row("child_parent_pk", "fk_catalog_child", 2, "a"),
-                dependency_row("child_parent_pk", "fk_catalog_child", 3, "a"),
+                dependency_row("child_parent_pk", "fk_catalog_child", 2, "n"),
+                dependency_row("child_parent_pk", "fk_catalog_child", 3, "n"),
                 dependency_row("child_parent_pk", "fk_catalog_parent", 0, "n"),
                 dependency_row("child_parent_pk", "fk_catalog_parent", 2, "n"),
                 dependency_row("child_parent_pk", "fk_catalog_parent", 3, "n"),
-                dependency_row("child_parent_pk", "fk_catalog_parent_pkey", 0, "n"),
                 dependency_row("child_parent_unique", "fk_catalog_child", 0, "a"),
-                dependency_row("child_parent_unique", "fk_catalog_child", 4, "a"),
-                dependency_row("child_parent_unique", "fk_catalog_child", 5, "a"),
+                dependency_row("child_parent_unique", "fk_catalog_child", 4, "n"),
+                dependency_row("child_parent_unique", "fk_catalog_child", 5, "n"),
                 dependency_row("child_parent_unique", "fk_catalog_parent", 0, "n"),
                 dependency_row("child_parent_unique", "fk_catalog_parent", 4, "n"),
                 dependency_row("child_parent_unique", "fk_catalog_parent", 5, "n"),
-                dependency_row(
-                    "child_parent_unique",
-                    "fk_catalog_parent_region_slug_key",
-                    0,
-                    "n",
-                ),
             ]
         );
     }
@@ -1666,9 +1651,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
 
@@ -1728,9 +1710,6 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            next_foreign_key_id: 0,
             next_column_object_id: u32::MAX,
         };
 
