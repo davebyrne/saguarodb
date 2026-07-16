@@ -1062,16 +1062,18 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
         server
-            .simple_query("create table users (id integer primary key, name text, code integer)")
+            .simple_query(
+                "create table users (id integer primary key, name text, code integer, marker integer)",
+            )
             .await
             .unwrap();
         server
-            .simple_query("create index users_code on users (code)")
+            .simple_query("create index users_marker on users (marker)")
             .await
             .unwrap();
         server
             .simple_query(
-                "insert into users (id, name, code) values (1, 'Ada', 10), (2, 'Grace', 20)",
+                "insert into users (id, name, code, marker) values (1, 'Ada', 10, 100), (2, 'Grace', 20, 200)",
             )
             .await
             .unwrap();
@@ -1092,7 +1094,17 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
             .await
             .unwrap();
         server
-            .simple_query("insert into users (id, code, enabled) values (3, '30', false)")
+            .simple_query(
+                "insert into users (id, code, marker, enabled) values (3, '30', 300, false)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("create table serial_cleanup (kept integer, doomed serial)")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table serial_cleanup drop column doomed")
             .await
             .unwrap();
     }
@@ -1138,11 +1150,17 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
     );
     assert_eq!(
         server
-            .simple_query("select id from users where code = '20'")
+            .simple_query("select id from users where marker = 200")
             .await
             .unwrap()
             .unwrap_rows(),
         vec![vec![Some("2".to_string())]]
+    );
+    assert!(
+        server
+            .simple_query("select nextval('serial_cleanup_doomed_seq')")
+            .await
+            .is_err()
     );
 }
 

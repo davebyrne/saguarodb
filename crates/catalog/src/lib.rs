@@ -2219,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_owned_sequence_default_column_is_rejected() {
+    fn dropping_owned_sequence_default_column_removes_the_sequence() {
         let catalog = MemoryCatalog::empty();
         catalog
             .create_sequence(
@@ -2244,21 +2244,45 @@ mod tests {
                         pg_type: Some(PgType::Int8),
                     },
                 ],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
 
-        let err = catalog
-            .drop_table_column(table.id, "serial_col")
-            .unwrap_err();
-
-        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        catalog.drop_table_column(table.id, "serial_col").unwrap();
         assert!(
             catalog
                 .get_sequence_by_name("serial_col_seq")
                 .unwrap()
-                .is_some()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn alter_type_blocks_only_an_exact_index_dependency() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .create_index(
+                "users_name_idx".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .preflight_alter_table_column_type(users.id, "name", &PgType::Int8)
+                .unwrap_err()
+                .code,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            catalog
+                .preflight_alter_table_column_type(users.id, "id", &PgType::Text)
+                .unwrap(),
+            crate::TableColumnAlteration::Rewrite
         );
     }
 

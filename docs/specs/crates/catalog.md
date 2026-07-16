@@ -533,7 +533,7 @@ complete removal atomically. The statement's single `CatalogChange` contains
 every table, index, hidden relation, and owned-sequence removal, so recovery
 validates and applies the complete committed result atomically.
 
-Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `add_table_column` assigns both the next dense `ColumnId` and the table's next never-reused `ColumnObjectId`. `drop_table_column` may renumber dense ordinals but preserves every surviving stable ID; a CHECK blocks the drop only when its typed tree references the target stable column. Existing index, FK, view, primary-key, and owned-sequence restrictions remain. Table and column renames change names without rewriting stored CHECK/default IR. Public changes increment `schema_version`, and preflight is repeated under the publication and relation locks.
+Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `add_table_column` assigns both the next dense `ColumnId` and the table's next never-reused `ColumnObjectId`. `drop_table_column` may renumber dense ordinals but preserves every surviving stable ID; exact stable-column dependency edges from CHECK, index, FK, view, primary-key, and UNIQUE objects block only the referenced column's drop. The dropped column's default and Auto-owned sequence are removed with it. Table and column renames change names without rewriting stored CHECK/default IR. Public changes increment `schema_version`, and preflight is repeated under the publication and relation locks.
 
 `create_view` assigns dense and stable output-column identities. A `replace_view` position preserves its `ColumnObjectId` only when its name, logical type, nullability, length, and PostgreSQL type metadata remain compatible. Incompatible or newly permitted output positions allocate monotonically, and removed IDs are never reused. The relation ID/name and diagnostic definition search path remain unchanged. Dependencies come from exact stable references in resolved query IR; wildcard expansion therefore does not depend on later-added columns, unused CTE definitions add no dependency, and referenced views are inlined before persistence.
 
@@ -641,9 +641,13 @@ metadata-only and keep existing storage
 ids. Table and column renames preserve view behavior because stored queries use
 stable relation/column identities; canonical SQL may remain textually unchanged.
 Renames likewise allow stored CHECK constraints because typed stable-column
-references, rather than canonical SQL, are execution authority. A column drop is blocked only by CHECKs
-that reference that stable column. Dropping a column also rejects primary-key,
-indexed, view-dependent, and owned-sequence-default columns.
+references, rather than canonical SQL, are execution authority. A column drop
+is blocked only by Normal/Internal dependents that reference that exact stable
+column. The graph therefore rejects exact CHECK, primary-key, unique, index,
+foreign-key, and view dependencies while allowing dependencies on other
+columns. The dropped column's default is removed with it, and an owned sequence
+follows its Auto edge into the drop closure; unrelated sequences and defaults
+remain intact.
 
 ## Create Table Rules
 
@@ -829,9 +833,11 @@ Recovery apply methods must update catalog state consistently with storage state
   SaguaroDB exposes no user-visible `CASCADE` mode.
 
 `preflight_alter_table_column_type` returns a no-op for an identical `PgType` and
-rejects dependencies that cannot safely be rebound. `alter_table_column_type`
-preserves the column ID while replacing its logical/wire type and converted
-default; the executor assigns fresh table, TOAST, and index storage generations.
+rejects CHECK, view, index, PK/UNIQUE, FK, and stored-expression dependencies on
+the exact stable column while ignoring dependencies on other columns.
+`alter_table_column_type` preserves the column ID while replacing its
+logical/wire type and converted default; the executor assigns fresh table,
+TOAST, and index storage generations.
 
 ## Acceptance Tests
 

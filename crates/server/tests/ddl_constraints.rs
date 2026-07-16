@@ -1471,11 +1471,20 @@ async fn alter_column_type_rewrites_rows_and_indexes_transactionally() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
 
-    conn.ok("create table typed (id integer primary key, value integer)")
+    conn.ok("create table typed (id integer primary key, value integer, marker integer)")
         .await;
-    conn.ok("create index typed_value_idx on typed (value)")
+    assert!(
+        conn.ok("create index typed_marker_idx on typed (marker)")
+            .await
+            .result
+            .is_ok()
+    );
+    conn.ok("insert into typed values (1, 42, 7), (2, null, 8)")
         .await;
-    conn.ok("insert into typed values (1, 42), (2, null)").await;
+    let indexed = conn
+        .ok("alter table typed alter column marker type text")
+        .await;
+    assert!(indexed.result.is_err());
     conn.ok("begin").await;
     conn.ok("alter table typed alter column value type text")
         .await;
@@ -1496,10 +1505,113 @@ async fn alter_column_type_rewrites_rows_and_indexes_transactionally() {
     conn.ok("alter table typed alter value set data type text")
         .await;
     assert_eq!(
-        conn.ok("select id from typed where value = '42'")
+        conn.ok("select id from typed where value = '42' and marker = 7")
             .await
             .rows(),
         vec![vec![Some("1".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn drop_column_uses_exact_stable_dependencies_and_removes_owned_children() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table evolution_parent (id integer primary key)")
+        .await;
+    conn.ok(
+        "create table evolution (obsolete integer default 9, id integer primary key, checked integer check (checked > 0), indexed integer, viewed integer, parent_id integer references evolution_parent(id), mutable integer)",
+    )
+    .await;
+    conn.ok("create index evolution_indexed_idx on evolution (indexed)")
+        .await;
+    conn.ok("create view evolution_view as select viewed from evolution")
+        .await;
+    conn.ok("insert into evolution_parent values (1)").await;
+    conn.ok(
+        "insert into evolution (id, checked, indexed, viewed, parent_id, mutable) values (1, 2, 3, 4, 1, 5)",
+    )
+    .await;
+
+    assert!(
+        conn.ok("alter table evolution drop column obsolete")
+            .await
+            .result
+            .is_ok()
+    );
+    assert_eq!(
+        conn.ok("select id, checked, indexed, viewed, parent_id, mutable from evolution")
+            .await
+            .rows(),
+        vec![vec![
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("3".to_string()),
+            Some("4".to_string()),
+            Some("1".to_string()),
+            Some("5".to_string()),
+        ]]
+    );
+    assert_eq!(
+        conn.ok("select * from evolution_view").await.rows(),
+        vec![vec![Some("4".to_string())]]
+    );
+    for column in ["id", "checked", "indexed", "viewed", "parent_id"] {
+        let outcome = conn
+            .ok(&format!("alter table evolution drop column {column}"))
+            .await;
+        let error = outcome
+            .result
+            .err()
+            .expect("dependent column drop should fail");
+        assert!(
+            error.message.contains("2BP01"),
+            "dependency should block dropping {column}: {}",
+            error.message
+        );
+    }
+    assert!(
+        conn.ok("alter table evolution alter column mutable type text")
+            .await
+            .result
+            .is_ok()
+    );
+    for column in ["id", "checked", "indexed", "viewed", "parent_id"] {
+        let outcome = conn
+            .ok(&format!(
+                "alter table evolution alter column {column} type text"
+            ))
+            .await;
+        let error = outcome
+            .result
+            .err()
+            .expect("dependent column type change should fail");
+        assert!(
+            error.message.contains("2BP01"),
+            "dependency should block altering {column}: {}",
+            error.message
+        );
+    }
+
+    conn.ok("create table serial_drop (kept integer, doomed serial)")
+        .await;
+    conn.ok("alter table serial_drop drop column doomed").await;
+    assert!(
+        conn.ok("select nextval('serial_drop_doomed_seq')")
+            .await
+            .result
+            .is_err()
+    );
+    conn.ok("create sequence retained_sequence").await;
+    conn.ok("create table retained_default (kept integer, doomed integer default nextval('retained_sequence'))")
+        .await;
+    conn.ok("alter table retained_default drop column doomed")
+        .await;
+    assert!(
+        conn.ok("select nextval('retained_sequence')")
+            .await
+            .result
+            .is_ok()
     );
 }
 

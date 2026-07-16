@@ -404,6 +404,11 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 - `DROP TABLE t` cascade-drops its owned sequences: for each column of `t` whose
   default is `ColumnDefault::Nextval(s)` with `catalog.sequence(s).owned`, include
   the sequence removal with the table removal in the same catalog change.
+- `DROP COLUMN` follows the same Auto ownership edge for that column, removing
+  its owned sequence in the same catalog change and physical transaction. It
+  takes the owned sequence's exclusive object lock before catalog or storage
+  removal. A user-owned sequence referenced by an ordinary `nextval` default
+  survives when the column and its default are removed.
 - `DROP SEQUENCE s` where `s.owned` → dependency error. To name the owning table
   the catalog scans tables for the column whose default is `Nextval(s)` (rare op;
   a linear scan is fine). `IF EXISTS` suppresses the not-found case, not this one.
@@ -459,8 +464,8 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   through the write path and is durable; transactional commit, rollback, and
   savepoint behavior for `CREATE`/`DROP SEQUENCE`; end-to-end SERIAL insert and id read-back via
   `INSERT ... RETURNING id` (primary idiom) and `currval`; `DROP TABLE`
-  cascade-dropping the owned sequence; `DROP SEQUENCE` of an owned sequence
-  erroring.
+  and `DROP COLUMN` cascade-dropping the owned sequence; `DROP SEQUENCE` of an
+  owned sequence erroring.
 - **interactions (§12)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
   still consumes a sequence value (observable gap); `excluded.<serial_col>` sees
   the `nextval`-filled value; a `SERIALIZABLE` transaction that calls `nextval`

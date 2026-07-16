@@ -2,20 +2,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, ConstraintId, ConstraintKind,
-    ConstraintSchema, DataType, DbError, DependencyEdge, FIRST_USER_SCHEMA_ID, FileId, IndexId,
-    IndexSchema, NamespaceSchema, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef,
-    ParsedDefault, PgType, RelationKind, Result, SchemaId, SequenceId, SequenceOptions,
-    SequenceSchema, SqlState, StoredExpr, StoredExpression, StoredQueryV1, TableId, TableSchema,
-    TableStatistics, ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
-    ViewSchema, needs_toast_relation, toast_schema,
+    CatalogObjectId, ColumnDef, ColumnDefault, ColumnId, CompressionSetting, ConstraintId,
+    ConstraintKind, ConstraintSchema, DataType, DbError, DependencyEdge, FIRST_USER_SCHEMA_ID,
+    FileId, IndexId, IndexSchema, NamespaceSchema, PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID,
+    ParsedColumnDef, ParsedDefault, PgType, RelationKind, Result, SchemaId, SequenceId,
+    SequenceOptions, SequenceSchema, SqlState, StoredExpr, StoredExpression, StoredQueryV1,
+    TableId, TableSchema, TableStatistics, ToastMode, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan, ViewColumn, ViewSchema, needs_toast_relation, toast_schema,
 };
 
 use crate::{
     CatalogAllocatorState, CatalogManager, ResolvedForeignKey, TableColumnAlteration,
     dependencies::{
-        build_dependencies, dependency_drop_closure, reconcile_constraints_and_dependencies,
-        validate_constraints_and_dependencies,
+        dependency_drop_closure, dependency_drop_closure_for_column,
+        reconcile_constraints_and_dependencies, validate_constraints_and_dependencies,
     },
     system::{MAX_COMPOUND_OID_SUB_ID, MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
 };
@@ -946,6 +946,7 @@ impl CatalogManager for MemoryCatalog {
         let DropColumnValidation::Rewrite {
             position,
             column_id,
+            closure,
         } = validate_drop_table_column(&snapshot, &schema, column, false)?
         else {
             return Err(DbError::internal(
@@ -953,11 +954,14 @@ impl CatalogManager for MemoryCatalog {
             ));
         };
 
+        let mut candidate = snapshot.clone();
         schema.columns.remove(position);
         remap_columns_after_drop(&mut schema, column_id);
-        remap_indexes_after_drop(&mut snapshot, id, column_id);
+        remap_indexes_after_drop(&mut candidate, id, column_id);
+        remove_dependency_closure_objects(&mut candidate, closure);
         bump_schema_version(&mut schema.schema_version)?;
-        replace_table_schema(&mut snapshot, schema.clone())?;
+        replace_table_schema(&mut candidate, schema.clone())?;
+        *snapshot = candidate;
         Ok(schema)
     }
 
@@ -1657,7 +1661,8 @@ impl CatalogManager for MemoryCatalog {
         columns: &[String],
         unique: bool,
     ) -> Result<IndexSchema> {
-        let mut snapshot = self.write_snapshot()?;
+        let mut guard = self.write_snapshot()?;
+        let mut snapshot = guard.clone();
         require_schema(&snapshot, schema_id, "index", &name)?;
 
         let index_id = snapshot.next_index_id;
@@ -1696,6 +1701,9 @@ impl CatalogManager for MemoryCatalog {
         snapshot.indexes_by_id.insert(schema.id, schema.clone());
         snapshot.next_index_id = next_index_id;
         snapshot.next_storage_id = next_storage_id;
+        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        validate_constraints_and_dependencies(&snapshot)?;
+        *guard = snapshot;
         Ok(schema)
     }
 
@@ -1899,7 +1907,7 @@ impl CatalogManager for MemoryCatalog {
 
     fn apply_drop_view(&self, id: TableId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        reject_dependent_views(&snapshot, id, Some(id))?;
+        dependency_drop_closure(&snapshot, [CatalogObjectId::View(id)])?;
         let schema = snapshot
             .views_by_id
             .remove(&id)
@@ -2749,7 +2757,7 @@ fn validate_alter_column_type(
     if target.wire_type() == *pg_type {
         return Ok(TableColumnAlteration::Noop);
     }
-    reject_stable_column_dependents(snapshot, schema.id, target.object_id, "alter type")?;
+    reject_alter_type_dependents(snapshot, schema.id, target.object_id)?;
     if matches!(target.default, Some(ColumnDefault::Expr(_))) {
         return Err(DbError::plan(
             SqlState::DependentObjectsStillExist,
@@ -2772,6 +2780,7 @@ enum DropColumnValidation {
     Rewrite {
         position: usize,
         column_id: ColumnId,
+        closure: BTreeSet<CatalogObjectId>,
     },
 }
 
@@ -2796,19 +2805,12 @@ fn validate_drop_table_column(
         ));
     };
     let column_id = schema.columns[position].id;
-    if schema.primary_key.contains(&column_id) {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!("cannot drop primary key column {column}"),
-        ));
-    }
     let column_object_id = schema.columns[position].object_id;
-    reject_stable_column_dependents(snapshot, schema.id, column_object_id, "drop")?;
-    reject_index_dependency(snapshot, schema.id, column_id, "drop")?;
-    reject_owned_sequence_default_drop(snapshot, &schema.columns[position])?;
+    let closure = dependency_drop_closure_for_column(snapshot, schema.id, column_object_id)?;
     Ok(DropColumnValidation::Rewrite {
         position,
         column_id,
+        closure,
     })
 }
 
@@ -4492,74 +4494,6 @@ fn bump_schema_version(version: &mut u64) -> Result<()> {
     Ok(())
 }
 
-fn reject_dependent_views(
-    snapshot: &CatalogSnapshot,
-    relation: TableId,
-    excluding_view: Option<TableId>,
-) -> Result<()> {
-    for view in snapshot.views_by_id.values() {
-        if Some(view.id) == excluding_view {
-            continue;
-        }
-        let dependent = common::CatalogObjectId::View(view.id);
-        if snapshot.dependencies.iter().any(|edge| edge.dependent == dependent && matches!(edge.referenced, common::CatalogObjectId::Table(id) | common::CatalogObjectId::View(id) if id == relation)) {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot drop relation {relation} because view {} depends on it",
-                    view.name
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn reject_owned_sequence_default_drop(
-    snapshot: &CatalogSnapshot,
-    column: &ColumnDef,
-) -> Result<()> {
-    let Some(ColumnDefault::Nextval(sequence_id)) = column.default.as_ref() else {
-        return Ok(());
-    };
-    let sequence = snapshot.sequences_by_id.get(sequence_id).ok_or_else(|| {
-        DbError::internal(format!(
-            "column {} references missing sequence {sequence_id}",
-            column.name
-        ))
-    })?;
-    if sequence.owned {
-        return Err(DbError::plan(
-            SqlState::DependentObjectsStillExist,
-            format!(
-                "cannot drop column {} because it owns sequence {}",
-                column.name, sequence.name
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn reject_index_dependency(
-    snapshot: &CatalogSnapshot,
-    table: TableId,
-    column: ColumnId,
-    action: &str,
-) -> Result<()> {
-    for index in snapshot.indexes_by_id.values() {
-        if index.table == table && index.columns.contains(&column) {
-            return Err(DbError::plan(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot {action} column {column} because index {} depends on it",
-                    index.name
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Preserves a table's optimizer statistics across a schema replacement only
 /// when every prior column is unchanged — same id, name, and type, i.e. a pure
 /// ADD COLUMN or a metadata-only update. Column ids are dense and shift on
@@ -5017,18 +4951,15 @@ fn allocate_constraint_id(snapshot: &mut CatalogSnapshot) -> Result<common::Cons
     Ok(id)
 }
 
-fn reject_stable_column_dependents(
+fn reject_alter_type_dependents(
     snapshot: &CatalogSnapshot,
     relation: TableId,
     column: common::ColumnObjectId,
-    operation: &str,
 ) -> Result<()> {
-    let target = common::CatalogObjectId::Column { relation, column };
-    let dependencies = build_dependencies(snapshot)?;
-    if let Some(dependency) = dependencies.iter().find(|edge| {
+    let target = CatalogObjectId::Column { relation, column };
+    if let Some(dependency) = snapshot.dependencies.iter().find(|edge| {
         edge.referenced == target
-            && !(operation == "alter type"
-                && matches!(edge.dependent, common::CatalogObjectId::Index(_)))
+            && edge.dependent != (CatalogObjectId::ColumnDefault { relation, column })
             && matches!(
                 edge.dependency_type,
                 common::DependencyType::Normal | common::DependencyType::Internal
@@ -5037,7 +4968,7 @@ fn reject_stable_column_dependents(
         return Err(DbError::plan(
             SqlState::DependentObjectsStillExist,
             format!(
-                "cannot {operation} column because {:?} depends on it",
+                "cannot alter type of column because {:?} depends on it",
                 dependency.dependent
             ),
         ));
@@ -5121,7 +5052,6 @@ fn validate_drop_table_dependencies(
                 )));
             }
         }
-        reject_dependent_views(snapshot, *table, None)?;
     }
 
     let mut candidate = snapshot.clone();
@@ -5162,54 +5092,40 @@ fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId])
             {
                 snapshot.tables_by_name.remove(&removed.name);
             }
-            drop_indexes_for_table(snapshot, table_id);
-            snapshot
-                .constraints_by_id
-                .retain(|_, constraint| constraint.table != table_id);
-            snapshot.statistics.remove(&table_id);
         }
     }
+    remove_dependency_closure_objects(snapshot, closure);
+    reconcile_constraints_and_dependencies(snapshot)?;
+    Ok(())
+}
+
+fn remove_dependency_closure_objects(
+    snapshot: &mut CatalogSnapshot,
+    closure: BTreeSet<CatalogObjectId>,
+) {
     for object in closure {
         match object {
-            common::CatalogObjectId::Constraint(id) => {
+            CatalogObjectId::Constraint(id) => {
                 snapshot.constraints_by_id.remove(&id);
             }
-            common::CatalogObjectId::Index(id) => {
+            CatalogObjectId::Index(id) => {
                 if let Some(index) = snapshot.indexes_by_id.remove(&id)
                     && index.schema_id == PUBLIC_SCHEMA_ID
                 {
                     snapshot.indexes_by_name.remove(&index.name);
                 }
             }
-            common::CatalogObjectId::Sequence(id) => {
+            CatalogObjectId::Sequence(id) => {
                 if let Some(sequence) = snapshot.sequences_by_id.remove(&id)
                     && sequence.schema_id == PUBLIC_SCHEMA_ID
                 {
                     snapshot.sequences_by_name.remove(&sequence.name);
                 }
             }
-            common::CatalogObjectId::Statistics(id) => {
+            CatalogObjectId::Statistics(id) => {
                 snapshot.statistics.remove(&id);
             }
             _ => {}
-        }
-    }
-    reconcile_constraints_and_dependencies(snapshot)?;
-    Ok(())
-}
-
-fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {
-    let dropped: Vec<IndexId> = snapshot
-        .indexes_by_id
-        .iter()
-        .filter(|(_, schema)| schema.table == table)
-        .map(|(id, _)| *id)
-        .collect();
-    for id in dropped {
-        if let Some(schema) = snapshot.indexes_by_id.remove(&id)
-            && schema.schema_id == PUBLIC_SCHEMA_ID
-        {
-            snapshot.indexes_by_name.remove(&schema.name);
         }
     }
 }

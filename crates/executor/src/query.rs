@@ -2543,6 +2543,13 @@ fn execute_alter_table_drop_column(
         .iter()
         .position(|existing| existing.name == column)
         .ok_or_else(|| DbError::internal("preflight accepted a missing dropped column"))?;
+    let owned_sequence = match old_schema.columns[position].default.as_ref() {
+        Some(ColumnDefault::Nextval(sequence)) => ctx
+            .catalog
+            .get_sequence(*sequence)?
+            .filter(|schema| schema.owned),
+        _ => None,
+    };
 
     let old_relations = ctx.relations.clone();
     let rewrite = mutate_catalog(ctx, || {
@@ -2550,6 +2557,9 @@ fn execute_alter_table_drop_column(
         apply_rewrite_storage_ids(ctx, dropped.id)
     })?;
     let schema = rewrite.table;
+    if let Some(sequence) = owned_sequence {
+        ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
+    }
     if let Some(toast_schema) = rewrite.toast_table.as_ref() {
         ctx.schema_ops
             .update_table_schema(&ctx.statement, toast_schema, &[])?;

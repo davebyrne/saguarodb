@@ -161,6 +161,36 @@ async fn sequence_drop_waits_for_transaction_owned_sequence_access() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_serial_column_waits_for_transaction_owned_sequence_access() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table serial_holder (kept integer, doomed serial)")
+        .await;
+
+    let mut holder = Connection::connect(&server).await.unwrap();
+    holder.ok("begin").await;
+    holder
+        .ok("select nextval('serial_holder_doomed_seq')")
+        .await;
+
+    let mut dropper = Connection::connect(&server).await.unwrap();
+    let drop_task = tokio::spawn(async move {
+        dropper
+            .query("alter table serial_holder drop column doomed")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !drop_task.is_finished(),
+        "DROP COLUMN must wait for transaction-owned SequenceAccess"
+    );
+
+    holder.ok("commit").await;
+    drop_task.await.unwrap().unwrap().result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vacuum_waits_for_target_writer_while_unrelated_vacuum_proceeds() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();

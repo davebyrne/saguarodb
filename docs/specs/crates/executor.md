@@ -566,8 +566,10 @@ not diverge between ALTER validation and later DML.
   recovery install matching table/index metadata.
 - `ALTER COLUMN TYPE` preserves column identity, explicitly casts every visible
   value and constant default, and rebuilds fresh heap/TOAST/index generations.
-  Identical wire types are metadata no-ops. `USING`, dependent views, CHECK
-  constraints, and expression defaults are rejected in this first implementation.
+  Identical wire types are metadata no-ops. `USING` is unsupported. The exact
+  stable target column may not have a dependent view, CHECK, index, PK/UNIQUE,
+  FK, or stored expression; dependencies confined to other columns do not block
+  the rewrite.
 - Successful schema-evolution statements return
   `Modified { command: "ALTER TABLE", count: 0 }`; no-op `IF [NOT] EXISTS`
   forms return the same tag without catalog/storage mutation.

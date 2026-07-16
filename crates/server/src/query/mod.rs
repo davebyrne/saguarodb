@@ -3117,6 +3117,20 @@ fn object_lock_requests(
                 }
             }
         }
+        BoundStatement::AlterTableDropColumn { table, column, .. } => {
+            if let Some(table) = catalog.get_table(*table)?
+                && let Some(column) = table
+                    .columns
+                    .iter()
+                    .find(|item| item.name == column.as_str())
+                && let Some(ColumnDefault::Nextval(sequence)) = column.default
+                && catalog
+                    .get_sequence(sequence)?
+                    .is_some_and(|schema| schema.owned)
+            {
+                make_sequence_exclusive(sequence);
+            }
+        }
         _ => {}
     }
 
@@ -4140,6 +4154,7 @@ mod tests {
         for sql in [
             "create table src (id integer primary key)",
             "create table dst (id serial primary key, value integer)",
+            "create table drop_col (kept integer, doomed serial)",
             "create sequence default_ids",
             "create index dst_value_idx on dst (value)",
             "create view dst_view as select id from dst",
@@ -4149,6 +4164,7 @@ mod tests {
         let catalog = app.components.catalog.as_ref();
         let src = catalog.get_table_by_name("src").unwrap().unwrap();
         let dst = catalog.get_table_by_name("dst").unwrap().unwrap();
+        let drop_col = catalog.get_table_by_name("drop_col").unwrap().unwrap();
         let owned_sequence = dst
             .columns
             .iter()
@@ -4160,6 +4176,15 @@ mod tests {
         let default_ids = catalog
             .get_sequence_by_name("default_ids")
             .unwrap()
+            .unwrap();
+        let dropped_column_sequence = drop_col
+            .columns
+            .iter()
+            .find(|column| column.name == "doomed")
+            .and_then(|column| match column.default {
+                Some(ColumnDefault::Nextval(sequence)) => Some(sequence),
+                _ => None,
+            })
             .unwrap();
         let view = catalog.get_view_by_name("dst_view").unwrap().unwrap();
 
@@ -4236,6 +4261,19 @@ mod tests {
                     RelationLockMode::AccessExclusive,
                 )])
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            requests("alter table drop_col drop column doomed"),
+            [ObjectLockRequest::schema(
+                PUBLIC_SCHEMA_ID,
+                CatalogLockMode::Access,
+            )]
+            .into_iter()
+            .chain([
+                ObjectLockRequest::table(drop_col.id, RelationLockMode::AccessExclusive),
+                ObjectLockRequest::sequence(dropped_column_sequence, SequenceLockMode::Exclusive,),
+            ])
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("drop table dst"),

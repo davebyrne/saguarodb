@@ -2546,6 +2546,14 @@ catalog constraint lookup on every write path. Server object discovery adds
 related parents and children to DML relation locks and prepared identities and
 recomputes that set during convergence; see `docs/specs/foreign-keys.md`.
 
+Schema evolution queries the exact dependency graph by stable column identity.
+DROP COLUMN removes the column's default and Auto-owned sequence but is blocked
+by surviving Normal/Internal dependents of that column; ALTER COLUMN TYPE is
+likewise blocked by an exact CHECK, view, index, PK/UNIQUE, FK, or stored-
+expression reference. Dependencies on other columns do not block either
+operation. Dense ordinals and physical row/index projections are rebuilt during
+the rewrite without changing surviving stable column identities.
+
 `create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
 metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;
 adding the first toastable column does the same when policy requires it. Hidden

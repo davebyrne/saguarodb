@@ -311,13 +311,32 @@ pub(crate) fn dependency_drop_closure(
     snapshot: &CatalogSnapshot,
     roots: impl IntoIterator<Item = CatalogObjectId>,
 ) -> Result<BTreeSet<CatalogObjectId>> {
+    dependency_drop_closure_impl(snapshot, roots, &BTreeSet::new())
+}
+
+pub(crate) fn dependency_drop_closure_for_column(
+    snapshot: &CatalogSnapshot,
+    relation: TableId,
+    column: common::ColumnObjectId,
+) -> Result<BTreeSet<CatalogObjectId>> {
+    let root = CatalogObjectId::Column { relation, column };
+    dependency_drop_closure_impl(snapshot, [root], &BTreeSet::from([root]))
+}
+
+fn dependency_drop_closure_impl(
+    snapshot: &CatalogSnapshot,
+    roots: impl IntoIterator<Item = CatalogObjectId>,
+    allowed_internal_roots: &BTreeSet<CatalogObjectId>,
+) -> Result<BTreeSet<CatalogObjectId>> {
     let roots: BTreeSet<_> = roots.into_iter().collect();
     for root in &roots {
-        if snapshot.dependencies.iter().any(|edge| {
-            edge.dependent == *root
-                && edge.dependency_type == DependencyType::Internal
-                && !roots.contains(&edge.referenced)
-        }) {
+        if !allowed_internal_roots.contains(root)
+            && snapshot.dependencies.iter().any(|edge| {
+                edge.dependent == *root
+                    && edge.dependency_type == DependencyType::Internal
+                    && !roots.contains(&edge.referenced)
+            })
+        {
             return Err(DbError::plan(
                 common::SqlState::DependentObjectsStillExist,
                 format!("cannot drop internally owned catalog object {root:?} directly"),
