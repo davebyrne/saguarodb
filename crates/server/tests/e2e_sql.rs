@@ -5178,6 +5178,134 @@ async fn e2e_values_query() {
     );
 }
 
+#[tokio::test]
+async fn e2e_views_execute_resolved_query_ir_after_renames() {
+    let server = TestServer::start().await.unwrap();
+    for sql in [
+        "create table view_left (id integer primary key, value integer)",
+        "create table view_right (id integer primary key, label text)",
+        "insert into view_left values (1, 10), (2, 20)",
+        "insert into view_right values (1, 'one'), (2, 'two')",
+        "create view join_view as select l.id, r.label from view_left l join view_right r on l.id = r.id",
+        "create view cte_view as with chosen as (select id, value from view_left where value > 10) select id from chosen",
+        "create view set_view as select id from view_left union select id from view_right",
+        "create view aggregate_view as select count(*) as n, sum(value) as total from view_left",
+        "create view coalesce_view as select id, coalesce(value, 0) as resolved, coalesce(value) as identity from view_left",
+        "create view subquery_view as select id, (select label from view_right r where r.id = l.id) as label from view_left l where exists (select id from view_right r where r.id = l.id)",
+        "create view in_subquery_view as select id from view_left where id in (select id from view_right)",
+        "create view function_view as select n from generate_series(1, 2) as g(n)",
+        "create view derived_outer_view as select d.n from view_left l left join (select 1 as n) d on false",
+        "create view function_outer_view as select g.n from view_left l left join generate_series(1, 1) as g(n) on false",
+        "create view system_outer_view as select c.relname from view_left l left join pg_catalog.pg_class c on false",
+        "create view base_view as select id, value from view_left",
+        "create view inlined_view as select id from base_view where value = 20",
+        "drop view base_view",
+        "alter table view_left rename column value to amount",
+        "alter table view_left rename to renamed_left",
+    ] {
+        server
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    assert_eq!(
+        server
+            .simple_query("select * from join_view order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![
+            vec![Some("1".into()), Some("one".into())],
+            vec![Some("2".into()), Some("two".into())]
+        ]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from cte_view")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".into())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from set_view order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from aggregate_view")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".into()), Some("30".into())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from coalesce_view order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![
+            vec![Some("1".into()), Some("10".into()), Some("10".into())],
+            vec![Some("2".into()), Some("20".into()), Some("20".into())]
+        ]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from subquery_view order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![
+            vec![Some("1".into()), Some("one".into())],
+            vec![Some("2".into()), Some("two".into())]
+        ]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from in_subquery_view order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("select * from function_view order by n")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".into())], vec![Some("2".into())]]
+    );
+    for view in [
+        "derived_outer_view",
+        "function_outer_view",
+        "system_outer_view",
+    ] {
+        assert_eq!(
+            server
+                .simple_query(&format!("select * from {view}"))
+                .await
+                .unwrap_or_else(|error| panic!("{view}: {error:?}"))
+                .unwrap_rows(),
+            vec![vec![None], vec![None]]
+        );
+    }
+    assert_eq!(
+        server
+            .simple_query("select * from inlined_view")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".into())]]
+    );
+}
+
 /// Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) end to end, including
 /// ORDER BY over the combined result, LIMIT, VALUES arms, derived-table use, NULL
 /// de-duplication, and the reconciliation/quantifier error cases.

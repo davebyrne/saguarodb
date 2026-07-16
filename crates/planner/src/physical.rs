@@ -3,8 +3,8 @@ use std::ops::Bound;
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DataType, IndexId, Key, KeyRange,
-    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SchemaId, SequenceOptions, TableId,
-    ToastOptions, Value, ViewDependency,
+    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SchemaId, SequenceOptions, StoredQueryV1,
+    TableId, ToastOptions, Value,
 };
 
 use crate::{
@@ -98,7 +98,7 @@ pub enum PhysicalPlan {
         columns: Vec<String>,
         query: crate::BoundQuery,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        stored_query: StoredQueryV1,
         definition_search_path: Vec<SchemaId>,
     },
     DropView {
@@ -417,7 +417,7 @@ fn physical_plan_inner(
             columns,
             query,
             definition,
-            dependencies,
+            stored_query,
             definition_search_path,
         } => Ok(PhysicalPlan::CreateView {
             schema: *schema,
@@ -426,7 +426,7 @@ fn physical_plan_inner(
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
-            dependencies: dependencies.clone(),
+            stored_query: stored_query.clone(),
             definition_search_path: definition_search_path.clone(),
         }),
         LogicalPlan::DropView {

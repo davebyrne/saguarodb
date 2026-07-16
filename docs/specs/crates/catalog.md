@@ -79,7 +79,7 @@ pub struct CatalogSnapshot {
 ```
 
 `NamespaceSchema`, `TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`,
-`ViewColumn`, `ViewDependency`, `ViewSchema`, and `SequenceSchema` live in
+`ViewColumn`, `ViewSchema`, `StoredQueryV1`, and `SequenceSchema` live in
 `common`. `TableSchema` additionally carries `schema_version: u64`,
 `compression: CompressionSetting`, and `active_dict_id: Option<u32>` (see
 "Compression" below). `TableSchema.storage_id` and `IndexSchema.storage_id` are
@@ -107,12 +107,22 @@ captures the schema-id search path used to bind its stored definition. Schema id
 indexes, sequences, and views. The legacy bare-name lookup and creation methods
 remain compatibility conveniences for `public`. Scoped index creation identifies
 its target table by stable `TableId`, avoiding ambiguous bare names. Scoped view
-creation records the exact schema-id search path used to bind its definition.
+creation records the exact schema-id search path used to bind its definition for
+diagnostics only.
+The durable view-object payload has its own required format version (`1`), so
+the introduction of resolved query IR is an explicit compatibility boundary
+inside catalog-v3 snapshots and generic catalog change-set WAL payloads.
+View publication and snapshot loading validate exact output OID/typmod metadata
+against producing base/positional columns, casts, and functions, plus the
+expression-context, grouping, `DISTINCT` ordering, and row-lock invariants
+established by the binder. Query IR size-limit failures retain SQLSTATE `54000`
+during live `CREATE VIEW`.
 Relation-name collision checks are per schema, while tables, views, indexes,
 sequences, and generated primary-key index names share one namespace within each
 schema. `create_schema` allocates a monotonic user schema id. `drop_schema` has
-RESTRICT semantics: it rejects a schema containing objects or referenced by a
-stored view definition search path.
+RESTRICT semantics for objects contained in the schema; diagnostic view search
+paths do not create dependencies and may retain ids of subsequently dropped
+schemas.
 
 The catalog JSON payload has its own format version, independently of the outer
 control-record version. Version 3 stores schemas, tables, views, indexes, and
@@ -426,14 +436,14 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema>;
     fn replace_view(
         &self,
         id: TableId,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema>;
     fn drop_view(&self, id: TableId) -> Result<()>;
 }
@@ -459,6 +469,13 @@ rejects names already held by any other public relation kind with
 with tables but are stored in separate `views_by_*` maps so storage startup
 installs only physical relations. Hidden TOAST relations are installed by ID only
 and are outside that user-visible namespace.
+
+Each view stores canonical SQL and its definition search path for introspection,
+plus versioned resolved query IR as execution authority. Catalog validation
+checks IR limits, output types, stable relation/column/sequence/function
+references, and derives Normal dependency edges by traversing that IR. Views
+referenced while defining another view are already inlined, so only their base
+objects appear in the stored query and graph.
 
 `attach_foreign_keys` validates and publishes a resolved batch atomically,
 generating omitted names and allocating consecutive global constraint IDs under
@@ -518,7 +535,7 @@ validates and applies the complete committed result atomically.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `add_table_column` assigns both the next dense `ColumnId` and the table's next never-reused `ColumnObjectId`. `drop_table_column` may renumber dense ordinals but preserves every surviving stable ID; a CHECK blocks the drop only when its typed tree references the target stable column. Existing index, FK, view, primary-key, and owned-sequence restrictions remain. Table and column renames change names without rewriting stored CHECK/default IR. Public changes increment `schema_version`, and preflight is repeated under the publication and relation locks.
 
-`create_view` assigns dense and stable output-column identities. A `replace_view` position preserves its `ColumnObjectId` only when its name, logical type, nullability, length, and PostgreSQL type metadata remain compatible. Incompatible or newly permitted output positions allocate monotonically, and removed IDs are never reused. The relation ID/name and existing dependency/search-path behavior remain unchanged.
+`create_view` assigns dense and stable output-column identities. A `replace_view` position preserves its `ColumnObjectId` only when its name, logical type, nullability, length, and PostgreSQL type metadata remain compatible. Incompatible or newly permitted output positions allocate monotonically, and removed IDs are never reused. The relation ID/name and diagnostic definition search path remain unchanged. Dependencies come from exact stable references in resolved query IR; wildcard expansion therefore does not depend on later-added columns, unused CTE definitions add no dependency, and referenced views are inlined before persistence.
 
 `create_index` resolves the table and column names, assigns an `IndexId` plus a
 fresh `storage_id`, and returns the stored `IndexSchema`; duplicate names
@@ -621,9 +638,10 @@ use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as
 part of the logical schema change. The caller appends the matching generic
 catalog change before storage initializes physical replacements. Renames are
 metadata-only and keep existing storage
-ids. Table/column renames reject dependent views. Table and column renames allow
-stored CHECK constraints because typed stable-column references, rather than
-canonical SQL, are execution authority. A column drop is blocked only by CHECKs
+ids. Table and column renames preserve view behavior because stored queries use
+stable relation/column identities; canonical SQL may remain textually unchanged.
+Renames likewise allow stored CHECK constraints because typed stable-column
+references, rather than canonical SQL, are execution authority. A column drop is blocked only by CHECKs
 that reference that stable column. Dropping a column also rejects primary-key,
 indexed, view-dependent, and owned-sequence-default columns.
 
@@ -790,10 +808,11 @@ Recovery apply methods must update catalog state consistently with storage state
   a backing index points to exactly one PK/UNIQUE constraint and cannot be
   dropped directly. Dropping a table follows Auto/Internal ownership edges to
   remove its indexes, constraints, TOAST relation, owned sequences, and stats.
-- Every view dependency references an existing relation and existing columns when
-  the dependency names columns. Dependent views block table/view drops. Column
-  DDL is blocked for named dependency columns and for dependencies marked
-  `all_columns`; relation-only dependencies block only relation drops/renames.
+- Every stored view query references existing catalog objects with matching
+  types. Its derived graph edges block base-table drops and exact referenced
+  column drops/type changes. Table/column renames and unrelated column additions
+  remain valid because stable identities, not stored names or wildcard intent,
+  are authoritative.
 - Binder is the only consumer that resolves table, column, and index names for
   query planning. `DROP SEQUENCE` intentionally carries the sequence name
   through planning and resolves it at execution time so extended-protocol

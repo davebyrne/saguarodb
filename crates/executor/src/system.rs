@@ -726,7 +726,7 @@ fn dependency_object(
             constraint_oid(id)?,
             0,
         ),
-        CatalogObjectId::Function(_) => return Ok(None),
+        CatalogObjectId::Function(_) | CatalogObjectId::SystemRelation(_) => return Ok(None),
         CatalogObjectId::Column { relation, column } => {
             let dense = if let Some(table) = catalog.get_table(relation)? {
                 table.dense_column_id(column)

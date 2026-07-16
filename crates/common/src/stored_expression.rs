@@ -888,7 +888,11 @@ fn require_declared_metadata(
     Ok(())
 }
 
-fn binary_result_type(left: &DataType, op: StoredBinOp, right: &DataType) -> Option<DataType> {
+pub(crate) fn binary_result_type(
+    left: &DataType,
+    op: StoredBinOp,
+    right: &DataType,
+) -> Option<DataType> {
     match op {
         StoredBinOp::Add
         | StoredBinOp::Sub
@@ -938,7 +942,7 @@ fn binary_result_type(left: &DataType, op: StoredBinOp, right: &DataType) -> Opt
     }
 }
 
-fn numeric_family(data_type: &DataType) -> Option<u8> {
+pub(crate) fn numeric_family(data_type: &DataType) -> Option<u8> {
     match data_type {
         DataType::Integer => Some(0),
         DataType::Double => Some(1),
@@ -971,7 +975,7 @@ fn interval_arithmetic_result(
     }
 }
 
-fn is_comparison(op: StoredBinOp) -> bool {
+pub(crate) fn is_comparison(op: StoredBinOp) -> bool {
     matches!(
         op,
         StoredBinOp::Eq
@@ -983,7 +987,7 @@ fn is_comparison(op: StoredBinOp) -> bool {
     )
 }
 
-fn array_shape_matches(dimensions: &[u32], element_count: usize) -> crate::Result<bool> {
+pub(crate) fn array_shape_matches(dimensions: &[u32], element_count: usize) -> crate::Result<bool> {
     if dimensions.is_empty() {
         return Ok(element_count == 0);
     }

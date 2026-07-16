@@ -162,6 +162,13 @@ impl SystemView {
         }
     }
 
+    pub fn from_relation_oid(oid: i64) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|view| view.relation_oid() == oid)
+    }
+
     pub fn columns(self) -> Vec<ColumnDef> {
         match self {
             SystemView::PgNamespace => vec![

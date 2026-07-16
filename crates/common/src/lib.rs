@@ -34,6 +34,7 @@ pub mod row;
 pub mod schema;
 pub mod statistics;
 pub mod stored_expression;
+pub mod stored_query;
 pub mod uuid;
 pub mod value;
 
@@ -93,8 +94,9 @@ pub use schema::{
     ConstraintSchema, DataType, ForeignKeyAction, ForeignKeyConstraint, INITIAL_SCHEMA_VERSION,
     IndexSchema, NamespaceSchema, ParsedColumnDef, ParsedDefault, QualifiedName, RelationKind,
     SequenceOptions, SequenceSchema, TableOptionPatch, TableSchema, ToastCompression, ToastMode,
-    ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
-    ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name, toast_schema,
+    ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    VIEW_SCHEMA_FORMAT_VERSION, ViewColumn, ViewSchema, needs_toast_relation, toast_relation_name,
+    toast_schema,
 };
 pub use statistics::{ColumnStatistics, NDistinct, TableStatistics, value_is_finite};
 pub use stored_expression::{
@@ -102,4 +104,5 @@ pub use stored_expression::{
     MAX_STORED_EXPRESSION_SQL_BYTES, STORED_EXPRESSION_VERSION, StoredBinOp, StoredExpr,
     StoredExpression, StoredUnaryOp, validate_stored_expression_shape,
 };
+pub use stored_query::*;
 pub use value::{Value, parse_bool_text};

@@ -1,7 +1,7 @@
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result, SchemaId,
-    SequenceOptions, TableId, ToastOptions, ViewDependency,
+    SequenceOptions, StoredQueryV1, TableId, ToastOptions,
 };
 
 use crate::{
@@ -96,7 +96,7 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        stored_query: StoredQueryV1,
         definition_search_path: Vec<SchemaId>,
     },
     DropView {
@@ -366,7 +366,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns,
             query,
             definition,
-            dependencies,
+            stored_query,
             definition_search_path,
         } => Ok(LogicalPlan::CreateView {
             schema: *schema,
@@ -375,7 +375,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
-            dependencies: dependencies.clone(),
+            stored_query: stored_query.clone(),
             definition_search_path: definition_search_path.clone(),
         }),
         BoundStatement::DropView {

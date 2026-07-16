@@ -1,8 +1,8 @@
 use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    ForeignKeyAction, IndexId, ParsedColumnDef, QualifiedName, SchemaId, SequenceOptions, TableId,
-    TableSchema, ToastOptions, ViewDependency,
+    ForeignKeyAction, IndexId, ParsedColumnDef, QualifiedName, SchemaId, SequenceOptions,
+    StoredQueryV1, TableId, TableSchema, ToastOptions,
 };
 use parser::SetOp;
 
@@ -261,7 +261,7 @@ pub enum BoundStatement {
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        stored_query: StoredQueryV1,
         definition_search_path: Vec<SchemaId>,
     },
     DropView {
@@ -403,10 +403,6 @@ pub enum BoundDistinct {
 pub struct BoundSelectItem {
     pub expr: BoundExpr,
     pub alias: String,
-    /// Set when this output item was produced by expanding `*` from a physical
-    /// user table. View dependency collection uses this to preserve wildcard
-    /// intent through nested derived tables and CTEs.
-    pub wildcard_source: Option<TableId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

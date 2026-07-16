@@ -23,6 +23,7 @@ mod physical;
 mod rewrite;
 mod simplify;
 mod stored_expression;
+mod stored_query;
 
 pub use binder::{
     BindOptions, bind, bind_default_expr, bind_default_expr_with_options, bind_parameterized,
@@ -52,6 +53,7 @@ pub use rewrite::{rewrite_expr, rewrite_plan_exprs};
 pub use stored_expression::{
     lower_stored_expression, store_bound_expression, validate_stored_expression,
 };
+pub use stored_query::{lower_stored_query, store_bound_query};
 
 pub fn mutates_sequences(statement: &BoundStatement) -> bool {
     match statement {

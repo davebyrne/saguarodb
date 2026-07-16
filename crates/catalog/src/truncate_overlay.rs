@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use common::{
     ColumnId, CompressionSetting, DbError, FileId, IndexId, IndexSchema, NamespaceSchema,
-    ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, TableId,
-    TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    ViewColumn, ViewDependency, ViewSchema,
+    ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, StoredQueryV1,
+    TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewSchema,
 };
 
 use crate::{
@@ -453,7 +453,7 @@ impl CatalogManager for TruncateCatalogOverlay {
         _name: String,
         _columns: Vec<ViewColumn>,
         _definition: String,
-        _dependencies: Vec<ViewDependency>,
+        _query: StoredQueryV1,
         _definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema> {
         Self::read_only()
@@ -464,7 +464,7 @@ impl CatalogManager for TruncateCatalogOverlay {
         _id: TableId,
         _columns: Vec<ViewColumn>,
         _definition: String,
-        _dependencies: Vec<ViewDependency>,
+        _query: StoredQueryV1,
     ) -> Result<ViewSchema> {
         Self::read_only()
     }
@@ -474,7 +474,7 @@ impl CatalogManager for TruncateCatalogOverlay {
         _id: TableId,
         _columns: Vec<ViewColumn>,
         _definition: String,
-        _dependencies: Vec<ViewDependency>,
+        _query: StoredQueryV1,
         _definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema> {
         Self::read_only()

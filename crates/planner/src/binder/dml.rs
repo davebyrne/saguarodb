@@ -502,7 +502,6 @@ fn bindings_select_items(ctx: &BindContext) -> Vec<BoundSelectItem> {
             binding.columns.iter().map(|column| BoundSelectItem {
                 expr: super::input_ref(binding, column),
                 alias: column.name.clone(),
-                wildcard_source: None,
             })
         })
         .collect()

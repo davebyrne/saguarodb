@@ -2641,15 +2641,8 @@ fn collect_bound_statement_objects(
                 collect_expr_objects(expr, references)?;
             }
         }
-        BoundStatement::CreateView {
-            query,
-            dependencies,
-            ..
-        } => {
+        BoundStatement::CreateView { query, .. } => {
             collect_query_objects(query, references)?;
-            for dependency in dependencies {
-                record_bound_relation_version(references, dependency.relation, None)?;
-            }
         }
     }
     Ok(())
@@ -5273,10 +5266,9 @@ mod tests {
             name: String,
             columns: Vec<common::ViewColumn>,
             definition: String,
-            dependencies: Vec<common::ViewDependency>,
+            query: common::StoredQueryV1,
         ) -> Result<common::ViewSchema> {
-            self.inner
-                .create_view(name, columns, definition, dependencies)
+            self.inner.create_view(name, columns, definition, query)
         }
 
         fn create_view_in_schema(
@@ -5285,7 +5277,7 @@ mod tests {
             name: String,
             columns: Vec<common::ViewColumn>,
             definition: String,
-            dependencies: Vec<common::ViewDependency>,
+            query: common::StoredQueryV1,
             definition_search_path: Vec<common::SchemaId>,
         ) -> Result<common::ViewSchema> {
             self.inner.create_view_in_schema(
@@ -5293,7 +5285,7 @@ mod tests {
                 name,
                 columns,
                 definition,
-                dependencies,
+                query,
                 definition_search_path,
             )
         }
@@ -5303,10 +5295,9 @@ mod tests {
             id: TableId,
             columns: Vec<common::ViewColumn>,
             definition: String,
-            dependencies: Vec<common::ViewDependency>,
+            query: common::StoredQueryV1,
         ) -> Result<common::ViewSchema> {
-            self.inner
-                .replace_view(id, columns, definition, dependencies)
+            self.inner.replace_view(id, columns, definition, query)
         }
 
         fn replace_view_with_search_path(
@@ -5314,14 +5305,14 @@ mod tests {
             id: TableId,
             columns: Vec<common::ViewColumn>,
             definition: String,
-            dependencies: Vec<common::ViewDependency>,
+            query: common::StoredQueryV1,
             definition_search_path: Vec<common::SchemaId>,
         ) -> Result<common::ViewSchema> {
             self.inner.replace_view_with_search_path(
                 id,
                 columns,
                 definition,
-                dependencies,
+                query,
                 definition_search_path,
             )
         }
@@ -6304,7 +6295,7 @@ mod tests {
     }
 
     #[test]
-    fn view_dependencies_block_drop_and_only_wildcards_block_add_column() {
+    fn view_dependencies_track_resolved_columns_and_ignore_unused_ctes() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
@@ -6343,11 +6334,9 @@ mod tests {
         app.query_service
             .execute_sql("create view all_users as select * from users")
             .unwrap();
-        let add_column = app
-            .query_service
+        app.query_service
             .execute_sql("alter table users add column email text")
-            .unwrap_err();
-        assert_eq!(add_column.code, SqlState::DependentObjectsStillExist);
+            .unwrap();
 
         app.query_service
             .execute_sql("drop view all_users")
@@ -6355,11 +6344,9 @@ mod tests {
         app.query_service
             .execute_sql("create view nested_all_users as select * from (select * from users) d")
             .unwrap();
-        let add_nested_column = app
-            .query_service
-            .execute_sql("alter table users add column email text")
-            .unwrap_err();
-        assert_eq!(add_nested_column.code, SqlState::DependentObjectsStillExist);
+        app.query_service
+            .execute_sql("alter table users add column phone text")
+            .unwrap();
 
         app.query_service
             .execute_sql("drop view nested_all_users")
@@ -6369,11 +6356,9 @@ mod tests {
                 "create view cte_all_users as with d as (select * from users) select * from d",
             )
             .unwrap();
-        let add_cte_column = app
-            .query_service
-            .execute_sql("alter table users add column email text")
-            .unwrap_err();
-        assert_eq!(add_cte_column.code, SqlState::DependentObjectsStillExist);
+        app.query_service
+            .execute_sql("alter table users add column address text")
+            .unwrap();
 
         app.query_service
             .execute_sql("create table logs (id integer primary key, message text)")
@@ -6384,14 +6369,7 @@ mod tests {
                  with unused as (select * from logs) select 1 as one",
             )
             .unwrap();
-        let drop_unused_cte_table = app
-            .query_service
-            .execute_sql("drop table logs")
-            .unwrap_err();
-        assert_eq!(
-            drop_unused_cte_table.code,
-            SqlState::DependentObjectsStillExist
-        );
+        app.query_service.execute_sql("drop table logs").unwrap();
 
         app.query_service
             .execute_sql("create sequence seq1")
@@ -7012,8 +6990,7 @@ mod tests {
             ]]
         );
         run("create view item_guard as with unused as (select id from items) select 1").unwrap();
-        let blocked = run("drop table items").unwrap_err();
-        assert_eq!(blocked.code, SqlState::DependentObjectsStillExist);
+        run("drop table items").unwrap();
         run("drop view item_guard").unwrap();
         run("create sequence ids").unwrap();
         let app_sequence = app

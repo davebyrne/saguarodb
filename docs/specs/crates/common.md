@@ -23,8 +23,8 @@
   and wire-format codecs map its format-neutral error into their boundary's
   structured `DbError` and SQLSTATE.
 - Schema description types: `QualifiedName`, `NamespaceSchema`, `DataType`, `ParsedColumnDef`, `ColumnDef`,
-  `ColumnInfo`, `TableSchema`, `IndexSchema`, `ViewColumn`,
-  `ViewDependency`, `ViewSchema`, `SequenceOptions`, and `SequenceSchema`.
+  `ColumnInfo`, `TableSchema`, `IndexSchema`, `ViewColumn`, `ViewSchema`,
+  `StoredQueryV1`, `SequenceOptions`, and `SequenceSchema`.
 - Relation-generation catalog handoff types: `TruncateTablePlan` and
   `TruncateCatalogUpdate`.
 - Query access helpers: `KeyRange`.
@@ -380,18 +380,13 @@ pub struct ViewColumn {
     pub pg_type: Option<PgType>,
 }
 
-pub struct ViewDependency {
-    pub relation: TableId,
-    pub columns: Vec<ColumnId>,
-    pub all_columns: bool,       // SELECT * / relation-wide column-set dependency
-}
-
 pub struct ViewSchema {
+    pub format_version: u32,
     pub id: TableId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub definition: String,
-    pub dependencies: Vec<ViewDependency>,
+    pub query: StoredQueryV1,
     pub schema_version: u64,
 }
 
@@ -430,11 +425,60 @@ pub struct TruncateCatalogUpdate {
 }
 ```
 
+`StoredQueryV1` is the durable resolved-query representation used by views. Its
+body covers SELECT, VALUES, and set operations; FROM inputs cover stable base
+and system relations, joins, derived/LATERAL queries, and stable-OID table
+functions. Expressions cover scalar and aggregate calls, sequence operations,
+arrays, predicates, casts, CASE, and scalar/IN/EXISTS subqueries. Base columns
+use `ColumnObjectId`; query-local inputs use `BindingId` range identities and
+positional columns. `LocalRef` is an output ordinal and `OuterRef` is a
+correlation-list ordinal—neither is an execution slot. CTEs and referenced
+views are inlined before persistence. LATERAL correlations may resolve only to
+preceding FROM ranges. CASE nodes record when their shape or nullability needs
+the flow-sensitive COALESCE rule so validation can recompute it exactly.
+
+Durable decoding bounds every query node list, including each inner VALUES row,
+and shares a 1,048,576-item allocation budget across all list elements, nested
+queries, optional nodes, and recursively boxed expression/JOIN edges within one
+stored view query. The budget is charged before deserializing the child. This
+rejects multiplicative or deeply branching shapes before their full allocation;
+catalog validation then enforces the exact semantic node and depth limits.
+The enclosing durable `ViewSchema` payload is independently versioned at `1`;
+unversioned or unknown view payloads are rejected explicitly even though they
+may appear inside either a catalog-v3 snapshot or a catalog change-set WAL
+record.
+Catalog validation enforces version 1, a 262,144-node total, 16,384 entries per
+ordinary expression/query list, up to 65,536 projection or range-schema columns,
+nesting depth 32, exact expression/function/aggregate metadata and output
+PostgreSQL wire types, binder-equivalent expression placement, grouping,
+`DISTINCT` ordering, and row-lock eligibility, valid output/range/correlation
+ordinals, and consistent query-body schemas before the IR can be published or
+loaded. Join predicates are validated against their inputs before the current
+outer join's null extension, while projection/filter references use the
+post-join range schema. Live construction reports
+these size bounds as `ProgramLimitExceeded`; durable decoding rejects oversized
+payloads as corruption. Canonical view SQL is not part of this execution
+representation.
+
 Stored-expression format version `1` admits at most 16,384 nodes, 128 levels,
 4,096 items in any node list, and 1 MiB of retained canonical SQL. List and SQL
 limits are enforced by bounded serde visitors while decoding, before an
 oversized collection is allocated; catalog validation enforces the aggregate
 node/depth limits and all stable references.
+
+Stored-query format version `1` is the catalog-resolved execution authority for
+views. It represents SELECT/VALUES/set-operation bodies, joins, derived and
+LATERAL inputs, ordering/limits, table functions, aggregates, and scalar/IN/
+EXISTS subqueries. Catalog references use stable relation, column, sequence, and
+built-in function identities; query-local range IDs identify derived, system,
+and table-function outputs. It never contains planner slots, physical plans,
+costs, parameters, or runtime value sets. The format admits at most 262,144
+semantic nodes, 32 levels, 16,384 items in an ordinary expression/query list,
+and 65,536 projection or range-schema columns. Bounded serde visitors enforce
+the per-list limits and a shared 1,048,576-item decode-allocation budget before
+the complete graph is materialized; catalog load validates its exact node/depth
+shape—including JOIN-tree edges—and every referenced identity. The 32-level
+limit is compatible with the nesting overhead of the durable JSON envelope.
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` has two
 identities: `ColumnId` is the dense row-slot ordinal within one schema version
@@ -465,13 +509,16 @@ are assigned. Stored view columns use dense `ColumnId`s, stable
 `ColumnObjectId`s, and no defaults. Replacement positions retain their stable
 IDs only when name, logical type, nullability, length, and PostgreSQL type
 metadata remain compatible; an incompatible position receives a new monotonic
-ID. `ViewDependency.columns` lists referenced dense column IDs;
-`all_columns = true` represents relation-wide dependencies such as `SELECT *`;
-neither specific columns nor `all_columns` represents relation-existence-only
-dependencies such as `count(*)`. The type-level decoder still defaults an absent
-`all_columns` paired with `columns = []` to `true`, but catalog formats older
-than v3 are rejected at the snapshot envelope rather than migrated. Newly
-serialized relation-existence dependencies include `all_columns = false`.
+ID. `ViewSchema.query` stores resolved typed query IR. Dependencies are extracted
+by traversing that IR, so wildcard expansion records the exact stable columns
+that existed at CREATE VIEW time and a later added column does not change the
+view. Canonical `definition` SQL and `definition_search_path` remain for display
+and diagnostics only. Referenced views are inlined before storage, leaving
+durable dependencies on their underlying base objects rather than view names.
+Catalog-column references and view outputs carry validated nullability metadata;
+outer-join null extension is derived from the stored join tree. A view payload
+without resolved query IR is rejected explicitly as an unsupported older
+encoding, whether encountered in a catalog snapshot or catalog-change WAL.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and

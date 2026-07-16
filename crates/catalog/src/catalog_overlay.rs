@@ -149,8 +149,9 @@ mod tests {
 
     use common::{
         CompressionSetting, DataType, MAX_STORED_EXPRESSION_SQL_BYTES, ParsedColumnDef,
-        STORED_EXPRESSION_VERSION, SqlState, StoredExpr, StoredExpression, ToastOptions, Value,
-        ViewColumn,
+        STORED_EXPRESSION_VERSION, SqlState, StoredExpr, StoredExpression, StoredQueryBody,
+        StoredQueryColumn, StoredQueryExpr, StoredQueryV1, StoredSelect, StoredSelectItem,
+        ToastOptions, Value, ViewColumn,
     };
 
     use super::*;
@@ -163,6 +164,37 @@ mod tests {
             max_length: None,
             default: None,
             pg_type: None,
+        }
+    }
+
+    fn constant_view_query() -> StoredQueryV1 {
+        StoredQueryV1 {
+            version: common::STORED_QUERY_VERSION,
+            body: StoredQueryBody::Select(Box::new(StoredSelect {
+                distinct: None,
+                columns: vec![StoredSelectItem {
+                    expr: StoredQueryExpr::Literal {
+                        value: Value::Integer(1),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                    },
+                    alias: "id".to_string(),
+                }],
+                from: None,
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                output_schema: vec![StoredQueryColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    pg_type: common::PgType::Int8,
+                }],
+            })),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            row_lock: None,
+            correlations: Vec::new(),
         }
     }
 
@@ -265,7 +297,7 @@ mod tests {
                         pg_type: None,
                     }],
                     "select 1".to_string(),
-                    Vec::new(),
+                    constant_view_query(),
                 )
             })
             .unwrap();

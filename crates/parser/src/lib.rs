@@ -27,8 +27,8 @@ pub fn parse(sql: &str) -> Result<Statement> {
 }
 
 /// Parse a single SQL scalar expression (not a statement). The binder uses this
-/// to re-parse the stored canonical text of a non-constant column `DEFAULT`
-/// before binding it.
+/// once while creating or altering a non-constant column `DEFAULT`; runtime
+/// execution lowers the resulting durable expression IR directly.
 pub fn parse_expression(sql: &str) -> Result<Expr> {
     convert::parse_expression(sql)
 }

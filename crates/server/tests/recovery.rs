@@ -2897,3 +2897,31 @@ async fn released_savepoint_row_survives_restart() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("1".to_string())]]);
 }
+
+#[tokio::test]
+async fn resolved_view_query_survives_renames_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        for sql in [
+            "create table view_source (id integer primary key, value integer)",
+            "insert into view_source values (1, 10), (2, 20)",
+            "create view durable_view as select id, value from view_source where value > 10",
+            "alter table view_source rename column value to amount",
+            "alter table view_source rename to renamed_source",
+        ] {
+            server.simple_query(sql).await.unwrap();
+        }
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select * from durable_view")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string()), Some("20".to_string())]],
+    );
+}

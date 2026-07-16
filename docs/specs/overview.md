@@ -1236,12 +1236,13 @@ pub enum BoundFrom {
 
 `BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The executor treats `None` as `TRUE` only for cross joins.
 
-`BoundFrom::View` is a user view from the catalog. The binder parses and binds
-the stored definition in the view's own scope (caller CTEs do not affect it),
-checks that its output width still matches the cataloged view columns, registers
-the view as the visible input binding, and lowers the stored query like a derived
-table. Prepared plans track the view's `schema_version` plus underlying table
-versions so view replacement or base-table shape changes force a reprepare.
+`BoundFrom::View` is a user view from the catalog. The binder lowers its
+validated `StoredQueryV1` directly, checks that the output width still matches
+the cataloged view columns, registers the view as the visible input binding, and
+treats the result like a derived table. Caller CTEs and search paths cannot
+affect the resolved IR. Prepared plans track the view's `schema_version` plus
+underlying table versions so view replacement or base-table shape changes force
+a reprepare.
 
 `BoundFrom::System` is a read-only virtual system view from `pg_catalog` or
 `information_schema`. Bare FROM names prefer CTEs and user tables before falling
@@ -2512,12 +2513,6 @@ pub struct TableSchema {
     pub schema_version: u64,
     pub next_column_object_id: ColumnObjectId,
 }
-
-pub struct ViewDependency {
-    pub relation: TableId,
-    pub columns: Vec<ColumnId>,
-    pub all_columns: bool,
-}
 ```
 
 `ColumnDef`, `DataType`, `ToastOptions`, relation/index/view/sequence schemas, and
@@ -2527,6 +2522,17 @@ a schema version and may be renumbered by rewrite DDL. Stable
 remain unchanged for surviving columns. CHECK/default execution uses versioned
 `StoredExpression` trees whose stable column/function/sequence references are
 validated at catalog load; canonical SQL is retained for display and diagnostics.
+Views likewise persist versioned `StoredQueryV1` resolved IR as execution and
+dependency authority. It stores stable catalog identities plus query-local range
+IDs, never planner slots or physical-plan state; referenced views and CTEs are
+inlined before storage. Catalog validation rechecks binder expression-placement,
+grouping, `DISTINCT` ordering, and row-lock invariants plus exact output
+OID/typmod metadata before publication or load. Canonical view SQL and definition
+search paths remain
+diagnostic/introspection metadata and are never reparsed for execution.
+The enclosing durable view-object payload has its own required format version
+`1`; missing or unknown versions fail explicitly inside catalog-v3 snapshots
+and catalog change-set WAL payloads.
 Logical table/index IDs remain stable while `storage_id` identifies the current
 physical generation and changes on TRUNCATE or rewrite. Public schema changes
 increment `schema_version`, which prepared execution revalidates after table-lock
@@ -2549,8 +2555,7 @@ and have distinct storage ids. Legacy snapshots use
 `ToastOptions::legacy_catalog_default()` and default missing relation kind to
 `User`. Validation enforces TOAST bounds, nonzero dictionary/storage ids,
 cross-links, and duplicate storage-id rules while preserving the legacy raw
-table/index collision allowed by file-kind bits. Older view dependencies with no
-`all_columns` field and no columns retain `all_columns = true` compatibility.
+table/index collision allowed by file-kind bits.
 
 User table/view column assignment is limited to the 65,536 values in the
 `ColumnId` space. Constraint identities use a checked global `u32` allocator;
@@ -2728,14 +2733,14 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema>;
     fn replace_view(
         &self,
         id: TableId,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema>;
     fn drop_view(&self, id: TableId) -> Result<()>;
 }

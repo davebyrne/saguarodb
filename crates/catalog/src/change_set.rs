@@ -249,6 +249,7 @@ fn object(snapshot: &CatalogSnapshot, id: CatalogObjectId) -> Option<CatalogObje
             .cloned()
             .map(CatalogObject::Constraint),
         CatalogObjectId::Function(_)
+        | CatalogObjectId::SystemRelation(_)
         | CatalogObjectId::Column { .. }
         | CatalogObjectId::ColumnDefault { .. } => None,
     }
@@ -327,6 +328,7 @@ fn apply_object(
             },
         ),
         CatalogObjectId::Function(_)
+        | CatalogObjectId::SystemRelation(_)
         | CatalogObjectId::Column { .. }
         | CatalogObjectId::ColumnDefault { .. } => Err(DbError::internal(
             "catalog change references a non-replaceable object",

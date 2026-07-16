@@ -37,7 +37,8 @@ trait seams.
   `UPDATE ... FROM`), `DELETE` (including `DELETE ... USING`), `RETURNING`,
   primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and
   `COPY ... FROM STDIN` / `COPY ... TO STDOUT` in text or CSV format.
-- `SELECT` support includes FROM-less projections, `VALUES`, views,
+- `SELECT` support includes FROM-less projections, `VALUES`, durable typed views
+  (stored resolved IR remains valid across base table/column renames),
   non-recursive CTEs, derived tables, set operations, `DISTINCT`, `WHERE`,
   inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`,
   `OFFSET`, scalar / `[NOT] IN` / `[NOT] EXISTS` subqueries — correlated in

@@ -7,9 +7,9 @@ User relation names carry an optional schema qualifier. `BindOptions.search_path
 contains the effective schema ids captured by the server for the statement. An
 explicit qualifier resolves only in that schema and an unknown schema returns
 `InvalidSchemaName`; an unqualified name searches the path in order. CTEs shadow
-only unqualified catalog names. Creation uses the first effective path schema,
-while stored views persist the path ids used at creation and rebind definitions
-against that path rather than the caller's current path.
+only unqualified catalog names. Creation uses the first effective path schema.
+Stored views retain those path ids for diagnostics, but references lower their
+resolved query IR directly and do not perform name resolution again.
 
 ## Purpose
 
@@ -120,20 +120,18 @@ Binder responsibilities:
   `SqlState::WrongObjectType` if any name belongs to a view. Execution resolves
   the complete target list before changing catalog or storage.
 - Bind `CREATE VIEW` by binding its query, validating any explicit view column
-  list against the query output width, rejecting query parameters, and deriving
-  durable `ViewDependency` metadata. Specific column references become named
-  column dependencies; `SELECT *` / `table.*` become `all_columns` dependencies,
-  including when the wildcard occurs inside a derived table or CTE used by the
-  view; relation references with no columns (for example `count(*)`) become
-  relation-existence dependencies. Dependencies also include bound CTE
-  definitions even when they are not referenced by the final query body, because
-  the stored SQL is rebound on later view use and those CTEs must remain
-  bindable. `CREATE VIEW` rejects `nextval`/`currval`/`setval` sequence
-  functions until durable sequence dependencies are represented. Bind
+  list against the query output width, rejecting query parameters, and converting
+  the resolved bound tree to versioned `StoredQueryV1`. Base inputs use stable
+  relation/column IDs; scalar and table functions use stable built-in OIDs;
+  derived, LATERAL, system, and table-function inputs use query-local range IDs.
+  CTEs and referenced views are already inlined by binding, so the stored form
+  depends only on executed base objects. `CREATE VIEW` continues to reject
+  `nextval`/`currval`/`setval` sequence functions under the existing SQL subset. Bind
   `DROP VIEW` as a pass-through carrying the normalized view name and `IF
   EXISTS`.
-- Resolve user views in `FROM` by parsing their stored query definition and
-  inlining it as a `BoundFrom::View`, which lowers like a derived table but
+- Resolve user views in `FROM` by lowering their stored resolved query directly
+  to an ordinary `BoundQuery` with fresh dense slots. Wrap it as a
+  `BoundFrom::View`, which lowers like a derived table but
   retains the view id/schema version for dependency tracking and prepared-plan
   invalidation. DML target resolution rejects view names with
   `FeatureNotSupported`.
@@ -173,7 +171,7 @@ pub enum BoundStatement {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, stored_query: StoredQueryV1 },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Query(BoundQuery),
@@ -327,13 +325,13 @@ execute-time parameter substitution or untracked sequence dependencies. When a
 view supplies an explicit column list, its length must exactly match the bound
 query output width and names must be unique (`SqlState::SyntaxError`).
 
-A `BoundFrom::Derived` exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). A non-`LATERAL` derived table binds its inner query in a fresh (sibling-free) scope and lowers to its inner query's plan (no dedicated plan node); a `LATERAL` one binds through the correlated-child-query path — sibling references become correlation entries on the bound query — and lowers to an `Apply` plan node (`docs/specs/subqueries.md` §7). The derived columns occupy a contiguous slot range at the derived binding, just like a base table; an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
+A `BoundFrom::Derived` exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). A non-`LATERAL` derived table binds its inner query in a fresh (sibling-free) scope and lowers to its inner query's plan (no dedicated plan node); a `LATERAL` one binds through the correlated-child-query path — sibling references become correlation entries on the bound query — and lowers to an `Apply` plan node (`docs/specs/subqueries.md` §7). The derived columns occupy a contiguous slot range at the derived binding, just like a base table; an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`). Derived tables and inlined CTEs preserve each inner output column's exact PostgreSQL wire OID/typmod in the exposed `ColumnDef`; positional aliases change names only.
 
-A `BoundFrom::View` represents a user view from the catalog. The binder parses
-the stored query text in the view's own scope (caller CTEs do not affect stored
-name resolution) and inlines the bound query like a derived table, while
-retaining the view relation id and schema version so prepared statements can be
-invalidated when the view changes or is dropped.
+A `BoundFrom::View` represents a user view from the catalog. The binder lowers
+the view's resolved `StoredQueryV1` directly and inlines it like a derived table;
+caller CTEs and the caller's search path cannot affect the result. It retains the
+view relation id and schema version so prepared statements can be invalidated
+when the view changes or is dropped.
 
 A `BoundFrom::System` represents a virtual system view from `pg_catalog` or
 `information_schema`. Bare names resolve in this order: CTE, user table, then
@@ -614,7 +612,7 @@ pub enum LogicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, stored_query: StoredQueryV1 },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
@@ -714,7 +712,7 @@ pub enum PhysicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { schema: SchemaId, name: String, options: SequenceOptions },
     DropSequence { name: String, search_path: Vec<SchemaId>, sequence: Option<SequenceId>, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, stored_query: StoredQueryV1 },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },

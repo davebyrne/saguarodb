@@ -40,8 +40,8 @@ use common::{
     ColumnDefault, ColumnId, CompressionSetting, ConstraintId, ConstraintSchema, DataType, DbError,
     DependencyEdge, FileId, ForeignKeyAction, ForeignKeyConstraint, IndexId, IndexSchema,
     NamespaceSchema, ParsedColumnDef, PgType, Result, SchemaId, SequenceId, SequenceOptions,
-    SequenceSchema, SqlState, TableId, TableSchema, TableStatistics, ToastOptions,
-    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    SequenceSchema, SqlState, StoredQueryV1, TableId, TableSchema, TableStatistics, ToastOptions,
+    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewSchema,
 };
 
 /// A name-optional but otherwise fully resolved foreign-key definition passed
@@ -690,14 +690,14 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema> {
         self.create_view_in_schema(
             common::PUBLIC_SCHEMA_ID,
             name,
             columns,
             definition,
-            dependencies,
+            query,
             vec![common::PUBLIC_SCHEMA_ID],
         )
     }
@@ -708,7 +708,7 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
         definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema>;
     fn replace_view(
@@ -716,14 +716,14 @@ pub trait CatalogManager: Send + Sync {
         id: TableId,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
     ) -> Result<ViewSchema>;
     fn replace_view_with_search_path(
         &self,
         id: TableId,
         columns: Vec<ViewColumn>,
         definition: String,
-        dependencies: Vec<ViewDependency>,
+        query: StoredQueryV1,
         definition_search_path: Vec<SchemaId>,
     ) -> Result<ViewSchema>;
     fn drop_view(&self, id: TableId) -> Result<()>;
@@ -736,9 +736,10 @@ mod tests {
     use common::{
         ColumnDef, ColumnDefault, CompressionSetting, ConstraintKind, DataType, ErrorKind,
         ForeignKeyAction, ForeignKeyConstraint, IndexSchema, ParsedColumnDef, PgType, RelationKind,
-        SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredExpr, StoredExpression,
-        TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn, ViewDependency,
-        toast_schema,
+        SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredColumnReference, StoredExpr,
+        StoredExpression, StoredFrom, StoredQueryBody, StoredQueryColumn, StoredQueryExpr,
+        StoredQueryV1, StoredSelect, StoredSelectItem, TableSchema, ToastCompression, ToastMode,
+        ToastOptions, ViewColumn, toast_schema,
     };
 
     use crate::{
@@ -846,6 +847,73 @@ mod tests {
             data_type,
             nullable,
             pg_type: None,
+        }
+    }
+
+    fn stored_view_query(
+        output: &[ViewColumn],
+        source: Option<(&TableSchema, &[u16])>,
+    ) -> StoredQueryV1 {
+        let columns = output
+            .iter()
+            .enumerate()
+            .map(|(position, column)| {
+                let expr = source
+                    .and_then(|(table, ids)| ids.get(position).map(|id| (table, *id)))
+                    .and_then(|(table, id)| table.columns.iter().find(|item| item.id == id))
+                    .map_or_else(
+                        || StoredQueryExpr::Literal {
+                            value: if !column.nullable && column.data_type == DataType::Integer {
+                                common::Value::Integer(1)
+                            } else {
+                                common::Value::Null
+                            },
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                        },
+                        |item| StoredQueryExpr::InputRef {
+                            range: 0,
+                            column: StoredColumnReference::Catalog(item.object_id),
+                            data_type: item.data_type.clone(),
+                            nullable: item.nullable,
+                        },
+                    );
+                StoredSelectItem {
+                    expr,
+                    alias: column.name.clone(),
+                }
+            })
+            .collect();
+        StoredQueryV1 {
+            version: common::STORED_QUERY_VERSION,
+            body: StoredQueryBody::Select(Box::new(StoredSelect {
+                distinct: None,
+                columns,
+                from: source.map(|(table, _)| StoredFrom::Table {
+                    table: table.id,
+                    range: 0,
+                    alias: None,
+                }),
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                output_schema: output
+                    .iter()
+                    .map(|column| StoredQueryColumn {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        pg_type: column
+                            .pg_type
+                            .clone()
+                            .unwrap_or_else(|| PgType::from(&column.data_type)),
+                    })
+                    .collect(),
+            })),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            row_lock: None,
+            correlations: Vec::new(),
         }
     }
 
@@ -1384,6 +1452,63 @@ mod tests {
     }
 
     #[test]
+    fn catalog_rejects_stored_view_column_with_stale_type() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let view = catalog
+            .create_view(
+                "typed_users".to_string(),
+                vec![view_column("id", DataType::Integer, false)],
+                "select id from users".to_string(),
+                stored_view_query(
+                    &[view_column("id", DataType::Integer, false)],
+                    Some((&users, &[0])),
+                ),
+            )
+            .unwrap();
+        let mut snapshot = catalog.snapshot().unwrap();
+        let stored = snapshot.views_by_id.get_mut(&view.id).unwrap();
+        let StoredQueryBody::Select(select) = &mut stored.query.body else {
+            panic!("test view is SELECT")
+        };
+        let StoredQueryExpr::InputRef { data_type, .. } = &mut select.columns[0].expr else {
+            panic!("test view selects a column")
+        };
+        *data_type = DataType::Text;
+        assert!(MemoryCatalog::try_from_snapshot(snapshot).is_err());
+    }
+
+    #[test]
+    fn catalog_rejects_stored_view_column_with_stale_nullability() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let view = catalog
+            .create_view(
+                "typed_users".to_string(),
+                vec![view_column("name", DataType::Text, true)],
+                "select name from users".to_string(),
+                stored_view_query(
+                    &[view_column("name", DataType::Text, true)],
+                    Some((&users, &[1])),
+                ),
+            )
+            .unwrap();
+        let mut snapshot = catalog.snapshot().unwrap();
+        let stored = snapshot.views_by_id.get_mut(&view.id).unwrap();
+        stored.columns[0].nullable = false;
+        let StoredQueryBody::Select(select) = &mut stored.query.body else {
+            panic!("test view is SELECT")
+        };
+        let StoredQueryExpr::InputRef { nullable, .. } = &mut select.columns[0].expr else {
+            panic!("test view selects a column")
+        };
+        *nullable = false;
+
+        let error = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(error.message.contains("stale metadata"));
+    }
+
+    #[test]
     fn duplicate_column_is_rejected() {
         let catalog = MemoryCatalog::empty();
 
@@ -1604,11 +1729,13 @@ mod tests {
                     view_column("name", DataType::Text, true),
                 ],
                 "SELECT id, name FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![0, 1],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[
+                        view_column("id", DataType::Integer, false),
+                        view_column("name", DataType::Text, true),
+                    ],
+                    Some((&users, &[0, 1])),
+                ),
             )
             .unwrap();
 
@@ -1642,18 +1769,23 @@ mod tests {
             MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
         let restored_view = restored.get_view(view.id).unwrap().unwrap();
         assert_eq!(restored_view.name, "active_users");
-        assert_eq!(restored_view.dependencies[0].relation, users.id);
+        assert!(
+            restored_view
+                .query
+                .referenced_catalog_objects()
+                .unwrap()
+                .contains(&common::CatalogObjectId::Table(users.id))
+        );
 
         let replacement = restored
             .replace_view(
                 view.id,
                 vec![view_column("id", DataType::Integer, false)],
                 "SELECT id FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![0],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[view_column("id", DataType::Integer, false)],
+                    Some((&users, &[0])),
+                ),
             )
             .unwrap();
         assert_eq!(replacement.id, view.id);
@@ -1669,11 +1801,13 @@ mod tests {
                     view_column("display_name", DataType::Text, true),
                 ],
                 "SELECT id, name FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![0, 1],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[
+                        view_column("id", DataType::Integer, false),
+                        view_column("display_name", DataType::Text, true),
+                    ],
+                    Some((&users, &[0, 1])),
+                ),
             )
             .unwrap();
         assert_eq!(extended.columns[0].object_id, view.columns[0].object_id);
@@ -1687,15 +1821,17 @@ mod tests {
             .replace_view(
                 view.id,
                 vec![
-                    view_column("id", DataType::Text, false),
+                    view_column("id", DataType::Text, true),
                     view_column("display_name", DataType::Text, true),
                 ],
                 "SELECT name, name FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![1],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[
+                        view_column("id", DataType::Text, true),
+                        view_column("display_name", DataType::Text, true),
+                    ],
+                    Some((&users, &[1, 1])),
+                ),
             )
             .unwrap();
         assert_eq!(
@@ -1709,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn view_dependencies_block_unsafe_relation_and_column_changes() {
+    fn view_dependencies_block_drops_but_allow_stable_identity_renames() {
         let catalog = catalog_with_users_without_primary_key();
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
         let view = catalog
@@ -1717,77 +1853,124 @@ mod tests {
                 "user_names".to_string(),
                 vec![view_column("name", DataType::Text, true)],
                 "SELECT name FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![1],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[view_column("name", DataType::Text, true)],
+                    Some((&users, &[1])),
+                ),
             )
             .unwrap();
 
         let drop_table = catalog.drop_table(users.id).unwrap_err();
         assert_eq!(drop_table.code, SqlState::DependentObjectsStillExist);
 
-        let rename_table = catalog
+        catalog
             .rename_table(users.id, "people".to_string())
-            .unwrap_err();
-        assert_eq!(rename_table.code, SqlState::DependentObjectsStillExist);
+            .unwrap();
 
         let drop_column = catalog.drop_table_column(users.id, "name").unwrap_err();
         assert_eq!(drop_column.code, SqlState::DependentObjectsStillExist);
 
-        let rename_column = catalog
-            .rename_table_column(users.id, "name", "full_name".to_string())
-            .unwrap_err();
-        assert_eq!(rename_column.code, SqlState::DependentObjectsStillExist);
-
-        catalog.drop_view(view.id).unwrap();
         catalog
             .rename_table_column(users.id, "name", "full_name".to_string())
             .unwrap();
+
+        catalog.drop_view(view.id).unwrap();
     }
 
     #[test]
-    fn view_on_view_dependencies_are_rejected_for_now() {
+    fn view_creation_accepts_an_already_inlined_query() {
         let catalog = catalog_with_users_without_primary_key();
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
-        let base_view = catalog
+        let _base_view = catalog
             .create_view(
                 "base_user_names".to_string(),
                 vec![view_column("name", DataType::Text, true)],
                 "SELECT name FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: vec![1],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[view_column("name", DataType::Text, true)],
+                    Some((&users, &[1])),
+                ),
             )
             .unwrap();
 
-        let err = catalog
+        catalog
             .create_view(
                 "derived_user_names".to_string(),
                 vec![view_column("name", DataType::Text, true)],
                 "SELECT name FROM base_user_names".to_string(),
-                vec![ViewDependency {
-                    relation: base_view.id,
-                    columns: vec![0],
-                    all_columns: false,
-                }],
+                stored_view_query(&[view_column("name", DataType::Text, true)], None),
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
         assert!(
             catalog
                 .get_view_by_name("derived_user_names")
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
-    fn apply_update_table_schema_remaps_view_dependencies_by_column_identity() {
+    fn view_query_limit_preserves_program_limit_sqlstate() {
+        let catalog = MemoryCatalog::empty();
+        let columns = vec![view_column("value", DataType::Integer, false)];
+        let mut query = stored_view_query(&columns, None);
+        query.order_by = (0..=common::MAX_STORED_QUERY_LIST_ITEMS)
+            .map(|_| common::StoredOrderBy {
+                expr: StoredQueryExpr::LocalRef {
+                    output: 0,
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ascending: true,
+                nulls_first: None,
+            })
+            .collect();
+        let error = catalog
+            .create_view(
+                "oversized_view".to_string(),
+                columns,
+                "SELECT 1".to_string(),
+                query,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+    }
+
+    #[test]
+    fn maximum_depth_view_query_round_trips_through_catalog_json() {
+        let catalog = MemoryCatalog::empty();
+        let columns = vec![view_column("value", DataType::Integer, false)];
+        let mut query = stored_view_query(&columns, None);
+        let StoredQueryBody::Select(select) = &mut query.body else {
+            panic!("test query is SELECT")
+        };
+        let mut expr = select.columns[0].expr.clone();
+        for _ in 0..common::MAX_STORED_QUERY_DEPTH - 1 {
+            expr = StoredQueryExpr::Unary {
+                op: common::StoredQueryUnaryOp::Neg,
+                expr: Box::new(expr),
+                data_type: DataType::Integer,
+                nullable: false,
+            };
+        }
+        select.columns[0].expr = expr;
+        catalog
+            .create_view(
+                "deep_view".to_string(),
+                columns,
+                "SELECT 1".to_string(),
+                query,
+            )
+            .unwrap();
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored = deserialize_catalog(&bytes).unwrap();
+        MemoryCatalog::try_from_durable_snapshot(restored).unwrap();
+    }
+
+    #[test]
+    fn apply_update_table_schema_preserves_stable_view_column_references() {
         let catalog = MemoryCatalog::empty();
         let accounts = catalog
             .create_table(
@@ -1820,14 +2003,15 @@ mod tests {
                 "account_balances".to_string(),
                 vec![view_column("balance", DataType::Integer, true)],
                 "SELECT balance FROM accounts".to_string(),
-                vec![ViewDependency {
-                    relation: accounts.id,
-                    columns: vec![2],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[view_column("balance", DataType::Integer, true)],
+                    Some((&accounts, &[2])),
+                ),
             )
             .unwrap();
 
+        let stable_balance = accounts.columns[2].object_id;
+        let accounts_id = accounts.id;
         let mut replayed_schema = accounts;
         replayed_schema.columns.remove(1);
         replayed_schema.columns[1].id = 1;
@@ -1835,7 +2019,16 @@ mod tests {
         catalog.apply_update_table_schema(replayed_schema).unwrap();
 
         let stored_view = catalog.get_view(view.id).unwrap().unwrap();
-        assert_eq!(stored_view.dependencies[0].columns, vec![1]);
+        assert!(
+            stored_view
+                .query
+                .referenced_catalog_objects()
+                .unwrap()
+                .contains(&common::CatalogObjectId::Column {
+                    relation: accounts_id,
+                    column: stable_balance,
+                })
+        );
     }
 
     #[test]
@@ -1948,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn relation_wide_view_dependency_blocks_add_column() {
+    fn resolved_wildcard_view_allows_later_add_column() {
         let catalog = catalog_with_users_without_primary_key();
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
         catalog
@@ -1959,15 +2152,17 @@ mod tests {
                     view_column("name", DataType::Text, true),
                 ],
                 "SELECT * FROM users".to_string(),
-                vec![ViewDependency {
-                    relation: users.id,
-                    columns: Vec::new(),
-                    all_columns: true,
-                }],
+                stored_view_query(
+                    &[
+                        view_column("id", DataType::Integer, false),
+                        view_column("name", DataType::Text, true),
+                    ],
+                    Some((&users, &[0, 1])),
+                ),
             )
             .unwrap();
 
-        let err = catalog
+        let updated = catalog
             .add_table_column(
                 users.id,
                 ParsedColumnDef {
@@ -1979,9 +2174,8 @@ mod tests {
                     pg_type: Some(PgType::Bool),
                 },
             )
-            .unwrap_err();
-
-        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+            .unwrap();
+        assert_eq!(updated.columns.len(), 3);
     }
 
     #[test]
@@ -4563,6 +4757,33 @@ mod tests {
     }
 
     #[test]
+    fn catalog_v3_explicitly_rejects_views_without_resolved_query_ir() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .create_view(
+                "user_ids".to_string(),
+                vec![view_column("id", DataType::Integer, false)],
+                "select id from users".to_string(),
+                stored_view_query(
+                    &[view_column("id", DataType::Integer, false)],
+                    Some((&users, &[0])),
+                ),
+            )
+            .unwrap();
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["views"][0].as_object_mut().unwrap().remove("query");
+
+        let error = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unsupported view catalog encoding without resolved query IR")
+        );
+    }
+
+    #[test]
     fn schema_catalog_rejects_duplicates_and_public_drop() {
         let catalog = MemoryCatalog::empty();
         let app = common::NamespaceSchema {
@@ -4732,7 +4953,7 @@ mod tests {
                 "items_view".to_string(),
                 vec![view_column("id", DataType::Integer, true)],
                 "select 1".to_string(),
-                Vec::new(),
+                stored_view_query(&[view_column("id", DataType::Integer, true)], None),
             )
             .unwrap();
         let mut view = catalog.get_view_by_name("items_view").unwrap().unwrap();
@@ -4853,11 +5074,10 @@ mod tests {
                 "item_view".to_string(),
                 vec![view_column("id", DataType::Integer, false)],
                 "SELECT id FROM items".to_string(),
-                vec![ViewDependency {
-                    relation: app_table.id,
-                    columns: vec![0],
-                    all_columns: false,
-                }],
+                stored_view_query(
+                    &[view_column("id", DataType::Integer, false)],
+                    Some((&app_table, &[0])),
+                ),
                 vec![app.id, common::PUBLIC_SCHEMA_ID],
             )
             .unwrap();
@@ -4871,7 +5091,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_schema_restricts_owned_objects_and_view_search_path_dependencies() {
+    fn drop_schema_ignores_diagnostic_view_search_paths() {
         let catalog = MemoryCatalog::empty();
         let app = catalog.create_schema("app".to_string()).unwrap();
         let table = catalog
@@ -4897,16 +5117,21 @@ mod tests {
                 "uses_app_path".to_string(),
                 vec![view_column("id", DataType::Integer, false)],
                 "SELECT 1 AS id".to_string(),
-                Vec::new(),
+                stored_view_query(&[view_column("id", DataType::Integer, false)], None),
                 vec![app.id, common::PUBLIC_SCHEMA_ID],
             )
             .unwrap();
-        assert_eq!(
-            catalog.drop_schema(app.id).unwrap_err().code,
-            SqlState::DependentObjectsStillExist
-        );
-        catalog.drop_view(view.id).unwrap();
         catalog.drop_schema(app.id).unwrap();
+        assert_eq!(
+            catalog
+                .get_view(view.id)
+                .unwrap()
+                .unwrap()
+                .definition_search_path,
+            vec![app.id, common::PUBLIC_SCHEMA_ID]
+        );
+        MemoryCatalog::try_from_snapshot(catalog.snapshot().unwrap()).unwrap();
+        catalog.drop_view(view.id).unwrap();
     }
 
     #[test]

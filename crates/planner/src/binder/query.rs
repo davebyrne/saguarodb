@@ -1,14 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use catalog::{CatalogManager, SystemView, is_system_schema, resolve_system_view};
 use common::{
     BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, DbError, PgType, Result, SqlState,
     TableId, TableSchema, Value, ViewSchema,
 };
-use parser::{
-    Cte, Distinct, Expr, FromItem, FunctionArg, OrderByItem, Query, QueryBody, Select, SelectItem,
-    Statement,
-};
+use parser::{Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody,
@@ -447,9 +442,12 @@ fn bind_cte(
         &[],
         &mut Vec::new(),
     )?;
-    let columns = derive_alias_columns(&query.output_columns(), &cte.column_aliases, || {
-        format!("CTE \"{}\"", cte.name)
-    })?;
+    let columns = derive_alias_columns(
+        &query.output_columns(),
+        query.output_schema(),
+        &cte.column_aliases,
+        || format!("CTE \"{}\"", cte.name),
+    )?;
     Ok(CteBinding {
         name: cte.name.clone(),
         query,
@@ -464,9 +462,16 @@ fn bind_cte(
 /// (e.g. `table "d"`, `CTE "x"`) and is only evaluated on error.
 pub(super) fn derive_alias_columns(
     output: &[OutputColumn],
+    output_schema: &[ColumnInfo],
     column_aliases: &[String],
     describe: impl FnOnce() -> String,
 ) -> Result<Vec<ColumnDef>> {
+    if output_schema.len() != output.len() {
+        return Err(plan_error(
+            SqlState::InternalError,
+            "query output metadata width mismatch",
+        ));
+    }
     if column_aliases.len() > output.len() {
         return Err(plan_error(
             SqlState::SyntaxError,
@@ -492,7 +497,7 @@ pub(super) fn derive_alias_columns(
             nullable: column.nullable,
             max_length: None,
             default: None,
-            pg_type: None,
+            pg_type: output_schema.get(index).map(|column| column.wire_type()),
         })
         .collect())
 }
@@ -1228,38 +1233,13 @@ fn bind_table_or_schema_qualified_name(
     }
 }
 
-fn parse_view_query(view: &ViewSchema) -> Result<Query> {
-    match parser::parse(&view.definition)? {
-        Statement::Query(query) => Ok(query),
-        _ => Err(plan_error(
-            SqlState::SyntaxError,
-            format!("view {} definition is not a SELECT query", view.name),
-        )),
-    }
-}
-
 fn bind_view_from_schema(
     catalog: &dyn CatalogManager,
     ctx: &mut BindContext,
     view: ViewSchema,
     alias: Option<String>,
 ) -> Result<BoundFrom> {
-    let mut query_ast = parse_view_query(&view)?;
-    stabilize_view_relation_names(catalog, &view, &mut query_ast)?;
-    // A stored view definition binds in its own isolated scope. Caller CTEs
-    // must not change what base relations the persisted SQL resolves to, and
-    // it sees no enclosing bindings (an outer reference in a persisted view
-    // definition is impossible: CREATE VIEW binds with no outer scope).
-    let query = bind_query(
-        catalog,
-        &query_ast,
-        &ctx.declared_params,
-        &view.definition_search_path,
-        &CteScope::default(),
-        None,
-        &[],
-        &mut Vec::new(),
-    )?;
+    let query = crate::lower_stored_query(catalog, &view.query)?;
     let output_len = query.output_schema().len();
     if output_len != view.columns.len() {
         return Err(plan_error(
@@ -1293,200 +1273,6 @@ fn bind_view_from_schema(
         alias: visible_name,
         schema: view.columns,
     })
-}
-
-fn stabilize_view_relation_names(
-    catalog: &dyn CatalogManager,
-    view: &ViewSchema,
-    query: &mut Query,
-) -> Result<()> {
-    let mut relations = BTreeMap::new();
-    for schema_id in &view.definition_search_path {
-        for dependency in &view.dependencies {
-            let relation = if let Some(table) = catalog.get_table(dependency.relation)? {
-                Some((table.schema_id, table.name))
-            } else {
-                catalog
-                    .get_view(dependency.relation)?
-                    .map(|view| (view.schema_id, view.name))
-            };
-            let Some((relation_schema, relation_name)) = relation else {
-                continue;
-            };
-            if relation_schema == *schema_id {
-                let Some(schema) = catalog.get_schema(relation_schema)? else {
-                    continue;
-                };
-                relations
-                    .entry(relation_name.clone())
-                    .or_insert((schema.name, relation_name));
-            }
-        }
-    }
-    stabilize_query_relations(query, &relations, &BTreeSet::new());
-    Ok(())
-}
-
-fn stabilize_query_relations(
-    query: &mut Query,
-    relations: &BTreeMap<String, (String, String)>,
-    inherited_ctes: &BTreeSet<String>,
-) {
-    let mut ctes = inherited_ctes.clone();
-    for cte in &mut query.with {
-        stabilize_query_relations(&mut cte.query, relations, &ctes);
-        ctes.insert(cte.name.clone());
-    }
-    match &mut query.body {
-        QueryBody::Select(select) => {
-            for item in &mut select.from {
-                stabilize_from_relations(item, relations, &ctes);
-            }
-            for item in &mut select.columns {
-                if let SelectItem::Expression { expr, .. } = item {
-                    stabilize_expr_relations(expr, relations, &ctes);
-                }
-            }
-            if let Some(filter) = &mut select.filter {
-                stabilize_expr_relations(filter, relations, &ctes);
-            }
-            for expr in &mut select.group_by {
-                stabilize_expr_relations(expr, relations, &ctes);
-            }
-            if let Some(having) = &mut select.having {
-                stabilize_expr_relations(having, relations, &ctes);
-            }
-        }
-        QueryBody::Values(rows) => {
-            for expr in rows.iter_mut().flatten() {
-                stabilize_expr_relations(expr, relations, &ctes);
-            }
-        }
-        QueryBody::SetOp { left, right, .. } => {
-            stabilize_query_relations(left, relations, &ctes);
-            stabilize_query_relations(right, relations, &ctes);
-        }
-    }
-    for order_by in &mut query.order_by {
-        stabilize_expr_relations(&mut order_by.expr, relations, &ctes);
-    }
-}
-
-fn stabilize_from_relations(
-    item: &mut FromItem,
-    relations: &BTreeMap<String, (String, String)>,
-    ctes: &BTreeSet<String>,
-) {
-    match item {
-        FromItem::Table { name, .. } if name.schema.is_none() && !ctes.contains(&name.name) => {
-            if let Some((schema, relation)) = relations.get(&name.name) {
-                name.schema = Some(schema.clone());
-                name.name = relation.clone();
-            }
-        }
-        FromItem::Table { .. } => {}
-        FromItem::TableFunction { args, .. } => {
-            for arg in args {
-                stabilize_expr_relations(arg, relations, ctes);
-            }
-        }
-        FromItem::Derived { subquery, .. } => stabilize_query_relations(subquery, relations, ctes),
-        FromItem::Join {
-            left,
-            right,
-            condition,
-            ..
-        } => {
-            stabilize_from_relations(left, relations, ctes);
-            stabilize_from_relations(right, relations, ctes);
-            if let Some(condition) = condition {
-                stabilize_expr_relations(condition, relations, ctes);
-            }
-        }
-    }
-}
-
-fn stabilize_expr_relations(
-    expr: &mut Expr,
-    relations: &BTreeMap<String, (String, String)>,
-    ctes: &BTreeSet<String>,
-) {
-    match expr {
-        Expr::Subquery(query)
-        | Expr::Exists {
-            subquery: query, ..
-        } => {
-            stabilize_query_relations(query, relations, ctes);
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            stabilize_expr_relations(expr, relations, ctes);
-            stabilize_query_relations(subquery, relations, ctes);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            stabilize_expr_relations(left, relations, ctes);
-            stabilize_expr_relations(right, relations, ctes);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => stabilize_expr_relations(expr, relations, ctes),
-        Expr::Function { args, .. } => {
-            for arg in args {
-                if let FunctionArg::Expr(expr) = arg {
-                    stabilize_expr_relations(expr, relations, ctes);
-                }
-            }
-        }
-        Expr::Array(items) => {
-            for item in items {
-                stabilize_expr_relations(item, relations, ctes);
-            }
-        }
-        Expr::ArraySubscript { array, subscripts } => {
-            stabilize_expr_relations(array, relations, ctes);
-            for index in subscripts {
-                stabilize_expr_relations(index, relations, ctes);
-            }
-        }
-        Expr::Any { left, array, .. } => {
-            stabilize_expr_relations(left, relations, ctes);
-            stabilize_expr_relations(array, relations, ctes);
-        }
-        Expr::InList { expr, list, .. } => {
-            stabilize_expr_relations(expr, relations, ctes);
-            for item in list {
-                stabilize_expr_relations(item, relations, ctes);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            stabilize_expr_relations(expr, relations, ctes);
-            stabilize_expr_relations(low, relations, ctes);
-            stabilize_expr_relations(high, relations, ctes);
-        }
-        Expr::Like { expr, pattern, .. } => {
-            stabilize_expr_relations(expr, relations, ctes);
-            stabilize_expr_relations(pattern, relations, ctes);
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(operand) = operand {
-                stabilize_expr_relations(operand, relations, ctes);
-            }
-            for (when, then) in when_clauses {
-                stabilize_expr_relations(when, relations, ctes);
-                stabilize_expr_relations(then, relations, ctes);
-            }
-            if let Some(else_clause) = else_clause {
-                stabilize_expr_relations(else_clause, relations, ctes);
-            }
-        }
-        Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => {}
-    }
 }
 
 fn bind_system_view(ctx: &mut BindContext, view: SystemView, alias: Option<String>) -> BoundFrom {
@@ -1608,9 +1394,12 @@ fn bind_derived_table(
             &mut Vec::new(),
         )?
     };
-    let columns = derive_alias_columns(&query.output_columns(), column_aliases, || {
-        format!("table \"{alias}\"")
-    })?;
+    let columns = derive_alias_columns(
+        &query.output_columns(),
+        query.output_schema(),
+        column_aliases,
+        || format!("table \"{alias}\""),
+    )?;
 
     let binding = ctx.next_binding;
     ctx.next_binding += 1;
@@ -1702,7 +1491,6 @@ pub(super) fn bind_select_item(
                     output.push(BoundSelectItem {
                         expr: input_ref(binding, column),
                         alias: column.name.clone(),
-                        wildcard_source: binding.table_id,
                     });
                 }
             }
@@ -1713,18 +1501,13 @@ pub(super) fn bind_select_item(
                 output.push(BoundSelectItem {
                     expr: input_ref(binding, column),
                     alias: column.name.clone(),
-                    wildcard_source: binding.table_id,
                 });
             }
         }
         SelectItem::Expression { expr, alias } => {
             let bound = bind_expr(ctx, expr, expected)?;
             let alias = alias.clone().unwrap_or_else(|| derive_alias(expr));
-            output.push(BoundSelectItem {
-                expr: bound,
-                alias,
-                wildcard_source: None,
-            });
+            output.push(BoundSelectItem { expr: bound, alias });
         }
     }
     Ok(())

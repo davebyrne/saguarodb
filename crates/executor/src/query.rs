@@ -371,7 +371,7 @@ impl QueryEngine {
                 columns,
                 query,
                 definition,
-                dependencies,
+                stored_query,
                 definition_search_path,
             } => execute_create_view(
                 ctx,
@@ -381,7 +381,7 @@ impl QueryEngine {
                 columns,
                 query,
                 definition,
-                dependencies,
+                stored_query,
                 definition_search_path,
             ),
             PhysicalPlan::DropView {
@@ -2752,7 +2752,7 @@ fn execute_create_view(
     columns: &[String],
     query: &planner::BoundQuery,
     definition: &str,
-    dependencies: &[common::ViewDependency],
+    stored_query: &common::StoredQueryV1,
     definition_search_path: &[SchemaId],
 ) -> Result<ExecutionResult> {
     let output = create_view_output_columns(columns, query);
@@ -2763,7 +2763,7 @@ fn execute_create_view(
                     existing.id,
                     output,
                     definition.to_string(),
-                    dependencies.to_vec(),
+                    stored_query.clone(),
                     definition_search_path.to_vec(),
                 )
             })?;
@@ -2786,7 +2786,7 @@ fn execute_create_view(
                     name.to_string(),
                     output,
                     definition.to_string(),
-                    dependencies.to_vec(),
+                    stored_query.clone(),
                     definition_search_path.to_vec(),
                 )
             })?;

@@ -80,38 +80,13 @@ pub(crate) fn build_dependencies(snapshot: &CatalogSnapshot) -> Result<BTreeSet<
                 DependencyType::Internal,
             );
         }
-        for dependency in &view.dependencies {
+        for referenced in view.query.referenced_catalog_objects()? {
             edge(
                 &mut edges,
                 CatalogObjectId::View(view.id),
-                CatalogObjectId::Table(dependency.relation),
+                referenced,
                 DependencyType::Normal,
             );
-            let relation = snapshot
-                .tables_by_id
-                .get(&dependency.relation)
-                .ok_or_else(|| {
-                    DbError::internal(format!(
-                        "view {} references missing relation {}",
-                        view.name, dependency.relation
-                    ))
-                })?;
-            let dense_columns: Vec<_> = if dependency.all_columns {
-                relation.columns.iter().map(|column| column.id).collect()
-            } else {
-                dependency.columns.clone()
-            };
-            for stable in stable_columns(snapshot, dependency.relation, &dense_columns)? {
-                edge(
-                    &mut edges,
-                    CatalogObjectId::View(view.id),
-                    CatalogObjectId::Column {
-                        relation: dependency.relation,
-                        column: stable,
-                    },
-                    DependencyType::Normal,
-                );
-            }
         }
     }
     for index in snapshot.indexes_by_id.values() {
@@ -501,7 +476,8 @@ fn object_exists(snapshot: &CatalogSnapshot, object: CatalogObjectId) -> bool {
         CatalogObjectId::Index(id) => snapshot.indexes_by_id.contains_key(&id),
         CatalogObjectId::Sequence(id) => snapshot.sequences_by_id.contains_key(&id),
         CatalogObjectId::Constraint(id) => snapshot.constraints_by_id.contains_key(&id),
-        CatalogObjectId::Function(id) => common::lookup_scalar_function_by_id(id).is_some(),
+        CatalogObjectId::Function(id) => common::stored_query_function_exists(id),
+        CatalogObjectId::SystemRelation(oid) => crate::SystemView::from_relation_oid(oid).is_some(),
         CatalogObjectId::Statistics(id) => snapshot.statistics.contains_key(&id),
         CatalogObjectId::Column { relation, column } => {
             snapshot

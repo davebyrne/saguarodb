@@ -106,8 +106,8 @@ pub enum Statement {
         or_replace: bool,
         columns: Vec<String>,
         query: Query,
-        /// Canonical SQL text for the stored view query. The catalog will persist
-        /// this text and re-parse it when expanding the view.
+        /// Canonical SQL text retained for view introspection and diagnostics.
+        /// Execution uses the durable resolved query produced by the binder.
         definition: String,
     },
     DropView {

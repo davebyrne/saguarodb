@@ -29,6 +29,8 @@ pub enum CatalogObjectId {
     Sequence(SequenceId),
     Constraint(ConstraintId),
     Function(FunctionId),
+    /// Virtual immutable system relation addressed by its PostgreSQL-compatible OID.
+    SystemRelation(i64),
     Statistics(TableId),
     Column {
         relation: TableId,

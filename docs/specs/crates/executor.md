@@ -6,7 +6,8 @@
 DDL physical plans carry resolved schema ids. CREATE TABLE/INDEX/SEQUENCE/VIEW
 uses schema-scoped catalog creation, CREATE/DROP SCHEMA emits the corresponding
 logical WAL through `SchemaOperations`, and conditional drops resolve within the
-qualified schema. CREATE VIEW persists the effective definition search path.
+qualified schema. CREATE VIEW persists canonical SQL/search-path metadata and
+the binder's resolved typed query IR.
 `pg_namespace` includes user schemas and `pg_class.relnamespace` reflects each
 user object's schema.
 
@@ -515,7 +516,8 @@ not diverge between ALTER validation and later DML.
   `AccessExclusive` (for replace), then the exclusive catalog publication gate.
   A new view has no existing object lock and goes directly to the gate.
 - The binder has already bound the view query, validated the optional output
-  column list, rejected query parameters, and attached durable dependencies.
+  column list, rejected query parameters, and produced durable `StoredQueryV1`;
+  catalog dependencies are derived from that typed IR.
 - Create/replace metadata and append WAL while the gate blocks catalog readers;
   release it only after Commit or rollback restore.
 - For `OR REPLACE` with an existing view, call `CatalogManager::replace_view`
@@ -545,10 +547,9 @@ not diverge between ALTER validation and later DML.
   target `AccessExclusive`, then the catalog publication gate.
 - `RENAME COLUMN` and `RENAME TO` are metadata updates: mutate catalog schema,
   then call `SchemaOperations::update_table_schema` with the updated table and
-  current secondary-index schemas. Catalog rejects these renames when dependent
-  views still rely on their stored SQL. Stored CHECK/default canonical SQL may
-  become textually stale, but rename remains valid because execution follows its
-  stable typed column references.
+  current secondary-index schemas. Stored CHECK/default/view canonical SQL may
+  become textually stale, but rename remains valid because execution follows
+  stable typed catalog references.
 - `ADD COLUMN` and `DROP COLUMN` are logical rewrites. Target `AccessExclusive`
   drains users of the old generation before the executor runs these plans. The executor first
   calls the catalog preflight helper, returning no-op/error outcomes before

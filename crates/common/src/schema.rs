@@ -534,43 +534,11 @@ impl TableSchema {
     }
 }
 
-/// A durable dependency from a view to another relation. `columns` tracks specific
-/// referenced columns. `all_columns` means the view depends on the relation's full
-/// column set (for example `SELECT *`) and column-level DDL should treat every
-/// column as referenced. A dependency with neither specific columns nor
-/// `all_columns` is a relation-existence dependency such as `count(*)`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ViewDependency {
-    pub relation: TableId,
-    pub columns: Vec<ColumnId>,
-    pub all_columns: bool,
-}
-
-impl<'de> Deserialize<'de> for ViewDependency {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RawViewDependency {
-            relation: TableId,
-            #[serde(default)]
-            columns: Vec<ColumnId>,
-            all_columns: Option<bool>,
-        }
-
-        let raw = RawViewDependency::deserialize(deserializer)?;
-        let all_columns = raw.all_columns.unwrap_or(raw.columns.is_empty());
-        Ok(Self {
-            relation: raw.relation,
-            columns: raw.columns,
-            all_columns,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredViewSchema")]
 pub struct ViewSchema {
+    /// Version of the durable view-catalog payload.
+    pub format_version: u32,
     pub id: TableId,
     #[serde(default = "public_schema_id")]
     pub schema_id: SchemaId,
@@ -578,8 +546,8 @@ pub struct ViewSchema {
     pub columns: Vec<ColumnDef>,
     /// Canonical SQL text for the view query.
     pub definition: String,
-    #[serde(default)]
-    pub dependencies: Vec<ViewDependency>,
+    /// Catalog-resolved typed query used for execution and dependencies.
+    pub query: crate::StoredQueryV1,
     #[serde(default = "initial_schema_version")]
     pub schema_version: u64,
     #[serde(default = "default_view_search_path")]
@@ -587,6 +555,55 @@ pub struct ViewSchema {
     /// Next never-reused durable output-column identity within this view.
     pub next_column_object_id: ColumnObjectId,
 }
+
+#[derive(Deserialize)]
+struct StoredViewSchema {
+    format_version: Option<u32>,
+    id: TableId,
+    #[serde(default = "public_schema_id")]
+    schema_id: SchemaId,
+    name: String,
+    columns: Vec<ColumnDef>,
+    definition: String,
+    query: Option<crate::StoredQueryV1>,
+    #[serde(default = "initial_schema_version")]
+    schema_version: u64,
+    #[serde(default = "default_view_search_path")]
+    definition_search_path: Vec<SchemaId>,
+    next_column_object_id: ColumnObjectId,
+}
+
+impl TryFrom<StoredViewSchema> for ViewSchema {
+    type Error = String;
+
+    fn try_from(stored: StoredViewSchema) -> std::result::Result<Self, Self::Error> {
+        let format_version = stored
+            .format_version
+            .ok_or_else(|| "unsupported unversioned view catalog encoding".to_string())?;
+        if format_version != VIEW_SCHEMA_FORMAT_VERSION {
+            return Err(format!(
+                "unsupported view catalog encoding version {format_version}"
+            ));
+        }
+        let query = stored.query.ok_or_else(|| {
+            "unsupported view catalog encoding without resolved query IR".to_string()
+        })?;
+        Ok(Self {
+            format_version,
+            id: stored.id,
+            schema_id: stored.schema_id,
+            name: stored.name,
+            columns: stored.columns,
+            definition: stored.definition,
+            query,
+            schema_version: stored.schema_version,
+            definition_search_path: stored.definition_search_path,
+            next_column_object_id: stored.next_column_object_id,
+        })
+    }
+}
+
+pub const VIEW_SCHEMA_FORMAT_VERSION: u32 = 1;
 
 fn default_view_search_path() -> Vec<SchemaId> {
     vec![PUBLIC_SCHEMA_ID]
@@ -733,8 +750,7 @@ pub struct TruncateCatalogUpdate {
 mod tests {
     use super::{
         ArrayType, ColumnDef, ColumnInfo, CompressionSetting, DataType, INITIAL_SCHEMA_VERSION,
-        PgType, RelationKind, TableSchema, ToastCompression, ToastMode, ToastOptions,
-        ViewDependency,
+        PgType, RelationKind, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewSchema,
     };
 
     #[test]
@@ -797,6 +813,49 @@ mod tests {
     }
 
     #[test]
+    fn view_schema_without_resolved_query_is_explicitly_unsupported() {
+        let json = r#"{
+            "format_version": 1,
+            "id": 1,
+            "name": "legacy_view",
+            "columns": [],
+            "definition": "select 1",
+            "next_column_object_id": 1
+        }"#;
+        let error = serde_json::from_str::<ViewSchema>(json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported view catalog encoding without resolved query IR")
+        );
+    }
+
+    #[test]
+    fn view_schema_requires_a_supported_payload_version() {
+        let unversioned = r#"{
+            "id": 1,
+            "name": "legacy_view",
+            "columns": [],
+            "definition": "select 1",
+            "next_column_object_id": 1
+        }"#;
+        let error = serde_json::from_str::<ViewSchema>(unversioned).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported unversioned view catalog encoding")
+        );
+
+        let unknown = unversioned.replacen('{', "{\"format_version\":2,", 1);
+        let error = serde_json::from_str::<ViewSchema>(&unknown).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported view catalog encoding version 2")
+        );
+    }
+
+    #[test]
     fn compression_setting_defaults_to_none() {
         assert_eq!(CompressionSetting::default(), CompressionSetting::None);
     }
@@ -812,17 +871,6 @@ mod tests {
         let error =
             serde_json::from_str::<DataType>(r#"{"Array":{"Array":"Integer"}}"#).unwrap_err();
         assert!(error.to_string().contains("cannot themselves be arrays"));
-    }
-
-    #[test]
-    fn legacy_empty_view_dependency_deserializes_as_all_columns() {
-        let json = r#"{"relation": 7, "columns": []}"#;
-        let dependency: ViewDependency = serde_json::from_str(json).unwrap();
-        assert!(dependency.all_columns);
-
-        let relation_only_json = r#"{"relation": 7, "columns": [], "all_columns": false}"#;
-        let dependency: ViewDependency = serde_json::from_str(relation_only_json).unwrap();
-        assert!(!dependency.all_columns);
     }
 
     #[test]

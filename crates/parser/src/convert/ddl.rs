@@ -843,8 +843,8 @@ fn apply_column_char_length(pg_type: PgType, max_length: Option<u32>) -> Result<
 /// volatile form accepted here is `nextval('sequence')`, which the catalog later
 /// resolves to a durable sequence id.
 fn convert_column_default(expr: &sql::Expr) -> Result<ParsedDefault> {
-    // Canonical SQL text, kept for the non-constant case so the binder can
-    // re-parse and bind the expression at CREATE TABLE and each INSERT.
+    // Canonical SQL text is carried to the DDL binder, which parses it once and
+    // persists typed durable expression IR. DML does not parse this text.
     let text = expr.to_string();
     match convert_expr(expr)? {
         Expr::Literal(value) => Ok(ParsedDefault::Const(value)),
