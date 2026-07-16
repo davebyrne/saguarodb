@@ -239,7 +239,7 @@ analyzed user tables and keep the `0`/`-1` "unknown" convention otherwise.
 
 Rows are rebuilt for each execution, sorted deterministically, and filtered with
 the bound scan predicate using the same `predicate_matches` semantics as storage
-scans. OID columns report PostgreSQL `oid` wire metadata. Legacy catalog-only
+scans. OID columns report PostgreSQL `oid` wire metadata. PostgreSQL catalog
 vector fields keep text values while reporting PostgreSQL-compatible wire
 identities; ordinary SQL arrays are first-class `SqlArray` values. Extended-query
 result format selection keeps only those legacy vector fields in text when a

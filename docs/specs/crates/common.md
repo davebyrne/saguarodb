@@ -114,8 +114,13 @@ object-ID-sorted before/after mutations and carries global plus per-relation
 stable-column and global constraint allocator high-water. `validate_shape`
 rejects unknown versions, empty/no-op or mismatched mutations,
 unsorted/duplicate identities, non-finite statistics, and over-limit
-mutation/column-allocator collections. Durable decoding
-applies those collection limits before growing the decoded vectors/maps.
+mutation/column-allocator collections. Shared bounded visitors also cap every
+nested durable catalog vector or map at 65,536 entries and reserve vector
+capacity fallibly before growth; durable byte vectors are capped at 64 MiB.
+Stored expressions and stored queries retain
+their smaller shape-specific limits and query-wide decode budget. Catalog
+snapshot collections and WAL committed-subtransaction lists reuse this same
+named, caller-limited vector visitor instead of maintaining separate implementations.
 
 `SqlArray::new` validates rectangular shape, scalar element types, signed
 dimension bounds, and the canonical zero-dimensional empty representation. It
@@ -302,6 +307,7 @@ pub struct ColumnInfo {
 
 pub struct TableSchema {
     pub id: TableId,
+    pub schema_id: SchemaId,
     pub storage_id: FileId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
@@ -357,6 +363,7 @@ pub enum ConstraintKind {
 
 pub struct IndexSchema {
     pub id: IndexId,
+    pub schema_id: SchemaId,
     pub storage_id: FileId,
     pub table: TableId,
     pub name: String,
@@ -383,11 +390,14 @@ pub struct ViewColumn {
 pub struct ViewSchema {
     pub format_version: u32,
     pub id: TableId,
+    pub schema_id: SchemaId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub definition: String,
     pub query: StoredQueryV1,
     pub schema_version: u64,
+    pub definition_search_path: Vec<SchemaId>,
+    pub next_column_object_id: ColumnObjectId,
 }
 
 pub struct SequenceOptions {
@@ -400,6 +410,7 @@ pub struct SequenceOptions {
 
 pub struct SequenceSchema {
     pub id: SequenceId,
+    pub schema_id: SchemaId,
     pub name: String,
     pub increment: i64,
     pub min_value: i64,
@@ -517,23 +528,25 @@ and diagnostics only. Referenced views are inlined before storage, leaving
 durable dependencies on their underlying base objects rather than view names.
 Catalog-column references and view outputs carry validated nullability metadata;
 outer-join null extension is derived from the stored join tree. A view payload
-without resolved query IR is rejected explicitly as an unsupported older
-encoding, whether encountered in a catalog snapshot or catalog-change WAL.
+requires resolved query IR and every schema/search-path/allocator field. Missing
+fields are rejected as malformed catalog v3 or catalog-change WAL; an unknown
+view payload version is rejected explicitly.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and
 `Value::Bytes(Vec<u8>)` remain fully materialized across parser, binder,
 planner, executor, protocol, COPY, indexes, and public storage traits.
-`ToastOptions::default_new_table()` is the intended default for newly created
-user tables after TOAST storage support is fully wired:
+`ToastOptions::default_new_table()` is the default for newly created user tables:
 `mode = Auto`, `tuple_target = 2048`, `min_value_size = 1024`,
 `compression = ZstdDict`, `active_dict_id = None`.
-`ToastOptions::legacy_catalog_default()` is used by serde defaults for catalog
-snapshots written before TOAST existed:
+`ToastOptions::disabled()` is used for hidden TOAST relations and for the
+catalog convenience constructor that explicitly requests no TOAST policy:
 `mode = Off`, `tuple_target = 2048`, `min_value_size = 1024`,
 `compression = None`, `active_dict_id = None`. `RelationKind::default()` is
-`User`. `TableSchema.toast_table_id = None` means no hidden TOAST relation is
-known for that table.
+`User` for in-memory construction only; durable catalog-v3 fields do not use
+Serde defaults. `TableSchema.toast_table_id = None` is valid only when a user
+table has no toastable columns (and on hidden TOAST relations themselves);
+catalog v3 rejects a toastable user table without its required hidden relation.
 Catalog validation rejects TOAST policy values outside the durable bounds:
 `tuple_target` must be in `256..=8000`, `min_value_size` must be at least `128`,
 and `active_dict_id = Some(0)` is invalid because dictionary id `0` is the
@@ -548,7 +561,7 @@ omitted options preserve the base options; `toast = aggressive` plus omitted
 `needs_toast_relation(schema)`, `toast_relation_name(base_table)`, and
 `toast_schema(base, toast_id)` define the hidden TOAST relation metadata shared
 by catalog/executor/storage phases. A user table needs a hidden relation when it
-has a `TEXT` or `BYTEA` column. The generated relation is named
+has a `TEXT`, `BYTEA`, or array column. The generated relation is named
 `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)`
 with primary key `(value_id, seq)`, uses at-rest page `compression = none`, and
 has `RelationKind::Toast { base_table }`.
@@ -1121,7 +1134,8 @@ The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned
 
 ## Invariants
 
-- IDs are stable and never reused within a database.
+- Catalog object IDs and stable column IDs are never reused within a database;
+  dense `ColumnId` values are schema-version-local row/storage ordinals.
 - `Row` carries only values. Schemas are external.
 - `ExecRow.identity` is preserved through filters, sort, limit, and projection; joins and aggregates produce `None`.
 - `common` must not depend on any other SaguaroDB crate.

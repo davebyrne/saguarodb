@@ -11,6 +11,7 @@
 
 use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState};
 use crc32fast::Hasher;
+use serde::{Deserialize, Deserializer};
 
 use crate::{WalRecord, WalRecordKind};
 
@@ -37,6 +38,10 @@ pub(crate) const TYPE_FULL_PAGE_IMAGE_COMPRESSED: u8 = 18;
 pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
 pub(crate) const TYPE_CATALOG_CHANGE: u8 = 31;
 const MAX_CATALOG_CHANGE_PAYLOAD_BYTES: usize = 67_108_864;
+const MAX_JSON_PAYLOAD_BYTES: usize = 67_108_864;
+const MAX_PAGE_BYTES: usize = 8_192;
+const MAX_DICTIONARY_BYTES: usize = 112_640;
+const MAX_COMMITTED_SUBXIDS: usize = 65_536;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -90,6 +95,11 @@ pub(crate) fn read_records(bytes: &[u8]) -> Result<(Vec<(WalRecord, u64)>, usize
                     .ok_or_else(|| wal_error("WAL decoder moved backwards"))?;
                 let encoded_len = u64::try_from(encoded_len)
                     .map_err(|_| wal_error("WAL record length does not fit u64"))?;
+                if records.len() == records.capacity() {
+                    records
+                        .try_reserve(1)
+                        .map_err(|_| wal_error("cannot grow decoded WAL record list"))?;
+                }
                 records.push((*record, encoded_len));
                 offset = next_offset;
             }
@@ -138,6 +148,7 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
             .map_err(|err| wal_error(format!("invalid WAL payload length header: {err}")))?,
     )
     .map_err(|_| wal_error("WAL payload length does not fit usize"))?;
+    validate_declared_payload_length(type_id, payload_len)?;
     let payload_and_crc_len = payload_len
         .checked_add(CRC_LEN)
         .ok_or_else(|| wal_error("WAL record length overflow"))?;
@@ -206,6 +217,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             slot,
             row_bytes,
         } => {
+            validate_body_length(row_bytes.len(), MAX_PAGE_BYTES, "heap-insert row")?;
             let mut payload = encoded_payload_buffer(10, row_bytes.len())?;
             payload.extend_from_slice(&file_id.to_le_bytes());
             payload.extend_from_slice(&page_num.to_le_bytes());
@@ -248,6 +260,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             page_num,
             image,
         } => {
+            validate_body_length(image.len(), MAX_PAGE_BYTES, "full-page image")?;
             let mut payload = encoded_payload_buffer(8, image.len())?;
             payload.extend_from_slice(&file_id.to_le_bytes());
             payload.extend_from_slice(&page_num.to_le_bytes());
@@ -261,6 +274,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             dict_id,
             payload,
         } => {
+            validate_body_length(payload.len(), MAX_PAGE_BYTES, "compressed full-page image")?;
             let mut buf = encoded_payload_buffer(13, payload.len())?;
             buf.extend_from_slice(&file_id.to_le_bytes());
             buf.extend_from_slice(&page_num.to_le_bytes());
@@ -274,6 +288,7 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             table_id,
             bytes,
         } => {
+            validate_body_length(bytes.len(), MAX_DICTIONARY_BYTES, "compression dictionary")?;
             let mut buf = encoded_payload_buffer(8, bytes.len())?;
             buf.extend_from_slice(&dict_id.to_le_bytes());
             buf.extend_from_slice(&table_id.to_le_bytes());
@@ -291,8 +306,13 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             }
             Ok(payload)
         }
-        _ => serde_json::to_vec(kind)
-            .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
+        WalRecordKind::CommitWithSubxids { subxids } => {
+            if subxids.len() > MAX_COMMITTED_SUBXIDS {
+                return Err(wal_error("commit WAL payload exceeds the subxid limit"));
+            }
+            encode_json_payload(kind)
+        }
+        _ => encode_json_payload(kind),
     }
 }
 
@@ -317,11 +337,15 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 return Err(wal_error("WAL heap-insert payload is truncated"));
             }
             let mut reader = physical_reader(payload);
+            let file_id = read_u32(&mut reader)?;
+            let page_num = read_u32(&mut reader)?;
+            let slot = read_u16(&mut reader)?;
+            let row_bytes = copy_remaining(&mut reader, "heap-insert row")?;
             Ok(WalRecordKind::HeapInsert {
-                file_id: read_u32(&mut reader)?,
-                page_num: read_u32(&mut reader)?,
-                slot: read_u16(&mut reader)?,
-                row_bytes: take_remaining(&mut reader)?.to_vec(),
+                file_id,
+                page_num,
+                slot,
+                row_bytes,
             })
         }
         TYPE_HEAP_DELETE => {
@@ -358,10 +382,13 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 return Err(wal_error("WAL full-page-image payload is truncated"));
             }
             let mut reader = physical_reader(payload);
+            let file_id = read_u32(&mut reader)?;
+            let page_num = read_u32(&mut reader)?;
+            let image = copy_remaining(&mut reader, "full-page image")?;
             Ok(WalRecordKind::FullPageImage {
-                file_id: read_u32(&mut reader)?,
-                page_num: read_u32(&mut reader)?,
-                image: take_remaining(&mut reader)?.to_vec(),
+                file_id,
+                page_num,
+                image,
             })
         }
         TYPE_FULL_PAGE_IMAGE_COMPRESSED => {
@@ -369,12 +396,17 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 return Err(wal_error("compressed full-page-image payload too short"));
             }
             let mut reader = physical_reader(payload);
+            let file_id = read_u32(&mut reader)?;
+            let page_num = read_u32(&mut reader)?;
+            let codec = read_u8(&mut reader)?;
+            let dict_id = read_u32(&mut reader)?;
+            let compressed = copy_remaining(&mut reader, "compressed full-page image")?;
             Ok(WalRecordKind::FullPageImageCompressed {
-                file_id: read_u32(&mut reader)?,
-                page_num: read_u32(&mut reader)?,
-                codec: read_u8(&mut reader)?,
-                dict_id: read_u32(&mut reader)?,
-                payload: take_remaining(&mut reader)?.to_vec(),
+                file_id,
+                page_num,
+                codec,
+                dict_id,
+                payload: compressed,
             })
         }
         TYPE_CREATE_DICTIONARY => {
@@ -382,10 +414,22 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 return Err(wal_error("create-dictionary payload too short"));
             }
             let mut reader = physical_reader(payload);
+            let dict_id = read_u32(&mut reader)?;
+            let table_id = read_u32(&mut reader)?;
+            let bytes = copy_remaining(&mut reader, "compression dictionary")?;
             Ok(WalRecordKind::CreateDictionary {
-                dict_id: read_u32(&mut reader)?,
-                table_id: read_u32(&mut reader)?,
-                bytes: take_remaining(&mut reader)?.to_vec(),
+                dict_id,
+                table_id,
+                bytes,
+            })
+        }
+        TYPE_COMMIT_WITH_SUBXIDS => {
+            let payload: CommitWithSubxidsPayload = serde_json::from_slice(payload)
+                .map_err(|err| wal_error(format!("failed to deserialize WAL payload: {err}")))?;
+            Ok(match payload {
+                CommitWithSubxidsPayload::CommitWithSubxids { subxids } => {
+                    WalRecordKind::CommitWithSubxids { subxids }
+                }
             })
         }
         _ => {
@@ -425,6 +469,41 @@ fn encoded_payload_buffer(header_len: usize, body_len: usize) -> Result<Vec<u8>>
     Ok(payload)
 }
 
+fn encode_json_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(kind)
+        .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}")))?;
+    if payload.len() > MAX_JSON_PAYLOAD_BYTES {
+        return Err(wal_error("JSON WAL payload exceeds 64 MiB"));
+    }
+    Ok(payload)
+}
+
+fn validate_declared_payload_length(type_id: u8, payload_len: usize) -> Result<()> {
+    let maximum = match type_id {
+        TYPE_HEAP_INIT => 8,
+        TYPE_HEAP_INSERT => 10 + MAX_PAGE_BYTES,
+        TYPE_HEAP_DELETE => 10,
+        TYPE_HEAP_UPDATE_HEADER => HEAP_UPDATE_HEADER_LEN,
+        TYPE_FULL_PAGE_IMAGE => 8 + MAX_PAGE_BYTES,
+        TYPE_FULL_PAGE_IMAGE_COMPRESSED => 13 + MAX_PAGE_BYTES,
+        TYPE_CREATE_DICTIONARY => 8 + MAX_DICTIONARY_BYTES,
+        _ => MAX_JSON_PAYLOAD_BYTES,
+    };
+    if payload_len > maximum {
+        return Err(wal_error("WAL payload exceeds the record-type size limit"));
+    }
+    Ok(())
+}
+
+fn validate_body_length(length: usize, maximum: usize, description: &str) -> Result<()> {
+    if length > maximum {
+        return Err(wal_error(format!(
+            "WAL {description} exceeds its size limit"
+        )));
+    }
+    Ok(())
+}
+
 fn physical_reader(payload: &[u8]) -> CheckedSliceReader<'_> {
     CheckedSliceReader::new(payload)
 }
@@ -457,6 +536,35 @@ fn take_remaining<'a>(reader: &mut CheckedSliceReader<'a>) -> Result<&'a [u8]> {
     reader
         .take_remaining()
         .map_err(|err| wal_error(format!("WAL physical payload is truncated: {err}")))
+}
+
+fn copy_remaining(reader: &mut CheckedSliceReader<'_>, description: &str) -> Result<Vec<u8>> {
+    let source = take_remaining(reader)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(source.len())
+        .map_err(|_| wal_error(format!("cannot allocate WAL {description}")))?;
+    result.extend_from_slice(source);
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+enum CommitWithSubxidsPayload {
+    CommitWithSubxids {
+        #[serde(deserialize_with = "deserialize_subxids")]
+        subxids: Vec<u64>,
+    },
+}
+
+fn deserialize_subxids<'de, D>(deserializer: D) -> std::result::Result<Vec<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_COMMITTED_SUBXIDS,
+        "commit WAL subxid limit",
+    )
 }
 
 fn finish_physical(reader: CheckedSliceReader<'_>) -> Result<()> {
@@ -492,7 +600,8 @@ mod tests {
     use crate::{WalRecord, WalRecordKind};
 
     use super::{
-        CRC_LEN, HEADER_LEN, MAX_CATALOG_CHANGE_PAYLOAD_BYTES, TYPE_CATALOG_CHANGE,
+        CRC_LEN, HEADER_LEN, MAX_CATALOG_CHANGE_PAYLOAD_BYTES, MAX_COMMITTED_SUBXIDS,
+        MAX_PAGE_BYTES, TYPE_CATALOG_CHANGE, TYPE_COMMIT_WITH_SUBXIDS, TYPE_FULL_PAGE_IMAGE,
         TYPE_HEAP_DELETE, decode_payload, decode_record, encode_record,
     };
 
@@ -859,6 +968,46 @@ mod tests {
 
         let err = decode_record(&bytes).unwrap_err();
         assert_eq!(err.kind, common::ErrorKind::Wal);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_declared_physical_payload_before_materialization() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.push(TYPE_FULL_PAGE_IMAGE);
+        let oversized = u32::try_from(8 + MAX_PAGE_BYTES + 1).unwrap();
+        bytes.extend_from_slice(&oversized.to_le_bytes());
+
+        let error = decode_record(&bytes).unwrap_err();
+        assert!(error.message.contains("record-type size limit"));
+    }
+
+    #[test]
+    fn encode_rejects_oversized_physical_body() {
+        let error = encode_record(&WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::FullPageImage {
+                file_id: 1,
+                page_num: 0,
+                image: vec![0; MAX_PAGE_BYTES + 1],
+            },
+        })
+        .unwrap_err();
+        assert!(error.message.contains("full-page image exceeds"));
+    }
+
+    #[test]
+    fn commit_subxid_decoder_rejects_an_extra_item() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "CommitWithSubxids": {
+                "subxids": vec![1_u64; MAX_COMMITTED_SUBXIDS + 1]
+            }
+        }))
+        .unwrap();
+        let error = decode_payload(TYPE_COMMIT_WITH_SUBXIDS, &payload).unwrap_err();
+        assert!(error.message.contains("subxid limit"));
     }
 
     #[test]

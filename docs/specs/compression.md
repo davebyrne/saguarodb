@@ -528,8 +528,8 @@ crate boundaries as the implementation:
   dictionary file is missing (boot-time validation regression test, §7);
   `ALTER TABLE ... SET (toast...)` updates future-write TOAST policy, can
   train a TOAST dictionary when the corpus is sufficient, survives restart,
-  creates a hidden TOAST relation for legacy tables when needed, and rejects
-  mixed page-compression/TOAST option lists.
+  and rejects mixed page-compression/TOAST option lists. Catalog v3 requires
+  CREATE TABLE to have installed any needed hidden TOAST relation already.
 
 ## 14. Related crate specs
 

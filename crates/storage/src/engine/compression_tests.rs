@@ -57,7 +57,7 @@ fn users_schema_zstd() -> TableSchema {
         primary_key: vec![0],
         compression: CompressionSetting::Zstd,
         active_dict_id: None,
-        toast: ToastOptions::legacy_catalog_default(),
+        toast: ToastOptions::disabled(),
         toast_table_id: None,
         relation_kind: RelationKind::User,
         schema_version: common::INITIAL_SCHEMA_VERSION,

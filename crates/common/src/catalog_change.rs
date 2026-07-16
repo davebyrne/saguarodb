@@ -155,6 +155,11 @@ where
                 let Some(mutation) = sequence.next_element()? else {
                     return Ok(mutations);
                 };
+                if mutations.len() == mutations.capacity() {
+                    mutations
+                        .try_reserve(1)
+                        .map_err(|_| A::Error::custom("cannot grow catalog mutation list"))?;
+                }
                 mutations.push(mutation);
             }
             // Probe for an over-limit element without materializing its nested

@@ -248,7 +248,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,

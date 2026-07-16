@@ -521,8 +521,34 @@ impl<'de> Deserialize<'de> for SqlArray {
         #[derive(Deserialize)]
         struct SerializedArray {
             element_type: DataType,
+            #[serde(deserialize_with = "deserialize_dimensions")]
             dimensions: Vec<ArrayDimension>,
+            #[serde(deserialize_with = "deserialize_elements")]
             elements: Vec<Value>,
+        }
+
+        fn deserialize_dimensions<'de, D>(
+            deserializer: D,
+        ) -> std::result::Result<Vec<ArrayDimension>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            crate::durable::deserialize_bounded_vec_with_limit::<
+                D,
+                ArrayDimension,
+                MAX_ARRAY_DIMENSIONS,
+            >(deserializer)
+        }
+
+        fn deserialize_elements<'de, D>(
+            deserializer: D,
+        ) -> std::result::Result<Vec<Value>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            crate::durable::deserialize_bounded_vec_with_limit::<D, Value, MAX_ARRAY_ELEMENTS>(
+                deserializer,
+            )
         }
 
         let array = SerializedArray::deserialize(deserializer)?;

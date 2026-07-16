@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
 const MANIFEST_VERSION: u32 = 4;
 const MANIFEST_HEADER_LEN: usize = 16;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 272 * 1024 * 1024;
+const MAX_MANIFEST_PAYLOAD_BYTES: usize = MAX_MANIFEST_BYTES - MANIFEST_HEADER_LEN;
+const MAX_MANIFEST_TABLES: usize = 65_536;
+const MAX_MANIFEST_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
 /// The durable control record. It is the checkpoint commit point: the redo
 /// boundary (`checkpoint_lsn`), the live table ids, and the catalog snapshot,
@@ -27,23 +31,65 @@ pub struct ControlData {
     pub page_size: u32,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ControlPayload {
+#[derive(Serialize)]
+struct ControlPayload<'a> {
     checkpoint_lsn: Lsn,
+    tables: &'a [TableId],
+    catalog: &'a [u8],
+    page_size: u32,
+}
+
+#[derive(Deserialize)]
+struct DecodedControlPayload {
+    checkpoint_lsn: Lsn,
+    #[serde(deserialize_with = "deserialize_tables")]
     tables: Vec<TableId>,
+    #[serde(deserialize_with = "deserialize_catalog")]
     catalog: Vec<u8>,
     page_size: u32,
 }
 
+fn deserialize_tables<'de, D>(deserializer: D) -> std::result::Result<Vec<TableId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_MANIFEST_TABLES,
+        "manifest table collection",
+    )
+}
+
+fn deserialize_catalog<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_MANIFEST_CATALOG_BYTES,
+        "manifest catalog bytes",
+    )
+}
+
 pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
+    if control.tables.len() > MAX_MANIFEST_TABLES {
+        return Err(corrupt_control("control file has too many table ids"));
+    }
+    if control.catalog.len() > MAX_MANIFEST_CATALOG_BYTES {
+        return Err(corrupt_control("control catalog exceeds 64 MiB"));
+    }
+    validate_sorted_tables(&control.tables)?;
     let payload = ControlPayload {
         checkpoint_lsn: control.checkpoint_lsn,
-        tables: control.tables.clone(),
-        catalog: control.catalog.clone(),
+        tables: &control.tables,
+        catalog: &control.catalog,
         page_size: control.page_size,
     };
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|err| corrupt_control(format!("failed to encode control payload: {err}")))?;
+    if payload_bytes.len() > MAX_MANIFEST_PAYLOAD_BYTES {
+        return Err(corrupt_control("control payload exceeds size limit"));
+    }
     let payload_len = u32::try_from(payload_bytes.len())
         .map_err(|_| corrupt_control("control payload is too large"))?;
     let checksum = crc32fast::hash(&payload_bytes);
@@ -64,6 +110,9 @@ pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(corrupt_control("control file exceeds size limit"));
+    }
     if bytes.len() < MANIFEST_HEADER_LEN {
         return Err(corrupt_control("control file is too short"));
     }
@@ -84,6 +133,9 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
 
     let payload_len = usize::try_from(read_u32(&mut reader, "control file payload length")?)
         .map_err(|_| corrupt_control("control file payload length does not fit usize"))?;
+    if payload_len > MAX_MANIFEST_PAYLOAD_BYTES {
+        return Err(corrupt_control("control payload exceeds size limit"));
+    }
     let expected_checksum = read_u32(&mut reader, "control file checksum")?;
     if reader.remaining() != payload_len {
         return Err(corrupt_control("control file length mismatch"));
@@ -99,7 +151,7 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
         return Err(corrupt_control("control file checksum mismatch"));
     }
 
-    let payload: ControlPayload = serde_json::from_slice(payload_bytes)
+    let payload: DecodedControlPayload = serde_json::from_slice(payload_bytes)
         .map_err(|err| corrupt_control(format!("failed to decode control payload: {err}")))?;
     validate_sorted_tables(&payload.tables)?;
     Ok(ControlData {
@@ -134,7 +186,7 @@ fn corrupt_control(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlData, decode_control, encode_control};
+    use super::{ControlData, MAX_MANIFEST_PAYLOAD_BYTES, decode_control, encode_control};
 
     fn control() -> ControlData {
         ControlData {
@@ -183,6 +235,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_declared_payload_before_materialization() {
+        let mut bytes = encode_control(&control()).unwrap();
+        let oversized = u32::try_from(MAX_MANIFEST_PAYLOAD_BYTES + 1).unwrap();
+        bytes[8..12].copy_from_slice(&oversized.to_le_bytes());
+
+        let err = decode_control(&bytes).unwrap_err();
+        assert!(err.message.contains("payload exceeds size limit"));
+    }
+
+    #[test]
     fn rejects_legacy_manifest_version() {
         // A v1 (full-snapshot) manifest envelope must be rejected, not migrated.
         let mut bytes = encode_control(&control()).unwrap();
@@ -195,13 +257,34 @@ mod tests {
     #[test]
     fn rejects_unsorted_or_duplicate_tables() {
         for tables in [vec![2, 1], vec![1, 1]] {
-            let bytes = encode_control(&ControlData {
+            let error = encode_control(&ControlData {
                 checkpoint_lsn: 42,
                 tables,
                 catalog: Vec::new(),
                 page_size: 8192,
             })
+            .unwrap_err();
+
+            assert!(error.message.contains("sorted table ids"));
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_checksummed_unsorted_or_duplicate_tables() {
+        for tables in [vec![2, 1], vec![1, 1]] {
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "checkpoint_lsn": 42,
+                "tables": tables,
+                "catalog": [],
+                "page_size": 8192
+            }))
             .unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"SGMF");
+            bytes.extend_from_slice(&4_u32.to_le_bytes());
+            bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
 
             let err = decode_control(&bytes).unwrap_err();
             assert!(err.message.contains("sorted table ids"));

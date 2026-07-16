@@ -51,6 +51,10 @@ pub struct Catalog {
     next_dictionary_id: u32,
     // Physical relation-generation ids for heaps and indexes.
     next_storage_id: FileId,
+    next_constraint_id: ConstraintId,
+    constraints_by_id: HashMap<ConstraintId, ConstraintSchema>,
+    dependencies: BTreeSet<DependencyEdge>,
+    statistics: HashMap<TableId, TableStatistics>,
 }
 
 pub struct CatalogSnapshot {
@@ -104,8 +108,8 @@ captures the schema-id search path used to bind its stored definition. Schema id
 `2`. Schema ids are monotonic and never reused.
 
 `CatalogManager` exposes schema-scoped lookup and creation operations for tables,
-indexes, sequences, and views. The legacy bare-name lookup and creation methods
-remain compatibility conveniences for `public`. Scoped index creation identifies
+indexes, sequences, and views. Bare-name lookup and creation methods target
+`public`. Scoped index creation identifies
 its target table by stable `TableId`, avoiding ambiguous bare names. Scoped view
 creation records the exact schema-id search path used to bind its definition for
 diagnostics only.
@@ -136,10 +140,10 @@ all are monotonically increasing and never reused. `next_index_id` starts at
 per-table identity index and is never assigned to a catalog index.
 `next_sequence_id` starts at `1`. `next_dictionary_id` starts at `1` (dictionary id `0` is
 reserved to mean "no dictionary", never assigned to a real dictionary).
-`next_storage_id` starts at `1`; storage id `0` is the legacy/missing sentinel,
-and ids with storage file-kind high bits set are invalid. The index, sequence,
-dictionary-id, storage-id, and statistics fields deserialize with defaults
-(empty maps and initial allocator values). A persisted user table that declares
+`next_storage_id` starts at `1`; storage id `0` is reserved, and ids with storage
+file-kind high bits set are invalid. Catalog v3 requires every object field,
+object collection, and allocator high-water value; missing fields are rejected
+rather than defaulted. A persisted user table that declares
 a primary key must have a matching primary-key constraint index; manifests from
 the older implicit-primary-key-index format are rejected rather than migrated.
 
@@ -156,9 +160,10 @@ including table rename); any other column change clears the per-column map but
 keeps the row/page counts, because column ids are dense and shift on DROP
 COLUMN. (The primary-key/compression/TOAST setters and the truncate apply
 paths — which only swap storage ids — bypass the funnel and never change
-column shape.) `DROP TABLE` removes the entry. Snapshot load *prunes*
-orphan statistics (missing table, non-user relation, or unknown column id)
-instead of rejecting them — a stale advisory entry must never block startup.
+column shape.) `DROP TABLE` removes the entry. Snapshot load rejects statistics
+for a missing/non-user table, an unknown dense column id, or a non-finite value
+as catalog corruption; generic DDL changes remove or remap valid entries before
+publication.
 The transactional-TRUNCATE overlay reads statistics from the base catalog
 unchanged and rejects writes.
 
@@ -458,7 +463,7 @@ deterministic object-ID-sorted mutations and allocator high-water;
 high-water, validates the complete snapshot, and only then returns it for atomic
 publication. Live publication and recovery share this implementation.
 
-The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
+The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database. A decoded persisted snapshot must use `MemoryCatalog::try_from_durable_snapshot(snapshot)`, which validates the serialized constraint and dependency metadata exactly without repairing it. `MemoryCatalog::try_from_snapshot(snapshot)` is for detached in-memory candidates assembled by trusted live/recovery code: it centrally rebuilds the dependency graph from the supplied first-class constraints and other catalog objects before validation. The unchecked `from_snapshot` constructor is crate-internal.
 
 User tables, user views, user-visible indexes (secondary, unique constraint, and
 primary-key constraint indexes), public sequences, and primary-key auto-names
@@ -508,7 +513,9 @@ rejected even when another eligible constraint covers the same columns. Type
 rewrites validate all incoming/outgoing FK declared types before allocating
 replacement TOAST/catalog state.
 
-`apply_create_table` and `apply_drop_table` are recovery-only APIs.
+`apply_create_table` and `apply_drop_table` are low-level validated object APIs
+used by catalog staging and rollback helpers; WAL recovery applies the shared
+generic change set instead of dispatching to them by record kind.
 `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects
 conflicting IDs and public relation names for user tables, rejects duplicate
 live table/TOAST `storage_id`s, adds only user tables to the name map, and
@@ -545,7 +552,7 @@ or applying a table with a primary key is likewise rejected when its
 `<relation>_pkey` auto-name would collide with any public relation. `drop_index`
 removes an index by ID, returning `SqlState::UndefinedTable` for a missing ID
 (indexes share the relation namespace, so there is no dedicated SQLSTATE).
-`apply_create_index` and `apply_drop_index` are the matching recovery-only APIs:
+`apply_create_index` and `apply_drop_index` are matching low-level validated APIs:
 `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects
 conflicting public relation names, IDs, or live secondary-index `storage_id`s,
 and advances `next_index_id` to at least `schema.id + 1` and `next_storage_id`
@@ -561,8 +568,8 @@ relation name or duplicate sequence ID returns `SqlState::DuplicateTable`; a
 missing sequence on drop returns `SqlState::UndefinedTable`; dropping a sequence
 still referenced by a column `ColumnDefault::Nextval` returns
 `SqlState::DependentObjectsStillExist` (`2BP01`).
-`apply_create_sequence` / `apply_drop_sequence` are the recovery-only APIs for
-historical sequence schemas, and
+`apply_create_sequence` / `apply_drop_sequence` are low-level validated APIs for
+fully assigned sequence schemas, and
 `reserve_sequence_id(id)` advances `next_sequence_id` to at least `id + 1`
 without installing a schema.
 
@@ -605,8 +612,7 @@ commit. `apply_truncate_tables(plans)` rejects duplicate logical targets and any
 replacement storage id reused anywhere across the batch, validates every plan
 against one catalog state, and applies the complete batch under one catalog
 write lock. Normal multi-table TRUNCATE uses the batch method;
-recovery keeps applying individual committed logical WAL records whose shared
-transaction outcome makes the batch durable together.
+recovery applies the transaction's committed generic catalog change atomically.
 
 `apply_truncate_updates(updates)` is the top-level commit publication path for
 transactional TRUNCATE. It accepts prebuilt overlay schemas, reconstructs and
@@ -678,8 +684,8 @@ remain intact.
   normal create-index orchestration. One generic catalog change carries the
   table, hidden relation, declared indexes, owned sequences, and attached FK
   metadata atomically before physical relation/index initialization.
-- `create_table_with_options` is the SQL DDL path. Its `compression: CompressionSetting` parameter (binder-resolved from optional `CREATE TABLE ... WITH (compression = ...)`, defaulting to `CompressionSetting::None`) is stored verbatim as `TableSchema.compression`; `active_dict_id` starts `None` — a freshly created `zstd` table is dict-less until an `ALTER` trains a dictionary (`docs/specs/compression.md` §4, §7). Its `toast: ToastOptions` parameter is stored verbatim on the user table after catalog validation. If the user table has at least one `TEXT` or `BYTEA` column, the catalog allocates a second `TableId` and a distinct storage id, stores the table id as `TableSchema.toast_table_id`, and creates a hidden TOAST relation by ID only. The hidden relation name is `"\0toast_<base_table_id>"`; columns are `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`; `compression = none`; `toast = ToastOptions::legacy_catalog_default()`; `toast_table_id = None`; `relation_kind = Toast { base_table }`. The hidden relation is not inserted into the user table name map.
-- `create_table` is a compatibility helper that delegates to `create_table_with_options` with `ToastOptions::legacy_catalog_default()`. New SQL DDL should use `create_table_with_options`.
+- `create_table_with_options` is the SQL DDL path. Its `compression: CompressionSetting` parameter (binder-resolved from optional `CREATE TABLE ... WITH (compression = ...)`, defaulting to `CompressionSetting::None`) is stored verbatim as `TableSchema.compression`; `active_dict_id` starts `None` — a freshly created `zstd` table is dict-less until an `ALTER` trains a dictionary (`docs/specs/compression.md` §4, §7). Its `toast: ToastOptions` parameter is stored verbatim on the user table after catalog validation. If the user table has at least one `TEXT`, `BYTEA`, or array column, the catalog allocates a second `TableId` and a distinct storage id, stores the table id as `TableSchema.toast_table_id`, and creates a hidden TOAST relation by ID only. Adding the first such column performs the same companion allocation. The hidden relation name is `"\0toast_<base_table_id>"`; columns are `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`; `compression = none`; `toast = ToastOptions::disabled()`; `toast_table_id = None`; `relation_kind = Toast { base_table }`. The hidden relation is not inserted into the user table name map.
+- `create_table` is a convenience helper that delegates to `create_table_with_options` with `ToastOptions::disabled()`. SQL DDL uses `create_table_with_options`.
 - `validate_create_table_definition(name, columns, primary_key, unique)` performs
   the catalog-owned table-shape validation used by table creation (duplicate
   columns, primary-key references, and unique-constraint column references)
@@ -687,7 +693,7 @@ remain intact.
   suppressing a duplicate-table error for `CREATE TABLE IF NOT EXISTS`, so invalid
   table definitions are still rejected even when the named table already exists.
 - `set_table_toast_metadata(table, toast, toast_table_id)` validates the target is a user table, validates TOAST bounds, validates any supplied hidden relation cross-link, updates `toast` and `toast_table_id` atomically in the catalog snapshot, and reserves `toast.active_dict_id` when present.
-- `set_table_primary_key(table, primary_key)` is retained only as an invariant-checking compatibility boundary: it validates the target and dependencies, returns the existing schema for an identical projection, and rejects an actual change because a standalone projection update cannot carry its authoritative first-class constraint and backing index. Runtime add/drop uses the atomic helpers below; recovery applies the complete generic catalog change set.
+- `set_table_primary_key(table, primary_key)` is an invariant-checking boundary: it validates the target and dependencies, returns the existing schema for an identical projection, and rejects an actual change because a standalone projection update cannot carry its authoritative first-class constraint and backing index. Runtime add/drop uses the atomic helpers below; recovery applies the complete generic catalog change set.
 - `apply_update_index_schema(schema)` may replace physical storage-generation metadata, but constraint ownership is immutable through this single-object boundary. A constraint-owned index also cannot change its name, columns, or uniqueness independently of its owning `ConstraintSchema`; the complete candidate snapshot is rebuilt and validated before publication.
 - `add_table_primary_key_index(table, primary_key, index)` atomically installs `TableSchema.primary_key` and the backing primary-key constraint index in the same catalog snapshot. It validates the target is a user table with no current primary key, validates the primary-key columns, validates the supplied index name/id/table/columns/constraint metadata, marks key columns non-null, increments `TableSchema.schema_version`, and advances the index allocator.
 - `drop_table_primary_key_index(table, index)` atomically clears `TableSchema.primary_key`, increments `TableSchema.schema_version`, and removes the named primary-key constraint index from the same catalog snapshot. It is the runtime `ALTER TABLE ... DROP PRIMARY KEY` path, so readers never observe a table with `primary_key = []` while the old primary-key constraint index is still catalog-visible. Former primary-key columns remain non-null.
@@ -730,7 +736,7 @@ remain intact.
 
 ## Catalog Persistence
 
-The catalog snapshot is deterministic JSON format version `3` inside the control record. Unversioned, older, and pre-foundation v3 layouts without the required typed-catalog allocator fields are rejected explicitly; development data directories are rebuilt rather than migrated. Catalog input and output are capped at 64 MiB. Transaction-local catalog mutation rejects growth past that durable limit with `ProgramLimitExceeded` before recording or publishing its overlay, so every successful catalog mutation remains checkpointable and reopenable. Validation requires unique nonzero stable column IDs below each relation's allocator, validates every stored-expression version/shape/reference and its bounded lists, requires each constant or stored-expression default to match its owning column type, and rejects unknown column, function, or sequence identities as catalog corruption. Canonical expression SQL is retained but is not execution authority. `reconcile_snapshot_derived_metadata` is the narrow persistence-boundary helper for callers that must add storage-authoritative sequence metadata to a detached snapshot; it rebuilds constraints and the exact dependency graph through the same central builder and validates the result before serialization.
+The catalog snapshot is deterministic JSON format version `3` inside the control record. Unversioned, older, and pre-foundation v3 layouts without the required typed-catalog allocator fields are rejected explicitly; development data directories are rebuilt rather than migrated. Catalog input and output are capped at 64 MiB. Each top-level object-kind collection is capped at 65,536 entries and the dependency collection at 1,000,000; serialization checks the same count limits as decoding before producing bytes, so a successful checkpoint is reopenable. Every nested catalog collection is also bounded before allocation. Custom visitors enforce those limits and use fallible reservation before growing decoded vectors, and reconstructed hash maps also reserve fallibly. Transaction-local catalog mutation rejects growth past the durable byte limit with `ProgramLimitExceeded` before recording or publishing its overlay, so every successful catalog mutation remains checkpointable and reopenable. Validation requires unique nonzero stable column IDs below each relation's allocator, requires every toastable user table to reference its matching hidden TOAST relation, validates every stored-expression version/shape/reference and its bounded lists, requires each constant or stored-expression default to match its owning column type, and rejects unknown column, function, or sequence identities as catalog corruption. Canonical expression SQL is retained but is not execution authority. `reconcile_snapshot_derived_metadata` is the narrow persistence-boundary helper for callers that must add storage-authoritative sequence metadata to a detached snapshot; it rebuilds the exact dependency graph from the supplied catalog objects through the same central builder and validates the result before serialization. It does not create or repair first-class constraints.
 
 Snapshot validation requires `public` to retain its fixed id/name, schema
 name/id maps to be bidirectionally consistent with unique names and ids, and
@@ -854,13 +860,14 @@ TOAST, and index storage generations.
 - Create index resolves columns and assigns monotonically increasing index IDs.
 - Duplicate index name, missing table, missing column, and duplicate/empty columns are rejected with the documented SQLSTATEs.
 - Dropping a table cascades to its indexes.
-- Serialization round-trip preserves indexes and `next_index_id`; a no-primary-key snapshot without index fields loads as an empty index set.
+- Serialization round-trip preserves indexes and `next_index_id`; a catalog-v3
+  snapshot missing index fields is rejected.
 - Snapshot validation rejects an index that references a missing table, uses the reserved storage identity index ID, has invalid primary-key constraint metadata, a primary-key table without exactly one matching primary-key constraint index, or a stale `next_index_id`.
 - Create/drop sequence assigns monotonically increasing sequence IDs, validates
   sequence options, rejects drops while a column default references the sequence
   or the sequence is owned by `SERIAL`, rejects explicit defaults that borrow an
-  owned sequence, persists through snapshot round-trip, and a snapshot without
-  sequence fields loads as an empty sequence set.
+  owned sequence, persists through snapshot round-trip, and a catalog-v3
+  snapshot missing sequence fields is rejected.
 - `create_table` stores the requested `compression` setting and starts
   `active_dict_id` at `None`.
 - `set_table_compression` updates and persists a table's `compression` and
@@ -869,5 +876,5 @@ TOAST, and index storage generations.
 - Dictionary ids allocate monotonically (`allocate_dictionary_id`) and survive
   `reserve_dictionary_id` (a reserve above the current high-water mark advances
   it; a reserve below a value already allocated is a no-op).
-- A snapshot without the dictionary-id field defaults `next_dictionary_id` to
-  `1`, and the first allocation from that defaulted state still returns `1`.
+- A snapshot without the dictionary-id field is rejected; a fresh empty catalog
+  starts `next_dictionary_id` at `1`.

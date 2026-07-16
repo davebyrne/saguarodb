@@ -10,7 +10,7 @@ expression `DEFAULT`, RETURNING, `ON CONFLICT`, and SSI work)
 > and expression defaults), `RETURNING`, `INSERT ... ON CONFLICT`,
 > composite/`UNIQUE` keys, and real **SSI** (`SERIALIZABLE` is now its own
 > isolation level). The plan below is retained as implementation history and
-> updated to describe the current contract; §12 records the interactions.
+> updated to describe the current contract; §11 records the interactions.
 
 ## 1. Overview
 
@@ -95,9 +95,8 @@ These were settled during design and drive the rest of the spec.
 5. **Widen the durable default field.** `ColumnDef.default` becomes
    `Option<ColumnDefault>`, whose variants are `Const(Value)`,
    `Nextval(SequenceId)`, and `Expr(StoredExpression)`.
-   Constant `DEFAULT` landed unreleased on this branch, so changing its on-disk
-   shape is acceptable. The catalog snapshot is versioned catalog-v3 JSON and
-   older formats are rejected (`serialize_catalog`). `ColumnDefault` derives its serde
+   The catalog snapshot is versioned catalog-v3 JSON and older formats are
+   rejected (`serialize_catalog`). `ColumnDefault` derives its serde
    (externally tagged); no compatibility shim is kept for the brief bare-`Value`
    form it had before this enum, since dev data is resettable (runtime-data
    convention).
@@ -110,8 +109,8 @@ These were settled during design and drive the rest of the spec.
 
 - `common::ParsedColumnDef.default` is `Option<ParsedDefault>` and
   `common::ColumnDef.default` is `Option<ColumnDefault>`
-  (`crates/common/src/schema.rs`), `#[serde(default)]`, and round-trip through
-  the catalog snapshot.
+  (`crates/common/src/schema.rs`) and round-trips through the catalog snapshot
+  as a required catalog-v3 field; absent fields are rejected.
 - The parser converts `DEFAULT <expr>` through `convert_column_default`
   (`crates/parser/src/convert/ddl.rs`): literals and unary-minus numerics become
   `ParsedDefault::Const`, a valid `nextval('<sequence>')` becomes
@@ -156,8 +155,9 @@ the SERIAL family; execution replaces it with internal
 `ParsedDefault::OwnedNextval(name)` after creating the owned sequence. User
 defaults use `Nextval(name)` and may not borrow an owned sequence. Keeping
 `Const(Value)` as a variant preserves the existing constant behavior unchanged;
-`Expr(StoredExpression)` stores typed durable IR plus canonical SQL for display. See Decision 5
-for the on-disk migration.
+`Expr(StoredExpression)` stores typed durable IR plus canonical SQL for display.
+Catalog v3 requires this representation and provides no reader or migration for
+the former text-only development format.
 
 ### 3.3 Parser
 
@@ -199,7 +199,7 @@ for the on-disk migration.
   `Expr(stored)` → lower typed IR directly and evaluate it over an empty row;
   absent default → `NULL`. Because this is the shared funnel, `INSERT`,
   `ON CONFLICT`, and `COPY ... FROM` all get sequence-backed and expression
-  defaults with no per-path work — see §12 for the ordering consequences.
+  defaults with no per-path work — see §11 for the ordering consequences.
 
 ## 4. Sequences
 
@@ -233,14 +233,14 @@ pub struct SequenceSchema {
 
 The `catalog` crate gains a sequence map paralleling its table/index maps:
 `create_sequence`, `drop_sequence`, `get_sequence_by_name`,
-`apply_create_sequence`/`apply_drop_sequence` (recovery-only), and
+`apply_create_sequence`/`apply_drop_sequence` (validated by-ID application used
+by live rollback/restore paths), and
 `reserve_sequence_id` (advance the allocator high-water mark without creating an
 object), mirroring the existing `reserve_table_id`/`reserve_index_id`.
 
 The manifest catalog snapshot (serialized as JSON into the control record) gains
-a `sequences` field. This is an additive change carried by `#[serde(default)]` on
-the catalog-v3 field; older catalog formats are rejected, so a current snapshot deserializes with an
-empty sequence set.
+a required `sequences` field. Catalog v3 rejects an absent field and every older
+catalog format; it never synthesizes an empty sequence set for compatibility.
 
 ### 4.2 Runtime: `SequenceManager` (`storage`)
 
@@ -350,7 +350,7 @@ Add two handles there the same way:
   `currval`.
 
 This is the one place the otherwise-pure expression evaluator gains side effects;
-it is confined to these three functions and does not perturb SSI tracking (§12),
+it is confined to these three functions and does not perturb SSI tracking (§11),
 because sequence ops touch no heap tuples.
 
 `nextval`/`setval`/`currval` are permitted in projection lists, `INSERT`/`COPY`
@@ -455,7 +455,8 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   `VALUES` item still being rejected, and non-`nextval` function defaults), plus
   the `SERIAL` family cases.
 - **catalog**: create/drop, id allocation high-water behavior, snapshot
-  round-trip including sequences + baseline values, old-snapshot compatibility.
+  round-trip including sequences + baseline values, and rejection of older or
+  incomplete snapshot formats.
 - **storage / recovery**: crash after N `nextval`s → no value reissued; an
   aborted transaction's `nextval` keeps the gap; `setval` then crash; `CYCLE`
   wrap and `NO CYCLE` exhaustion; concurrent `nextval` from parallel writers
@@ -466,57 +467,29 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   `INSERT ... RETURNING id` (primary idiom) and `currval`; `DROP TABLE`
   and `DROP COLUMN` cascade-dropping the owned sequence; `DROP SEQUENCE` of an
   owned sequence erroring.
-- **interactions (§12)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
+- **interactions (§11)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
   still consumes a sequence value (observable gap); `excluded.<serial_col>` sees
   the `nextval`-filled value; a `SERIALIZABLE` transaction that calls `nextval`
   (with no heap reads/writes) commits without a `40001`, and a SERIALIZABLE abort
   of a txn that did touch heap does not roll back its sequence advance.
 
-## 10. Build order
+## 10. Related specifications
 
-A single implementation plan, sequenced as independently testable commits:
-
-1. **Generalize the default field (no sequences yet).** Introduce
-   `ColumnDefault`/`ParsedDefault` enums, migrate `ParsedColumnDef.default` and
-   `ColumnDef.default` to them with `Const` preserving today's constant behavior
-   and `Expr` carrying non-constant defaults as `StoredExpression`, update
-   `convert_column_default`, `validate_default_value`, the catalog snapshot
-   (the snapshot is catalog-v3 JSON), and the `build_insert_row` fill step to
-   lower and evaluate the stored default. Existing DEFAULT tests stay green;
-   `Nextval` has no producer yet.
-2. **Sequence catalog object + DDL.** `SequenceId`/`SequenceSchema`, catalog
-   map + allocator + recovery hooks, manifest field, generic catalog WAL,
-   `CREATE`/`DROP SEQUENCE` parsing and server DDL dispatch, recovery replay. No
-   functions yet.
-3. **Functions + runtime.** `SequenceManager` with WAL-logged advance/setval and
-   recovery fast-forward, `nextval`/`currval`/`setval` evaluation, session
-   state + `StatementContext` threading, write-path routing for
-   sequence-mutating statements, and the `build_insert_row` `Nextval` evaluation.
-   Also wire `nextval` as an explicit `DEFAULT nextval('existing')` resolved in
-   `catalog.create_table`.
-4. **`SERIAL` desugaring + ownership.** `SERIAL` family parsing, desugar to
-   owned sequence + `ParsedDefault::OwnedNextval`, owned-sequence cascade on
-   `DROP TABLE`, `DROP SEQUENCE` ownership guard.
-5. **Specs + sweep.** `COPY ... FROM` already inherits defaults via the shared
-   funnel — add tests rather than code; update `docs/specs/overview.md` and the
-   affected `docs/specs/crates/*.md`; full `cargo fmt` / `clippy` / `test` sweep.
-
-## 11. Spec impact
-
-This feature updates:
+Sequence behavior is also specified in:
 
 - `docs/specs/overview.md` — data types (note `SERIAL` family → `INTEGER`) and
   SQL subset (`CREATE`/`DROP SEQUENCE`, `DEFAULT nextval`, sequence functions,
   and `SERIAL`). No `Value`/`DataType` change.
 - `docs/specs/crates/parser.md` — sequence grammar, `DEFAULT`, `SERIAL`.
 - `docs/specs/crates/catalog.md` — sequence object, allocator, snapshot field.
-- `docs/specs/crates/wal.md` — the four new record kinds and their replay gating.
+- `docs/specs/crates/wal.md` — generic catalog changes for sequence DDL and the
+  two non-transactional sequence-value record kinds with their replay rules.
 - `docs/specs/crates/storage.md` — `SequenceManager`, recovery fast-forward.
 - `docs/specs/crates/executor.md` — sequence functions and default application.
 - `docs/specs/crates/server.md` — DDL dispatch, write-path routing, session
   state, checkpoint baseline.
 
-## 12. Interactions with RETURNING, ON CONFLICT, and SSI
+## 11. Interactions with RETURNING, ON CONFLICT, and SSI
 
 These features landed after the first draft; all three flow through the shared
 `build_insert_row` funnel (`crates/executor/src/query.rs`), which fills defaults

@@ -1604,9 +1604,9 @@ runs before any external TOAST chunks are written, so oversized indexed values
 return `SqlState::ProgramLimitExceeded` without leaving orphan chunk rows.
 
 Hidden TOAST relations bypass TOAST recursively and are encoded as plain v3 rows.
-Legacy user tables with `toast_table_id = None` also encode inline-only: no
-inline compression, no externalization, and a row that cannot fit on one heap page
-returns `ProgramLimitExceeded`.
+Catalog v3 requires every user table with a toastable column to reference its
+catalog-created hidden TOAST relation. Storage treats a missing reference as
+catalog corruption rather than retaining an inline-only compatibility path.
 
 For user tables with a hidden TOAST relation, non-null `TEXT`, `BYTEA`, and array
 values whose logical byte length is at least `toast.min_value_size` are candidates.

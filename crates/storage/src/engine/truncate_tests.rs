@@ -384,7 +384,7 @@ fn other_schema(storage_id: FileId) -> TableSchema {
     let mut schema = users_schema(storage_id);
     schema.id = OTHER_TABLE_ID;
     schema.name = "other".to_string();
-    schema.toast = ToastOptions::legacy_catalog_default();
+    schema.toast = ToastOptions::disabled();
     schema.toast_table_id = None;
     schema
 }
@@ -653,7 +653,7 @@ fn create_index_is_not_visible_until_physical_build_finishes() {
     let engine =
         Arc::new(PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap());
     let mut schema = users_schema(BASE_STORAGE_ID);
-    schema.toast = ToastOptions::legacy_catalog_default();
+    schema.toast = ToastOptions::disabled();
     schema.toast_table_id = None;
     engine.create_table(&ctx(100), &schema).unwrap();
     engine

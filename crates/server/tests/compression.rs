@@ -1,11 +1,7 @@
 mod support;
 
-use common::{
-    ColumnDef, CompressionSetting, DataType, KeyRange, PgType, RelationKind, StatementContext,
-    TableSchema, ToastCompression, ToastMode, ToastOptions,
-};
+use common::{KeyRange, StatementContext, ToastCompression, ToastMode};
 use saguarodb_server::config::Config;
-use storage::SchemaOperations;
 use support::{Connection, TestServer};
 
 /// Independently probes whether this filesystem's `fallocate`
@@ -581,45 +577,6 @@ fn hidden_toast_chunk_count(server: &TestServer, table: &str) -> usize {
     chunks
 }
 
-fn legacy_schema_without_toast() -> TableSchema {
-    TableSchema {
-        id: 50,
-        schema_id: common::PUBLIC_SCHEMA_ID,
-        storage_id: 50,
-        name: "legacy_docs".to_string(),
-        columns: vec![
-            ColumnDef {
-                id: 0,
-                object_id: 1,
-                name: "id".to_string(),
-                data_type: DataType::Integer,
-                nullable: false,
-                max_length: None,
-                default: None,
-                pg_type: Some(PgType::Int8),
-            },
-            ColumnDef {
-                id: 1,
-                object_id: 2,
-                name: "body".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                max_length: None,
-                default: None,
-                pg_type: Some(PgType::Text),
-            },
-        ],
-        primary_key: Vec::new(),
-        schema_version: common::INITIAL_SCHEMA_VERSION,
-        compression: CompressionSetting::None,
-        active_dict_id: None,
-        toast: ToastOptions::legacy_catalog_default(),
-        toast_table_id: None,
-        relation_kind: RelationKind::User,
-        next_column_object_id: u32::MAX,
-    }
-}
-
 #[tokio::test]
 async fn alter_toast_options_apply_to_future_writes_and_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -793,73 +750,6 @@ async fn alter_toast_zstd_dict_allows_tiny_corpus_without_dictionary() {
         .expect("notes table exists");
     assert_eq!(notes.toast.compression, ToastCompression::ZstdDict);
     assert_eq!(notes.toast.active_dict_id, None);
-}
-
-#[tokio::test]
-async fn alter_toast_options_create_hidden_relation_for_legacy_catalog_table() {
-    let server = TestServer::start().await.unwrap();
-    let legacy = legacy_schema_without_toast();
-    server
-        .app()
-        .components
-        .catalog
-        .apply_create_table(legacy.clone())
-        .unwrap();
-    server
-        .app()
-        .components
-        .storage
-        .create_table(&StatementContext::new(0), &legacy)
-        .unwrap();
-    server
-        .simple_query("create index legacy_docs_body on legacy_docs (body)")
-        .await
-        .unwrap();
-    let body_index = server
-        .app()
-        .components
-        .catalog
-        .get_index_by_name("legacy_docs_body")
-        .unwrap()
-        .expect("legacy_docs_body index exists");
-
-    server
-        .simple_query("alter table legacy_docs set (toast = off)")
-        .await
-        .unwrap();
-
-    let legacy_docs = server
-        .app()
-        .components
-        .catalog
-        .get_table_by_name("legacy_docs")
-        .unwrap()
-        .expect("legacy_docs table exists");
-    let toast_id = legacy_docs
-        .toast_table_id
-        .expect("ALTER should allocate hidden TOAST relation for legacy text table");
-    let hidden = server
-        .app()
-        .components
-        .catalog
-        .get_table(toast_id)
-        .unwrap()
-        .expect("hidden TOAST relation exists");
-    assert_eq!(
-        hidden.relation_kind,
-        RelationKind::Toast {
-            base_table: legacy_docs.id
-        }
-    );
-    assert_eq!(hidden.compression, CompressionSetting::None);
-    assert_ne!(
-        hidden.storage_id, body_index.storage_id,
-        "late TOAST relation must allocate a fresh storage id, not reuse a secondary index generation"
-    );
-    assert!(
-        hidden.storage_id > body_index.storage_id,
-        "late TOAST relation should come after the pre-existing secondary index in storage allocation order"
-    );
 }
 
 #[tokio::test]

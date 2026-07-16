@@ -1,11 +1,11 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use common::{DbError, Lsn, Result, SqlState, TableId};
 
 use crate::ControlData;
-use crate::manifest::{decode_control, encode_control};
+use crate::manifest::{MAX_MANIFEST_BYTES, decode_control, encode_control};
 
 /// Persists the durable control record (the checkpoint commit point). The record
 /// is written atomically via a temp file + rename + directory fsync.
@@ -49,8 +49,9 @@ impl FileControlStore {
 
 impl ControlStore for FileControlStore {
     fn load(&self) -> Result<Option<ControlData>> {
-        match fs::read(self.manifest_path()) {
-            Ok(bytes) => {
+        match File::open(self.manifest_path()) {
+            Ok(mut file) => {
+                let bytes = read_manifest_bounded(&mut file, &self.manifest_path())?;
                 let control = decode_control(&bytes)?;
                 if control.page_size != self.page_size {
                     return Err(DbError::storage(
@@ -72,10 +73,20 @@ impl ControlStore for FileControlStore {
     }
 
     fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()> {
+        let mut table_copy = Vec::new();
+        table_copy
+            .try_reserve_exact(tables.len())
+            .map_err(|_| DbError::io("cannot allocate control table list"))?;
+        table_copy.extend_from_slice(tables);
+        let mut catalog_copy = Vec::new();
+        catalog_copy
+            .try_reserve_exact(catalog.len())
+            .map_err(|_| DbError::io("cannot allocate control catalog buffer"))?;
+        catalog_copy.extend_from_slice(catalog);
         let control = ControlData {
             checkpoint_lsn,
-            tables: tables.to_vec(),
-            catalog: catalog.to_vec(),
+            tables: table_copy,
+            catalog: catalog_copy,
             page_size: self.page_size,
         };
         let bytes = encode_control(&control)?;
@@ -116,6 +127,59 @@ impl ControlStore for FileControlStore {
     }
 }
 
+fn read_manifest_bounded(file: &mut File, path: &Path) -> Result<Vec<u8>> {
+    let declared_len = file
+        .metadata()
+        .map_err(|err| {
+            DbError::io(format!(
+                "failed to inspect control file {}: {err}",
+                path.display()
+            ))
+        })?
+        .len();
+    let declared_len = usize::try_from(declared_len)
+        .map_err(|_| DbError::io("control file length does not fit this platform"))?;
+    if declared_len > MAX_MANIFEST_BYTES {
+        return Err(DbError::storage(
+            SqlState::InternalError,
+            "control file exceeds size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(declared_len)
+        .map_err(|_| DbError::io("cannot allocate control file buffer"))?;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut chunk).map_err(|err| {
+            DbError::io(format!(
+                "failed to read control file {}: {err}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let next_len = bytes
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| DbError::io("control file length overflows"))?;
+        if next_len > MAX_MANIFEST_BYTES {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "control file exceeds size limit",
+            ));
+        }
+        bytes
+            .try_reserve(read)
+            .map_err(|_| DbError::io("cannot grow control file buffer"))?;
+        let source = chunk
+            .get(..read)
+            .ok_or_else(|| DbError::io("control file read exceeded buffer"))?;
+        bytes.extend_from_slice(source);
+    }
+}
+
 fn fsync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
@@ -129,6 +193,10 @@ fn fsync_dir(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
+    use crate::manifest::MAX_MANIFEST_BYTES;
+
     use super::{ControlStore, FileControlStore};
 
     #[test]
@@ -142,5 +210,23 @@ mod tests {
         assert!(err.message.contains("page size"), "got: {}", err.message);
         assert!(err.message.contains("8192"));
         assert!(err.message.contains("16384"));
+    }
+
+    #[test]
+    fn load_rejects_oversized_manifest_before_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.dat");
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.set_len(u64::try_from(MAX_MANIFEST_BYTES + 1).unwrap())
+            .unwrap();
+        let store = FileControlStore::open(dir.path(), 8192).unwrap();
+
+        let err = store.load().unwrap_err();
+        assert!(err.message.contains("control file exceeds size limit"));
     }
 }

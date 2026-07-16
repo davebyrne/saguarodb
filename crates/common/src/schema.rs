@@ -1,15 +1,11 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    ColumnId, ColumnObjectId, ConstraintId, DbError, FileId, IndexId, PUBLIC_SCHEMA_ID, PgType,
-    SchemaId, SequenceId, SqlState, StoredExpression, TableId, Value,
+    ColumnId, ColumnObjectId, ConstraintId, DbError, FileId, IndexId, PgType, SchemaId, SequenceId,
+    SqlState, StoredExpression, TableId, Value,
 };
 
 pub const INITIAL_SCHEMA_VERSION: u64 = 1;
-
-pub fn public_schema_id() -> SchemaId {
-    PUBLIC_SCHEMA_ID
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct QualifiedName {
@@ -52,10 +48,6 @@ impl PartialEq<&str> for QualifiedName {
 pub struct NamespaceSchema {
     pub id: SchemaId,
     pub name: String,
-}
-
-fn initial_schema_version() -> u64 {
-    INITIAL_SCHEMA_VERSION
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -243,7 +235,7 @@ impl ToastOptions {
         }
     }
 
-    pub fn legacy_catalog_default() -> Self {
+    pub fn disabled() -> Self {
         Self {
             mode: ToastMode::Off,
             tuple_target: Self::DEFAULT_TOAST_TUPLE_TARGET,
@@ -336,18 +328,15 @@ pub struct ParsedColumnDef {
     /// Maximum length in characters for a bounded character type
     /// (`VARCHAR(n)` / `CHAR(n)`). `None` for unbounded `TEXT` and all
     /// non-character types.
-    #[serde(default)]
     pub max_length: Option<u32>,
     /// The column `DEFAULT`, applied when an `INSERT` omits the column. Constants
     /// are folded at parse time; sequence defaults keep a sequence name until the
     /// catalog resolves it to a durable id.
-    #[serde(default)]
     pub default: Option<ParsedDefault>,
     /// The declared PostgreSQL wire type (integer width, character kind, length),
     /// captured by the parser so the protocol can report the exact OID/typmod.
     /// `None` when the parser has not labeled the column; resolved to the collapsed
     /// default (`Integer` => int8, `Text` => text) downstream.
-    #[serde(default)]
     pub pg_type: Option<PgType>,
 }
 
@@ -363,24 +352,21 @@ pub struct ColumnDef {
     /// Maximum length in characters for a bounded character type
     /// (`VARCHAR(n)` / `CHAR(n)`); `None` means unbounded. Enforced at write
     /// time by the executor, not represented as a distinct `DataType`.
-    #[serde(default)]
     pub max_length: Option<u32>,
     /// The column `DEFAULT` applied when an `INSERT`/`COPY` omits the column.
     /// Persisted inside its relation object and replayed through catalog changes.
-    #[serde(default)]
     pub default: Option<ColumnDefault>,
     /// The declared PostgreSQL wire type, persisted so the column reports the same
-    /// OID/typmod after a restart. `None` on catalogs written before this field
-    /// existed; use [`ColumnDef::wire_type`] rather than reading this directly.
-    #[serde(default)]
+    /// OID/typmod after a restart. Use [`ColumnDef::wire_type`] rather than
+    /// reading this directly so transient unlabeled columns resolve consistently.
     pub pg_type: Option<PgType>,
 }
 
 impl ColumnDef {
-    /// The column's PostgreSQL wire type, resolving an unlabeled column (`None`,
-    /// e.g. a pre-existing catalog snapshot) to the collapsed default derived from
-    /// its `DataType` (`Integer` => int8, `Text` => text). This is what the
-    /// protocol should report; it is always concrete.
+    /// The column's PostgreSQL wire type, resolving an unlabeled column (`None`)
+    /// to the collapsed default derived from its `DataType` (`Integer` => int8,
+    /// `Text` => text). This is what the protocol should report; it is always
+    /// concrete.
     pub fn wire_type(&self) -> PgType {
         self.pg_type
             .clone()
@@ -397,7 +383,6 @@ pub struct ColumnInfo {
     /// The declared PostgreSQL wire type of this result column. `None` for a
     /// synthetic/computed column, which resolves to the collapsed default from
     /// `data_type`. Use [`ColumnInfo::wire_type`] rather than reading this directly.
-    #[serde(default)]
     pub pg_type: Option<PgType>,
 }
 
@@ -419,7 +404,6 @@ pub struct ViewColumn {
     pub nullable: bool,
     /// The declared PostgreSQL wire type for this view output column. `None`
     /// resolves to the collapsed default from `data_type`.
-    #[serde(default)]
     pub pg_type: Option<PgType>,
 }
 
@@ -434,10 +418,11 @@ pub enum ForeignKeyAction {
 pub struct ForeignKeyConstraint {
     pub id: ConstraintId,
     pub name: String,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub columns: Vec<ColumnId>,
     pub referenced_table: TableId,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub referenced_columns: Vec<ColumnId>,
-    #[serde(default)]
     pub referenced_index: IndexId,
     pub on_update: ForeignKeyAction,
     pub on_delete: ForeignKeyAction,
@@ -449,17 +434,21 @@ pub enum ConstraintKind {
         expression: StoredExpression,
     },
     PrimaryKey {
+        #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
         columns: Vec<ColumnObjectId>,
         index: IndexId,
     },
     Unique {
+        #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
         columns: Vec<ColumnObjectId>,
         index: IndexId,
     },
     ForeignKey {
+        #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
         columns: Vec<ColumnObjectId>,
         referenced_table: TableId,
         referenced_constraint: ConstraintId,
+        #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
         referenced_columns: Vec<ColumnObjectId>,
         on_update: ForeignKeyAction,
         on_delete: ForeignKeyAction,
@@ -481,35 +470,28 @@ pub struct ConstraintSchema {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: TableId,
-    #[serde(default = "public_schema_id")]
     pub schema_id: SchemaId,
     /// Physical storage-generation id for this table's heap and primary index.
-    /// `0` means a legacy decoded schema is missing the field; catalog migration
-    /// replaces it with a non-zero id before installation.
-    #[serde(default)]
+    /// Zero is reserved and rejected by catalog validation.
     pub storage_id: FileId,
     pub name: String,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub columns: Vec<ColumnDef>,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub primary_key: Vec<ColumnId>,
     /// Monotonic logical schema version. It starts at 1 for a newly created
     /// relation and increments on public schema metadata changes.
-    #[serde(default = "initial_schema_version")]
     pub schema_version: u64,
     /// At-rest page compression for this table's heap and index files.
-    #[serde(default)]
     pub compression: CompressionSetting,
     /// The trained dictionary new heap-page writes compress against
     /// (`None` until an ALTER trains one). Index files never use it.
-    #[serde(default)]
     pub active_dict_id: Option<u32>,
     /// Storage-private TOAST policy for future writes.
-    #[serde(default = "ToastOptions::legacy_catalog_default")]
     pub toast: ToastOptions,
     /// Hidden companion relation for out-of-line toast chunks, when present.
-    #[serde(default)]
     pub toast_table_id: Option<TableId>,
     /// User table vs. hidden toast relation metadata.
-    #[serde(default)]
     pub relation_kind: RelationKind,
     /// Next never-reused durable column identity within this relation.
     pub next_column_object_id: ColumnObjectId,
@@ -540,7 +522,6 @@ pub struct ViewSchema {
     /// Version of the durable view-catalog payload.
     pub format_version: u32,
     pub id: TableId,
-    #[serde(default = "public_schema_id")]
     pub schema_id: SchemaId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
@@ -548,9 +529,7 @@ pub struct ViewSchema {
     pub definition: String,
     /// Catalog-resolved typed query used for execution and dependencies.
     pub query: crate::StoredQueryV1,
-    #[serde(default = "initial_schema_version")]
     pub schema_version: u64,
-    #[serde(default = "default_view_search_path")]
     pub definition_search_path: Vec<SchemaId>,
     /// Next never-reused durable output-column identity within this view.
     pub next_column_object_id: ColumnObjectId,
@@ -558,17 +537,16 @@ pub struct ViewSchema {
 
 #[derive(Deserialize)]
 struct StoredViewSchema {
-    format_version: Option<u32>,
+    format_version: u32,
     id: TableId,
-    #[serde(default = "public_schema_id")]
     schema_id: SchemaId,
     name: String,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     columns: Vec<ColumnDef>,
     definition: String,
-    query: Option<crate::StoredQueryV1>,
-    #[serde(default = "initial_schema_version")]
+    query: crate::StoredQueryV1,
     schema_version: u64,
-    #[serde(default = "default_view_search_path")]
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     definition_search_path: Vec<SchemaId>,
     next_column_object_id: ColumnObjectId,
 }
@@ -577,17 +555,12 @@ impl TryFrom<StoredViewSchema> for ViewSchema {
     type Error = String;
 
     fn try_from(stored: StoredViewSchema) -> std::result::Result<Self, Self::Error> {
-        let format_version = stored
-            .format_version
-            .ok_or_else(|| "unsupported unversioned view catalog encoding".to_string())?;
+        let format_version = stored.format_version;
         if format_version != VIEW_SCHEMA_FORMAT_VERSION {
             return Err(format!(
                 "unsupported view catalog encoding version {format_version}"
             ));
         }
-        let query = stored.query.ok_or_else(|| {
-            "unsupported view catalog encoding without resolved query IR".to_string()
-        })?;
         Ok(Self {
             format_version,
             id: stored.id,
@@ -595,7 +568,7 @@ impl TryFrom<StoredViewSchema> for ViewSchema {
             name: stored.name,
             columns: stored.columns,
             definition: stored.definition,
-            query,
+            query: stored.query,
             schema_version: stored.schema_version,
             definition_search_path: stored.definition_search_path,
             next_column_object_id: stored.next_column_object_id,
@@ -604,10 +577,6 @@ impl TryFrom<StoredViewSchema> for ViewSchema {
 }
 
 pub const VIEW_SCHEMA_FORMAT_VERSION: u32 = 1;
-
-fn default_view_search_path() -> Vec<SchemaId> {
-    vec![PUBLIC_SCHEMA_ID]
-}
 
 pub fn needs_toast_relation(schema: &TableSchema) -> bool {
     schema.relation_kind == RelationKind::User
@@ -665,7 +634,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
         schema_version: INITIAL_SCHEMA_VERSION,
         compression: CompressionSetting::None,
         active_dict_id: None,
-        toast: ToastOptions::legacy_catalog_default(),
+        toast: ToastOptions::disabled(),
         toast_table_id: None,
         relation_kind: RelationKind::Toast {
             base_table: base.id,
@@ -698,7 +667,6 @@ impl Default for SequenceOptions {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceSchema {
     pub id: SequenceId,
-    #[serde(default = "public_schema_id")]
     pub schema_id: SchemaId,
     pub name: String,
     pub increment: i64,
@@ -717,15 +685,13 @@ pub struct SequenceSchema {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub id: IndexId,
-    #[serde(default = "public_schema_id")]
     pub schema_id: SchemaId,
     /// Physical storage-generation id for this secondary index. `0` means a
-    /// legacy decoded schema is missing the field; catalog migration replaces it
-    /// with a non-zero id before installation.
-    #[serde(default)]
+    /// missing or invalid generation and is rejected by catalog validation.
     pub storage_id: FileId,
     pub table: TableId,
     pub name: String,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub columns: Vec<ColumnId>,
     pub unique: bool,
     pub constraint: Option<ConstraintId>,
@@ -736,6 +702,7 @@ pub struct TruncateTablePlan {
     pub table_id: TableId,
     pub new_table_storage_id: FileId,
     pub new_toast_storage_id: Option<(TableId, FileId)>,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub new_index_storage_ids: Vec<(IndexId, FileId)>,
 }
 
@@ -743,6 +710,7 @@ pub struct TruncateTablePlan {
 pub struct TruncateCatalogUpdate {
     pub table: TableSchema,
     pub toast_table: Option<TableSchema>,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub indexes: Vec<IndexSchema>,
 }
 
@@ -793,8 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn table_schema_without_compression_fields_deserializes_to_defaults() {
-        // Current schemas still default optional compression metadata.
+    fn table_schema_requires_complete_durable_fields() {
         let json = r#"{
             "id": 1,
             "name": "users",
@@ -802,52 +769,55 @@ mod tests {
             "primary_key": [],
             "next_column_object_id": 1
         }"#;
-        let schema: TableSchema = serde_json::from_str(json).unwrap();
-        assert_eq!(schema.compression, CompressionSetting::None);
-        assert_eq!(schema.storage_id, 0);
-        assert_eq!(schema.schema_version, INITIAL_SCHEMA_VERSION);
-        assert_eq!(schema.active_dict_id, None);
-        assert_eq!(schema.toast, ToastOptions::legacy_catalog_default());
-        assert_eq!(schema.toast_table_id, None);
-        assert_eq!(schema.relation_kind, RelationKind::User);
+        let error = serde_json::from_str::<TableSchema>(json).unwrap_err();
+        assert!(error.to_string().contains("missing field `schema_id`"));
     }
 
     #[test]
-    fn view_schema_without_resolved_query_is_explicitly_unsupported() {
+    fn view_schema_requires_resolved_query() {
         let json = r#"{
             "format_version": 1,
             "id": 1,
-            "name": "legacy_view",
+            "schema_id": 1,
+            "name": "view_without_query",
             "columns": [],
             "definition": "select 1",
+            "schema_version": 1,
+            "definition_search_path": [1],
             "next_column_object_id": 1
         }"#;
         let error = serde_json::from_str::<ViewSchema>(json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported view catalog encoding without resolved query IR")
-        );
+        assert!(error.to_string().contains("missing field `query`"));
     }
 
     #[test]
     fn view_schema_requires_a_supported_payload_version() {
-        let unversioned = r#"{
-            "id": 1,
-            "name": "legacy_view",
-            "columns": [],
-            "definition": "select 1",
-            "next_column_object_id": 1
-        }"#;
-        let error = serde_json::from_str::<ViewSchema>(unversioned).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported unversioned view catalog encoding")
-        );
-
-        let unknown = unversioned.replacen('{', "{\"format_version\":2,", 1);
-        let error = serde_json::from_str::<ViewSchema>(&unknown).unwrap_err();
+        let schema = ViewSchema {
+            format_version: crate::VIEW_SCHEMA_FORMAT_VERSION,
+            id: 1,
+            schema_id: crate::PUBLIC_SCHEMA_ID,
+            name: "versioned_view".to_string(),
+            columns: Vec::new(),
+            definition: "values ()".to_string(),
+            query: crate::StoredQueryV1 {
+                version: crate::STORED_QUERY_VERSION,
+                body: crate::StoredQueryBody::Values(crate::StoredValues {
+                    rows: Vec::new(),
+                    output_schema: Vec::new(),
+                }),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                row_lock: None,
+                correlations: Vec::new(),
+            },
+            schema_version: INITIAL_SCHEMA_VERSION,
+            definition_search_path: vec![crate::PUBLIC_SCHEMA_ID],
+            next_column_object_id: 1,
+        };
+        let mut unknown = serde_json::to_value(schema).unwrap();
+        unknown["format_version"] = serde_json::json!(2);
+        let error = serde_json::from_value::<ViewSchema>(unknown).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -874,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn toast_options_defaults_are_split_for_new_and_legacy_tables() {
+    fn toast_options_distinguish_new_tables_from_disabled_relations() {
         assert_eq!(
             ToastOptions::default_new_table(),
             ToastOptions {
@@ -886,7 +856,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ToastOptions::legacy_catalog_default(),
+            ToastOptions::disabled(),
             ToastOptions {
                 mode: ToastMode::Off,
                 tuple_target: 2048,

@@ -118,8 +118,8 @@ impl PageBackedStorageEngine {
         // metadata only and must not build or backfill the tree.
         let mut state = self.lock_state()?;
         // The owning table's compression setting determines the (dict-less)
-        // index file config (`compression.md` §4); it must already be installed
-        // (CreateTable replays before CreateIndex).
+        // index file config (`compression.md` §4); the generic catalog change
+        // installs table objects before their index objects.
         let table_compression = state
             .tables
             .get(&schema.table)

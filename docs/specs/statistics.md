@@ -115,20 +115,19 @@ the existing catalog JSON encoding and ordering semantics.
 Statistics are catalog state, keyed off the schema objects but versioned
 independently of them:
 
-- `CatalogSnapshot` gains `#[serde(default)] statistics: HashMap<TableId,
-  TableStatistics>` — the same backward-compatible evolution used when views,
-  secondary indexes, sequences, and dictionaries were added
-  (`crates/catalog/src/memory.rs`). Old manifests deserialize with empty
-  statistics. The current typed-catalog release uses catalog v3 inside manifest
-  (`SGMF`) v4; older development formats are not migrated.
+- `CatalogSnapshot` carries `statistics: HashMap<TableId, TableStatistics>` in
+  catalog format v3 inside manifest (`SGMF`) v4. The durable field is required;
+  older development formats and incomplete v3 payloads are rejected rather than
+  defaulted or migrated.
 - Catalog API: `get_table_statistics(TableId)` and
   `set_table_statistics(TableId, TableStatistics)` (set validates the table is
   a live user relation and every statistics column id exists). Schema-change
   behavior follows the reconciliation rule above (§2): `ADD COLUMN` and
   renames of the table keep statistics; `DROP COLUMN` and `RENAME COLUMN`
   clear the per-column map (counts stay); `DROP TABLE` removes the entry.
-  Snapshot load prunes orphan statistics rather than rejecting them —
-  advisory data must never block startup.
+  Snapshot load rejects orphan, non-user-table, unknown-column, or non-finite
+  statistics as catalog corruption. Advisory statistics may be absent, but a
+  present object must be internally consistent.
 - **`schema_version` is NOT bumped** by a statistics update. Cached prepared
   plans stay valid and keep their old estimates until re-prepare — an
   intentional, documented divergence from PostgreSQL's relcache invalidation.
@@ -145,8 +144,11 @@ the generic `CatalogChange` record. There is no statistics-specific WAL variant.
 - Recovery applies committed change sets in LSN order (last write wins); storage
   ignores statistics mutations. Aborted/in-flight statistics objects are not
   published, while the generic allocator reservation pass remains harmless.
-- If the record's `table_id` no longer resolves at apply time (table dropped
-  later in the log), the record is skipped.
+- Generic change-set application treats a statistics creation whose owning live
+  user table is absent at that point in the object stream as an advisory no-op.
+  This keeps recovery tolerant of a committed statistics record whose table is
+  not present, while a persisted snapshot containing an orphan remains corrupt
+  and is rejected at load.
 - Normal durability lifecycle: the record is appended before the in-memory
   catalog is updated (WAL-before-state, same ordering as DDL), the maintenance
   transaction's `Commit` is flushed before success is reported, and the next
@@ -375,8 +377,9 @@ Mirrors checkpoint auto-prune:
   default statistics target (no session). A manual full `ANALYZE` (no table)
   also resets the counter; a single-table ANALYZE does not.
 
-Like auto-prune, this fires only on the commit path — a known limitation
-shared with checkpointing itself, resolved by a future background scheduler.
+Like auto-prune, this fires only on the commit path, a known limitation shared
+with checkpointing itself. A background scheduler is outside the current
+contract.
 
 ## 11. Interactions and invariants
 
@@ -394,37 +397,16 @@ shared with checkpointing itself, resolved by a future background scheduler.
   generic catalog object payload. Old catalog/WAL formats are intentionally
   rejected; `Value` variant order is untouched.
 
-## 12. Milestones
+## 12. Implementation coverage
 
-Each milestone is a reviewable commit (or small commit series) with its own
-tests, spec updates, and a green `cargo fmt` / `clippy -D warnings` /
-`cargo test --workspace`.
+The current implementation includes catalog-v3 statistics storage and generic
+catalog-change recovery, snapshot-visible collection and estimator math,
+`ANALYZE`/`VACUUM ANALYZE`, `default_statistics_target`, system-catalog
+introspection, planner selectivity and row estimates, statistics-informed
+hash-join build-side and seq-vs-index choices, and checkpoint auto-analyze.
+Tests cover persistence and crash behavior, estimator distributions, SQL and
+protocol behavior, introspection, plan choices with and without statistics,
+and automatic threshold handling.
 
-- **A — Statistics types + catalog storage.** `common::statistics`,
-  `CatalogSnapshot.statistics` (serde-default), get/set/removal hooks wired to
-  DROP TABLE / DROP COLUMN, serialization round-trip + old-manifest
-  compatibility tests. No SQL surface.
-- **B — WAL + recovery.** Generic statistics catalog mutation, recovery apply
-  (committed-only, LSN order), replay + checkpoint
-  round-trip tests at the wal/server level.
-- **C — Collector.** Reservoir sampling over a snapshot-visible heap scan,
-  estimator math (§6) as pure functions, deterministic-seed unit tests on
-  synthetic distributions (uniform, skewed, unique, all-null, mostly-null).
-- **D — SQL surface.** Parser intercept for `ANALYZE [table]`,
-  `Vacuum.analyze` flag, `run_analyze` orchestration (§5),
-  `default_statistics_target` GUC, command tag, txn-block rejection, e2e
-  tests: analyze → inspect → restart → statistics survive; crash before
-  commit → no statistics; `VACUUM ANALYZE` end-to-end. Spec + instruction
-  files updated for the semantics change.
-- **E — Introspection.** `pg_class.reltuples`/`relpages` from statistics,
-  `pg_stats` view, psql-visible smoke test.
-- **F — Estimation + EXPLAIN.** `planner::estimate`, selectivity rules,
-  `rows=` in EXPLAIN, existing EXPLAIN tests updated. No plan-shape changes.
-- **G — First cost decisions.** Hash-join build-side swap; seq-vs-index cost
-  choice with the no-stats fallback preserving today's plans. EXPLAIN-based
-  plan-choice tests over analyzed vs un-analyzed tables.
-- **H — Auto-analyze.** Counter, flag, checkpoint hook, threshold tests.
-
-Follow-on projects (out of scope, enabled by this): greedy join reordering;
-index-eligibility widening (parameters, more types, composite ranges); page
-sampling; cost GUCs; extended statistics.
+Greedy join reordering, wider index eligibility, page sampling, cost GUCs, and
+extended statistics are outside the current contract.

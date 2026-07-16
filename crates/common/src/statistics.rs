@@ -31,9 +31,11 @@ pub struct ColumnStatistics {
     pub n_distinct: NDistinct,
     /// Most-common non-null values with their estimated overall frequency,
     /// most frequent first.
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub most_common: Vec<(Value, OrderedF64)>,
     /// Equi-height histogram bounds over sampled non-MCV values, ascending.
     /// Empty when the MCV list already covers every sampled distinct value.
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_vec")]
     pub histogram_bounds: Vec<Value>,
 }
 
@@ -51,6 +53,7 @@ pub struct TableStatistics {
     pub row_count: u64,
     /// Heap page count at collection time.
     pub page_count: u64,
+    #[serde(deserialize_with = "crate::durable::deserialize_bounded_map")]
     pub columns: BTreeMap<ColumnId, ColumnStatistics>,
 }
 

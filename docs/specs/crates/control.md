@@ -54,12 +54,20 @@ The control record uses a versioned binary envelope:
 - payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, `catalog`,
   and `page_size`
 
+The opaque `catalog` bytes must contain catalog format v3. Manifest v4 and
+catalog v3 are one compatibility boundary: neither decoder supplies missing
+typed-catalog fields or migrates an older development data directory.
+
 The four header fields form a fixed 16-byte header (`MANIFEST_HEADER_LEN = 16`)
 that precedes the payload.
 
 Decode must reject a file shorter than the 16-byte header, magic mismatch,
 unsupported versions (including versions `1` through `3`), length mismatch, checksum
 mismatch, malformed payload JSON, unsorted table IDs, and duplicate table IDs.
+The manifest envelope is capped at 272 MiB before file materialization; its
+opaque catalog field is capped at 64 MiB and its table-id list at 65,536 entries.
+Bounded visitors reserve these payload vectors fallibly and reject an extra item
+without materializing it. Encoding enforces the same limits.
 Development builds do not migrate older formats; an incompatible or corrupt
 control file surfaces as `SqlState::InternalError` (there is no dedicated
 corruption SQLSTATE) and the data directory must be rebuilt.
@@ -73,7 +81,10 @@ startup error naming both values, not corruption — the envelope itself decoded
 fine.
 
 `checkpoint_lsn` is the WAL high-water mark whose effects are reflected in the
-heap. Recovery replays committed WAL records with `LSN > checkpoint_lsn`.
+heap. Recovery replays every physical WAL record with `LSN > checkpoint_lsn`
+using page-LSN idempotence regardless of transaction outcome, then applies only
+committed generic `CatalogChange` metadata in LSN order. Non-transactional
+sequence-value records are also replayed independently of commit status.
 
 ## Public API
 

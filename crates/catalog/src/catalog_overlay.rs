@@ -488,7 +488,7 @@ mod tests {
                     vec![column()],
                     Vec::new(),
                     CompressionSetting::None,
-                    ToastOptions::legacy_catalog_default(),
+                    ToastOptions::disabled(),
                     checks,
                 )
             })

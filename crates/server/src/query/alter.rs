@@ -4,7 +4,7 @@ use catalog::{CatalogManager, MemoryCatalog, ResolvedForeignKey};
 use common::{
     ColumnId, CompressionSetting, DbError, IndexId, IndexSchema, IsolationLevel, QualifiedName,
     QueryCancel, RelationKind, Result, SqlState, StatementContext, TableId, TableOptionPatch,
-    TableSchema, ToastCompression, WriteGuard, needs_toast_relation, toast_schema,
+    TableSchema, ToastCompression, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, validate_existing_foreign_keys};
 use parser::{ParsedForeignKey, Statement};
@@ -27,7 +27,6 @@ const TOAST_DICT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 struct ToastAlterPostCommit {
     table_id: TableId,
-    hidden_schema: Option<TableSchema>,
     catalog_after: catalog::CatalogSnapshot,
     change_set: common::CatalogChangeSet,
 }
@@ -616,11 +615,6 @@ impl QueryService {
     /// TOAST chunks are left byte-for-byte as they are; normal reads keep using the
     /// per-value physical metadata to decode old rows.
     ///
-    /// If the ALTER has to create a hidden TOAST relation for a legacy catalog
-    /// table, the storage relation is created before the DDL commit so its empty
-    /// primary-key B-tree pages are WAL-before-Commit and crash-recoverable. The
-    /// catalog does not expose that hidden relation, nor does the base table point
-    /// at it, until after the commit record is flushed.
     pub(super) fn run_alter_table_toast_options(
         &self,
         statement: Statement,
@@ -673,15 +667,6 @@ impl QueryService {
             }) {
                 self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                 return Err(err);
-            }
-            if let Some(hidden) = &post_commit.hidden_schema {
-                let ctx = StatementContext::new(txn_id)
-                    .with_tuple_lock_manager(components.lock_manager.clone())
-                    .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
-                if let Err(err) = components.storage.create_table(&ctx, hidden) {
-                    self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
-                    return Err(err);
-                }
             }
             if let Err(err) = cancel.check() {
                 self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
@@ -750,34 +735,13 @@ impl QueryService {
             }
         }
 
-        let hidden_schema = if schema.toast_table_id.is_none() && needs_toast_relation(schema) {
-            let toast_table_id = components.catalog.snapshot()?.next_table_id;
-            components.catalog.reserve_table_id(toast_table_id)?;
-            let toast_storage_id = components.catalog.allocate_storage_id()?;
-            let mut base = schema.clone();
-            base.toast_table_id = Some(toast_table_id);
-            let mut hidden = toast_schema(&base, toast_table_id);
-            hidden.storage_id = toast_storage_id;
-            Some(hidden)
-        } else {
-            None
-        };
-        let toast_table_id = hidden_schema
-            .as_ref()
-            .map(|schema| schema.id)
-            .or(schema.toast_table_id);
-
         let catalog_before = components.catalog.snapshot()?;
         let staged = MemoryCatalog::try_from_snapshot(catalog_before.clone())?;
-        if let Some(hidden) = &hidden_schema {
-            staged.apply_create_table(hidden.clone())?;
-        }
-        staged.set_table_toast_metadata(schema.id, toast.clone(), toast_table_id)?;
+        staged.set_table_toast_metadata(schema.id, toast.clone(), schema.toast_table_id)?;
         let catalog_after = staged.snapshot()?;
         let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
         Ok(ToastAlterPostCommit {
             table_id: schema.id,
-            hidden_schema,
             catalog_after,
             change_set,
         })

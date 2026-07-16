@@ -399,7 +399,7 @@ pub trait CatalogManager: Send + Sync {
             columns,
             primary_key,
             compression,
-            ToastOptions::legacy_catalog_default(),
+            ToastOptions::disabled(),
             Vec::new(),
         )
     }
@@ -738,8 +738,8 @@ mod tests {
         ForeignKeyAction, ForeignKeyConstraint, IndexSchema, ParsedColumnDef, PgType, RelationKind,
         SequenceOptions, SequenceSchema, SqlState, StoredBinOp, StoredColumnReference, StoredExpr,
         StoredExpression, StoredFrom, StoredQueryBody, StoredQueryColumn, StoredQueryExpr,
-        StoredQueryV1, StoredSelect, StoredSelectItem, TableSchema, ToastCompression, ToastMode,
-        ToastOptions, ViewColumn, toast_schema,
+        StoredQueryV1, StoredSelect, StoredSelectItem, TableSchema, TableStatistics,
+        ToastCompression, ToastMode, ToastOptions, ViewColumn, toast_schema,
     };
 
     use crate::{
@@ -937,7 +937,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -1422,7 +1422,7 @@ mod tests {
                         vec![id_column(false)],
                         Vec::new(),
                         CompressionSetting::None,
-                        ToastOptions::legacy_catalog_default(),
+                        ToastOptions::disabled(),
                         vec![expression],
                     )
                     .is_err()
@@ -1690,7 +1690,7 @@ mod tests {
                 vec![id_column(false)],
                 Vec::new(),
                 CompressionSetting::None,
-                ToastOptions::legacy_catalog_default(),
+                ToastOptions::disabled(),
                 vec![check.clone()],
             )
             .unwrap();
@@ -2216,6 +2216,45 @@ mod tests {
             }
         );
         assert_eq!(catalog.get_table_by_name(&toast.name).unwrap(), None);
+    }
+
+    #[test]
+    fn add_array_column_allocates_hidden_toast_relation() {
+        let catalog = MemoryCatalog::empty();
+        let table = catalog
+            .create_table(
+                "measurements".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+
+        let updated = catalog
+            .add_table_column(
+                table.id,
+                ParsedColumnDef {
+                    name: "values".to_string(),
+                    data_type: DataType::Array(common::ArrayType::new(DataType::Integer).unwrap()),
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::array(PgType::Int4).unwrap()),
+                },
+            )
+            .unwrap();
+
+        let toast_id = updated.toast_table_id.expect("hidden TOAST relation id");
+        let toast = catalog
+            .get_table(toast_id)
+            .unwrap()
+            .expect("hidden TOAST relation exists");
+        assert_eq!(
+            toast.relation_kind,
+            RelationKind::Toast {
+                base_table: updated.id
+            }
+        );
     }
 
     #[test]
@@ -2828,7 +2867,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -2951,7 +2990,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3014,7 +3053,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3182,7 +3221,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3206,6 +3245,7 @@ mod tests {
                 },
             )]),
             next_index_id: 2,
+            next_storage_id: 5,
             next_constraint_id: 2,
             constraints_by_id: HashMap::from([(
                 1,
@@ -3257,7 +3297,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3295,7 +3335,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3335,7 +3375,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -3661,7 +3701,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -4295,7 +4335,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -4347,7 +4387,7 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             next_column_object_id: u32::MAX,
@@ -4446,7 +4486,7 @@ mod tests {
         assert_eq!(hidden.name, "\0toast_1");
         assert_eq!(hidden.relation_kind, RelationKind::Toast { base_table: 1 });
         assert_eq!(hidden.compression, CompressionSetting::None);
-        assert_eq!(hidden.toast, ToastOptions::legacy_catalog_default());
+        assert_eq!(hidden.toast, ToastOptions::disabled());
         assert_eq!(hidden.primary_key, vec![0, 1]);
         assert_eq!(
             hidden
@@ -4594,12 +4634,39 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 1), ("other".to_string(), 2)]),
             tables_by_id: HashMap::from([(1, base), (2, unrelated)]),
             next_table_id: 3,
+            next_storage_id: 3,
             ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
         assert_eq!(err.code, SqlState::InternalError);
         assert!(err.message.contains("non-matching TOAST relation"));
+    }
+
+    #[test]
+    fn validate_rejects_toastable_table_without_hidden_relation() {
+        let mut table = stored_id_table(1, "users");
+        table.columns.push(ColumnDef {
+            id: 1,
+            object_id: 2,
+            name: "payload".to_string(),
+            data_type: DataType::Text,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        });
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, table)]),
+            next_table_id: 2,
+            next_storage_id: 2,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("missing its TOAST relation"));
     }
 
     #[test]
@@ -4611,6 +4678,7 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
             tables_by_id: HashMap::from([(1, base), (2, toast)]),
             next_table_id: 3,
+            next_storage_id: 3,
             ..CatalogSnapshot::default()
         };
 
@@ -4644,6 +4712,7 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
             tables_by_id: HashMap::from([(1, base), (2, toast)]),
             next_table_id: 3,
+            next_storage_id: 3,
             ..CatalogSnapshot::default()
         };
 
@@ -4767,6 +4836,11 @@ mod tests {
                 .contains("unsupported pre-foundation catalog v3 layout")
         );
 
+        let mut incomplete_v3 = value.clone();
+        incomplete_v3.as_object_mut().unwrap().remove("statistics");
+        let error = deserialize_catalog(&serde_json::to_vec(&incomplete_v3).unwrap()).unwrap_err();
+        assert!(error.message.contains("missing field `statistics`"));
+
         let legacy = serde_json::json!({
             "tables_by_name": {},
             "tables_by_id": {},
@@ -4778,6 +4852,33 @@ mod tests {
                 .message
                 .contains("unsupported unversioned catalog format")
         );
+    }
+
+    #[test]
+    fn durable_snapshot_rejects_zero_storage_ids_and_orphan_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+
+        let mut zero_storage = catalog.snapshot().unwrap();
+        zero_storage
+            .tables_by_id
+            .get_mut(&users.id)
+            .unwrap()
+            .storage_id = 0;
+        let error = MemoryCatalog::try_from_durable_snapshot(zero_storage).unwrap_err();
+        assert!(error.message.contains("storage id 0 is reserved"));
+
+        let mut orphan_statistics = catalog.snapshot().unwrap();
+        orphan_statistics.statistics.insert(
+            users.id + 100,
+            TableStatistics {
+                row_count: 0,
+                page_count: 0,
+                columns: std::collections::BTreeMap::new(),
+            },
+        );
+        let error = MemoryCatalog::try_from_durable_snapshot(orphan_statistics).unwrap_err();
+        assert!(error.message.contains("statistics reference missing table"));
     }
 
     #[test]
@@ -4800,11 +4901,7 @@ mod tests {
         value["views"][0].as_object_mut().unwrap().remove("query");
 
         let error = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap_err();
-        assert!(
-            error
-                .message
-                .contains("unsupported view catalog encoding without resolved query IR")
-        );
+        assert!(error.message.contains("missing field `query`"));
     }
 
     #[test]
@@ -4868,6 +4965,19 @@ mod tests {
             {"id": 1, "name": "duplicate"}
         ]);
         assert!(deserialize_catalog(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn catalog_v3_rejects_duplicate_dependency_edges() {
+        let catalog = catalog_with_users_without_primary_key();
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let dependencies = value["dependencies"].as_array_mut().unwrap();
+        let dependency = dependencies.first().unwrap().clone();
+        dependencies.push(dependency);
+
+        let error = deserialize_catalog(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(error.message.contains("duplicate dependency edge"));
     }
 
     #[test]
@@ -5043,7 +5153,7 @@ mod tests {
                 vec![id_column(false)],
                 Vec::new(),
                 CompressionSetting::None,
-                ToastOptions::legacy_catalog_default(),
+                ToastOptions::disabled(),
                 Vec::new(),
             )
             .unwrap();
@@ -5125,7 +5235,7 @@ mod tests {
                 vec![id_column(false)],
                 Vec::new(),
                 CompressionSetting::None,
-                ToastOptions::legacy_catalog_default(),
+                ToastOptions::disabled(),
                 Vec::new(),
             )
             .unwrap();

@@ -7,7 +7,7 @@ use common::{
 
 use crate::CatalogSnapshot;
 
-pub(crate) fn reconcile_constraints_and_dependencies(snapshot: &mut CatalogSnapshot) -> Result<()> {
+pub(crate) fn rebuild_dependencies(snapshot: &mut CatalogSnapshot) -> Result<()> {
     snapshot.dependencies = build_dependencies(snapshot)?;
     Ok(())
 }

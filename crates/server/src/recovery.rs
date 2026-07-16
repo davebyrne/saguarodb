@@ -611,12 +611,10 @@ fn validate_dictionary_ref(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
     use catalog::CatalogManager;
-    use storage::{RecoveryOperations, SchemaOperations};
+    use storage::SchemaOperations;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     fn catalog_change(
@@ -661,153 +659,11 @@ mod tests {
             schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: common::CompressionSetting::None,
             active_dict_id: None,
-            toast: common::ToastOptions::legacy_catalog_default(),
+            toast: common::ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: common::RelationKind::User,
             next_column_object_id: u32::MAX,
         }
-    }
-
-    #[derive(Default)]
-    struct CapturingRecoveryOps {
-        tables: Mutex<Vec<common::TableSchema>>,
-        indexes: Mutex<Vec<common::IndexSchema>>,
-    }
-
-    impl RecoveryOperations for CapturingRecoveryOps {
-        fn apply_create_table(&self, schema: common::TableSchema) -> common::Result<()> {
-            self.tables.lock().expect("tables lock").push(schema);
-            Ok(())
-        }
-
-        fn apply_drop_table(&self, _table: common::TableId) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_create_index(&self, schema: common::IndexSchema) -> common::Result<()> {
-            self.indexes.lock().expect("indexes lock").push(schema);
-            Ok(())
-        }
-
-        fn apply_update_table_schema(&self, schema: common::TableSchema) -> common::Result<()> {
-            self.tables.lock().expect("tables lock").push(schema);
-            Ok(())
-        }
-
-        fn apply_update_index_schema(&self, schema: common::IndexSchema) -> common::Result<()> {
-            self.indexes.lock().expect("indexes lock").push(schema);
-            Ok(())
-        }
-
-        fn apply_drop_index(&self, _index: common::IndexId) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_create_sequence(&self, _schema: common::SequenceSchema) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_drop_sequence(&self, _sequence: common::SequenceId) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_sequence_advance(
-            &self,
-            _sequence: common::SequenceId,
-            _value: i64,
-        ) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_set_sequence_value(
-            &self,
-            _sequence: common::SequenceId,
-            _value: i64,
-            _is_called: bool,
-        ) -> common::Result<()> {
-            Ok(())
-        }
-
-        fn apply_rebuild_table_identity(&self, _schema: common::TableSchema) -> common::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn recovery_applies_catalog_normalized_legacy_create_schemas_to_storage() {
-        let catalog = catalog::MemoryCatalog::empty();
-        let storage = CapturingRecoveryOps::default();
-        let buffer_pool = buffer::MemoryBufferPool::empty(1);
-        let compression = compress::CompressionRegistry::new();
-        let dict_dir = tempfile::tempdir().unwrap();
-        let dict_store = compress::DictStore::open(dict_dir.path()).unwrap();
-
-        let mut legacy_table = table_schema(41, "legacy_table");
-        legacy_table.storage_id = 0;
-        legacy_table.primary_key.clear();
-        super::apply_redo(
-            &catalog,
-            &storage,
-            &buffer_pool,
-            &compression,
-            &dict_store,
-            catalog_change(&catalog, |staged| {
-                staged.apply_create_table(legacy_table.clone())
-            }),
-            super::ReplayRecordContext { lsn: 1 },
-        )
-        .unwrap();
-
-        let installed_table = catalog
-            .get_table(legacy_table.id)
-            .unwrap()
-            .expect("table installed in catalog");
-        let captured_table = storage
-            .tables
-            .lock()
-            .expect("tables lock")
-            .pop()
-            .expect("storage saw table create");
-        assert_ne!(captured_table.storage_id, 0);
-        assert_eq!(captured_table, installed_table);
-
-        let legacy_index = common::IndexSchema {
-            id: 7,
-            schema_id: common::PUBLIC_SCHEMA_ID,
-            storage_id: 0,
-            table: legacy_table.id,
-            name: "legacy_table_id_idx".to_string(),
-            columns: vec![0],
-            unique: false,
-            constraint: None,
-        };
-        super::apply_redo(
-            &catalog,
-            &storage,
-            &buffer_pool,
-            &compression,
-            &dict_store,
-            catalog_change(&catalog, |staged| {
-                staged.apply_create_index(legacy_index.clone())
-            }),
-            super::ReplayRecordContext { lsn: 2 },
-        )
-        .unwrap();
-
-        let installed_index = catalog
-            .list_indexes_for_table(legacy_table.id)
-            .unwrap()
-            .into_iter()
-            .find(|index| index.id == legacy_index.id)
-            .expect("index installed in catalog");
-        let captured_index = storage
-            .indexes
-            .lock()
-            .expect("indexes lock")
-            .pop()
-            .expect("storage saw index create");
-        assert_ne!(captured_index.storage_id, 0);
-        assert_eq!(captured_index, installed_index);
     }
 
     #[test]
@@ -1471,7 +1327,7 @@ mod tests {
                 .get_table_by_name("aborted_table")
                 .unwrap(),
             None,
-            "an aborted CreateTable record must not install a catalog table"
+            "an aborted table-creation catalog change must not install a catalog table"
         );
         assert_eq!(
             reopened
@@ -1706,7 +1562,7 @@ mod tests {
                 .get_sequence_by_name("aborted_seq")
                 .unwrap(),
             None,
-            "an aborted CreateSequence record must not install a catalog sequence"
+            "an aborted sequence-creation catalog change must not install a catalog sequence"
         );
         assert_eq!(
             reopened
@@ -1750,7 +1606,7 @@ mod tests {
                 app.query_service.execute_sql(sql).unwrap();
             }
             // No checkpoint happened (few commits), so recovery must replay the
-            // CreateIndex record rather than load it from the snapshot.
+            // index-creation CatalogChange rather than load it from the snapshot.
             let index = app
                 .components
                 .catalog
@@ -1761,8 +1617,8 @@ mod tests {
             index_id = index.id;
         }
 
-        // Reopen: recovery replays the CreateIndex record into both catalog and
-        // storage and rebuilds the secondary tree from its full-page images.
+        // Reopen: recovery applies the index-creation catalog change and rebuilds
+        // the secondary tree from its separate full-page images.
         let reopened = AppState::open_for_test(dir.path()).unwrap();
         let comps = &reopened.components;
         assert!(

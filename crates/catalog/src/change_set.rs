@@ -5,8 +5,7 @@ use common::{
     SqlState,
 };
 
-use crate::dependencies::reconcile_constraints_and_dependencies;
-use crate::{CatalogSnapshot, MemoryCatalog};
+use crate::{CatalogSnapshot, reconcile_snapshot_derived_metadata};
 
 pub fn catalog_change_set_between(
     before: &CatalogSnapshot,
@@ -48,8 +47,7 @@ pub fn apply_catalog_change_set(
     reserve_change_allocators(&mut result, &change_set.allocator_high_water);
     reserve_change_allocators(&mut result, &existing_high_water);
     rebuild_name_indexes(&mut result);
-    reconcile_constraints_and_dependencies(&mut result)?;
-    MemoryCatalog::try_from_snapshot(result.clone())?;
+    reconcile_snapshot_derived_metadata(&mut result)?;
     Ok(result)
 }
 
@@ -434,7 +432,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{CatalogManager, serialize_catalog};
+    use crate::{CatalogManager, MemoryCatalog, serialize_catalog};
 
     #[test]
     fn between_is_deterministic_and_applies_atomically() {

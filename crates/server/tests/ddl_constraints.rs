@@ -401,8 +401,8 @@ async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
     assert_eq!(create_index_records, 2);
 }
 
-/// Column defaults persist across a restart (replayed from the durable catalog /
-/// `CreateTable` WAL record) and are still applied to inserts after recovery.
+/// Column defaults persist across a restart through the table's generic catalog
+/// change and are still applied to inserts after recovery.
 #[tokio::test]
 async fn column_default_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -527,8 +527,8 @@ async fn expression_default_invalid_is_rejected() {
     );
 }
 
-/// An expression `DEFAULT` survives a restart (replayed from the durable catalog /
-/// `CreateTable` WAL record) and is still evaluated for inserts after recovery.
+/// An expression `DEFAULT` survives a restart through the table's generic
+/// catalog change and is still evaluated for inserts after recovery.
 #[tokio::test]
 async fn expression_default_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -582,7 +582,7 @@ async fn coalesce_default_and_check_survive_restart() {
             .await
             .unwrap();
         // Exercise catalog-v3 StoredExpression serialization rather than
-        // relying only on CreateTable WAL replay.
+        // relying only on generic catalog-change replay.
         server.force_checkpoint().await.unwrap();
     }
 
@@ -897,8 +897,8 @@ async fn check_uses_stable_column_identity_after_rename_and_dense_shift() {
     assert!(error.message.contains("23514"));
 }
 
-/// A `CHECK` constraint survives a restart (replayed from the durable catalog /
-/// `CreateTable` WAL record) and is still enforced for inserts after recovery.
+/// A `CHECK` constraint survives a restart through its generic catalog change
+/// and is still enforced for inserts after recovery.
 #[tokio::test]
 async fn check_constraint_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -1303,7 +1303,7 @@ async fn sequence_ddl_survives_restart() {
             )
             .await
             .unwrap();
-        // No checkpoint: force recovery to replay the CreateSequence WAL record.
+        // No checkpoint: force recovery to replay the sequence catalog mutation.
     }
 
     let server = restart(&path).await;
@@ -1338,7 +1338,7 @@ async fn sequence_drop_replay_removes_checkpointed_sequence() {
             .simple_query("drop sequence users_id_seq")
             .await
             .unwrap();
-        // No checkpoint after the drop: force recovery to replay DropSequence.
+        // No checkpoint after the drop: force recovery to replay the sequence deletion.
     }
 
     let server = restart(&path).await;
@@ -1346,7 +1346,7 @@ async fn sequence_drop_replay_removes_checkpointed_sequence() {
         .simple_query("drop sequence users_id_seq")
         .await
         .err()
-        .expect("DropSequence replay should remove the checkpointed sequence");
+        .expect("catalog-change replay should remove the checkpointed sequence");
     assert!(
         missing.message.contains("42P01"),
         "expected UndefinedTable: {}",
@@ -1850,8 +1850,8 @@ async fn table_unique_constraint_over_two_columns() {
     );
 }
 
-/// A `UNIQUE` constraint's index is rebuilt on restart (replayed from its
-/// `CreateIndex` WAL record) and still enforces uniqueness.
+/// A `UNIQUE` constraint's index is rebuilt on restart from generic catalog and
+/// physical WAL records and still enforces uniqueness.
 #[tokio::test]
 async fn unique_constraint_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -1866,8 +1866,8 @@ async fn unique_constraint_survives_restart() {
             .simple_query("insert into t (id, email) values (1, 'a@b')")
             .await
             .unwrap();
-        // No checkpoint: recovery must replay both the CreateTable and the
-        // auto-created unique-index CreateIndex records.
+        // No checkpoint: recovery must replay the table, constraint, and
+        // auto-created unique-index catalog mutations.
     }
 
     let server = restart(&path).await;
@@ -2060,8 +2060,8 @@ async fn alter_table_primary_key_survives_restart() {
             .simple_query("alter table only t add constraint t_pkey primary key (id)")
             .await
             .unwrap();
-        // No checkpoint: recovery must replay the primary-key catalog change and the
-        // primary-key constraint CreateIndex.
+        // No checkpoint: recovery must replay the primary-key constraint and its
+        // backing-index catalog mutations.
     }
 
     let server = restart(&path).await;

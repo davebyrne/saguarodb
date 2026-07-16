@@ -38,7 +38,7 @@ pub enum Value {
     /// canonical estimate (so `1 mon` == `30 days`).
     Interval(Interval),
     /// `BYTEA` — a raw byte string. `Vec<u8>` ordering/hashing are lexicographic.
-    Bytes(Vec<u8>),
+    Bytes(#[serde(deserialize_with = "crate::durable::deserialize_bounded_bytes")] Vec<u8>),
     /// `UUID`, stored as its 16 bytes. `[u8; 16]` ordering is the canonical
     /// (network-order) byte ordering, matching PostgreSQL.
     Uuid([u8; 16]),

@@ -20,6 +20,7 @@ pub mod concurrency;
 pub mod context;
 pub mod copy;
 pub mod datetime;
+mod durable;
 pub mod error;
 pub mod float;
 pub mod flush;
@@ -62,6 +63,8 @@ pub use context::{
     no_catalog_introspection, no_system_state,
 };
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
+#[doc(hidden)]
+pub use durable::deserialize_bounded_vec_named;
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};

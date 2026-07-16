@@ -183,6 +183,10 @@ precedence.
   swap, WAL checkpoint records, WAL truncation, and graceful shutdown.
 - Be conservative with durable formats. WAL, manifest, snapshot, and page/row
   encodings need versioning/checksum behavior consistent with their specs.
+- The typed catalog foundation is an intentional compatibility break: catalog
+  snapshots are v3, manifests are v4, and catalog metadata WAL uses only generic
+  `CatalogChange` records. Do not add migration/defaulting readers for older
+  catalog, manifest, or specialized catalog-WAL layouts.
 
 ## Testing And Verification
 

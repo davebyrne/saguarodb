@@ -77,6 +77,13 @@ CRC32: 4 bytes
 
 CRC covers header and payload except the CRC field. `CatalogChange` uses JSON; physiological redo uses compact little-endian binary fields. `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields. The type byte is authoritative and must match the decoded variant.
 
+The decoder rejects an oversized length from the record header before waiting
+for or materializing the payload. Heap-row and raw/compressed full-page bodies
+are capped at 8 KiB, dictionary bodies at 112,640 bytes, and JSON payloads at 64
+MiB. Physical byte bodies are copied only after a fallible exact reservation.
+`CommitWithSubxids` additionally caps its list at 65,536 entries with a bounded
+visitor, so JSON size cannot amplify into an unbounded transaction-id vector.
+
 ## Public API
 
 ```rust

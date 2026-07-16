@@ -3123,11 +3123,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_legacy_table_without_toast_relation_stays_plain() {
+    fn prepare_toastable_table_without_toast_relation_is_rejected() {
         let harness = StorageHarness::new();
         let ctx = crate::test_statement_context(1);
         let (mut base, _) = base_and_toast_schema();
         base.toast_table_id = None;
+        base.toast.mode = ToastMode::Auto;
         base.toast.min_value_size = 128;
         base.toast.compression = ToastCompression::Zstd;
         harness.storage.create_table(&ctx, &base).unwrap();
@@ -3141,9 +3142,22 @@ mod tests {
             ],
         };
 
-        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+        let error = harness
+            .storage
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
+            .unwrap_err();
 
-        assert_eq!(values[1], DecodedPhysicalValue::Value(Value::Text(raw)));
+        assert_eq!(error.code, SqlState::InternalError);
+        assert!(error.message.contains("missing its TOAST relation"));
     }
 
     #[test]
@@ -3241,7 +3255,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_table_rejects_oversized_array_before_row_materialization() {
+    fn toastable_table_without_toast_relation_is_rejected_before_materialization() {
         let harness = StorageHarness::new();
         let ctx = crate::test_statement_context(1);
         let (mut base, _) = array_base_and_toast_schema();
@@ -3265,7 +3279,8 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+        assert_eq!(error.code, SqlState::InternalError);
+        assert!(error.message.contains("missing its TOAST relation"));
     }
 
     #[test]
@@ -5285,7 +5300,7 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,
@@ -5406,7 +5421,7 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
             schema_version: common::INITIAL_SCHEMA_VERSION,

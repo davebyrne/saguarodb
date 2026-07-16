@@ -786,7 +786,8 @@ impl PageBackedStorageEngine {
     ) -> Result<Vec<u8>> {
         validate_logical_index_keys_fit(self, relations, schema, row)?;
         if matches!(schema.relation_kind, RelationKind::Toast { .. })
-            || schema.toast_table_id.is_none()
+            || !common::needs_toast_relation(schema)
+            || (schema.toast_table_id.is_none() && schema.toast.mode == common::ToastMode::Off)
         {
             let plans = plain_column_plans(row);
             ensure_planned_row_fits_page(schema, row, &plans)?;
@@ -794,6 +795,12 @@ impl PageBackedStorageEngine {
             let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
             ensure_row_len_fits_page(bytes.len())?;
             return Ok(bytes);
+        }
+        if schema.toast_table_id.is_none() {
+            return Err(DbError::internal(format!(
+                "toastable table {} is missing its TOAST relation",
+                schema.name
+            )));
         }
 
         let (mut plans, mut candidates) = self.prepare_inline_toast_candidates(schema, row)?;

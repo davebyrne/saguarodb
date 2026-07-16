@@ -2023,7 +2023,7 @@ Development builds do not migrate older page formats. Existing page files withou
 - `BOOLEAN`: 1 byte
 - `NULL`: represented in the null bitmap, no data bytes
 
-Storage uses a TOAST-aware row preparation helper for ordinary INSERT and normal non-HOT UPDATE. The helper converts logical rows to v3 parent tuple bytes, preflights identity and catalog-index key sizes before any chunk writes, bypasses recursive TOAST for hidden TOAST relations, preserves inline-only behavior for legacy user tables without a companion TOAST relation, attempts configured value compression for eligible medium `TEXT`/`BYTEA` values, length-simulates largest-first externalization before writing chunks, then writes TOAST chunks under the caller's transaction only after the final parent tuple is known to fit a page. HOT UPDATE reuses the inline preparation logic with `HEAP_ONLY` set and is eligible for TOAST-enabled tables only when the predecessor has no external TOAST pointer and the successor can be prepared without external chunks; any external-pointer owner or would-be-externalized successor falls back to the normal fully-indexed update path.
+Storage uses a TOAST-aware row preparation helper for ordinary INSERT and normal non-HOT UPDATE. The helper converts logical rows to v3 parent tuple bytes, preflights identity and catalog-index key sizes before any chunk writes, bypasses recursive TOAST for hidden TOAST relations, requires every toastable user table to reference its catalog-created companion TOAST relation, attempts configured value compression for eligible medium `TEXT`/`BYTEA` values, length-simulates largest-first externalization before writing chunks, then writes TOAST chunks under the caller's transaction only after the final parent tuple is known to fit a page. HOT UPDATE reuses the inline preparation logic with `HEAP_ONLY` set and is eligible for TOAST-enabled tables only when the predecessor has no external TOAST pointer and the successor can be prepared without external chunks; any external-pointer owner or would-be-externalized successor falls back to the normal fully-indexed update path.
 
 User-facing storage reads resolve tuple visibility from MVCC headers before materializing v3 TOAST values. Only visible parent tuples decompress inline compressed values or read external chunks from the hidden TOAST relation; invisible tuples with missing or corrupt chunks are skipped without touching those chunks.
 
@@ -2486,6 +2486,9 @@ The `catalog` crate manages metadata about all database objects.
 
 ```rust
 pub struct Catalog {
+    schemas_by_name: HashMap<String, SchemaId>,
+    schemas_by_id: HashMap<SchemaId, NamespaceSchema>,
+    next_schema_id: SchemaId,
     tables_by_name: HashMap<String, TableId>,
     tables_by_id: HashMap<TableId, TableSchema>,
     views_by_name: HashMap<String, TableId>,
@@ -2497,10 +2500,15 @@ pub struct Catalog {
     sequences_by_name: HashMap<String, SequenceId>,
     sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     next_sequence_id: SequenceId,
+    constraints_by_id: HashMap<ConstraintId, ConstraintSchema>,
+    dependencies: BTreeSet<DependencyEdge>,
+    statistics: HashMap<TableId, TableStatistics>,
+    next_constraint_id: ConstraintId,
 }
 
 pub struct TableSchema {
     pub id: TableId,
+    pub schema_id: SchemaId,
     pub storage_id: FileId,
     pub name: String,
     pub columns: Vec<ColumnDef>,       // ColumnDef with assigned IDs
@@ -2555,15 +2563,15 @@ operation. Dense ordinals and physical row/index projections are rebuilt during
 the rewrite without changing surviving stable column identities.
 
 `create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
-metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;
+metadata, and creates hidden TOAST metadata for tables with `TEXT`, `BYTEA`, or array columns;
 adding the first toastable column does the same when policy requires it. Hidden
 relations are named `"\0toast_<base_table_id>"`, use `(value_id BIGINT, seq
 INTEGER, data BYTEA)` with primary key `(value_id, seq)`, disable page compression,
-and have distinct storage ids. Legacy snapshots use
-`ToastOptions::legacy_catalog_default()` and default missing relation kind to
-`User`. Validation enforces TOAST bounds, nonzero dictionary/storage ids,
-cross-links, and duplicate storage-id rules while preserving the legacy raw
-table/index collision allowed by file-kind bits.
+and have distinct storage ids. Hidden relations use `ToastOptions::disabled()`.
+Catalog v3 requires every durable schema field; it does not synthesize missing
+TOAST, relation-kind, schema, or storage-generation metadata. Validation enforces
+TOAST bounds, nonzero dictionary/storage ids, cross-links, and duplicate
+storage-id rules.
 
 User table/view column assignment is limited to the 65,536 values in the
 `ColumnId` space. Constraint identities use a checked global `u32` allocator;
@@ -2818,9 +2826,9 @@ The `server` crate is the binary entry point.
 6. Load/register durable dictionaries, burn orphan dictionary ids, and validate
    every currently referenced dictionary before redo.
 7. Redo-all for records with `LSN > checkpoint_lsn`: apply physical records
-   under PageLSN gating regardless of transaction outcome; apply committed
-   committed generic catalog changes; reserve allocator high-water from every
-   change; and replay sequence values unconditionally. The seeded/folded CLOG
+   under PageLSN gating regardless of transaction outcome; apply generic catalog
+   changes whose transactions the CLOG marks committed; reserve allocator
+   high-water from every change; and replay sequence values unconditionally. The seeded/folded CLOG
    decides visibility, and recovery appends no WAL.
 8. Resolve crashed in-flight writers as aborted and perform deferred primary-key
    identity-tree rebuilds.

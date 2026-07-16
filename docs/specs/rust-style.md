@@ -16,7 +16,7 @@ This document defines Rust style and engineering conventions for SaguaroDB. It c
 ## Toolchain and Formatting
 
 - Use Rust 2024 edition for all crates.
-- Add `rust-toolchain.toml` in Task 1 and pin to stable Rust with `rustfmt` and `clippy` components.
+- Keep `rust-toolchain.toml` pinned to stable Rust with `rustfmt` and `clippy` components.
 - Commit `Cargo.lock`; this workspace includes the `saguarodb-server` binary.
 - Use default `rustfmt` formatting. Do not add `rustfmt.toml` unless a concrete project need appears.
 - Run `cargo fmt --all` before every checkpoint commit.

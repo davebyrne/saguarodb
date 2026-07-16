@@ -1,14 +1,33 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::indexing_slicing
+    )
+)]
+
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Display,
+    hash::Hash,
+};
+
 use common::{
     ConstraintSchema, DbError, DependencyEdge, FileId, IndexId, IndexSchema, NamespaceSchema,
     RelationKind, Result, SchemaId, SequenceId, SequenceSchema, TableId, TableSchema,
     TableStatistics, ViewSchema,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::CatalogSnapshot;
 
 const CATALOG_FORMAT_VERSION: u32 = 3;
 const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CATALOG_OBJECTS_PER_KIND: usize = 65_536;
+const MAX_CATALOG_DEPENDENCIES: usize = 1_000_000;
 
 #[derive(Serialize)]
 struct CatalogV3<'a> {
@@ -34,14 +53,21 @@ struct CatalogV3<'a> {
 struct OwnedCatalogV3 {
     #[serde(rename = "version")]
     _version: u32,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     schemas: Vec<NamespaceSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     tables: Vec<TableSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     views: Vec<ViewSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     indexes: Vec<IndexSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     sequences: Vec<SequenceSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     constraints: Vec<ConstraintSchema>,
+    #[serde(deserialize_with = "deserialize_bounded_dependencies")]
     dependencies: Vec<DependencyEdge>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_bounded_objects")]
     statistics: Vec<(TableId, TableStatistics)>,
     next_schema_id: SchemaId,
     next_table_id: TableId,
@@ -59,6 +85,47 @@ struct CatalogHeader {
 }
 
 pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
+    ensure_collection_limit(
+        snapshot.schemas_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog schema collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.tables_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog table collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.views_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog view collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.indexes_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog index collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.sequences_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog sequence collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.constraints_by_id.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog constraint collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.statistics.len(),
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog statistics collection",
+    )?;
+    ensure_collection_limit(
+        snapshot.dependencies.len(),
+        MAX_CATALOG_DEPENDENCIES,
+        "catalog dependency collection",
+    )?;
+
     let mut schemas: Vec<_> = snapshot.schemas_by_id.values().collect();
     schemas.sort_by_key(|schema| schema.id);
     let mut tables: Vec<_> = snapshot.tables_by_id.values().collect();
@@ -107,6 +174,16 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn ensure_collection_limit(count: usize, limit: usize, description: &str) -> Result<()> {
+    if count > limit {
+        return Err(DbError::plan(
+            common::SqlState::ProgramLimitExceeded,
+            format!("{description} exceeds {limit} entries"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
     if bytes.len() > MAX_CATALOG_BYTES {
         return Err(DbError::internal("catalog snapshot exceeds size limit"));
@@ -130,50 +207,79 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
     let catalog: OwnedCatalogV3 = serde_json::from_slice(bytes)
         .map_err(|err| DbError::internal(format!("failed to deserialize catalog: {err}")))?;
 
-    let schemas_by_name = catalog
-        .schemas
-        .iter()
-        .map(|schema| (schema.name.clone(), schema.id))
-        .collect();
+    let schemas_by_name = collect_pairs(
+        catalog
+            .schemas
+            .iter()
+            .map(|schema| (schema.name.clone(), schema.id)),
+        catalog.schemas.len(),
+        "catalog schema name index",
+    )?;
     let schemas_by_id = collect_unique(catalog.schemas, |schema| schema.id, "schema")?;
-    let tables_by_name = catalog
-        .tables
-        .iter()
-        .filter(|table| table.relation_kind == RelationKind::User)
-        .filter(|table| table.schema_id == common::PUBLIC_SCHEMA_ID)
-        .map(|table| (table.name.clone(), table.id))
-        .collect();
+    let tables_by_name = collect_pairs(
+        catalog
+            .tables
+            .iter()
+            .filter(|table| table.relation_kind == RelationKind::User)
+            .filter(|table| table.schema_id == common::PUBLIC_SCHEMA_ID)
+            .map(|table| (table.name.clone(), table.id)),
+        catalog.tables.len(),
+        "catalog table name index",
+    )?;
     let tables_by_id = collect_unique(catalog.tables, |table| table.id, "table")?;
-    let views_by_name = catalog
-        .views
-        .iter()
-        .filter(|view| view.schema_id == common::PUBLIC_SCHEMA_ID)
-        .map(|view| (view.name.clone(), view.id))
-        .collect();
+    let views_by_name = collect_pairs(
+        catalog
+            .views
+            .iter()
+            .filter(|view| view.schema_id == common::PUBLIC_SCHEMA_ID)
+            .map(|view| (view.name.clone(), view.id)),
+        catalog.views.len(),
+        "catalog view name index",
+    )?;
     let views_by_id = collect_unique(catalog.views, |view| view.id, "view")?;
-    let indexes_by_name = catalog
-        .indexes
-        .iter()
-        .filter(|index| index.schema_id == common::PUBLIC_SCHEMA_ID)
-        .map(|index| (index.name.clone(), index.id))
-        .collect();
+    let indexes_by_name = collect_pairs(
+        catalog
+            .indexes
+            .iter()
+            .filter(|index| index.schema_id == common::PUBLIC_SCHEMA_ID)
+            .map(|index| (index.name.clone(), index.id)),
+        catalog.indexes.len(),
+        "catalog index name index",
+    )?;
     let indexes_by_id = collect_unique(catalog.indexes, |index| index.id, "index")?;
-    let sequences_by_name = catalog
-        .sequences
-        .iter()
-        .filter(|sequence| sequence.schema_id == common::PUBLIC_SCHEMA_ID)
-        .map(|sequence| (sequence.name.clone(), sequence.id))
-        .collect();
+    let sequences_by_name = collect_pairs(
+        catalog
+            .sequences
+            .iter()
+            .filter(|sequence| sequence.schema_id == common::PUBLIC_SCHEMA_ID)
+            .map(|sequence| (sequence.name.clone(), sequence.id)),
+        catalog.sequences.len(),
+        "catalog sequence name index",
+    )?;
     let sequences_by_id = collect_unique(catalog.sequences, |sequence| sequence.id, "sequence")?;
     let constraints_by_id = collect_unique(
         catalog.constraints,
         |constraint| constraint.id,
         "constraint",
     )?;
-    let statistics = collect_unique(catalog.statistics, |(table, _)| *table, "statistics")?
-        .into_iter()
-        .map(|(table, (_, statistics))| (table, statistics))
-        .collect();
+    let statistics_with_ids =
+        collect_unique(catalog.statistics, |(table, _)| *table, "statistics")?;
+    let mut statistics = HashMap::new();
+    statistics
+        .try_reserve(statistics_with_ids.len())
+        .map_err(|_| DbError::internal("cannot allocate catalog statistics map"))?;
+    for (table, (_, table_statistics)) in statistics_with_ids {
+        statistics.insert(table, table_statistics);
+    }
+
+    let mut dependencies = BTreeSet::new();
+    for dependency in catalog.dependencies {
+        if !dependencies.insert(dependency) {
+            return Err(DbError::internal(
+                "catalog contains a duplicate dependency edge",
+            ));
+        }
+    }
 
     Ok(CatalogSnapshot {
         schemas_by_name,
@@ -194,7 +300,7 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         next_storage_id: catalog.next_storage_id,
         next_constraint_id: catalog.next_constraint_id,
         constraints_by_id,
-        dependencies: catalog.dependencies.into_iter().collect(),
+        dependencies,
         statistics,
     })
 }
@@ -203,7 +309,10 @@ fn collect_unique<T, K>(values: Vec<T>, key: impl Fn(&T) -> K, kind: &str) -> Re
 where
     K: Copy + Eq + Hash + Display,
 {
-    let mut result = HashMap::with_capacity(values.len());
+    let mut result = HashMap::new();
+    result
+        .try_reserve(values.len())
+        .map_err(|_| DbError::internal(format!("cannot allocate catalog {kind} map")))?;
     for value in values {
         let id = key(&value);
         if result.insert(id, value).is_some() {
@@ -214,4 +323,100 @@ where
     }
     Ok(result)
 }
-use std::{collections::HashMap, fmt::Display, hash::Hash};
+
+fn collect_pairs<K, V>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+    capacity: usize,
+    description: &str,
+) -> Result<HashMap<K, V>>
+where
+    K: Eq + Hash,
+{
+    let mut result = HashMap::new();
+    result
+        .try_reserve(capacity)
+        .map_err(|_| DbError::internal(format!("cannot allocate {description}")))?;
+    for (key, value) in pairs {
+        result.insert(key, value);
+    }
+    Ok(result)
+}
+
+fn deserialize_bounded_objects<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_CATALOG_OBJECTS_PER_KIND,
+        "catalog object collection",
+    )
+}
+
+fn deserialize_bounded_dependencies<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_CATALOG_DEPENDENCIES,
+        "catalog dependency collection",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::{
+        MAX_CATALOG_OBJECTS_PER_KIND, deserialize_bounded_objects, ensure_collection_limit,
+    };
+
+    #[derive(Debug, Deserialize)]
+    struct BoundedValues {
+        #[serde(deserialize_with = "deserialize_bounded_objects")]
+        values: Vec<u8>,
+    }
+
+    #[test]
+    fn bounded_catalog_collection_rejects_an_extra_item() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "values": vec![0_u8; MAX_CATALOG_OBJECTS_PER_KIND + 1]
+        }))
+        .unwrap();
+        let error = serde_json::from_slice::<BoundedValues>(&json).unwrap_err();
+        assert!(error.to_string().contains("exceeds 65536 items"));
+    }
+
+    #[test]
+    fn bounded_catalog_collection_accepts_its_limit() {
+        let json = serde_json::to_vec(&serde_json::json!({
+            "values": vec![0_u8; MAX_CATALOG_OBJECTS_PER_KIND]
+        }))
+        .unwrap();
+        let values: BoundedValues = serde_json::from_slice(&json).unwrap();
+        assert_eq!(values.values.len(), MAX_CATALOG_OBJECTS_PER_KIND);
+    }
+
+    #[test]
+    fn catalog_encoder_rejects_a_collection_above_the_decoder_limit() {
+        ensure_collection_limit(
+            MAX_CATALOG_OBJECTS_PER_KIND,
+            MAX_CATALOG_OBJECTS_PER_KIND,
+            "catalog schema collection",
+        )
+        .unwrap();
+        let error = ensure_collection_limit(
+            MAX_CATALOG_OBJECTS_PER_KIND + 1,
+            MAX_CATALOG_OBJECTS_PER_KIND,
+            "catalog schema collection",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, common::SqlState::ProgramLimitExceeded);
+        assert!(error.message.contains("exceeds 65536 entries"));
+    }
+}

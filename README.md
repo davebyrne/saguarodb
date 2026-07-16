@@ -54,6 +54,8 @@ trait seams.
 - Column defaults, `nextval` defaults, non-constant expression defaults,
   unnamed `CHECK` constraints, sequence functions, PostgreSQL-compatible system
   information functions, and catalog/probe functions used by common clients.
+  Defaults and CHECKs execute from durable typed expression trees, while PK,
+  UNIQUE, CHECK, and FK definitions are stable first-class catalog constraints.
 - Multi-statement transactions, autocommit, transaction-scoped and
   session-scoped isolation settings, savepoints, forward-only read-only SQL
   cursors, `statement_timeout`, `work_mem`, and `DISCARD ALL`.
@@ -82,7 +84,10 @@ trait seams.
   and WAL full-page-image compression.
 - Physiological redo WAL with full-page-image torn-page protection, one generic
   atomic catalog-change record for metadata, manifest checkpoints, WAL
-  truncation, and crash recovery.
+  truncation, and crash recovery. Manifest v4 with catalog v3 is the current
+  format and uses stable object/column IDs plus an exact dependency graph;
+  older manifest, catalog, and catalog-WAL layouts are rejected rather than
+  migrated.
 
 SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, or time-travel
@@ -476,7 +481,9 @@ IDs and register referenced physical generations, then replays WAL after
 `checkpoint_lsn` onto heap and index pages (redo-all). It atomically applies only
 committed catalog changes in LSN order. The CLOG is seeded from `clog.dat` and folded forward
 with later `Commit`/`Abort` records, including subtransaction commit records; if
-the snapshot is absent, it is rebuilt from retained WAL records.
+the snapshot is absent, it is rebuilt from retained WAL records. Catalog,
+manifest, and catalog-WAL format transitions provide no data-directory migration
+path; unsupported versions fail startup explicitly.
 
 ```text
 server startup

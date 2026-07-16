@@ -14,8 +14,8 @@ use common::{
 use crate::{
     CatalogAllocatorState, CatalogManager, ResolvedForeignKey, TableColumnAlteration,
     dependencies::{
-        dependency_drop_closure, dependency_drop_closure_for_column,
-        reconcile_constraints_and_dependencies, validate_constraints_and_dependencies,
+        dependency_drop_closure, dependency_drop_closure_for_column, rebuild_dependencies,
+        validate_constraints_and_dependencies,
     },
     system::{MAX_COMPOUND_OID_SUB_ID, MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
 };
@@ -24,54 +24,29 @@ const STORAGE_ID_KIND_BITS: FileId = 0xC000_0000;
 const MAX_STORAGE_ID: FileId = !STORAGE_ID_KIND_BITS;
 const STORAGE_ID_EXHAUSTED: FileId = MAX_STORAGE_ID + 1;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct CatalogSnapshot {
-    #[serde(default = "default_schemas_by_name")]
     pub schemas_by_name: HashMap<String, SchemaId>,
-    #[serde(default = "default_schemas_by_id")]
     pub schemas_by_id: HashMap<SchemaId, NamespaceSchema>,
-    #[serde(default = "default_next_schema_id")]
     pub next_schema_id: SchemaId,
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
-    #[serde(default)]
     pub views_by_name: HashMap<String, TableId>,
-    #[serde(default)]
     pub views_by_id: HashMap<TableId, ViewSchema>,
-    // Secondary-index fields default so catalogs written before secondary
-    // indexes existed still deserialize (no indexes, ids start after the
-    // reserved primary-key id).
-    #[serde(default)]
     pub indexes_by_name: HashMap<String, IndexId>,
-    #[serde(default)]
     pub indexes_by_id: HashMap<IndexId, IndexSchema>,
-    #[serde(default = "default_next_index_id")]
     pub next_index_id: IndexId,
-    #[serde(default)]
     pub sequences_by_name: HashMap<String, SequenceId>,
-    #[serde(default)]
     pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
-    #[serde(default = "default_next_sequence_id")]
     pub next_sequence_id: SequenceId,
-    // Dictionary-id allocator for trained compression dictionaries. Defaults
-    // so catalogs written before compression existed still deserialize (no
-    // dictionaries yet, first allocation is 1; 0 is reserved to mean "no
-    // dictionary").
-    #[serde(default = "default_next_dictionary_id")]
     pub next_dictionary_id: u32,
-    // Physical storage-generation id allocator. Defaults so catalogs written
-    // before relation generations existed migrate from logical ids.
-    #[serde(default = "default_next_storage_id")]
     pub next_storage_id: FileId,
     /// Reserved global constraint allocator used by generic catalog changes.
-    #[serde(default = "default_next_constraint_id")]
     pub next_constraint_id: common::ConstraintId,
     pub constraints_by_id: HashMap<common::ConstraintId, ConstraintSchema>,
     pub dependencies: BTreeSet<DependencyEdge>,
     // Optimizer statistics per analyzed user table (docs/specs/statistics.md).
-    // Defaults so catalogs written before ANALYZE existed still deserialize.
-    #[serde(default)]
     pub statistics: HashMap<TableId, TableStatistics>,
 }
 
@@ -162,18 +137,14 @@ impl MemoryCatalog {
     }
 
     pub fn try_from_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
-        normalize_snapshot_storage_ids(&mut snapshot)?;
-        prune_orphan_statistics(&mut snapshot);
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
     }
 
     /// Installs a decoded durable snapshot without repairing its persisted
     /// constraint or dependency metadata.
-    pub fn try_from_durable_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
-        normalize_snapshot_storage_ids(&mut snapshot)?;
-        prune_orphan_statistics(&mut snapshot);
+    pub fn try_from_durable_snapshot(snapshot: CatalogSnapshot) -> Result<Self> {
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
     }
@@ -461,13 +432,12 @@ impl CatalogManager for MemoryCatalog {
 
     fn snapshot(&self) -> Result<CatalogSnapshot> {
         let mut snapshot = self.read_snapshot()?.clone();
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(snapshot)
     }
 
     fn restore(&self, mut snapshot: CatalogSnapshot) -> Result<()> {
-        normalize_snapshot_storage_ids(&mut snapshot)?;
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         let mut current = self.write_snapshot()?;
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
@@ -500,10 +470,9 @@ impl CatalogManager for MemoryCatalog {
         reserve_id(&mut snapshot.next_table_id, id, "table")
     }
 
-    fn apply_create_table(&self, mut schema: TableSchema) -> Result<()> {
+    fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
         require_schema(&snapshot, schema.schema_id, "table", &schema.name)?;
-        normalize_table_storage_id(&mut schema, &snapshot)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
         if schema.relation_kind == RelationKind::User {
             reject_duplicate_relation_name_in_schema(
@@ -561,7 +530,7 @@ impl CatalogManager for MemoryCatalog {
 
     fn apply_drop_table(&self, id: TableId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         dependency_drop_closure(&snapshot, [common::CatalogObjectId::Table(id)])?;
         remove_drop_table_targets(&mut snapshot, &[id])
     }
@@ -648,7 +617,7 @@ impl CatalogManager for MemoryCatalog {
         }
         bump_schema_version(&mut schema.schema_version)?;
         snapshot.tables_by_id.insert(table, schema.clone());
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_constraints_and_dependencies(&snapshot)?;
         *guard = snapshot;
         Ok(schema)
@@ -691,7 +660,7 @@ impl CatalogManager for MemoryCatalog {
         snapshot.constraints_by_id.remove(&constraint);
         bump_schema_version(&mut schema.schema_version)?;
         snapshot.tables_by_id.insert(table, schema.clone());
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(Some(schema))
     }
 
@@ -824,7 +793,7 @@ impl CatalogManager for MemoryCatalog {
         install_check_constraints(&mut snapshot, schema.id, &constraint_checks)?;
         snapshot.next_table_id = next_table_id;
         snapshot.next_storage_id = next_storage_id;
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_constraints_and_dependencies(&snapshot)?;
         Ok(schema)
     }
@@ -1538,10 +1507,9 @@ impl CatalogManager for MemoryCatalog {
         reserve_id(&mut snapshot.next_index_id, id, "index")
     }
 
-    fn apply_create_index(&self, mut schema: IndexSchema) -> Result<()> {
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {
         let mut guard = self.write_snapshot()?;
         let mut snapshot = guard.clone();
-        normalize_index_storage_id(&mut schema, &snapshot)?;
         reject_duplicate_index_id(&snapshot, schema.id)?;
         validate_storage_id("index", schema.storage_id)?;
         reject_duplicate_index_storage_id(&snapshot, schema.storage_id, "index storage id")?;
@@ -1562,7 +1530,7 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_index_id = snapshot.next_index_id.max(next_after_schema);
         reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
         snapshot.indexes_by_id.insert(schema.id, schema);
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_constraints_and_dependencies(&snapshot)?;
         *guard = snapshot;
         Ok(())
@@ -1617,7 +1585,7 @@ impl CatalogManager for MemoryCatalog {
         }
         reserve_storage_id_value(&mut candidate.next_storage_id, schema.storage_id)?;
         candidate.indexes_by_id.insert(schema.id, schema);
-        reconcile_constraints_and_dependencies(&mut candidate)?;
+        rebuild_dependencies(&mut candidate)?;
         validate_constraints_and_dependencies(&candidate)?;
         *snapshot = candidate;
         Ok(())
@@ -1635,7 +1603,7 @@ impl CatalogManager for MemoryCatalog {
                 *supporting_index = None;
             }
         }
-        reconcile_constraints_and_dependencies(&mut candidate)?;
+        rebuild_dependencies(&mut candidate)?;
         dependency_drop_closure(&candidate, [common::CatalogObjectId::Index(id)])?;
         let schema = candidate
             .indexes_by_id
@@ -1647,7 +1615,7 @@ impl CatalogManager for MemoryCatalog {
         if schema.schema_id == PUBLIC_SCHEMA_ID {
             candidate.indexes_by_name.remove(&schema.name);
         }
-        reconcile_constraints_and_dependencies(&mut candidate)?;
+        rebuild_dependencies(&mut candidate)?;
         validate_constraints_and_dependencies(&candidate)?;
         *snapshot = candidate;
         Ok(())
@@ -1701,7 +1669,7 @@ impl CatalogManager for MemoryCatalog {
         snapshot.indexes_by_id.insert(schema.id, schema.clone());
         snapshot.next_index_id = next_index_id;
         snapshot.next_storage_id = next_storage_id;
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         validate_constraints_and_dependencies(&snapshot)?;
         *guard = snapshot;
         Ok(schema)
@@ -1868,7 +1836,7 @@ impl CatalogManager for MemoryCatalog {
         }
         snapshot.next_table_id = snapshot.next_table_id.max(next_after_schema);
         snapshot.views_by_id.insert(schema.id, schema);
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(())
     }
 
@@ -1901,7 +1869,7 @@ impl CatalogManager for MemoryCatalog {
             }
         }
         snapshot.views_by_id.insert(schema.id, schema);
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(())
     }
 
@@ -1915,7 +1883,7 @@ impl CatalogManager for MemoryCatalog {
         if schema.schema_id == PUBLIC_SCHEMA_ID {
             snapshot.views_by_name.remove(&schema.name);
         }
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(())
     }
 
@@ -1947,7 +1915,7 @@ impl CatalogManager for MemoryCatalog {
         }
         snapshot.views_by_id.insert(schema.id, schema.clone());
         snapshot.next_table_id = next_table_id;
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(schema)
     }
 
@@ -2002,7 +1970,7 @@ impl CatalogManager for MemoryCatalog {
         bump_schema_version(&mut schema.schema_version)?;
         validate_live_view_schema(&schema, &snapshot)?;
         snapshot.views_by_id.insert(schema.id, schema.clone());
-        reconcile_constraints_and_dependencies(&mut snapshot)?;
+        rebuild_dependencies(&mut snapshot)?;
         Ok(schema)
     }
 
@@ -2165,7 +2133,7 @@ fn next_storage_id_after(id: FileId, overflow_message: &'static str) -> Result<F
 fn validate_storage_id(kind: &str, id: FileId) -> Result<()> {
     if id == 0 {
         return Err(DbError::internal(format!(
-            "catalog {kind} storage id 0 is reserved for legacy missing ids"
+            "catalog {kind} storage id 0 is reserved"
         )));
     }
     if id & STORAGE_ID_KIND_BITS != 0 {
@@ -2174,158 +2142,6 @@ fn validate_storage_id(kind: &str, id: FileId) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> {
-    let mut table_assigned = explicit_table_storage_ids(snapshot);
-    let mut index_assigned = explicit_index_storage_ids(snapshot);
-    let mut assigned = table_assigned
-        .iter()
-        .chain(index_assigned.iter())
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut next_storage_id = snapshot
-        .next_storage_id
-        .max(default_next_storage_id())
-        .max(next_after_max_storage_id(&assigned)?);
-
-    let mut table_ids = snapshot.tables_by_id.keys().copied().collect::<Vec<_>>();
-    table_ids.sort_unstable();
-    for table_id in table_ids {
-        let table = snapshot
-            .tables_by_id
-            .get_mut(&table_id)
-            .ok_or_else(|| DbError::internal("catalog table disappeared during normalization"))?;
-        if table.storage_id == 0 {
-            table.storage_id =
-                legacy_or_fresh_storage_id(table.id, &mut next_storage_id, &mut table_assigned)?;
-            assigned.insert(table.storage_id);
-        } else {
-            table_assigned.insert(table.storage_id);
-            assigned.insert(table.storage_id);
-        }
-    }
-
-    let mut index_ids = snapshot.indexes_by_id.keys().copied().collect::<Vec<_>>();
-    index_ids.sort_unstable();
-    for index_id in index_ids {
-        let index = snapshot
-            .indexes_by_id
-            .get_mut(&index_id)
-            .ok_or_else(|| DbError::internal("catalog index disappeared during normalization"))?;
-        if index.storage_id == 0 {
-            index.storage_id =
-                legacy_or_fresh_storage_id(index.id, &mut next_storage_id, &mut index_assigned)?;
-            assigned.insert(index.storage_id);
-        } else {
-            index_assigned.insert(index.storage_id);
-            assigned.insert(index.storage_id);
-        }
-    }
-
-    snapshot.next_storage_id = next_storage_id.max(next_after_max_storage_id(&assigned)?);
-    Ok(())
-}
-
-fn explicit_table_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
-    snapshot
-        .tables_by_id
-        .values()
-        .filter_map(|table| (table.storage_id != 0).then_some(table.storage_id))
-        .collect()
-}
-
-fn explicit_index_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
-    snapshot
-        .indexes_by_id
-        .values()
-        .filter_map(|index| (index.storage_id != 0).then_some(index.storage_id))
-        .collect()
-}
-
-fn legacy_or_fresh_storage_id(
-    preferred: FileId,
-    next_storage_id: &mut FileId,
-    assigned: &mut HashSet<FileId>,
-) -> Result<FileId> {
-    if preferred != 0 && preferred & STORAGE_ID_KIND_BITS == 0 && !assigned.contains(&preferred) {
-        assigned.insert(preferred);
-        return Ok(preferred);
-    }
-    loop {
-        let candidate = *next_storage_id;
-        *next_storage_id = next_storage_id_after(candidate, "catalog storage id overflow")?;
-        if !assigned.contains(&candidate) {
-            assigned.insert(candidate);
-            return Ok(candidate);
-        }
-    }
-}
-
-fn next_after_max_storage_id(ids: &HashSet<FileId>) -> Result<FileId> {
-    match ids.iter().copied().max() {
-        Some(max) => next_storage_id_after(max, "catalog storage id overflow"),
-        None => Ok(default_next_storage_id()),
-    }
-}
-
-fn normalize_table_storage_id(schema: &mut TableSchema, snapshot: &CatalogSnapshot) -> Result<()> {
-    if schema.storage_id != 0 {
-        return Ok(());
-    }
-    let mut assigned = live_table_storage_ids(snapshot);
-    let all_assigned = live_storage_ids(snapshot);
-    let mut next_storage_id = snapshot
-        .next_storage_id
-        .max(next_after_max_storage_id(&all_assigned)?);
-    schema.storage_id = legacy_or_fresh_storage_id(schema.id, &mut next_storage_id, &mut assigned)?;
-    Ok(())
-}
-
-fn normalize_index_storage_id(schema: &mut IndexSchema, snapshot: &CatalogSnapshot) -> Result<()> {
-    if schema.storage_id != 0 {
-        return Ok(());
-    }
-    let mut assigned = live_index_storage_ids(snapshot);
-    let all_assigned = live_storage_ids(snapshot);
-    let mut next_storage_id = snapshot
-        .next_storage_id
-        .max(next_after_max_storage_id(&all_assigned)?);
-    schema.storage_id = legacy_or_fresh_storage_id(schema.id, &mut next_storage_id, &mut assigned)?;
-    Ok(())
-}
-
-fn live_table_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
-    snapshot
-        .tables_by_id
-        .values()
-        .map(|table| table.storage_id)
-        .filter(|id| *id != 0)
-        .collect()
-}
-
-fn live_index_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
-    snapshot
-        .indexes_by_id
-        .values()
-        .map(|index| index.storage_id)
-        .filter(|id| *id != 0)
-        .collect()
-}
-
-fn live_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
-    snapshot
-        .tables_by_id
-        .values()
-        .map(|table| table.storage_id)
-        .chain(
-            snapshot
-                .indexes_by_id
-                .values()
-                .map(|index| index.storage_id),
-        )
-        .filter(|id| *id != 0)
-        .collect()
 }
 
 fn validate_storage_ids(snapshot: &CatalogSnapshot) -> Result<()> {
@@ -2717,11 +2533,9 @@ fn validate_add_table_column(
     };
     let mut schema_after = schema.clone();
     schema_after.columns.push(column.clone());
-    let new_column_is_toastable = matches!(&column.data_type, DataType::Text | DataType::Bytea);
-    let toast_table_id = if new_column_is_toastable
-        && schema.toast_table_id.is_none()
-        && needs_toast_relation(&schema_after)
-    {
+    let new_column_requires_toast =
+        !needs_toast_relation(schema) && needs_toast_relation(&schema_after);
+    let toast_table_id = if new_column_requires_toast && schema.toast_table_id.is_none() {
         let toast_id = snapshot.next_table_id;
         reject_duplicate_relation_id(snapshot, toast_id)?;
         toast_id
@@ -3019,7 +2833,7 @@ pub fn validate_create_table_definition(
             columns: columns_for_shape,
             primary_key: primary_key.to_vec(),
             compression: CompressionSetting::None,
-            toast: ToastOptions::legacy_catalog_default(),
+            toast: ToastOptions::disabled(),
             checks: Vec::new(),
         },
     )?;
@@ -3041,6 +2855,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     validate_namespaces(snapshot)?;
     let mut max_relation_id = 0;
     validate_sequences(snapshot)?;
+    validate_statistics(snapshot)?;
     validate_constraints_and_dependencies(snapshot)?;
 
     for (name, id) in &snapshot.tables_by_name {
@@ -3164,10 +2979,43 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn validate_statistics(snapshot: &CatalogSnapshot) -> Result<()> {
+    for (table_id, statistics) in &snapshot.statistics {
+        let table = snapshot.tables_by_id.get(table_id).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog statistics reference missing table id {table_id}"
+            ))
+        })?;
+        if table.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "catalog statistics reference hidden relation {}",
+                table.name
+            )));
+        }
+        if let Some(column_id) = statistics
+            .columns
+            .keys()
+            .find(|column_id| !table.columns.iter().any(|column| column.id == **column_id))
+        {
+            return Err(DbError::internal(format!(
+                "catalog statistics for table {} reference unknown column id {column_id}",
+                table.name
+            )));
+        }
+        if !statistics.is_finite() {
+            return Err(DbError::internal(format!(
+                "catalog statistics for table {} contain a non-finite number",
+                table.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rebuilds catalog metadata derived from the durable object maps and validates
 /// the resulting snapshot before an external caller persists it.
 pub fn reconcile_snapshot_derived_metadata(snapshot: &mut CatalogSnapshot) -> Result<()> {
-    reconcile_constraints_and_dependencies(snapshot)?;
+    rebuild_dependencies(snapshot)?;
     validate_snapshot(snapshot)
 }
 
@@ -3364,6 +3212,12 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
     for schema in snapshot.tables_by_id.values() {
         match schema.relation_kind {
             RelationKind::User => {
+                if needs_toast_relation(schema) && schema.toast_table_id.is_none() {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot toastable table {} is missing its TOAST relation",
+                        schema.name
+                    )));
+                }
                 if let Some(toast_table_id) = schema.toast_table_id {
                     if toast_table_id == schema.id {
                         return Err(DbError::internal(format!(
@@ -4481,7 +4335,7 @@ fn replace_table_and_index_schemas(
         }
         candidate.indexes_by_id.insert(index.id, index.clone());
     }
-    reconcile_constraints_and_dependencies(&mut candidate)?;
+    rebuild_dependencies(&mut candidate)?;
     validate_snapshot(&candidate)?;
     *snapshot = candidate;
     Ok(())
@@ -4526,30 +4380,6 @@ fn reconcile_statistics_for_table_update(
     if !columns_preserved {
         stats.columns.clear();
     }
-}
-
-/// Drops statistics that no longer reference a live user table, and per-column
-/// entries whose column id the table no longer has. Statistics are advisory:
-/// a stale manifest entry must never block startup, so orphans are pruned
-/// rather than rejected by validation.
-fn prune_orphan_statistics(snapshot: &mut CatalogSnapshot) {
-    let CatalogSnapshot {
-        statistics,
-        tables_by_id,
-        ..
-    } = snapshot;
-    statistics.retain(|table_id, stats| {
-        let Some(schema) = tables_by_id.get(table_id) else {
-            return false;
-        };
-        if schema.relation_kind != RelationKind::User {
-            return false;
-        }
-        stats
-            .columns
-            .retain(|column_id, _| schema.columns.iter().any(|column| column.id == *column_id));
-        true
-    });
 }
 
 fn remap_columns_after_drop(schema: &mut TableSchema, dropped: ColumnId) {
@@ -4881,7 +4711,7 @@ fn create_key_constraint_index(
             .insert(index.name.clone(), index.id);
     }
     snapshot.indexes_by_id.insert(index.id, index.clone());
-    reconcile_constraints_and_dependencies(&mut snapshot)?;
+    rebuild_dependencies(&mut snapshot)?;
     validate_constraints_and_dependencies(&snapshot)?;
     *guard = snapshot;
     Ok(index)
@@ -5055,7 +4885,7 @@ fn validate_drop_table_dependencies(
     }
 
     let mut candidate = snapshot.clone();
-    reconcile_constraints_and_dependencies(&mut candidate)?;
+    rebuild_dependencies(&mut candidate)?;
     dependency_drop_closure(
         &candidate,
         targets.into_iter().map(common::CatalogObjectId::Table),
@@ -5064,7 +4894,7 @@ fn validate_drop_table_dependencies(
 }
 
 fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId]) -> Result<()> {
-    reconcile_constraints_and_dependencies(snapshot)?;
+    rebuild_dependencies(snapshot)?;
     let closure = dependency_drop_closure(
         snapshot,
         tables.iter().copied().map(common::CatalogObjectId::Table),
@@ -5095,7 +4925,7 @@ fn remove_drop_table_targets(snapshot: &mut CatalogSnapshot, tables: &[TableId])
         }
     }
     remove_dependency_closure_objects(snapshot, closure);
-    reconcile_constraints_and_dependencies(snapshot)?;
+    rebuild_dependencies(snapshot)?;
     Ok(())
 }
 
