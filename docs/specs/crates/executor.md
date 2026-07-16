@@ -474,7 +474,7 @@ not diverge between ALTER validation and later DML.
 - Server query orchestration acquires the write guard before execution.
 - Use `CatalogManager::create_index` to validate the table/columns/name and assign the `IndexId`.
 - Call `SchemaOperations::create_index` to build and backfill the secondary tree; storage does not publish the new index generation until that build succeeds. On failure, roll back the catalog with `CatalogManager::drop_index` before returning the error (mirroring `CREATE TABLE`).
-- Append the index `CatalogChange` before `SchemaOperations::create_index` builds
+- Append and flush the index `CatalogChange` before `SchemaOperations::create_index` builds
   the physical tree; server query orchestration appends `Commit`.
 - Return `Modified { command: "CREATE INDEX", count: 0 }`.
 
@@ -483,7 +483,7 @@ not diverge between ALTER validation and later DML.
 - Resolve the index to its `IndexId` in binder.
 - Call `SchemaOperations::drop_index`.
 - Call `CatalogManager::drop_index`.
-- Append the index-removal `CatalogChange` before `SchemaOperations::drop_index`;
+- Append and flush the index-removal `CatalogChange` before `SchemaOperations::drop_index`;
   server query orchestration appends `Commit`.
 - Return `Modified { command: "DROP INDEX", count: 0 }`.
 

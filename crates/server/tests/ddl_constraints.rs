@@ -356,7 +356,7 @@ async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
             .unwrap();
     }
 
-    let wal = FileWalManager::open(path.join("wal.dat")).unwrap();
+    let wal = FileWalManager::open(path).unwrap();
     let records = wal
         .replay_from(0)
         .unwrap()

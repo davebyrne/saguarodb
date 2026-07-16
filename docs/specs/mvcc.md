@@ -301,7 +301,7 @@ and (ii) **rebuilt at recovery by scanning the durable `Commit`/`Abort` records*
 exactly as §8 describes. The A–D MVP invented no new durable format because
 recovery rebuilds the CLOG from the WAL regardless; Milestone F adds the durable
 CLOG snapshot `clog.dat` (below) to bound that rebuild scan and carry the floors
-across restart, with the in-memory WAL rebuild retained as its fallback. The
+across restart, with a lazy retained-WAL scan as its fallback. The
 `Clog` lives in `crates/wal` because it supersedes the `committed_txns` set
 previously in `crates/wal/src/file.rs` and is reconstructed during recovery's WAL
 scan.
@@ -309,26 +309,27 @@ scan.
 **Durable CLOG file (Milestone F — implemented).** A standalone durable CLOG
 snapshot, `clog.dat`, now persists the transaction-status map so the WAL need not
 retain `Commit`/`Abort` records to remember outcomes across restart. It is a
-sibling of `wal.dat` (`<data-dir>/clog.dat`) written whole at each checkpoint via
+sibling of the segmented `wal/` directory (`<data-dir>/clog.dat`) written whole at each checkpoint via
 the same versioned + CRC-checked envelope as the control record
 (`crates/control/src/manifest.rs`): magic `SGCL` + version + payload length +
 CRC32 over a JSON payload. The payload is the **live window** — the explicit
 `Committed`/`Aborted` ids at or above the implicit-committed floor — plus three
 scalars: `clog_lsn` (the WAL LSN through which the statuses are absorbed), the
-`committed_floor`, and the `vacuum_floor`. Size is `O(live window)`, bounded by
-checkpoint cadence and VACUUM (everything below the floor is implicit-committed and
-omitted). The WAL manager exposes `persist_clog(clog_lsn)`; the checkpoint calls it
-**after** the heap + control record are durable and **before** `truncate_before`
-(§8), so the snapshot covers the truncation boundary before any record below it is
-dropped. It is written atomically (temp file + fsync + rename + parent-dir fsync).
+`committed_floor`, and the `vacuum_floor`. Size is `O(live window)`: each checkpoint
+advances past all settled commits, while the oldest un-reclaimed abort pins the floor
+until VACUUM makes it safe to omit. The payload is capped at 64 MiB and each status
+list at 1,000,000 ids with bounded decoding. The WAL manager exposes `persist_clog(clog_lsn)`; the checkpoint calls it
+**after** the heap + control record are durable and **before** `recycle_through`
+(§8), so the snapshot covers the replay floor before old segments are unlinked.
+It is written atomically (temp file + fsync + rename + parent-dir fsync).
 
 - **Recovery loads it (bounding the status-rebuild scan).** At open, when `clog.dat`
   is present the CLOG is *seeded* from it (statuses + both floors) and then only the
   `Commit`/`Abort` records with `lsn > clog_lsn` are folded on top — so the
   status-rebuild scan is bounded by checkpoint cadence rather than all retained WAL.
-  When `clog.dat` is **absent** (a fresh database, or a data directory from a
-  pre-durable-CLOG build) recovery falls back to rebuilding the CLOG from the full
-  retained WAL — backward compatible, no migration step. A **corrupt** `clog.dat`
+  When `clog.dat` is absent, recovery may rebuild it only for a fresh WAL whose
+  replay floor is zero. After recycling, a missing snapshot is fatal because
+  status records below the floor no longer exist. A **corrupt** `clog.dat`
   (CRC/version mismatch) is surfaced as an error, exactly like a bad `manifest.dat`:
   the atomic temp+rename means a torn write never occurs, so a mismatch is real
   corruption, not an expected partial write.
@@ -338,35 +339,35 @@ dropped. It is written atomically (temp file + fsync + rename + parent-dir fsync
   of resetting to the conservative initial value. (The no-snapshot fallback above
   still resets them conservatively, which is safe — see the vacuum-floor bullet
   below.)
-- **WAL truncation is decoupled from abort-pinning.** Because the snapshot remembers
-  every outcome, `truncate_before` is **unconditional** (it drops everything below
-  `checkpoint_lsn`); the vacuum floor now gates only `clog.dat` pruning, not WAL
-  retention. See the floor invariant below.
+- **WAL recycling is decoupled from abort-pinning.** Because the snapshot remembers
+  every outcome, `recycle_through` may advance the replay floor to
+  `checkpoint_lsn`; the vacuum floor gates only `clog.dat` pruning. Segments are
+  unlinked only when wholly below the floor. See the floor invariant below.
 
 - The CLOG is the authoritative status source. At recovery it is seeded from
   `clog.dat` plus post-snapshot `Commit`/`Abort` records, or rebuilt from all
-  retained status records when no snapshot exists; the old single-bit
+  retained status records only at replay floor zero when no snapshot exists; the old single-bit
   `committed_txns` model and redo-committed-only replay are retired.
 - Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as
   `Committed`/visible; an unrecorded normal id reads as `InProgress`.
 - An **implicit-committed floor**: an unrecorded normal id strictly below the
   floor reads as `Committed`, covering a *committed* transaction whose `Commit`
-  record a checkpoint truncated. An explicit recorded status (e.g. `Aborted`) is
+  record is logically below the replay floor. An explicit recorded status (e.g. `Aborted`) is
   checked first and always wins over the floor.
 - Consulted by visibility and uniqueness checks. The flush policy no longer
   consults transaction status; it admits any dirty page whose page-LSN is
   WAL-durable, and the CLOG hides non-committed versions after the page reaches
   disk or is replayed.
 
-**Unconditional truncation + the durable CLOG (the floor invariant).** Once the
+**Replay-floor recycling + the durable CLOG (the floor invariant).** Once the
 relaxed flush gate (§8) lets an aborted/in-flight transaction's pages reach the
 heap, the floor rule "unrecorded-below-floor ⇒ committed" is only sound if such a
 transaction is never *below* the floor while its on-disk versions survive. The
 durable CLOG snapshot (above) — **not** WAL retention — enforces this:
 
-- **WAL truncation (`WalManager::truncate_before`) is unconditional**: a checkpoint
-  drops every record below `checkpoint_lsn`. It no longer pins an aborted
-  transaction's `Abort` record, because `persist_clog` — run *before* the truncation,
+- **WAL recycling (`WalManager::recycle_through`) is unconditional with respect to transaction status**: a checkpoint
+  advances the replay floor to `checkpoint_lsn`. It no longer pins an aborted
+  transaction's `Abort` record, because `persist_clog` — run *before* recycling,
   on the same checkpoint — durably recorded that outcome (and both floors) in
   `clog.dat`. No write transaction is ever in-flight during a checkpoint (under
   Stage-1 serialized writers trivially, and under Stage-2/E2b because the checkpoint
@@ -380,8 +381,7 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
   a recorded abort below the floor is never falsely shown.
 - At recovery the floor is **loaded from the snapshot** (authoritative);
   `establish_recovery_committed_floor` is a no-op when a snapshot was loaded. The
-  no-snapshot fallback (fresh database, or a pre-durable-CLOG data directory whose
-  WAL is still conservatively truncated) re-derives it conservatively as
+  no-snapshot fallback for a fresh replay-floor-zero WAL re-derives it conservatively as
   `min(allocation_boundary, oldest_non_committed_retained_xid)`.
 - **The vacuum floor `B` bounds snapshot pruning** (Milestone F4c). A FULL VACUUM
   pass (holding `Share` on every user table) removes **every on-disk
@@ -425,8 +425,8 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
     are still only in memory.
   - **Durable across restart via `clog.dat`.** The vacuum floor is persisted in the
     durable CLOG snapshot (above) and reloaded at open, so a full VACUUM's reclamation
-    horizon survives a clean restart. When **no** snapshot is present (fresh database
-    or pre-durable-CLOG data dir) it falls back to `FIRST_NORMAL_XID`. That fallback is
+    horizon survives a clean restart. For a fresh replay-floor-zero WAL with no
+    snapshot it falls back to `FIRST_NORMAL_XID`. That fallback is
     safe: the snapshot then simply retains every aborted transaction's explicit entry
     until the first post-restart full VACUUM — never less safe, only less aggressive.
 
@@ -512,7 +512,7 @@ Committed**.
   `WouldBlock`) and the E2a per-index / per-heap structural latches plus the
   buffer pool's per-frame latches — not from a writer lock. Readers stay lock-free. The
   exclusive checkpoint guard preserves the "no in-flight writer at checkpoint"
-  invariant verbatim, so every transaction below the truncation boundary is settled
+  invariant verbatim, so every transaction below the WAL replay floor is settled
   and captured by `persist_clog`'s snapshot, keeping recovery correct with no fuzzy
   checkpoint.
 
@@ -619,7 +619,7 @@ becomes load-bearing once writers run concurrently (E2b).
   (heap/index/header/full-page-image) under PageLSN gating, regardless of the
   dirtying transaction's outcome. The CLOG — seeded from the durable CLOG snapshot
   `clog.dat` and brought current by folding the post-`clog_lsn` `Commit`/`Abort`
-  records as the WAL opens (or, with no snapshot, fully rebuilt from those records;
+  records as the WAL opens (or, only at replay floor zero, rebuilt from those records;
   §5.4) — decides visibility afterwards. Any transaction with neither a durable
   `Commit` nor `Abort` at crash (in-flight at crash) is **resolved to `Aborted`**:
   after the redo pass, `resolve_in_flight_as_aborted` marks every replayed writer xid
@@ -641,14 +641,14 @@ becomes load-bearing once writers run concurrently (E2b).
     Thus orphan physical pages/generations can never collide with a later object.
 - **Checkpoint** ordering (`crates/server/src/checkpoint.rs`):
   `wal.flush` → `flush_dirty_pages` → `store.sync_all` → control record →
-  `persist_clog` → `Checkpoint` marker → `truncate_before` → `mark_all_clean`.
+  `persist_clog` → `Checkpoint` marker → `recycle_through` → `mark_all_clean`.
   (`flush_committed_pages` is renamed `flush_dirty_pages`: it now spills committed,
   aborted, and — under Stage 2 — in-flight dirty pages alike, since all are WAL-durable
   once `wal.flush` has run and the CLOG hides the non-committed ones.) `persist_clog`
-  writes the durable CLOG snapshot *before* `truncate_before`, so the snapshot covers
-  every outcome truncation is about to drop.
-- **Unconditional WAL truncation + durable CLOG / `committed_floor`** (see §5.4):
-  `truncate_before` drops every record below `checkpoint_lsn` unconditionally. It no
+  writes the durable CLOG snapshot *before* `recycle_through`, so the snapshot covers
+  every outcome replay-floor advancement is about to exclude logically.
+- **WAL recycling + durable CLOG / `committed_floor`** (see §5.4):
+  `recycle_through` advances the replay floor to `checkpoint_lsn` regardless of transaction status. It no
   longer has to retain an aborted transaction's `Abort` record, because `persist_clog`
   durably recorded that outcome in `clog.dat` first. The snapshot's `committed_floor`
   never crosses an un-reclaimed aborted transaction (its explicit `Aborted` entry is
@@ -903,7 +903,8 @@ design, because index entries accumulate per version as well as heap tuples.
   each committed `DELETE` row and each committed `UPDATE` row is one dead version, added
   on a successful, durable commit only (never on abort). When a checkpoint runs and the
   count reaches `config.auto_vacuum_dead_rows` (CLI `--auto-vacuum-dead-rows`, default
-  `10000`; `0` disables auto-prune), the checkpoint captures `gc_horizon()` **under the
+  `10000`; `0` disables this dead-row trigger), or when an unreclaimed abort-pinned
+  CLOG window approaches its durable status-list limit, the checkpoint captures `gc_horizon()` **under the
   exclusive guard it already holds** and runs the F4a orchestration over every user
   table **before** flushing dirty pages — so the vacuum's pages and full-page images are
   made durable by that same checkpoint — then resets the counter. This bounds heap +
@@ -927,7 +928,7 @@ design, because index entries accumulate per version as well as heap tuples.
   checkpoint's `persist_clog` may then **drop those aborted transactions' explicit
   `Aborted` entries** from `clog.dat` and let the implicit-committed floor cover them —
   they have no surviving on-disk reference, so it is vacuously committed-below-floor
-  (§5.4). (WAL `truncate_before` is unconditional and does not consult `B`.) This closes
+  (§5.4). (WAL `recycle_through` does not consult `B`.) This closes
   the hazard for ALL aborted UPDATE/DELETE (HOT or non-HOT), not just aborted inserts: an
   aborted UPDATE/DELETE's surviving predecessor would otherwise carry an `xmax = T` that
   reads as an implicit-committed delete once the snapshot drops `T`, wrongly removing the
@@ -1059,10 +1060,10 @@ an already-evicted page).
   physical record under PageLSN gating; the CLOG (built from `Commit`/`Abort` at
   WAL open) decides visibility; in-flight-at-crash = aborted. Logical catalog
   records are CLOG-gated (§8).
-- **Conservative truncation / floor** (§5.4): the floor never marks an
+- **Conservative status / replay floor** (§5.4): the floor never marks an
   aborted/in-flight transaction implicitly committed (the critical correctness
-  guard). Milestone D kept the aborted txn's records by pinning truncation;
-  Milestone F's durable CLOG (`clog.dat`) makes truncation **unconditional** and
+  guard). Milestone D kept the aborted txn's records by pinning the replay boundary;
+  Milestone F's durable CLOG (`clog.dat`) makes replay-floor advancement **unconditional** and
   instead remembers the outcome in the snapshot, with D's conservative recovery-floor
   re-derivation retained only as the no-snapshot fallback. Crash tests cover checkpoint boundaries, the
   committed-via-floor path, torn pages, eviction of uncommitted/aborted pages, and
@@ -1105,8 +1106,8 @@ conflicts (`40001`).
   draining all writers and running alone. This turns the E1 conflict detection and
   the E2a per-index / per-heap structural latches into load-bearing, contended
   mechanisms. It **preserves the "no in-flight writer at checkpoint" invariant** that
-  recovery/truncation relies on (so every transaction below `checkpoint_lsn` is
-  settled and captured by `persist_clog` before the unconditional truncation — §8,
+  recovery/replay-floor advancement relies on (so every transaction below `checkpoint_lsn` is
+  settled and captured by `persist_clog` before unconditional advancement — §8,
   §5.4), so recovery stays correct without a fuzzy checkpoint. The buffer pool's steal-eviction is made concurrency-safe under
   overlapping writers (an `evicting` frame is never handed out, so a steal can never
   flush a stale snapshot of a frame a writer is concurrently modifying; page-number
@@ -1134,13 +1135,14 @@ in-progress conflicts — see §7.3 and `docs/specs/deadlock.md`.)
   horizon captured once afterward (§9). **F4b —
   auto-prune at checkpoint (live).** A checkpoint folds a VACUUM pass over every user
   table into itself when `dead_rows_since_vacuum >= --auto-vacuum-dead-rows` (committed
-  dead versions since the last auto-prune; default `10000`, `0` disables), under the
+  dead versions since the last auto-prune; default `10000`, `0` disables this trigger)
+  or when an unreclaimed abort-pinned CLOG window approaches its durable status-list limit, under the
   guard it already holds, with the horizon captured under that guard and the vacuum run
   before `flush_dirty_pages` so its pages/FPIs are durable that checkpoint — bounding
   space without operator `VACUUM`, with F4a's no-data-loss safety. **F4c — durable CLOG
-  + CLOG-snapshot pruning for reclaimed aborts (live).** WAL `truncate_before` is
-  **unconditional** (it drops everything below `checkpoint_lsn`), relying on the durable
-  CLOG snapshot `clog.dat` — written by `persist_clog` before the truncation — to
+  + CLOG-snapshot pruning for reclaimed aborts (live).** WAL `recycle_through` is
+  unconditional with respect to transaction status: it advances the logical replay
+  floor to `checkpoint_lsn`, relying on the durable CLOG snapshot written first to
   remember every aborted outcome. A full VACUUM pass advances the **vacuum floor** `B`
   (`min(next_txn_id, oldest_active_xid)` at the start of the pass); the next
   checkpoint's `persist_clog` then drops the explicit `Aborted` entry of — and floats the
@@ -1400,7 +1402,7 @@ savepoints via sub-transaction xids (implemented; `docs/specs/savepoints.md`).
     the collapse primitive; F3a/F3b handle `REDIRECT` (skip — entry stays live) vs
     `DEAD` (remove entry + reclaim slot) correctly, and heap-only members freed to
     `UNUSED` never reach F3a. The unconditional-`FullPageImage`-per-mutated-page logging
-    (VACUUM_TXN = 0, PageLSN-gated idempotent redo) and the fsync-before-truncate
+    (VACUUM_TXN = 0, PageLSN-gated idempotent redo) and fsync-before-replay-floor-advance
     ordering are preserved verbatim. `apply_prune_plan` applies the plan **atomically**:
     it mutates a scratch copy of the page and publishes the finished, checksum-stamped
     image into the live frame only if every step plus the `FullPageImage` append
@@ -1470,7 +1472,7 @@ savepoints via sub-transaction xids (implemented; `docs/specs/savepoints.md`).
   instead, because the current split protocol has no latch coupling).
 - **Fuzzy checkpoint** — checkpointing with writers in flight; Milestone E keeps
   the "no in-flight writer at checkpoint" invariant via the shared-writer /
-  exclusive-checkpoint guard (E2b), so Milestone-D recovery/truncation stays
+  exclusive-checkpoint guard (E2b), so Milestone-D recovery/replay-floor logic stays
   correct.
 - **Per-tuple CLOG-probe contention** — reducing repeated CLOG probes on hot
   tuples (beyond the `infomask` hint bits) under concurrent writers.
@@ -1500,11 +1502,11 @@ savepoints via sub-transaction xids (implemented; `docs/specs/savepoints.md`).
   `clog.dat` is written whole at each checkpoint (its cadence) carrying the live-window
   statuses and both floors; it is a self-pruning snapshot — entries below the
   implicit-committed floor are simply omitted — rather than a separately-truncated log,
-  so there is no second truncation protocol to coordinate. The in-memory WAL rebuild
-  remains the no-snapshot fallback. See §5.4 for the format.)*
-  *(Truncation vs aborted transactions — resolution: WAL `truncate_before` is
-  **unconditional** (it drops everything below `checkpoint_lsn`); the durable CLOG
-  snapshot `clog.dat`, written by `persist_clog` before each truncation, remembers every
+  so there is no second truncation protocol to coordinate. The lazy WAL scan
+  is available as a no-snapshot fallback only before the replay floor advances. See §5.4.)*
+  *(Recycling vs aborted transactions — resolution: WAL `recycle_through` is
+  unconditional with respect to transaction status; it advances the logical replay
+  floor while retaining the boundary segment. The durable CLOG snapshot written first remembers every
   aborted outcome and its `committed_floor` never crosses an un-reclaimed aborted id, so
   aborted-but-flushed versions stay invisible across restart without an undo pass (§5.4,
   §8). **F4c resolution (live):** once a FULL VACUUM pass reclaims an aborted

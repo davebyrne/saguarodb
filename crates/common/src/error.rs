@@ -18,6 +18,9 @@ pub enum ErrorKind {
     Storage,
     Io,
     Wal,
+    /// A durability commit point may or may not have reached stable storage.
+    /// The process must stop without reporting rollback or continuing service.
+    DurabilityOutcomeUnknown,
     Protocol,
     Internal,
 }
@@ -253,6 +256,14 @@ impl DbError {
 
     pub fn wal(code: SqlState, message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Wal, code, message)
+    }
+
+    pub fn durability_outcome_unknown(message: impl Into<String>) -> Self {
+        Self::new(
+            ErrorKind::DurabilityOutcomeUnknown,
+            SqlState::IoError,
+            message,
+        )
     }
 
     pub fn protocol(code: SqlState, message: impl Into<String>) -> Self {

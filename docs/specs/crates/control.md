@@ -23,7 +23,8 @@ whole-table snapshots.
 data/
   manifest.dat
   manifest.dat.tmp
-  wal.dat
+  wal/wal.meta
+  wal/<segment>.wal
   heap/<TableId>.heap   (owned by storage::HeapPageStore)
 ```
 
@@ -42,19 +43,19 @@ pub struct ControlData {
 
 With MVCC's relaxed flush gate, the heap may include page effects from committed,
 aborted, and in-flight-at-checkpoint transactions at or below the boundary. The
-CLOG, persisted separately by the checkpoint before WAL truncation, decides which
+CLOG, persisted separately by the checkpoint before WAL recycling, decides which
 versions are visible.
 
 The control record uses a versioned binary envelope:
 
 - magic: `SGMF` (4 bytes)
-- version: little-endian `u32`, current = `4`
+- version: little-endian `u32`, current = `5`
 - payload length: little-endian `u32`
 - payload checksum: little-endian CRC32 over the exact payload bytes
 - payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, `catalog`,
   and `page_size`
 
-The opaque `catalog` bytes must contain catalog format v3. Manifest v4 and
+The opaque `catalog` bytes must contain catalog format v3. Manifest v5 and
 catalog v3 are one compatibility boundary: neither decoder supplies missing
 typed-catalog fields or migrates an older development data directory.
 
@@ -112,7 +113,7 @@ impl FileControlStore {
 
 The rename is the checkpoint commit point. The caller (server checkpoint) must
 fsync the heap (`PageStore::sync_all`) **before** calling `store`, and must
-truncate the WAL only **after** `store` succeeds.
+advance the WAL replay floor only **after** `store` succeeds.
 
 ## Recovery Behavior
 

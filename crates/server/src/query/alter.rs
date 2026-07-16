@@ -14,6 +14,7 @@ use wal::{WalRecord, WalRecordKind};
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::lock_manager::{ObjectLockGuard, ObjectLockRequest, RelationLockMode};
 
+use super::vacuum::append_and_flush_maintenance_catalog_change;
 use super::{PreparedRelationVersion, QueryService};
 
 /// How many heap pages to sample for dictionary training (`compression.md`
@@ -525,11 +526,7 @@ impl QueryService {
                 // 4. DDL record + immediate commit, flushed durable before any page
                 // image can reference the new state. THIS is the durable commit
                 // point: everything above (and this block) is rolled back on error.
-                components.wal.append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::CatalogChange { change_set },
-                })?;
+                append_and_flush_maintenance_catalog_change(components, txn_id, change_set)?;
                 cancel.check()?;
                 Ok(catalog_after)
             })();
@@ -658,13 +655,11 @@ impl QueryService {
                 }
             };
 
-            if let Err(err) = components.wal.append(WalRecord {
-                lsn: 0,
+            if let Err(err) = append_and_flush_maintenance_catalog_change(
+                components,
                 txn_id,
-                kind: WalRecordKind::CatalogChange {
-                    change_set: post_commit.change_set.clone(),
-                },
-            }) {
+                post_commit.change_set.clone(),
+            ) {
                 self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                 return Err(err);
             }
@@ -858,11 +853,7 @@ impl QueryService {
                 let catalog_after = staged.snapshot()?;
                 let change_set =
                     catalog::catalog_change_set_between(&catalog_snapshot, &catalog_after);
-                components.wal.append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::CatalogChange { change_set },
-                })?;
+                append_and_flush_maintenance_catalog_change(components, txn_id, change_set)?;
                 components.storage.create_index(&ctx, &index, gc_horizon)?;
                 Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Add {
                     txn_id,
@@ -1252,11 +1243,7 @@ impl QueryService {
             staged.drop_table_primary_key_index(schema.id, index.id)?;
             let catalog_after = staged.snapshot()?;
             let change_set = catalog::catalog_change_set_between(&catalog_snapshot, &catalog_after);
-            components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::CatalogChange { change_set },
-            })?;
+            append_and_flush_maintenance_catalog_change(components, txn_id, change_set)?;
             Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Drop {
                 txn_id,
                 schema: new_schema,

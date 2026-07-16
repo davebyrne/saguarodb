@@ -2052,7 +2052,9 @@ Files are named by stable numeric ID, not by user-visible names. This avoids ren
 The control record is updated atomically via write-to-temp + fsync + rename (atomic on POSIX) + directory fsync. Recovery reads it to find the redo boundary and catalog. See Checkpoint below for the full protocol.
 
 **Other files:**
-- `data/wal.dat` — write-ahead log (append-only)
+- `data/wal/wal.meta` — CRC-checked replay-floor and durable-end marker
+- `data/wal/<16-hex-digits>.wal` — fixed 16 MiB WAL payload segments
+- `data/clog.dat` — durable transaction-status snapshot (format v2)
 
 Table names are purely a catalog-level concept. The storage engine uses stable logical table/index IDs for metadata lookup, then routes page I/O through the current `storage_id` stored in `TableSchema` / `IndexSchema`.
 
@@ -2206,9 +2208,9 @@ pub trait ControlStore: Send + Sync {
 }
 ```
 
-`store` writes `data/manifest.dat` via temp file + fsync + rename + directory fsync. The rename is the checkpoint commit point: the caller must fsync the heap (`PageStore::sync_all`) **before** `store`, and truncate the WAL only **after** it.
+`store` writes `data/manifest.dat` via temp file + fsync + rename + directory fsync. The rename is the checkpoint commit point: the caller must fsync the heap (`PageStore::sync_all`) **before** `store`, and advance the WAL replay floor only **after** it.
 
-The control record uses the version-4 binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and catalog-v3 bytes. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. Older manifests and catalogs are rejected, not migrated.
+The control record uses the version-5 binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and catalog-v3 bytes. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. Older manifests and catalogs are rejected, not migrated.
 
 ### checkpoint_lsn
 
@@ -2216,7 +2218,7 @@ The control record uses the version-4 binary envelope: magic `SGMF`, a `u32` ver
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL** plus one authoritative generic metadata record, `CatalogChange { change_set }`. Physical page records are PageLSN-gated; catalog change sets carry deterministic object-ID-sorted before/after objects and allocator high-water; dictionary bytes, non-transactional sequence values, and transaction/checkpoint markers remain separate. Recovery is redo-all for physical records, pre-reserves allocators from every catalog change regardless of outcome, and applies only committed change sets atomically in LSN order. The CLOG decides tuple visibility, and sequence values replay unconditionally.
+The `wal` crate provides durability with a **physiological redo WAL** plus one authoritative generic metadata record, `CatalogChange { change_set }`. Physical page records are PageLSN-gated; catalog change sets carry deterministic object-ID-sorted before/after objects and allocator high-water; dictionary bytes, non-transactional sequence values, and transaction/checkpoint markers remain separate. Normal schema operations append and flush their still-uncommitted/CLOG-gated catalog change before dependent physical work, making allocator reservations durable before orphan generations can exist. Recovery is redo-all for physical records, pre-reserves allocators from every catalog change regardless of outcome, and applies only committed change sets atomically in LSN order. The CLOG decides tuple visibility, and sequence values replay unconditionally.
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -2224,7 +2226,7 @@ Table data lives in mutable per-generation heap files; pages are mutated in the 
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
-- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the durable CLOG snapshot (`clog.dat`) is written, then the WAL prefix is truncated. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM. WAL truncation is unconditional: it drops every record below the boundary, relying on the CLOG snapshot (written first) to remember aborted outcomes (`docs/specs/mvcc.md` §5.4/§8).
+- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the durable CLOG snapshot (`clog.dat`) is written, then the WAL replay floor advances and wholly obsolete segments are recycled. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM (`docs/specs/mvcc.md` §5.4/§8).
 
 This gives the invariants:
 1. After a crash, recovery loads the heap as of the last control record and replays redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe. (With MVCC this is redo-all + CLOG visibility.)
@@ -2262,19 +2264,19 @@ This gives the invariants:
 | `CatalogChange` | versioned `CatalogChangeSet`: sorted object mutations with complete `before`/`after` values plus allocator high-water |
 | `Commit` | (empty — marks the transaction as committed) |
 | `Abort` | (empty — marks the transaction as aborted; `txn_id` in the header) |
-| `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
+| `Checkpoint` | `redo_lsn` — marks a completed checkpoint. The replay floor may advance past earlier WAL records. |
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
 | `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
 | `HeapDelete` | `FileId`, `PageNum`, `slot` |
 | `HeapUpdateHeader` | `FileId`, `PageNum`, `slot`, `xmax`, `t_ctid` (`PageNum`, `u16`), `infomask` — in-place mutation of a v2 tuple header (MVCC version stamping; redo via `page::set_tuple_header`, emitted by the update/delete path via `stamp_xmax_logged`) |
 | `FullPageImage` | `FileId`, `PageNum`, full page image (torn-page protection) |
 
-Transaction ids `0..FIRST_NORMAL_XID` (3) are reserved: `INVALID_XID = 0` (no/non-transactional record), `1`, and `FROZEN_XID = 2` (always-committed/visible). Real statement transaction ids are allocated at or above `FIRST_NORMAL_XID = 3`. The `Checkpoint` marker reuses the per-record `txn_id` header field to carry the transaction-id high-water mark at checkpoint time, so the allocator boundary survives WAL truncation (preventing id reuse after a truncating checkpoint + restart); the CLOG additionally treats unrecorded normal ids below the truncation floor as committed (see §5.4 of `docs/specs/mvcc.md`).
+Transaction ids `0..FIRST_NORMAL_XID` (3) are reserved: `INVALID_XID = 0` (no/non-transactional record), `1`, and `FROZEN_XID = 2` (always-committed/visible). Real statement transaction ids are allocated at or above `FIRST_NORMAL_XID = 3`. The `Checkpoint` marker reuses the per-record `txn_id` header field to carry the transaction-id high-water mark at checkpoint time, so the allocator boundary survives WAL recycling; the CLOG additionally treats unrecorded normal ids below its committed floor as committed (see §5.4 of `docs/specs/mvcc.md`).
 
 ### WAL Trait
 
 ```rust
-pub trait WalManager: Send + Sync {
+pub trait WalManager: Send + Sync + TxnStatusView {
     /// Append a record to the WAL buffer (not yet durable).
     fn append(&self, record: WalRecord) -> Result<Lsn>;
 
@@ -2285,38 +2287,60 @@ pub trait WalManager: Send + Sync {
     /// fallible — a corrupt record mid-replay returns an error.
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
 
-    /// Truncate WAL records before the given LSN (after checkpoint). Unconditional:
-    /// drops every record with `record.lsn < lsn`; the caller must persist the CLOG
-    /// snapshot covering `lsn` first (see below / §5.4).
-    fn truncate_before(&self, lsn: Lsn) -> Result<()>;
+    /// Advance the exclusive replay floor after checkpoint. The caller must first
+    /// persist a CLOG snapshot at the current durable end; that exact boundary is
+    /// required here and only wholly obsolete segments are unlinked.
+    fn recycle_through(&self, lsn: Lsn) -> Result<()>;
 
     /// Last LSN known to be durable after fsync.
     fn flushed_lsn(&self) -> Lsn;
 
-    /// Total encoded bytes of retained records whose stored LSN is > lsn.
+    /// Inclusive `(replay_floor, durable_end)` range used to validate the
+    /// control-record checkpoint before recovery.
+    fn retained_range(&self) -> Result<(Lsn, Lsn)>;
+
+    /// Whether checkpoint should force full maintenance before the durable CLOG
+    /// live window approaches its format cap.
+    fn needs_clog_maintenance(&self) -> Result<bool>;
+
+    /// Logical stream bytes after byte position `lsn`, clamped to the retained
+    /// range (zero at or beyond the current end).
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 
-    /// Persist the durable CLOG snapshot (`clog.dat`) through `clog_lsn`; the
-    /// checkpoint calls this after the control record and before `truncate_before`.
+    /// Persist the durable CLOG snapshot (`clog.dat`) at the current durable
+    /// frame end; the checkpoint calls this after the control record and before
+    /// `recycle_through`.
     fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
     /// Advance the vacuum floor (Milestone F4c); bounds `clog.dat` pruning.
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
     /// Establish the CLOG implicit-committed floor at recovery (no-op when a durable
     /// `clog.dat` snapshot was loaded; conservative re-derivation otherwise).
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
+    /// Resolve crashed writers still in progress after replay without appending WAL.
+    fn resolve_in_flight_as_aborted(&self, writer_xids: &HashSet<u64>) -> Result<()>;
 }
 // `WalManager: TxnStatusView`, so `status`/`is_committed`/`is_aborted` come from the
 // CLOG (seeded from `clog.dat`, else rebuilt from `Commit`/`Abort`). The
 // redo-committed-only `replay_committed_from` is retired with MVCC.
 ```
 
-`append(record)` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. Replay preserves the stored LSN from disk.
+`append(record)` assigns a monotonically increasing logical byte-position LSN,
+defined as the stream position immediately after the record. Records may cross
+fixed 16 MiB segment boundaries; segment headers are outside logical LSN space.
+A filled segment is fsynced before its successor's durable header is installed,
+so crash discovery cannot observe a successor behind a torn earlier segment.
 
 `replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap, and (redo-all) applies every page-mutation record, deciding visibility via the CLOG.
 
-`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Unconditional truncation (MVCC):** it drops every record below `lsn`, including aborted transactions' records. It is safe because the checkpoint calls `persist_clog` — which durably records every aborted outcome in the CLOG snapshot `clog.dat` — *before* truncating, and under the exclusive checkpoint guard no write transaction is in flight (`docs/specs/mvcc.md` §5.4/§8). Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
+`recycle_through(lsn)` atomically advances the exclusive retained replay floor in
+`wal.meta`, then unlinks only segments wholly below it. It does not rewrite the
+boundary segment or retained records. This is safe because checkpoint persists
+`clog.dat` first and no writer is in flight under the exclusive guard. The CLOG
+snapshot must be taken at the current durable frame end; its exact LSN is the only
+advancing boundary `recycle_through` accepts, preventing a mid-frame replay floor
+without scanning the retained stream.
 
-`bytes_after(lsn)` is server checkpoint accounting only. It counts encoded bytes for retained WAL records with stored `LSN > lsn`; if `lsn` predates the retained WAL after truncation, it returns the encoded byte size of all retained records.
+`bytes_after(lsn)` is O(1) server checkpoint accounting over byte-position LSNs.
 
 ### Durability Rules
 
@@ -2326,10 +2350,12 @@ One rule ensures redo recovery is correct:
 
 The WAL is the source of durability between checkpoints:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
+- A failed fsync truncates the complete suffix after the prior durable LSN and poisons the live WAL manager, so every concurrent flush waiter fails; the truncation protocol is restart-safe and reopening resumes from the corrected durable stream.
+- If the atomic durable-end marker was renamed but its directory fsync fails, commit outcome is unknown. The WAL returns `DurabilityOutcomeUnknown`; server orchestration exits immediately without rollback or a terminal client response, and recovery resolves whichever marker is durable.
 - The buffer pool holds modified pages in memory until the next checkpoint flushes them to the heap.
 - Each heap page is recoverable from the last checkpoint plus the redo records after it.
 
-This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full-page images) restores every heap page to its post-boundary on-disk state, and the CLOG (seeded from `clog.dat` and folded forward, with retained-WAL rebuild as the no-snapshot fallback) decides which versions are visible.**
+This gives a clean invariant: **after a crash, PageLSN-gated redo-all restores every heap page to its post-boundary state, and the CLOG seeded from `clog.dat` decides visibility. A missing snapshot is tolerated only before the replay floor first advances.**
 
 ### Write Protocol
 
@@ -2394,15 +2420,15 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point (atomic temp + fsync + rename + directory fsync).
-6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` (every transaction outcome plus both floors) before truncating, so it remembers every outcome the truncation drops (`mvcc.md` §5.4).
-7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)` (unconditional — `persist_clog` ran in step 6b, so every dropped outcome is durable in `clog.dat`; `mvcc.md` §5.4).
+6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` before advancing the replay floor, so it remembers every logically excluded outcome (`mvcc.md` §5.4).
+7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `recycle_through(checkpoint_lsn)` (`persist_clog` ran in step 6b, so every outcome below the floor is durable in `clog.dat`; `mvcc.md` §5.4).
 8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
 9. Attempt relation-generation cleanup: remove unreferenced truncate/drop-retired generations and untracked orphan files only after buffer pin/transition checks. Dropped metadata is not live-file protection once commit has queued the retired generation.
 10. Drop write guard.
 
-**Crash safety analysis:** the ordering is heap fsync (4) → control record (6) → WAL truncation (7).
+**Crash safety analysis:** the ordering is heap fsync (4) → control record (6) → WAL recycling (7).
 - Crash before step 6: the control record is unchanged; recovery falls back to the previous `checkpoint_lsn`, and this cycle's full-page images (logged since that boundary) repair any torn heap write.
-- Crash between steps 6 and 7: the new control record is durable and the heap is consistent; the un-truncated WAL tail replays idempotently under PageLSN gating.
+- Crash between steps 6 and 7: the new control record is durable and the heap is consistent; the unrecycled WAL tail replays idempotently under PageLSN gating.
 - Crash after step 7: consistent.
 
 **Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls best-effort `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. If a post-commit checkpoint attempt fails, the failure is logged and the non-reset counter lets a later write retry. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O.
@@ -2466,7 +2492,8 @@ impl PageBackedStorageEngine {
    through shared atomic application plus `RecoveryOperations`, and unconditional
    sequence value records. Table before/after changes to the primary key defer
    the identity-tree rebuild until after replay and crashed-writer abort resolution. The seeded/folded CLOG decides
-   tuple visibility; when `clog.dat` is absent it is rebuilt from retained WAL.
+   tuple visibility; an absent `clog.dat` is rebuilt only for an unrecycled
+   replay-floor-zero WAL and is fatal after recycling.
 5. If records were replayed: checkpoint to persist the redone state and advance
    the boundary.
 6. Attempt relation-generation cleanup while no user readers exist.
@@ -2474,9 +2501,13 @@ impl PageBackedStorageEngine {
 
 **Idempotency:** PageLSN gating applies each record's effect at most once, so replay is safe even when the heap already reflects some post-boundary work (e.g. a partially completed prior checkpoint).
 
-### File
+### Files
 
-`data/wal.dat` — single file, append-only. Old segments before the last completed checkpoint can be truncated.
+`data/wal/` contains CRC-checked format-v2 16 MiB segments and the atomically
+updated `wal.meta` replay-floor/durable-end marker. Recovery discards physical
+bytes beyond the durable end, then lazily decodes the retained durable stream
+across segment headers rather than loading it into RAM. Legacy data
+directories containing `data/wal.dat` are intentionally rejected without migration.
 
 ## 11. Catalog
 
@@ -2815,7 +2846,7 @@ The `server` crate is the binary entry point.
 1. Load configuration and construct the shared compression registry, dictionary
    store, control store, and heap page store. Create `<data-dir>/tmp` and verify
    that an anonymous spill file can be created there.
-2. Open `data/wal.dat`; WAL open loads `clog.dat` when present and folds later
+2. Open `data/wal/`; WAL open loads `clog.dat` when present and folds later
    transaction outcomes on top.
 3. Construct the buffer pool and immediately enable eviction-flush-on-steal,
    before loading the control record.
@@ -2841,9 +2872,9 @@ The `server` crate is the binary entry point.
 11. Switch storage to **normal mode**, construct `QueryService`, start Tokio, and
     bind the listener.
 
-Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 11 transitions to normal operation where `StorageEngine` methods append WAL records.
+Recovery computes `next_txn_id` by scanning all logically retained records from `WalManager::replay_from(0)`, including the `Checkpoint` marker's high-water. Scanning from the retained floor covers the crash window after the manifest/CLOG checkpoint is durable but before the marker is appended; after replay-floor advancement, the post-boundary marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. Overflow fails startup with a structured error.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--auto-analyze-changed-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. The two automatic-maintenance thresholds accept `0` to disable their respective checkpoint pass; all other numeric flags must be positive and `--port` is limited to `1..=65535`. TLS is off unless both certificate and key paths are supplied. Invalid input prints usage to stderr and exits with code `2`.
+The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--auto-analyze-changed-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. The two automatic-maintenance thresholds accept `0` to disable their respective workload-counter trigger; pressure from an unreclaimed abort-pinned CLOG window can still force a full VACUUM pass. All other numeric flags must be positive and `--port` is limited to `1..=65535`. TLS is off unless both certificate and key paths are supplied. Invalid input prints usage to stderr and exits with code `2`.
 
 `statement_timeout` is session configuration rather than a startup flag. Its
 canonical value is an integer number of milliseconds (`0` disables it), while
@@ -2914,7 +2945,7 @@ pub struct Config {
     pub buffer_pool_frames: usize,    // default: 1024 (8MB)
     pub checkpoint_every_n_commits: u64, // default: 100
     pub checkpoint_wal_bytes: u64,    // default: 64 * 1024 * 1024
-    pub auto_vacuum_dead_rows: u64,   // default: 10000 (0 disables auto-prune)
+    pub auto_vacuum_dead_rows: u64,   // default: 10000 (0 disables dead-row trigger)
     pub auto_analyze_changed_rows: u64, // default: 10000 (0 disables auto-analyze)
     pub shutdown_timeout_ms: u64,     // default: 30000
     pub deadlock_timeout_ms: u64,     // default: 1000

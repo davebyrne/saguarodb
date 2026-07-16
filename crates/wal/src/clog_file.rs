@@ -1,7 +1,8 @@
 //! Durable CLOG snapshot (`clog.dat`) — the persisted transaction-status map.
 //!
 //! The in-memory [`Clog`](crate::Clog) is reconstructed at every open — seeded from
-//! this snapshot when present, else rebuilt from the WAL. The durable CLOG snapshot
+//! this snapshot when present, or rebuilt from the WAL only for an unrecycled
+//! replay-floor-zero stream. The durable CLOG snapshot
 //! persists transaction outcomes (and the two floors) so the WAL no longer has to
 //! retain `Abort` records to remember them: it carries the statuses across restart
 //! and lets recovery fold only the post-snapshot `Commit`/`Abort` records
@@ -27,8 +28,11 @@ use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TxnId};
 use serde::{Deserialize, Serialize};
 
 const CLOG_MAGIC: &[u8; 4] = b"SGCL";
-const CLOG_VERSION: u32 = 1;
+const CLOG_VERSION: u32 = 2;
 const CLOG_HEADER_LEN: usize = 16;
+pub(crate) const MAX_CLOG_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CLOG_FILE_BYTES: usize = CLOG_HEADER_LEN + MAX_CLOG_PAYLOAD_BYTES;
+const MAX_CLOG_STATUS_COUNT: usize = 1_000_000;
 
 /// A durable snapshot of the CLOG, captured at a checkpoint.
 ///
@@ -61,12 +65,41 @@ struct ClogPayload {
     clog_lsn: Lsn,
     committed_floor: TxnId,
     vacuum_floor: TxnId,
+    #[serde(deserialize_with = "deserialize_committed")]
     committed: Vec<TxnId>,
+    #[serde(deserialize_with = "deserialize_aborted")]
     aborted: Vec<TxnId>,
+}
+
+fn deserialize_committed<'de, D>(deserializer: D) -> std::result::Result<Vec<TxnId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_CLOG_STATUS_COUNT,
+        "committed CLOG status list",
+    )
+}
+
+fn deserialize_aborted<'de, D>(deserializer: D) -> std::result::Result<Vec<TxnId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_CLOG_STATUS_COUNT,
+        "aborted CLOG status list",
+    )
 }
 
 /// Encode a CLOG snapshot into its durable envelope (header + JSON payload).
 pub(crate) fn encode_clog(snapshot: &ClogSnapshot) -> Result<Vec<u8>> {
+    if snapshot.committed.len() > MAX_CLOG_STATUS_COUNT
+        || snapshot.aborted.len() > MAX_CLOG_STATUS_COUNT
+    {
+        return Err(corrupt_clog("CLOG status list exceeds the item limit"));
+    }
     let payload = ClogPayload {
         clog_lsn: snapshot.clog_lsn,
         committed_floor: snapshot.committed_floor,
@@ -76,6 +109,9 @@ pub(crate) fn encode_clog(snapshot: &ClogSnapshot) -> Result<Vec<u8>> {
     };
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|err| corrupt_clog(format!("failed to encode CLOG payload: {err}")))?;
+    if payload_bytes.len() > MAX_CLOG_PAYLOAD_BYTES {
+        return Err(corrupt_clog("CLOG payload exceeds 64 MiB"));
+    }
     let payload_len = u32::try_from(payload_bytes.len())
         .map_err(|_| corrupt_clog("CLOG payload is too large"))?;
     let checksum = crc32fast::hash(&payload_bytes);
@@ -97,8 +133,9 @@ pub(crate) fn encode_clog(snapshot: &ClogSnapshot) -> Result<Vec<u8>> {
 
 /// Decode a CLOG snapshot from its durable envelope, validating the magic,
 /// version, length, and CRC. A mismatch returns a storage error. The caller treats a
-/// **missing** `clog.dat` as "no snapshot" and falls back to rebuilding the CLOG from
-/// the WAL, but a **corrupt** one is surfaced as an error (like a bad `manifest.dat`):
+/// **missing** `clog.dat` as "no snapshot" only for an unrecycled replay-floor-zero
+/// WAL; after recycling, absence is fatal. A **corrupt** snapshot is always surfaced
+/// as an error (like a bad `manifest.dat`):
 /// the atomic temp+rename write never tears, so a mismatch is real corruption.
 pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
     if bytes.len() < CLOG_HEADER_LEN {
@@ -121,6 +158,9 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
 
     let payload_len = usize::try_from(read_u32(&mut reader, "CLOG file payload length")?)
         .map_err(|_| corrupt_clog("CLOG payload length does not fit usize"))?;
+    if payload_len > MAX_CLOG_PAYLOAD_BYTES {
+        return Err(corrupt_clog("CLOG payload exceeds 64 MiB"));
+    }
     let expected_checksum = read_u32(&mut reader, "CLOG file checksum")?;
     if reader.remaining() != payload_len {
         return Err(corrupt_clog("CLOG file length mismatch"));
@@ -138,7 +178,11 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
 
     let payload: ClogPayload = serde_json::from_slice(payload_bytes)
         .map_err(|err| corrupt_clog(format!("failed to decode CLOG payload: {err}")))?;
-    validate_status_lists(&payload.committed, &payload.aborted)?;
+    validate_status_lists(
+        payload.committed_floor,
+        &payload.committed,
+        &payload.aborted,
+    )?;
     Ok(ClogSnapshot {
         clog_lsn: payload.clog_lsn,
         committed_floor: payload.committed_floor,
@@ -155,7 +199,11 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
 /// bug — but an overlap would otherwise resolve silently to `Aborted` on load, so
 /// surfacing it (as `validate_sorted_tables` does for the control record) is cheap
 /// insurance against a same-id-in-both-lists mistake.
-fn validate_status_lists(committed: &[TxnId], aborted: &[TxnId]) -> Result<()> {
+fn validate_status_lists(
+    committed_floor: TxnId,
+    committed: &[TxnId],
+    aborted: &[TxnId],
+) -> Result<()> {
     for list in [committed, aborted] {
         if list
             .windows(2)
@@ -165,6 +213,15 @@ fn validate_status_lists(committed: &[TxnId], aborted: &[TxnId]) -> Result<()> {
                 "CLOG status lists must be sorted without duplicates",
             ));
         }
+    }
+    if committed
+        .iter()
+        .chain(aborted)
+        .any(|id| *id < committed_floor)
+    {
+        return Err(corrupt_clog(
+            "CLOG explicit status is below the committed floor",
+        ));
     }
     // Both are sorted; a linear merge finds any shared id without allocating.
     let mut committed = committed.iter().peekable();
@@ -199,7 +256,10 @@ fn corrupt_clog(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClogSnapshot, decode_clog, encode_clog};
+    use super::{
+        CLOG_HEADER_LEN, CLOG_MAGIC, CLOG_VERSION, ClogSnapshot, MAX_CLOG_PAYLOAD_BYTES,
+        MAX_CLOG_STATUS_COUNT, decode_clog, encode_clog,
+    };
 
     fn snapshot() -> ClogSnapshot {
         ClogSnapshot {
@@ -303,5 +363,44 @@ mod tests {
 
         let err = decode_clog(&bytes).unwrap_err();
         assert!(err.message.contains("both committed and aborted"));
+    }
+
+    #[test]
+    fn rejects_explicit_status_below_the_committed_floor() {
+        let bytes = encode_clog(&ClogSnapshot {
+            aborted: vec![9],
+            ..snapshot()
+        })
+        .unwrap();
+
+        let err = decode_clog(&bytes).unwrap_err();
+        assert!(err.message.contains("below the committed floor"));
+    }
+
+    #[test]
+    fn rejects_declared_payload_over_the_byte_limit_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CLOG_MAGIC);
+        bytes.extend_from_slice(&CLOG_VERSION.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(MAX_CLOG_PAYLOAD_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(bytes.len(), CLOG_HEADER_LEN);
+
+        let error = decode_clog(&bytes).unwrap_err();
+        assert!(error.message.contains("exceeds 64 MiB"));
+    }
+
+    #[test]
+    fn rejects_status_list_over_the_item_limit() {
+        let snapshot = ClogSnapshot {
+            committed: vec![3; MAX_CLOG_STATUS_COUNT + 1],
+            ..snapshot()
+        };
+        let error = encode_clog(&snapshot).unwrap_err();
+        assert!(error.message.contains("item limit"));
     }
 }

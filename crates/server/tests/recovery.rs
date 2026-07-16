@@ -2102,10 +2102,10 @@ async fn split_index_survives_restart_and_post_restart_growth() {
 }
 
 #[tokio::test]
-async fn committed_then_truncated_transaction_stays_visible_via_floor() {
-    // A committed transaction whose `Commit` record is later truncated by a
+async fn committed_below_replay_floor_stays_visible_via_clog_floor() {
+    // A committed transaction whose `Commit` record is later placed below the replay
     // checkpoint must stay visible after restart, via the implicit-committed floor
-    // (`docs/specs/mvcc.md` §5.4). Sequence: commit a row, checkpoint (truncates
+    // (`docs/specs/mvcc.md` §5.4). Sequence: commit a row, checkpoint (logically excludes
     // that txn's records), commit a second row, checkpoint, then crash. After
     // restart the first row — whose Commit is long gone — is still visible.
     let dir = tempfile::tempdir().unwrap();
@@ -2146,8 +2146,8 @@ async fn committed_then_truncated_transaction_stays_visible_via_floor() {
 async fn committed_row_survives_back_to_back_checkpoints_with_no_write_between() {
     // Regression for the Checkpoint-marker/floor interaction (`docs/specs/mvcc.md`
     // §5.4): two checkpoints with NO committed write between them. The second
-    // checkpoint's truncation boundary lands on the FIRST checkpoint's `Checkpoint`
-    // marker (the highest retained LSN), dropping the last committed transaction's
+    // checkpoint's replay floor lands on the FIRST checkpoint's `Checkpoint`
+    // marker (the highest retained LSN), logically excluding the last transaction's
     // real `Commit` record. The marker carries that transaction's id as its
     // high-water `txn_id`, but the marker is metadata, not a transaction needing
     // protection — so the recovery floor scan must EXCLUDE it. If it counted the
@@ -2190,8 +2190,8 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
     // restart (`docs/specs/mvcc.md` §5.4, §8). An explicit transaction writes rows,
     // ROLLBACKs (status-based abort: no undo), its pages are flushed to the heap by a
     // checkpoint, and a LATER committed row pushes the aborted txn below the next
-    // checkpoint's truncation boundary. Truncation is unconditional, so the aborted
-    // txn's `Abort` record is dropped — but the checkpoint first records the abort in
+    // checkpoint's replay floor. Advancement is unconditional, so the aborted
+    // txn's `Abort` record is logically excluded — but the checkpoint first records the abort in
     // the durable CLOG snapshot (`clog.dat`), and because the txn was never VACUUMed its
     // explicit `Aborted` entry is kept. So after a crash, redo-all replays its rows yet
     // the durable CLOG keeps them invisible. (If the snapshot dropped the un-vacuumed
@@ -2222,11 +2222,11 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
         conn.close().await;
 
         // Checkpoint: flushes the aborted txn's dirty pages to the heap (relaxed
-        // flush gate), records the abort in `clog.dat`, and truncates the WAL.
+        // flush gate), records the abort in `clog.dat`, and advances the WAL replay floor.
         server.force_checkpoint().await.unwrap();
 
         // A later committed row, then another checkpoint, so the aborted txn sits
-        // below the truncation boundary (the scenario the durable CLOG must survive).
+        // below the replay boundary (the scenario the durable CLOG must survive).
         server
             .simple_query("insert into users (id, name) values (3, 'Bea')")
             .await
@@ -2253,15 +2253,15 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
 }
 
 #[tokio::test]
-async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_restart() {
+async fn vacuumed_aborted_txn_is_recycled_past_with_no_resurrection_after_restart() {
     // THE critical Milestone-F4c test under the durable CLOG (`docs/specs/mvcc.md`
     // §5.4, §9). Sequence:
     //   1. A committed base row 'Ada'.
     //   2. An explicit transaction inserts 'Ghost', then ROLLBACKs (status-based abort,
     //      no undo); its heap+index pages stay dirty.
     //   3. A checkpoint flushes the aborted txn's pages to the heap, records the abort
-    //      in `clog.dat`, and truncates the WAL unconditionally — so 'Ghost' stays
-    //      invisible after a restart even though its `Abort` record is dropped (the
+    //      in `clog.dat`, and advances the replay floor — so 'Ghost' stays
+    //      invisible after a restart even though its `Abort` record is logically excluded (the
     //      durable CLOG snapshot remembers the abort).
     //   4. A FULL `VACUUM` reclaims the aborted-creator 'Ghost' tuple (heap + index;
     //      aborted-creator reclaim has NO age requirement) and advances the vacuum
@@ -2295,7 +2295,7 @@ async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_resta
         conn.close().await;
 
         // Checkpoint: flush the aborted txn's pages and record the abort in `clog.dat`;
-        // the WAL is truncated unconditionally (the Abort record is dropped).
+        // the replay floor advances past the Abort record.
         server.force_checkpoint().await.unwrap();
 
         // FULL VACUUM: reclaim the aborted-creator 'Ghost' tuple (heap + index) and
@@ -2433,7 +2433,7 @@ async fn nonhot_update_rollback_row_survives_vacuum_truncate_and_restart() {
         conn.close().await;
 
         // Checkpoint records the abort in `clog.dat` (no VACUUM yet, so T's explicit
-        // entry is kept) and truncates the WAL unconditionally.
+        // entry is kept) and advances the WAL replay floor.
         server.force_checkpoint().await.unwrap();
 
         // FULL VACUUM: abort-cleanup resets the predecessor's aborted-deleter xmax and
@@ -2526,7 +2526,7 @@ async fn hot_update_rollback_reads_original_value_after_vacuum_truncate_and_rest
     // aborted txn T. A full VACUUM must (1) RECLAIM the aborted-creator heap-only
     // successor (the corrected H2 skip-guard) and (2) abort-clean the root's
     // aborted-deleter xmax (resetting it and un-HOTing the dangling t_ctid). After the
-    // floor floats past T, truncation drops its Abort and a crash+restart must read the
+    // floor floats past T, replay-floor advancement excludes its Abort and a crash+restart must read the
     // ORIGINAL value — no resurrection of the rolled-back `note`, no loss of the row.
     let dir = tempfile::tempdir().unwrap();
     {

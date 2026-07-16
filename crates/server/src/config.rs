@@ -12,7 +12,8 @@ pub struct Config {
     /// versions have accumulated since the last auto-prune, the checkpoint runs a
     /// VACUUM pass over every user table under its exclusive guard before flushing
     /// dirty pages (`docs/specs/mvcc.md` §9, Milestone F4b). `0` disables
-    /// auto-prune entirely (space is then bounded only by explicit `VACUUM`).
+    /// the dead-row trigger; pressure from an unreclaimed abort-pinned CLOG window
+    /// can still force a full pass.
     pub auto_vacuum_dead_rows: u64,
     /// Checkpoint auto-analyze threshold (`docs/specs/statistics.md` §10):
     /// committed changed rows since the last auto-analyze. `0` disables.
@@ -103,7 +104,7 @@ where
                 config.checkpoint_wal_bytes = parse_positive_u64(&value, "--checkpoint-wal-bytes")?;
             }
             "--auto-vacuum-dead-rows" => {
-                // 0 is allowed and disables auto-prune (see Config::auto_vacuum_dead_rows).
+                // 0 disables the dead-row trigger, not the CLOG safety trigger.
                 let value = next_value(&mut args, "--auto-vacuum-dead-rows")?;
                 config.auto_vacuum_dead_rows = parse_u64(&value, "--auto-vacuum-dead-rows")?;
             }
@@ -149,7 +150,7 @@ pub fn usage(program: &str) -> String {
            --buffer-pool-frames <N>           default 1024\n\
            --checkpoint-every-n-commits <N>   default 100\n\
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
-           --auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)\n\
+           --auto-vacuum-dead-rows <N>        default 10000 (0 disables dead-row trigger)\n\
            --auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
            --deadlock-timeout-ms <MS>         default 1000\n\

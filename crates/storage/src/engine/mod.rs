@@ -1175,7 +1175,8 @@ impl PageBackedStorageEngine {
 
     /// Install a primary-key ALTER during normal execution and rebuild the table
     /// identity B-tree with physical full-page-image redo. The caller must flush
-    /// WAL before any checkpoint may truncate the logical ALTER record.
+    /// WAL before any checkpoint may advance the replay floor past the logical
+    /// ALTER record.
     pub fn set_table_primary_key_logged(
         &self,
         schema: &TableSchema,
@@ -2723,13 +2724,20 @@ impl SchemaOperations for PageBackedStorageEngine {
         change_set: &common::CatalogChangeSet,
     ) -> Result<()> {
         let state = self.lock_state()?;
-        self.append_wal(
+        let lsn = self.append_wal(
             &state,
             ctx,
             WalRecordKind::CatalogChange {
                 change_set: change_set.clone(),
             },
         )?;
+        if lsn != 0 {
+            // Allocator reservations may already name physical files created by
+            // the following schema operation. Make the generic change durable
+            // even while it remains CLOG-gated and uncommitted, so recovery burns
+            // those ids after a failed statement or crash.
+            self.wal.flush()?;
+        }
         Ok(())
     }
 

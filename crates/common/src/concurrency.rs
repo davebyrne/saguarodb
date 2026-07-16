@@ -19,7 +19,7 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///   ([`begin_checkpoint`](ConcurrencyController::begin_checkpoint)), which drains
 ///   every in-flight shared writer and then runs alone. This preserves the
 ///   "no in-flight writer during a checkpoint" invariant verbatim, so every
-///   transaction below the truncation boundary is settled and captured by
+///   transaction below the new WAL replay floor is settled and captured by
 ///   `persist_clog`'s snapshot, keeping recovery correct without a fuzzy
 ///   checkpoint (`docs/specs/mvcc.md` §5.4, §8, §12).
 /// - **Readers take no guard at all** and run lock-free; they are unaffected by

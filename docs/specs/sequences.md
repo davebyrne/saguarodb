@@ -310,7 +310,7 @@ operation; recovery never appends WAL (`docs/specs/crates/wal.md`).
 - **Checkpoint:** `run_checkpoint` (`server/src/checkpoint.rs`) already
   serializes the catalog under the exclusive guard. It additionally pulls each
   sequence's current `(last_value, is_called)` from the `SequenceManager` into
-  the snapshot baseline before writing the control record, and WAL truncation
+  the snapshot baseline before writing the control record, and WAL recycling
   proceeds as today.
 - **Recovery:** load sequence definitions + baseline values from the manifest;
   reserve sequence ids from all catalog allocator high-water values; apply

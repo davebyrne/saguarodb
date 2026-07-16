@@ -180,11 +180,12 @@ precedence.
   ID allocation, WAL commit records, WAL flush, rollback before durable commit,
   cleanup after durable commit, and checkpoint triggering.
 - Preserve fsync-sensitive ordering for WAL flush, snapshot writes, manifest
-  swap, WAL checkpoint records, WAL truncation, and graceful shutdown.
+  swap, WAL checkpoint records, WAL replay-floor advancement/recycling, and graceful shutdown.
 - Be conservative with durable formats. WAL, manifest, snapshot, and page/row
   encodings need versioning/checksum behavior consistent with their specs.
 - The typed catalog foundation is an intentional compatibility break: catalog
-  snapshots are v3, manifests are v4, and catalog metadata WAL uses only generic
+  snapshots are v3, manifests are v5, CLOG snapshots are v2, segmented WAL is
+  format v2, and catalog metadata WAL uses only generic
   `CatalogChange` records. Do not add migration/defaulting readers for older
   catalog, manifest, or specialized catalog-WAL layouts.
 
@@ -225,7 +226,9 @@ cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev -
   `--auto-analyze-changed-rows 10000`, `--shutdown-timeout-ms 30000`, and
   `--deadlock-timeout-ms 1000`.
   `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead
-  versions since the last auto-prune; `0` disables auto-prune).
+  versions since the last auto-prune; `0` disables the dead-row trigger). A full
+  maintenance pass may still run when an unreclaimed abort-pinned CLOG window
+  approaches its durable status limit.
   `--deadlock-timeout-ms` is how long a writer blocked on a row lock waits before
   the deadlock detector runs (`docs/specs/deadlock.md`).
 - TLS is off by default. Pass both `--tls-cert-file <PATH>` (PEM cert chain) and

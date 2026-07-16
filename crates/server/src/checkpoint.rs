@@ -17,8 +17,8 @@ pub struct CheckpointState {
 /// redo boundary. Cost is O(pages changed), not O(database size).
 ///
 /// Ordering is durability-critical: heap pages are fsynced before the control
-/// record (the commit point) is written, which happens before the WAL prefix is
-/// truncated. A crash before the control record falls back to the previous redo
+/// record (the commit point) is written, which happens before the WAL replay floor
+/// advances. A crash before the control record falls back to the previous redo
 /// boundary, where this cycle's full-page images repair any torn heap writes.
 pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // Take the EXCLUSIVE checkpoint guard (E2b lock inversion, `docs/specs/mvcc.md`
@@ -26,21 +26,23 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // guard) this blocks until every in-flight writer has drained, then holds off
     // any new writer until the checkpoint returns — so the checkpoint body runs with
     // **no in-flight writer**, exactly as under Stage 1's single exclusive writer.
-    // That preserves the recovery / truncation invariant (no in-flight writer is ever
-    // below the truncation boundary, so every transaction `persist_clog` snapshots is
+    // That preserves the recovery / recycling invariant (no in-flight writer is ever
+    // below the replay boundary, so every transaction `persist_clog` snapshots is
     // settled — §5.4, §8) without a fuzzy checkpoint, and keeps the `txn_high_water`
     // stamping below correct (no concurrent writer advances `next_txn_id` while we hold
     // the exclusive guard).
     let _guard = components.concurrency.begin_checkpoint()?;
 
-    // Auto-prune (Milestone F4b, `docs/specs/mvcc.md` §9/§10 F): when enough dead
-    // versions have accumulated since the last auto-prune, fold a VACUUM pass over
-    // every user table into THIS checkpoint, under the exclusive guard we already
-    // hold. This bounds heap + index space under sustained DELETE/UPDATE churn with
-    // no operator `VACUUM`. It runs HERE — at the very start of the checkpoint body,
+    // Full checkpoint maintenance (Milestone F4b, `docs/specs/mvcc.md` §9/§10 F):
+    // fold a VACUUM pass over every user table into THIS checkpoint when either the
+    // configured dead-row threshold is reached or an unreclaimed abort pins a CLOG
+    // window that approaches its durable format limit. The latter is a safety trigger
+    // even when the configured threshold is zero. This bounds heap + index space under sustained DELETE/UPDATE churn and
+    // keeps abort-heavy workloads checkpointable without operator action. It runs
+    // HERE — at the very start of the checkpoint body,
     // BEFORE `flush_dirty_pages` — so the pages the vacuum dirties and the full-page
     // images it logs are flushed and made durable by THIS checkpoint, and its WAL
-    // records precede the WAL truncation below.
+    // records precede the replay-floor advancement below.
     //
     // **No data loss (same safety as on-demand VACUUM, F4a):** the horizon is
     // captured by `gc_horizon()` HERE, *under* the exclusive guard. Under that guard
@@ -60,13 +62,16 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // by `flush_dirty_pages()` and fsynced by `store.sync_all()` BEFORE the control
     // record (the commit point) — exactly the existing WAL-before-page ordering. So
     // once this checkpoint commits, the vacuum's effects are durably in the heap and
-    // the redo boundary advances past them; truncating the vacuum's now-redundant WAL
-    // records below `checkpoint_lsn` is therefore safe (their effect is already on
+    // the redo boundary advances past them; excluding the vacuum's now-redundant WAL
+    // records below `checkpoint_lsn` from future replay is therefore safe
     // disk). A crash BEFORE the control record falls back to the previous redo
     // boundary, where the prior cycle's images repair any torn write and the vacuum
     // simply did not happen.
     let threshold = components.config.auto_vacuum_dead_rows;
-    if threshold != 0 && components.dead_rows_since_vacuum.load(Ordering::Acquire) >= threshold {
+    let dead_row_pressure =
+        threshold != 0 && components.dead_rows_since_vacuum.load(Ordering::Acquire) >= threshold;
+    let clog_pressure = components.wal.needs_clog_maintenance()?;
+    if dead_row_pressure || clog_pressure {
         let horizon = components.gc_horizon();
         // Full pass over every user table, AND advance the vacuum floor (F4c,
         // `docs/specs/mvcc.md` §9): this captures `B = next_txn_id` under the guard,
@@ -89,7 +94,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // `wal.flush()` and the catalog snapshot: its generic catalog change is
     // flushed by this checkpoint and sits below `checkpoint_lsn`,
     // and the manifest written below carries the fresh statistics — so
-    // truncating those records is safe (their effect is already durable).
+    // advancing past those records is safe (their effect is already durable).
     let analyze_threshold = components.config.auto_analyze_changed_rows;
     if analyze_threshold != 0
         && components
@@ -110,7 +115,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // in-flight alike — to the heap; the CLOG hides the non-committed tuples and
     // VACUUM (Milestone F) reclaims them. fsync ordering is preserved: WAL flush →
     // flush dirty pages → store fsync → control record → Checkpoint marker → WAL
-    // truncation → mark clean.
+    // replay-floor advancement/recycling → mark clean.
     components.wal.flush()?;
     components.buffer_pool.flush_dirty_pages()?;
     components.store.sync_all()?;
@@ -159,20 +164,20 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
 
     // Persist the durable CLOG snapshot (`docs/specs/mvcc.md` §5.4) covering through
     // `checkpoint_lsn`, AFTER the heap + control record are durable and BEFORE the WAL
-    // is truncated. It durably records every transaction outcome (and both floors), so
+    // replay floor advances. It durably records every transaction outcome (and both floors), so
     // recovery seeds the CLOG from it and the implicit-committed / vacuum floors survive
     // restart. The ordering is the load-bearing invariant: the snapshot must cover the
-    // truncation boundary before `truncate_before` drops any record below it.
+    // recycling boundary before `recycle_through` excludes earlier records from replay.
     components.wal.persist_clog(checkpoint_lsn)?;
 
     // The Checkpoint marker is optional metadata; recovery uses the control
-    // record's LSN. Truncating below it reclaims the now-redundant WAL prefix.
+    // record's LSN. Advancing the replay floor makes the now-redundant prefix recyclable.
     //
     // Stamp the marker with the current transaction-id high-water mark (the
-    // highest id allocated so far). The marker survives truncation (its LSN is the
-    // retained boundary), so on recovery `next_txn_id`'s max-scan recovers the
+    // highest id allocated so far). The marker is appended after the new replay
+    // floor, so on recovery `next_txn_id`'s max-scan recovers the
     // allocator boundary even when every data record below the checkpoint was
-    // truncated. Without this the allocator would restart low and reissue ids that
+    // excluded from replay. Without this the allocator would restart low and reissue ids that
     // already stamped committed tuples, corrupting visibility. A checkpoint holds
     // the write guard, so no concurrent writer advances the allocator here.
     let txn_high_water = components
@@ -187,7 +192,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         },
     })?;
     components.wal.flush()?;
-    components.wal.truncate_before(checkpoint_lsn)?;
+    components.wal.recycle_through(checkpoint_lsn)?;
 
     components.buffer_pool.mark_all_clean()?;
     cleanup_relation_generation_files(components)?;

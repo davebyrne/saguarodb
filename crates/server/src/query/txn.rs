@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use catalog::CatalogManager;
 use common::{
-    CatalogIntrospectionProvider, DbError, IsolationLevel, QueryCancel, Result, SequenceManager,
-    SessionInfo, SessionSequenceState, Snapshot, SqlState, StatementContext, SystemStateProvider,
-    no_catalog_introspection, no_system_state,
+    CatalogIntrospectionProvider, DbError, ErrorKind, IsolationLevel, QueryCancel, Result,
+    SequenceManager, SessionInfo, SessionSequenceState, Snapshot, SqlState, StatementContext,
+    SystemStateProvider, no_catalog_introspection, no_system_state,
 };
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
@@ -876,6 +876,9 @@ impl QueryService {
                 txn_id: subxid,
                 kind: WalRecordKind::Abort,
             }) {
+                if err.kind == ErrorKind::DurabilityOutcomeUnknown {
+                    self.fatal_ambiguous_commit(err);
+                }
                 // Best-effort durable record (recovery aborts any subxid with no
                 // durable commit); the in-memory `Aborted` status is recorded by the
                 // append itself even on failure, so log and continue rather than
@@ -1305,7 +1308,12 @@ impl QueryService {
             txn_id,
             kind,
         })?;
-        self.components.wal.flush()?;
+        if let Err(err) = self.components.wal.flush() {
+            if err.kind == ErrorKind::DurabilityOutcomeUnknown {
+                self.fatal_ambiguous_commit(err);
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1359,6 +1367,9 @@ impl QueryService {
             txn_id,
             kind: WalRecordKind::Abort,
         }) {
+            if err.kind == ErrorKind::DurabilityOutcomeUnknown {
+                self.fatal_ambiguous_commit(err);
+            }
             eprintln!("failed to append Abort record for txn {txn_id}: {err}");
         }
         self.components.active_txns.deregister(txn_id);
@@ -1402,6 +1413,11 @@ impl QueryService {
     pub(super) fn fatal_after_durable_commit(&self, err: DbError) -> ! {
         eprintln!("fatal cleanup failure after durable commit: {err}");
         let _ = self.components.wal.flush();
+        std::process::exit(1);
+    }
+
+    fn fatal_ambiguous_commit(&self, err: DbError) -> ! {
+        eprintln!("fatal commit durability outcome unknown: {err}");
         std::process::exit(1);
     }
 

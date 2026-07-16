@@ -855,7 +855,7 @@ pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
             path.display()
         ))
     })?;
-    let wal = FileWalManager::open(path.join("wal.dat"))?;
+    let wal = FileWalManager::open(path)?;
     wal.append(WalRecord {
         lsn: 0,
         txn_id: 1,
@@ -887,7 +887,7 @@ pub fn write_uncommitted_schema_for_test(path: &Path, schema_id: u32) -> Result<
             path.display()
         ))
     })?;
-    let wal = FileWalManager::open(path.join("wal.dat"))?;
+    let wal = FileWalManager::open(path)?;
     let schema = common::NamespaceSchema {
         id: schema_id,
         name: "crashed_schema".to_string(),

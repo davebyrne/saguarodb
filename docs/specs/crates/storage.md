@@ -223,7 +223,7 @@ pinning unrelated tables. Reads and writes use only the statement-captured
 generations; missing/stale write handles remain errors. A relation snapshot is
 retained through its statement stream/portal/COPY lifetime and then released.
 
-`RecoveryOperations` carries storage-owned application of committed generic catalog changes; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. The caller appends `CatalogChange` before invoking schema operations that create, drop, or rewrite physical generations. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate and schema-rewrite preparation receive catalog changes whose allocator high-water marks reserve fresh storage ids before replacement heap/index files are initialized. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. Recovery operations must not append WAL records.
+`RecoveryOperations` carries storage-owned application of committed generic catalog changes; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Before schema operations that create, drop, or rewrite physical generations, `apply_catalog_change` appends and immediately flushes `CatalogChange` in normal mode. The record remains CLOG-gated and uncommitted, but its allocator high-water is durable before orphan physical files can exist, so failed/crashed DDL cannot reuse their ids. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate and schema-rewrite preparation receive catalog changes whose allocator high-water marks reserve fresh storage ids before replacement heap/index files are initialized. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. Recovery operations must not append WAL records.
 
 `RecoveryOperations::reconcile_catalog_change` is the single entry point for
 that storage-owned metadata reconciliation. It consumes the complete generic
@@ -648,7 +648,7 @@ relies on this. It is the middle phase of the live VACUUM orchestration
   index's latch is taken (rule 1: never two structural latches at once).
 - **Maintenance txn.** Removals are logged under txn id `0` (`VACUUM_TXN`), the
   recovery/maintenance convention, so they are never undone by an abort and do not pin
-  WAL truncation. Recovery reinstalls each changed leaf's `FullPageImage` by PageLSN
+  WAL recycling. Recovery reinstalls each changed leaf's `FullPageImage` by PageLSN
   gating, independent of the record's `txn_id`.
 - It does **not** reclaim line pointers `DEAD → UNUSED` (F3b); the slots stay `DEAD`
   until that later step.
@@ -997,7 +997,7 @@ After the DDL commit is durable, the identity tree is reset and rebuilt from hea
 rows under the table's identity rewrite gate, so concurrent identity scans cannot
 observe the transient empty or partially rebuilt tree. In normal execution the
 reset and inserts log full-page-image redo for the identity B-tree and the server
-flushes that WAL before checkpoint truncation can run. The committed generic
+flushes that WAL before checkpoint replay-floor advancement can run. The committed generic
 catalog change carrying the table and backing-index replacement is the recovery
 source of truth when the
 crash happens before a checkpoint containing the rebuild completes: recovery
@@ -1401,7 +1401,7 @@ Normal data operations append physiological redo records as they mutate pages, s
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
 - Each identity or catalog index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the identity index, and `create_index` initializes and backfills a catalog index, logged the same way.
-- The caller appends one generic `CatalogChange` before invoking schema
+- The caller appends and flushes one generic `CatalogChange` before invoking schema
   operations. It may atomically carry tables, hidden relations, indexes,
   sequences, views, schemas, and statistics. Schema operations append only the
   dependent physical page WAL required for relation/index construction.

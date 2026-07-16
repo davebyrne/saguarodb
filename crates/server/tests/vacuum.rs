@@ -771,7 +771,8 @@ async fn checkpoint_auto_prunes_only_above_the_threshold() {
     );
 }
 
-/// A threshold of 0 disables auto-prune: no checkpoint ever auto-prunes, regardless
+/// A threshold of 0 disables dead-row-triggered auto-prune: below CLOG safety pressure,
+/// checkpoints do not auto-prune regardless
 /// of how much churn accumulates.
 #[tokio::test]
 async fn auto_prune_disabled_when_threshold_is_zero() {
@@ -794,7 +795,7 @@ async fn auto_prune_disabled_when_threshold_is_zero() {
     assert_eq!(
         server.dead_rows_since_vacuum(),
         dead_before,
-        "threshold 0 disables auto-prune; the accumulator is never reset by a checkpoint"
+        "threshold 0 disables the dead-row trigger; the accumulator is not reset"
     );
 }
 

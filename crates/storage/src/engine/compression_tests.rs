@@ -129,7 +129,7 @@ impl Fixture {
         );
         let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
         buffer.enable_stealing();
-        let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let engine = PageBackedStorageEngine::open_with_compression(
             buffer.clone(),
             wal.clone(),

@@ -35,7 +35,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         config.data_dir.join("heap"),
         compression.clone(),
     )?);
-    let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(config.data_dir.join("wal.dat"))?);
+    let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(&config.data_dir)?);
     let buffer_pool: Arc<dyn BufferPool> = Arc::new(MemoryBufferPool::new(
         config.buffer_pool_frames,
         Box::new(WalFlushPolicy { wal: wal.clone() }),
@@ -53,6 +53,8 @@ pub fn open_app(config: Config) -> Result<AppState> {
         .as_ref()
         .map(|control| control.checkpoint_lsn)
         .unwrap_or(0);
+    let (replay_floor, durable_end) = wal.retained_range()?;
+    validate_checkpoint_wal_range(checkpoint_lsn, replay_floor, durable_end)?;
     let catalog: Arc<dyn CatalogManager> = match &loaded {
         Some(control) => Arc::new(MemoryCatalog::try_from_durable_snapshot(
             deserialize_catalog(&control.catalog)?,
@@ -271,13 +273,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
     let next_txn_id = next_txn_id(wal.as_ref())?;
     // Establish the CLOG implicit-committed floor (`docs/specs/mvcc.md` §5.4, §8).
     // When the WAL loaded a durable `clog.dat` snapshot its floor is authoritative and
-    // this is a no-op. Otherwise (no snapshot — a fresh database, or a pre-durable-CLOG
-    // data directory whose WAL was conservatively truncated by the older build) the WAL
+    // this is a no-op. Otherwise (no snapshot on a fresh replay-floor-zero WAL) the WAL
     // re-derives the floor conservatively: the oldest transaction in the retained WAL
     // whose CLOG status is not `Committed` (aborted or in-flight), or — if every retained
-    // transaction is committed — the allocation boundary. That conservatively-truncated
-    // WAL guarantees every transaction dropped below the oldest non-committed one was
-    // committed, so flooring just under it never marks an aborted/in-flight txn committed.
+    // transaction is committed — the allocation boundary. Since no record has yet been
+    // recycled, flooring just under it never marks an aborted/in-flight txn committed.
     wal.establish_recovery_committed_floor(next_txn_id)?;
     // Resolve crashed in-flight writers to Aborted (no-undo MVCC has no undo pass).
     // Must run AFTER the floor is set, so a ghost xid sits at/above the floor and reads
@@ -352,6 +352,23 @@ pub fn open_app(config: Config) -> Result<AppState> {
         components: components.clone(),
         query_service: Arc::new(QueryService::new(components)),
     })
+}
+
+fn validate_checkpoint_wal_range(
+    checkpoint_lsn: common::Lsn,
+    replay_floor: common::Lsn,
+    durable_end: common::Lsn,
+) -> Result<()> {
+    if checkpoint_lsn < replay_floor || checkpoint_lsn > durable_end {
+        return Err(DbError::wal(
+            common::SqlState::InternalError,
+            format!(
+                "control checkpoint LSN {checkpoint_lsn} is outside retained WAL range \
+                 {replay_floor}..={durable_end}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn unknown_index_table(schema: &common::IndexSchema) -> DbError {
@@ -528,7 +545,7 @@ fn next_txn_id(wal: &dyn WalManager) -> Result<u64> {
     // control record's checkpoint LSN. This intentionally covers the crash window
     // where the manifest and CLOG snapshot are durable but the checkpoint marker
     // carrying the transaction-id high-water has not yet been appended/flushed. If a
-    // completed checkpoint later truncates below the boundary, the retained
+    // completed checkpoint later advances the replay floor, the retained
     // Checkpoint marker still carries that high-water mark.
     for record in wal.replay_from(0)? {
         let record = record?;
@@ -538,7 +555,7 @@ fn next_txn_id(wal: &dyn WalManager) -> Result<u64> {
         // A committed savepoint subxid lives only in the `CommitWithSubxids`
         // payload, not a record header (e.g. a released read-only savepoint).
         // Fold it in so the allocator never reissues a committed subxid. (Records
-        // truncated below a completed checkpoint are covered by the retained
+        // logically excluded by a completed checkpoint are covered by the retained
         // `Checkpoint` marker's high-water mark, which already includes subxids —
         // they are allocated from the same counter.
         if let WalRecordKind::CommitWithSubxids { subxids } = &record.kind
@@ -616,6 +633,14 @@ mod tests {
     use catalog::CatalogManager;
     use storage::SchemaOperations;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    #[test]
+    fn checkpoint_must_fall_within_the_durable_retained_wal_range() {
+        assert!(super::validate_checkpoint_wal_range(20, 20, 30).is_ok());
+        assert!(super::validate_checkpoint_wal_range(30, 20, 30).is_ok());
+        assert!(super::validate_checkpoint_wal_range(19, 20, 30).is_err());
+        assert!(super::validate_checkpoint_wal_range(31, 20, 30).is_err());
+    }
 
     fn catalog_change(
         catalog: &dyn CatalogManager,
@@ -1300,7 +1325,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skipped_schema = table_schema(41, "aborted_table");
         {
-            let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            let wal = FileWalManager::open(dir.path()).unwrap();
             let empty = catalog::MemoryCatalog::empty();
             wal.append(WalRecord {
                 lsn: 0,
@@ -1535,7 +1560,7 @@ mod tests {
             is_called: false,
         };
         {
-            let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            let wal = FileWalManager::open(dir.path()).unwrap();
             let empty = catalog::MemoryCatalog::empty();
             wal.append(WalRecord {
                 lsn: 0,
@@ -1922,7 +1947,7 @@ mod tests {
     }
 
     /// The recovery resolution must be durable: after the recovery checkpoint persists
-    /// the aborts to `clog.dat` and truncates the WAL, a SECOND restart (which has no
+    /// the aborts to `clog.dat` and advances the WAL replay floor, a SECOND restart
     /// redo records left for the ghost) plus a VACUUM must still not resurrect it.
     #[test]
     fn resolved_in_flight_abort_survives_restart_and_vacuum() {
@@ -1968,7 +1993,7 @@ mod tests {
         }
 
         // First restart resolves the ghost to Aborted and the recovery checkpoint
-        // persists it to clog.dat (then truncates the WAL).
+        // persists it to clog.dat (then advances the WAL replay floor).
         drop(open_app(config()).unwrap());
 
         // Second restart has NO redo records for the ghost; it must rely on the durable
@@ -1992,7 +2017,7 @@ mod tests {
     #[test]
     fn next_txn_id_rejects_retained_u64_max_txn_id() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+        let wal = FileWalManager::open(dir.path()).unwrap();
         wal.append(WalRecord {
             lsn: 0,
             txn_id: u64::MAX,
@@ -2008,7 +2033,7 @@ mod tests {
     #[test]
     fn next_txn_id_accounts_for_committed_subxids_in_payload() {
         let dir = tempfile::tempdir().unwrap();
-        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+        let wal = FileWalManager::open(dir.path()).unwrap();
         // Top txn 5 commits with a released subxid 9 that did no writes, so 9
         // appears only in the commit payload, not a record header. The allocator
         // must resume at 10 (above 9), or it would reissue the committed subxid.
@@ -2185,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_survive_checkpoint_and_wal_truncation() {
+    fn statistics_survive_checkpoint_and_wal_recycling() {
         let dir = tempfile::tempdir().unwrap();
         let table_id;
         {
@@ -2203,7 +2228,7 @@ mod tests {
             append_statistics_record(&app, 42, table_id, Some(WalRecordKind::Commit));
             // Install in the live catalog too (normal execution does both),
             // then checkpoint: the manifest must carry the statistics after
-            // the WAL below the checkpoint is truncated.
+            // the WAL replay floor advances past the checkpoint.
             app.components
                 .catalog
                 .set_table_statistics(table_id, users_statistics())

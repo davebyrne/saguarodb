@@ -1519,7 +1519,7 @@ mod tests {
     fn create_index_uses_caller_supplied_catalog_change_record() {
         let dir = tempfile::tempdir().unwrap();
         let buffer = Arc::new(MemoryBufferPool::empty(64));
-        let wal = Arc::new(wal::FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal = Arc::new(wal::FileWalManager::open(dir.path()).unwrap());
         let storage =
             PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
         let ctx = crate::test_statement_context(1);
@@ -5199,7 +5199,7 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn truncate_before(&self, _lsn: Lsn) -> Result<()> {
+        fn recycle_through(&self, _lsn: Lsn) -> Result<()> {
             Ok(())
         }
 

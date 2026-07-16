@@ -15,8 +15,8 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{WalRecord, WalRecordKind};
 
-const HEADER_LEN: usize = 8 + 8 + 1 + 4;
-const CRC_LEN: usize = 4;
+pub(crate) const HEADER_LEN: usize = 8 + 8 + 1 + 4;
+pub(crate) const CRC_LEN: usize = 4;
 
 /// `HeapUpdateHeader` payload: file_id(4) + page_num(4) + slot(2) + xmax(8) +
 /// t_ctid page(4) + t_ctid slot(2) + infomask(2).
@@ -69,6 +69,65 @@ pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(crate) fn encode_record_at(
+    mut record: WalRecord,
+    start_lsn: Lsn,
+) -> Result<(WalRecord, Vec<u8>)> {
+    record.lsn = 0;
+    let mut bytes = encode_record(&record)?;
+    let encoded_len = u64::try_from(bytes.len())
+        .map_err(|_| wal_error("encoded WAL record length does not fit u64"))?;
+    let end_lsn = start_lsn
+        .checked_add(encoded_len)
+        .ok_or_else(|| wal_error("WAL LSN overflow"))?;
+    record.lsn = end_lsn;
+    let lsn_bytes = bytes
+        .get_mut(..8)
+        .ok_or_else(|| wal_error("encoded WAL record is missing its LSN header"))?;
+    lsn_bytes.copy_from_slice(&end_lsn.to_le_bytes());
+    let checksum_end = bytes
+        .len()
+        .checked_sub(CRC_LEN)
+        .ok_or_else(|| wal_error("encoded WAL record is shorter than its checksum"))?;
+    let checksum = crc32fast::hash(
+        bytes
+            .get(..checksum_end)
+            .ok_or_else(|| wal_error("encoded WAL checksum range is invalid"))?,
+    );
+    bytes
+        .get_mut(checksum_end..)
+        .ok_or_else(|| wal_error("encoded WAL checksum footer is invalid"))?
+        .copy_from_slice(&checksum.to_le_bytes());
+    Ok((record, bytes))
+}
+
+pub(crate) fn frame_len_from_header(header: &[u8]) -> Result<usize> {
+    if header.len() != HEADER_LEN {
+        return Err(wal_error("incomplete WAL record header"));
+    }
+    let mut reader = CheckedSliceReader::new(header);
+    let _lsn = reader
+        .read_u64_le()
+        .map_err(|err| wal_error(format!("invalid WAL LSN header: {err}")))?;
+    let _txn_id = reader
+        .read_u64_le()
+        .map_err(|err| wal_error(format!("invalid WAL transaction header: {err}")))?;
+    let type_id = reader
+        .read_u8()
+        .map_err(|err| wal_error(format!("invalid WAL record type header: {err}")))?;
+    let payload_len = usize::try_from(
+        reader
+            .read_u32_le()
+            .map_err(|err| wal_error(format!("invalid WAL payload length header: {err}")))?,
+    )
+    .map_err(|_| wal_error("WAL payload length does not fit usize"))?;
+    validate_declared_payload_length(type_id, payload_len)?;
+    HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(CRC_LEN))
+        .ok_or_else(|| wal_error("WAL record length overflow"))
+}
+
 pub fn decode_record(bytes: &[u8]) -> Result<WalRecord> {
     match decode_one(bytes, 0)? {
         DecodeResult::Record {
@@ -78,52 +137,6 @@ pub fn decode_record(bytes: &[u8]) -> Result<WalRecord> {
         DecodeResult::Record { .. } => Err(wal_error("WAL buffer contains trailing bytes")),
         DecodeResult::Incomplete => Err(wal_error("incomplete WAL record")),
     }
-}
-
-pub(crate) fn read_records(bytes: &[u8]) -> Result<(Vec<(WalRecord, u64)>, usize)> {
-    let mut records = Vec::new();
-    let mut offset = 0;
-
-    while offset < bytes.len() {
-        match decode_one(bytes, offset)? {
-            DecodeResult::Record {
-                record,
-                next_offset,
-            } => {
-                let encoded_len = next_offset
-                    .checked_sub(offset)
-                    .ok_or_else(|| wal_error("WAL decoder moved backwards"))?;
-                let encoded_len = u64::try_from(encoded_len)
-                    .map_err(|_| wal_error("WAL record length does not fit u64"))?;
-                if records.len() == records.capacity() {
-                    records
-                        .try_reserve(1)
-                        .map_err(|_| wal_error("cannot grow decoded WAL record list"))?;
-                }
-                records.push((*record, encoded_len));
-                offset = next_offset;
-            }
-            DecodeResult::Incomplete
-                if suffix_contains_complete_record(
-                    bytes,
-                    offset
-                        .checked_add(1)
-                        .ok_or_else(|| wal_error("WAL scan offset overflows"))?,
-                )? =>
-            {
-                return Err(wal_error(
-                    "incomplete WAL record before later complete record",
-                ));
-            }
-            DecodeResult::Incomplete => break,
-        }
-    }
-
-    Ok((records, offset))
-}
-
-pub(crate) fn max_lsn(records: &[WalRecord]) -> Lsn {
-    records.iter().map(|record| record.lsn).max().unwrap_or(0)
 }
 
 fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
@@ -575,16 +588,6 @@ fn finish_physical(reader: CheckedSliceReader<'_>) -> Result<()> {
 
 fn wal_error(message: impl Into<String>) -> DbError {
     DbError::wal(SqlState::InternalError, message)
-}
-
-fn suffix_contains_complete_record(bytes: &[u8], start: usize) -> Result<bool> {
-    for offset in start..bytes.len() {
-        match decode_one(bytes, offset) {
-            Ok(DecodeResult::Record { .. }) => return Ok(true),
-            Ok(DecodeResult::Incomplete) | Err(_) => {}
-        }
-    }
-    Ok(false)
 }
 
 enum DecodeResult {

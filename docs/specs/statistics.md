@@ -116,7 +116,7 @@ Statistics are catalog state, keyed off the schema objects but versioned
 independently of them:
 
 - `CatalogSnapshot` carries `statistics: HashMap<TableId, TableStatistics>` in
-  catalog format v3 inside manifest (`SGMF`) v4. The durable field is required;
+  catalog format v3 inside manifest (`SGMF`) v5. The durable field is required;
   older development formats and incomplete v3 payloads are rejected rather than
   defaulted or migrated.
 - Catalog API: `get_table_statistics(TableId)` and
@@ -152,7 +152,7 @@ the generic `CatalogChange` record. There is no statistics-specific WAL variant.
 - Normal durability lifecycle: the record is appended before the in-memory
   catalog is updated (WAL-before-state, same ordering as DDL), the maintenance
   transaction's `Commit` is flushed before success is reported, and the next
-  checkpoint's manifest snapshot absorbs the statistics so WAL truncation is
+  checkpoint's manifest snapshot absorbs the statistics so WAL recycling is
   safe.
 - The WAL codec itself refuses to encode a non-finite payload
   (`TableStatistics::is_finite`), so the append fails cleanly instead of

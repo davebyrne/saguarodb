@@ -197,11 +197,11 @@ in-memory-only scheme would lose released-subxid rows on a crash.
 - A subxid that is neither in a durable commit set nor `Abort`-logged (e.g. open
   under a top that never committed) recovers via the existing **in-flight =
   aborted** rule.
-- **CLOG truncation / floors**: the existing `committed_floor`/`vacuum_floor`
+- **CLOG pruning / floors**: the existing `committed_floor`/`vacuum_floor`
   conservatism — never drop an aborted xid's record above the vacuum floor — must
   apply to rolled-back **subxids** too, so a rolled-back subxid below a naive floor
   never wrongly reads `Committed`. This is the trickiest interaction and gets
-  dedicated recovery/truncation tests.
+  dedicated recovery/replay-floor tests.
 
 ## 6. Active registry, snapshot & GC horizon
 

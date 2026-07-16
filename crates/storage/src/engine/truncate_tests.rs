@@ -98,7 +98,7 @@ impl WalManager for BlockingFpiWal {
         Ok(Box::new(std::iter::empty()))
     }
 
-    fn truncate_before(&self, _lsn: Lsn) -> common::Result<()> {
+    fn recycle_through(&self, _lsn: Lsn) -> common::Result<()> {
         Ok(())
     }
 
@@ -150,7 +150,7 @@ impl Fixture {
             Arc::new(HeapPageStore::open(dir.path().join("data")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
         buffer.enable_stealing();
-        let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let engine =
             PageBackedStorageEngine::open(buffer.clone(), wal.clone(), StorageMode::Normal)
                 .unwrap();

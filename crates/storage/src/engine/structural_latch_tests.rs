@@ -32,7 +32,7 @@ fn engine() -> (
     let store: Arc<dyn PageStore> = Arc::new(HeapPageStore::open(dir.path().join("data")).unwrap());
     let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
     buffer.enable_stealing();
-    let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+    let wal = Arc::new(FileWalManager::open(dir.path()).unwrap());
     let engine =
         PageBackedStorageEngine::open(buffer, wal.clone(), super::StorageMode::Normal).unwrap();
     (engine, wal, dir)

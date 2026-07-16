@@ -15,7 +15,7 @@ pub trait ControlStore: Send + Sync {
 
     /// Atomically write a new control record. This is the durable commit point of
     /// a checkpoint: it must run only after heap pages are fsynced and before the
-    /// WAL is truncated.
+    /// WAL replay floor is advanced and obsolete segments are recycled.
     fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
 }
 

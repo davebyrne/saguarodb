@@ -13,7 +13,7 @@ use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
-const MANIFEST_VERSION: u32 = 4;
+const MANIFEST_VERSION: u32 = 5;
 const MANIFEST_HEADER_LEN: usize = 16;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 272 * 1024 * 1024;
 const MAX_MANIFEST_PAYLOAD_BYTES: usize = MAX_MANIFEST_BYTES - MANIFEST_HEADER_LEN;
@@ -186,7 +186,9 @@ fn corrupt_control(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlData, MAX_MANIFEST_PAYLOAD_BYTES, decode_control, encode_control};
+    use super::{
+        ControlData, MANIFEST_VERSION, MAX_MANIFEST_PAYLOAD_BYTES, decode_control, encode_control,
+    };
 
     fn control() -> ControlData {
         ControlData {
@@ -281,7 +283,7 @@ mod tests {
             .unwrap();
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"SGMF");
-            bytes.extend_from_slice(&4_u32.to_le_bytes());
+            bytes.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
             bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
             bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
             bytes.extend_from_slice(&payload);

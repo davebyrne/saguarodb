@@ -10,15 +10,22 @@
 //! map is seeded from that snapshot via [`Clog::from_snapshot`] and brought current
 //! by folding the post-snapshot `Commit`/`Abort` records, and [`Clog::live_snapshot`]
 //! / [`Clog::prune_to`] produce the next snapshot at each checkpoint. When no
-//! snapshot exists the map is instead fully rebuilt from the durable `Commit`/`Abort`
-//! WAL records (the historical fallback); either way those records remain the source
-//! of truth for transaction outcome.
+//! snapshot exists on a fresh replay-floor-zero WAL, the map is rebuilt from its
+//! retained status records. After recycling, the snapshot is required.
 
 use std::collections::HashMap;
 
 use common::{FIRST_NORMAL_XID, Lsn, TxnId, TxnStatus, TxnStatusView};
 
 use crate::clog_file::ClogSnapshot;
+
+/// Trigger full checkpoint maintenance before either durable status list can
+/// approach its one-million-entry format cap.
+const CLOG_MAINTENANCE_STATUS_COUNT: usize = 750_000;
+
+fn status_pressure_needs_maintenance(status_count: usize, floor_is_pinned: bool) -> bool {
+    status_count >= CLOG_MAINTENANCE_STATUS_COUNT && floor_is_pinned
+}
 
 /// In-memory map `txn_id -> TxnStatus`.
 ///
@@ -30,16 +37,14 @@ use crate::clog_file::ClogSnapshot;
 /// [`TxnStatus::InProgress`] (it is in flight, or aborted-but-never-recorded —
 /// indistinguishable, and treated as not-yet-committed either way).
 ///
-/// **Implicit-committed floor.** Transactions whose `Commit`/`Abort` records were
-/// truncated by a checkpoint (or pruned from the CLOG snapshot) are no longer in the
+/// **Implicit-committed floor.** Transactions whose status records are logically
+/// below the replay floor (or pruned from the CLOG snapshot) are no longer in the
 /// map, yet their flushed tuples survive in the heap. Per `docs/specs/mvcc.md` §5.4
-/// ("transactions older than the horizon are implicitly committed") and the
-/// Milestone B flush-gate invariant (uncommitted pages are never flushed, so a
-/// surviving tuple is committed), any unrecorded normal id **below**
+/// ("transactions older than the horizon are implicitly committed"), every
+/// unreclaimed abort retains an explicit entry, so any unrecorded normal id **below**
 /// `committed_floor` reads as [`TxnStatus::Committed`]. The floor is loaded from the
-/// durable CLOG snapshot at recovery (or re-established conservatively from the
-/// retained WAL when no snapshot exists) and advances monotonically at runtime when a
-/// checkpoint prunes the CLOG ([`Clog::prune_to`]) or truncates the WAL.
+/// durable CLOG snapshot at recovery (or re-established from an unrecycled fresh WAL)
+/// and advances monotonically when a checkpoint prunes the CLOG ([`Clog::prune_to`]).
 #[derive(Debug)]
 pub struct Clog {
     statuses: HashMap<TxnId, TxnStatus>,
@@ -62,10 +67,9 @@ impl Clog {
 
     /// Raise the implicit-committed floor: unrecorded normal ids strictly below
     /// the floor read as committed (see the type docs). Monotonic — the floor only
-    /// ever advances, so a later checkpoint truncation cannot un-settle a
-    /// transaction an earlier one already covered. Set at recovery to the
-    /// transaction-id allocation boundary, and advanced past each checkpoint's
-    /// truncated transactions at runtime.
+    /// ever advances, so later replay-floor advancement cannot un-settle a
+    /// transaction an earlier durable snapshot already covered. It is established
+    /// conservatively during recovery and persisted in each CLOG snapshot.
     pub fn set_committed_floor(&mut self, floor: TxnId) {
         self.committed_floor = self.committed_floor.max(floor).max(FIRST_NORMAL_XID);
     }
@@ -75,9 +79,19 @@ impl Clog {
         self.committed_floor
     }
 
+    pub(crate) fn needs_maintenance(&self, vacuum_floor: TxnId) -> bool {
+        let floor_is_pinned = self.statuses.iter().any(|(id, status)| match status {
+            TxnStatus::Aborted => *id >= vacuum_floor,
+            TxnStatus::InProgress => true,
+            TxnStatus::Committed => false,
+        });
+        status_pressure_needs_maintenance(self.statuses.len(), floor_is_pinned)
+    }
+
     /// The status of `txn_id`. Reserved ids (`< FIRST_NORMAL_XID`) are always
     /// committed; an unrecorded normal id below the implicit-committed floor is
-    /// committed (its `Commit` record was truncated by a checkpoint); any other
+    /// committed (its outcome is covered by the durable CLOG floor even if its old
+    /// WAL segment remains physically present); any other
     /// unrecorded normal id is `InProgress`.
     pub fn status(&self, txn_id: TxnId) -> TxnStatus {
         if txn_id < FIRST_NORMAL_XID {
@@ -144,8 +158,8 @@ impl Clog {
     ///
     /// The implicit-committed floor it reports advances to the oldest transaction
     /// whose status must stay explicit: the smallest **un-reclaimed** aborted id
-    /// (`>= vacuum_floor`), or `vacuum_floor` itself when every aborted id is
-    /// reclaimed. Everything below that floor is implicit-committed — genuinely
+    /// (`>= vacuum_floor`), or one past the latest settled status when every aborted
+    /// id is reclaimed. Everything below that floor is implicit-committed — genuinely
     /// committed, or an aborted transaction whose on-disk versions a full VACUUM
     /// reclaimed (`docs/specs/mvcc.md` §5.4) — so it is omitted. The floor is
     /// monotonic, so a smaller `vacuum_floor` never lowers it. `clog_lsn` records how
@@ -162,15 +176,23 @@ impl Clog {
     /// its still-uncommitted on-disk versions would wrongly read as committed. The
     /// exclusive checkpoint guard is what guarantees this cannot happen.
     pub fn live_snapshot(&self, clog_lsn: Lsn, vacuum_floor: TxnId) -> ClogSnapshot {
-        let smallest_unreclaimed_abort = self
+        let oldest_status_requiring_explicit_entry = self
             .statuses
             .iter()
-            .filter(|(_, status)| matches!(status, TxnStatus::Aborted))
-            .map(|(id, _)| *id)
-            .filter(|id| *id >= vacuum_floor)
+            .filter_map(|(id, status)| match status {
+                TxnStatus::Aborted if *id >= vacuum_floor => Some(*id),
+                TxnStatus::InProgress => Some(*id),
+                TxnStatus::Committed | TxnStatus::Aborted => None,
+            })
             .min();
-        let floor = smallest_unreclaimed_abort
-            .unwrap_or(vacuum_floor)
+        let settled_boundary = self
+            .statuses
+            .keys()
+            .copied()
+            .max()
+            .map_or(self.committed_floor, |id| id.saturating_add(1));
+        let floor = oldest_status_requiring_explicit_entry
+            .unwrap_or(settled_boundary)
             .max(self.committed_floor)
             .max(FIRST_NORMAL_XID);
 
@@ -223,7 +245,39 @@ impl TxnStatusView for Clog {
 mod tests {
     use common::{FIRST_NORMAL_XID, FROZEN_XID, INVALID_XID, Lsn, TxnId, TxnStatus};
 
-    use super::{Clog, ClogSnapshot};
+    use super::{
+        CLOG_MAINTENANCE_STATUS_COUNT, Clog, ClogSnapshot, status_pressure_needs_maintenance,
+    };
+
+    #[test]
+    fn requests_maintenance_only_when_status_pressure_has_a_floor_pin() {
+        assert!(!status_pressure_needs_maintenance(
+            CLOG_MAINTENANCE_STATUS_COUNT - 1,
+            true,
+        ));
+        assert!(!status_pressure_needs_maintenance(
+            CLOG_MAINTENANCE_STATUS_COUNT,
+            false,
+        ));
+        assert!(status_pressure_needs_maintenance(
+            CLOG_MAINTENANCE_STATUS_COUNT,
+            true,
+        ));
+    }
+
+    #[test]
+    fn commit_only_pressure_does_not_request_vacuum_but_an_unreclaimed_abort_does() {
+        let mut clog = Clog::new();
+        let limit = u64::try_from(CLOG_MAINTENANCE_STATUS_COUNT).unwrap();
+        for xid in FIRST_NORMAL_XID..FIRST_NORMAL_XID + limit {
+            clog.set_committed(xid);
+        }
+        assert!(!clog.needs_maintenance(FIRST_NORMAL_XID));
+
+        clog.set_aborted(FIRST_NORMAL_XID);
+        assert!(clog.needs_maintenance(FIRST_NORMAL_XID));
+        assert!(!clog.needs_maintenance(FIRST_NORMAL_XID + 1));
+    }
 
     #[test]
     fn reserved_ids_read_as_committed() {
@@ -242,12 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn committed_floor_treats_truncated_ids_as_committed() {
+    fn committed_floor_treats_covered_ids_as_committed() {
         let mut clog = Clog::new();
         // No floor yet: an unrecorded normal id is in-progress.
         assert_eq!(clog.status(10), TxnStatus::InProgress);
 
-        // Raise the floor to 10: ids below it (whose Commit records were truncated)
+        // Raise the floor to 10: ids below it (whose outcomes are durably covered)
         // read as committed; ids at/above stay in-progress.
         clog.set_committed_floor(10);
         assert_eq!(clog.status(9), TxnStatus::Committed);
@@ -302,28 +356,42 @@ mod tests {
         let snapshot = clog.live_snapshot(99, 15);
         // The floor it reports is not yet applied: the in-memory floor is unchanged
         // and id 10 still reads from its explicit entry, not the implicit floor.
-        assert_eq!(snapshot.committed_floor, 15);
+        assert_eq!(snapshot.committed_floor, 21);
         assert_eq!(clog.committed_floor(), FIRST_NORMAL_XID);
         assert_eq!(clog.status(10), TxnStatus::Committed);
     }
 
     #[test]
-    fn prune_with_no_aborts_floors_at_vacuum_floor_and_drops_below() {
+    fn prune_with_no_aborts_advances_past_all_settled_commits() {
         let mut clog = Clog::new();
         clog.set_committed(10);
         clog.set_committed(20);
 
-        // No aborts: everything below the vacuum floor is implicit-committed, so the
-        // floor advances to the vacuum floor and the committed id below it is dropped.
+        // No aborts: every settled id can become implicit-committed, independent of
+        // the vacuum floor, so commit-only workloads keep a bounded live window.
         let snapshot = snapshot_and_prune(&mut clog, 99, 15);
-        assert_eq!(snapshot.committed_floor, 15);
+        assert_eq!(snapshot.committed_floor, 21);
         assert_eq!(snapshot.vacuum_floor, 15);
         assert_eq!(snapshot.clog_lsn, 99);
-        assert_eq!(snapshot.committed, vec![20]);
+        assert!(snapshot.committed.is_empty());
         assert!(snapshot.aborted.is_empty());
-        // id 10 (below the floor) reads implicit-committed; id 20 stays explicit.
+        // Both ids now read implicit-committed.
         assert_eq!(clog.status(10), TxnStatus::Committed);
         assert_eq!(clog.status(20), TxnStatus::Committed);
+    }
+
+    #[test]
+    fn commit_only_snapshot_has_a_bounded_live_window_without_vacuum() {
+        let mut clog = Clog::new();
+        for xid in FIRST_NORMAL_XID..10_003 {
+            clog.set_committed(xid);
+        }
+
+        let snapshot = snapshot_and_prune(&mut clog, 99, FIRST_NORMAL_XID);
+        assert_eq!(snapshot.committed_floor, 10_003);
+        assert!(snapshot.committed.is_empty());
+        assert!(snapshot.aborted.is_empty());
+        assert_eq!(clog.status(10_002), TxnStatus::Committed);
     }
 
     #[test]
@@ -363,7 +431,6 @@ mod tests {
     fn prune_keeps_floor_monotonic() {
         let mut clog = Clog::new();
         clog.set_committed_floor(30);
-        clog.set_committed(40);
         // A smaller vacuum floor must not lower the established floor.
         let snapshot = snapshot_and_prune(&mut clog, 1, 5);
         assert_eq!(snapshot.committed_floor, 30);

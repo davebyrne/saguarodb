@@ -14,14 +14,14 @@ use common::{
     Row, SqlState, StatementContext, TableSchema, TableStatistics, Value, value_is_finite,
 };
 use storage::{PageBackedStorageEngine, RelationSnapshot, StorageEngine};
-use wal::{WalRecord, WalRecordKind};
 
 use super::QueryService;
 use super::gucs::DEFAULT_STATISTICS_TARGET_DEFAULT;
 use super::txn::CapturedSnapshots;
 use super::vacuum::{
-    append_and_flush_maintenance_commit, cleanup_after_durable_maintenance_commit,
-    fatal_after_durable_maintenance_commit, rollback_maintenance_txn_or_die,
+    append_and_flush_maintenance_catalog_change, append_and_flush_maintenance_commit,
+    cleanup_after_durable_maintenance_commit, fatal_after_durable_maintenance_commit,
+    rollback_maintenance_txn_or_die,
 };
 use crate::app::ServerComponents;
 use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
@@ -525,11 +525,9 @@ impl QueryService {
                 }
             };
             let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
-            if let Err(err) = components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::CatalogChange { change_set },
-            }) {
+            if let Err(err) =
+                append_and_flush_maintenance_catalog_change(components, txn_id, change_set)
+            {
                 self.rollback_pre_durable_or_die(txn_id, None);
                 return Err(err);
             }
@@ -606,11 +604,7 @@ pub(crate) fn checkpoint_auto_analyze(components: &ServerComponents) -> Result<(
         }
         let catalog_after = staged.snapshot()?;
         let change_set = catalog::catalog_change_set_between(&catalog_before, &catalog_after);
-        components.wal.append(WalRecord {
-            lsn: 0,
-            txn_id,
-            kind: WalRecordKind::CatalogChange { change_set },
-        })?;
+        append_and_flush_maintenance_catalog_change(components, txn_id, change_set)?;
         components.catalog.restore(catalog_after)?;
         Ok(())
     })();

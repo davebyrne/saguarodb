@@ -84,8 +84,9 @@ trait seams.
   and WAL full-page-image compression.
 - Physiological redo WAL with full-page-image torn-page protection, one generic
   atomic catalog-change record for metadata, manifest checkpoints, WAL
-  truncation, and crash recovery. Manifest v4 with catalog v3 is the current
-  format and uses stable object/column IDs plus an exact dependency graph;
+  recycling, and crash recovery. Manifest v5 with catalog v3, CLOG v2, and
+  segmented WAL v2 are the current durable formats. The catalog uses stable
+  object/column IDs plus an exact dependency graph;
   older manifest, catalog, and catalog-WAL layouts are rejected rather than
   migrated.
 
@@ -164,7 +165,7 @@ The server accepts:
 --buffer-pool-frames <N>           default 1024
 --checkpoint-every-n-commits <N>   default 100
 --checkpoint-wal-bytes <BYTES>     default 67108864
---auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)
+--auto-vacuum-dead-rows <N>        default 10000 (0 disables dead-row trigger)
 --auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)
 --shutdown-timeout-ms <MS>         default 30000
 --deadlock-timeout-ms <MS>         default 1000
@@ -380,7 +381,9 @@ generations with the same heap/index file pattern.
 
 ```text
 data/
-  wal.dat
+  wal/
+    wal.meta                  retained replay floor + durable WAL end
+    0000000000000000.wal      16 MiB fixed-payload segment
   clog.dat
   manifest.dat
   manifest.dat.tmp
@@ -406,8 +409,8 @@ contain committed, aborted, or still-in-flight row versions.
                 |
                 v
         +-----------------+
-        | redo WAL        |  fsynced on every commit
-        | data/wal.dat    |
+        | segmented WAL   |  fsynced on every commit
+        | data/wal/       |
         +-----------------+
                 |
                 | records page changes since the redo boundary
@@ -460,13 +463,13 @@ checkpoint
     |
     +-- append WAL Checkpoint metadata record and fsync
     |
-    +-- truncate WAL records before checkpoint_lsn
+    +-- advance wal.meta floor and recycle wholly obsolete segments
     |
     +-- mark buffer pages clean
 ```
 
 The control record is the commit point: it is written only after the heap and
-index pages it describes are durable. Before the WAL prefix is truncated, the
+index pages it describes are durable. Before the WAL replay floor advances, the
 server also persists `clog.dat` through the new boundary so every transaction
 outcome removed from WAL remains durable. If the server crashes mid-checkpoint,
 recovery falls back to the previous redo boundary, where this cycle's full-page
@@ -488,7 +491,7 @@ path; unsupported versions fail startup explicitly.
 ```text
 server startup
     |
-    +-- open control store, dictionary store, heap page store, and data/wal.dat
+    +-- open control store, dictionary store, heap page store, and data/wal/
     |
     +-- enable buffer stealing; load clog.dat when present
     |

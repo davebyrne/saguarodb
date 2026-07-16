@@ -4704,7 +4704,7 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn truncate_before(&self, _lsn: Lsn) -> Result<()> {
+        fn recycle_through(&self, _lsn: Lsn) -> Result<()> {
             Ok(())
         }
 
@@ -4754,9 +4754,9 @@ mod tests {
     }
 
     impl FailingCommitWal {
-        fn open(path: &Path) -> Self {
+        fn open(data_dir: &Path) -> Self {
             Self {
-                inner: FileWalManager::open(path).unwrap(),
+                inner: FileWalManager::open(data_dir).unwrap(),
                 fail_next_commit: AtomicBool::new(false),
                 fail_next_flush: AtomicBool::new(false),
             }
@@ -4794,8 +4794,8 @@ mod tests {
             self.inner.replay_from(lsn)
         }
 
-        fn truncate_before(&self, lsn: Lsn) -> Result<()> {
-            self.inner.truncate_before(lsn)
+        fn recycle_through(&self, lsn: Lsn) -> Result<()> {
+            self.inner.recycle_through(lsn)
         }
 
         fn flushed_lsn(&self) -> Lsn {
@@ -5367,7 +5367,7 @@ mod tests {
             dir.path(),
             Config::default(),
             Arc::new(MemoryCatalog::empty()),
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(FileWalManager::open(dir.path()).unwrap()),
             Arc::new(
                 control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
             ),
@@ -5408,7 +5408,7 @@ mod tests {
             dir.path(),
             Config::default(),
             Arc::new(MemoryCatalog::empty()),
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(FileWalManager::open(dir.path()).unwrap()),
             Arc::new(
                 control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
             ),
@@ -5440,7 +5440,7 @@ mod tests {
             dir.path(),
             Config::default(),
             Arc::new(MemoryCatalog::empty()),
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(FileWalManager::open(dir.path()).unwrap()),
             Arc::new(
                 control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
             ),
@@ -5532,7 +5532,7 @@ mod tests {
     #[test]
     fn transactional_truncate_commit_failure_restores_before_unblocking_and_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let failing_wal = Arc::new(FailingCommitWal::open(dir.path()));
         let wal: Arc<dyn WalManager> = failing_wal.clone();
         let app = app_with_parts(
             dir.path(),
@@ -5608,7 +5608,7 @@ mod tests {
     #[test]
     fn analyze_commit_failure_restores_uncommitted_statistics() {
         let dir = tempfile::tempdir().unwrap();
-        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let failing_wal = Arc::new(FailingCommitWal::open(dir.path()));
         let wal: Arc<dyn WalManager> = failing_wal.clone();
         let app = app_with_parts(
             dir.path(),
@@ -5651,7 +5651,7 @@ mod tests {
     #[test]
     fn aborted_add_primary_key_burns_storage_id_across_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let failing_wal = Arc::new(FailingCommitWal::open(&dir.path().join("wal.dat")));
+        let failing_wal = Arc::new(FailingCommitWal::open(dir.path()));
         let wal: Arc<dyn WalManager> = failing_wal.clone();
         let app = app_with_parts(
             dir.path(),
@@ -5851,8 +5851,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -5901,8 +5900,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -5954,8 +5952,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -6022,8 +6019,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -6552,8 +6548,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -7276,8 +7271,7 @@ mod tests {
     #[test]
     fn catalog_introspection_provider_is_wired_into_statement_context() {
         let dir = tempfile::tempdir().unwrap();
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             Config::default(),
@@ -7648,8 +7642,7 @@ mod tests {
             checkpoint_wal_bytes: u64::MAX,
             ..Config::default()
         };
-        let wal: Arc<dyn WalManager> =
-            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(dir.path()).unwrap());
         let app = app_with_parts(
             dir.path(),
             config,
@@ -9075,7 +9068,7 @@ mod tests {
     #[test]
     fn alter_foreign_key_wal_failures_restore_catalog_and_storage_before_unlock() {
         let add_dir = tempfile::tempdir().unwrap();
-        let add_wal = Arc::new(FailingCommitWal::open(&add_dir.path().join("wal.dat")));
+        let add_wal = Arc::new(FailingCommitWal::open(add_dir.path()));
         let app = app_with_parts(
             add_dir.path(),
             Config::default(),
@@ -9178,7 +9171,7 @@ mod tests {
         );
 
         let drop_dir = tempfile::tempdir().unwrap();
-        let drop_wal = Arc::new(FailingCommitWal::open(&drop_dir.path().join("wal.dat")));
+        let drop_wal = Arc::new(FailingCommitWal::open(drop_dir.path()));
         let app = app_with_parts(
             drop_dir.path(),
             Config::default(),

@@ -576,7 +576,31 @@ pub(super) fn append_and_flush_maintenance_commit(
         txn_id,
         kind: WalRecordKind::Commit,
     })?;
-    components.wal.flush()?;
+    if let Err(err) = components.wal.flush() {
+        if err.kind == common::ErrorKind::DurabilityOutcomeUnknown {
+            fatal_ambiguous_maintenance_commit(err);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(super) fn append_and_flush_maintenance_catalog_change(
+    components: &ServerComponents,
+    txn_id: u64,
+    change_set: common::CatalogChangeSet,
+) -> Result<()> {
+    components.wal.append(WalRecord {
+        lsn: 0,
+        txn_id,
+        kind: WalRecordKind::CatalogChange { change_set },
+    })?;
+    if let Err(err) = components.wal.flush() {
+        if err.kind == common::ErrorKind::DurabilityOutcomeUnknown {
+            fatal_ambiguous_maintenance_commit(err);
+        }
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -586,6 +610,9 @@ pub(super) fn rollback_maintenance_txn_or_die(components: &ServerComponents, txn
         txn_id,
         kind: WalRecordKind::Abort,
     }) {
+        if err.kind == common::ErrorKind::DurabilityOutcomeUnknown {
+            fatal_ambiguous_maintenance_commit(err);
+        }
         eprintln!("failed to append Abort record for maintenance txn {txn_id}: {err}");
     }
     components.active_txns.deregister(txn_id);
@@ -620,6 +647,11 @@ pub(super) fn fatal_after_durable_maintenance_commit(
 
 fn fatal_pre_durable_maintenance_rollback(err: DbError) -> ! {
     eprintln!("fatal TOAST cleanup rollback failure before durable commit: {err}");
+    std::process::exit(1);
+}
+
+fn fatal_ambiguous_maintenance_commit(err: DbError) -> ! {
+    eprintln!("fatal maintenance commit durability outcome unknown: {err}");
     std::process::exit(1);
 }
 
