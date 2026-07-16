@@ -1704,18 +1704,6 @@ impl SchemaOperations for MemoryStorage {
     fn drop_sequence(&self, _ctx: &StatementContext, _sequence: common::SequenceId) -> Result<()> {
         Ok(())
     }
-
-    fn create_view(&self, _ctx: &StatementContext, _schema: &common::ViewSchema) -> Result<()> {
-        Ok(())
-    }
-
-    fn replace_view(&self, _ctx: &StatementContext, _schema: &common::ViewSchema) -> Result<()> {
-        Ok(())
-    }
-
-    fn drop_view(&self, _ctx: &StatementContext, _view: TableId) -> Result<()> {
-        Ok(())
-    }
 }
 
 fn begin_txn(state: &mut MemoryStorageState, txn_id: u64) {

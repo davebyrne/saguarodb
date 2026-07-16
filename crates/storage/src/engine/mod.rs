@@ -3101,21 +3101,6 @@ impl SchemaOperations for PageBackedStorageEngine {
         state.sequences.remove(&sequence);
         Ok(())
     }
-
-    fn create_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
-        let _ = (ctx, schema);
-        Ok(())
-    }
-
-    fn replace_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
-        let _ = (ctx, schema);
-        Ok(())
-    }
-
-    fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()> {
-        let _ = (ctx, view);
-        Ok(())
-    }
 }
 
 impl SequenceManager for PageBackedStorageEngine {

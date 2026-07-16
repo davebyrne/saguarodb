@@ -2767,45 +2767,31 @@ fn execute_create_view(
 ) -> Result<ExecutionResult> {
     let output = create_view_output_columns(columns, query);
     let schema = match ctx.catalog.get_view_in_schema(namespace, name)? {
-        Some(existing) if or_replace => {
-            let replaced = mutate_catalog(ctx, || {
-                ctx.catalog.replace_view_with_search_path(
-                    existing.id,
-                    output,
-                    definition.to_string(),
-                    stored_query.clone(),
-                    definition_search_path.to_vec(),
-                )
-            })?;
-            if let Err(err) = ctx.schema_ops.replace_view(&ctx.statement, &replaced) {
-                let _ = ctx.catalog.apply_replace_view(existing);
-                return Err(err);
-            }
-            replaced
-        }
+        Some(existing) if or_replace => mutate_catalog(ctx, || {
+            ctx.catalog.replace_view_with_search_path(
+                existing.id,
+                output,
+                definition.to_string(),
+                stored_query.clone(),
+                definition_search_path.to_vec(),
+            )
+        })?,
         Some(_) => {
             return Err(DbError::plan(
                 SqlState::DuplicateTable,
                 format!("relation {name} already exists"),
             ));
         }
-        None => {
-            let schema = mutate_catalog(ctx, || {
-                ctx.catalog.create_view_in_schema(
-                    namespace,
-                    name.to_string(),
-                    output,
-                    definition.to_string(),
-                    stored_query.clone(),
-                    definition_search_path.to_vec(),
-                )
-            })?;
-            if let Err(err) = ctx.schema_ops.create_view(&ctx.statement, &schema) {
-                let _ = ctx.catalog.apply_drop_view(schema.id);
-                return Err(err);
-            }
-            schema
-        }
+        None => mutate_catalog(ctx, || {
+            ctx.catalog.create_view_in_schema(
+                namespace,
+                name.to_string(),
+                output,
+                definition.to_string(),
+                stored_query.clone(),
+                definition_search_path.to_vec(),
+            )
+        })?,
     };
     if schema.name != name {
         return Err(DbError::internal(
@@ -2874,7 +2860,6 @@ fn execute_drop_view(
         ));
     };
     mutate_catalog(ctx, || ctx.catalog.drop_view(view.id))?;
-    ctx.schema_ops.drop_view(&ctx.statement, view.id)?;
     Ok(ExecutionResult::Modified {
         command: "DROP VIEW".to_string(),
         count: 0,

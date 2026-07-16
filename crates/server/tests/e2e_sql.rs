@@ -5199,6 +5199,10 @@ async fn e2e_views_execute_resolved_query_ir_after_renames() {
         "create view system_outer_view as select c.relname from view_left l left join pg_catalog.pg_class c on false",
         "create view base_view as select id, value from view_left",
         "create view inlined_view as select id from base_view where value = 20",
+        // Referenced views are stored as inlined query IR. Replacing the source
+        // with an incompatible output allocates new source-column identities but
+        // cannot leave the already-stored inlined view with dangling references.
+        "create or replace view base_view as select cast(id as text) as id, value from view_left",
         "drop view base_view",
         "alter table view_left rename column value to amount",
         "alter table view_left rename to renamed_left",

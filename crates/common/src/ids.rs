@@ -12,8 +12,8 @@ pub type ColumnObjectId = u32;
 pub type FunctionId = u32;
 /// Globally durable identity of a catalog constraint.
 pub type ConstraintId = u32;
-/// Per-table foreign-key identifier. Values are allocated monotonically and
-/// never reused.
+/// Globally durable identity of a catalog index. Zero is reserved for the
+/// synthetic primary-key index identity; user index IDs are never reused.
 pub type IndexId = u32;
 pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;

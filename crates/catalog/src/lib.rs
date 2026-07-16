@@ -1842,6 +1842,37 @@ mod tests {
             incompatible.columns[1].object_id,
             extended.columns[1].object_id
         );
+
+        // Reinstalling the before-image models rollback after a failed
+        // replacement. The allocator must retain the identity burned by the
+        // failed after-image instead of rewinding with the restored schema.
+        restored.apply_replace_view(extended.clone()).unwrap();
+        let rolled_back = restored.get_view(view.id).unwrap().unwrap();
+        assert_eq!(
+            rolled_back.next_column_object_id,
+            incompatible.next_column_object_id
+        );
+        let retried = restored
+            .replace_view(
+                view.id,
+                vec![
+                    view_column("id", DataType::Text, true),
+                    view_column("display_name", DataType::Text, true),
+                ],
+                "SELECT name, name FROM users".to_string(),
+                stored_view_query(
+                    &[
+                        view_column("id", DataType::Text, true),
+                        view_column("display_name", DataType::Text, true),
+                    ],
+                    Some((&users, &[1, 1])),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            retried.columns[0].object_id,
+            incompatible.next_column_object_id
+        );
     }
 
     #[test]

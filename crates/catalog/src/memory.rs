@@ -1840,14 +1840,15 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn apply_replace_view(&self, schema: ViewSchema) -> Result<()> {
+    fn apply_replace_view(&self, mut schema: ViewSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
-        validate_view_schema(&schema, &snapshot)?;
         let old = snapshot
             .views_by_id
             .get(&schema.id)
             .cloned()
             .ok_or_else(|| undefined_view(format!("view id {} does not exist", schema.id)))?;
+        schema.next_column_object_id = schema.next_column_object_id.max(old.next_column_object_id);
+        validate_view_schema(&schema, &snapshot)?;
         if old.schema_id != schema.schema_id {
             return Err(DbError::internal(format!(
                 "cannot change schema for view id {}",

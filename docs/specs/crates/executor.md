@@ -521,10 +521,9 @@ not diverge between ALTER validation and later DML.
 - Create/replace metadata and append WAL while the gate blocks catalog readers;
   release it only after Commit or rollback restore.
 - For `OR REPLACE` with an existing view, call `CatalogManager::replace_view`
-  (same id/name, incremented schema version), then
-  `SchemaOperations::replace_view`; the before/after view is carried by the
-  statement `CatalogChange`. If storage/WAL
-  append fails, restore the previous view schema before returning the error.
+  (same id/name, incremented schema version); the before/after view is carried
+  by the statement `CatalogChange`. Views have no physical storage mutation or
+  second rollback path.
 - A non-`OR REPLACE` duplicate relation name returns `SqlState::DuplicateTable`.
 - Return `Modified { command: "CREATE VIEW", count: 0 }`.
 
@@ -534,8 +533,8 @@ not diverge between ALTER validation and later DML.
   `SqlState::UndefinedTable` unless `IF EXISTS` was present.
 - If the name belongs to an existing table, return `SqlState::WrongObjectType`
   rather than treating the statement as missing or as an `IF EXISTS` no-op.
-- For an existing view, append the view-removal `CatalogChange`, call
-  `SchemaOperations::drop_view`, then publish the catalog removal.
+- For an existing view, append and publish the view-removal `CatalogChange`;
+  views have no physical storage mutation.
 - For `IF EXISTS` and a missing view, perform no catalog or WAL mutation and
   return the normal command tag.
 - Return `Modified { command: "DROP VIEW", count: 0 }`.

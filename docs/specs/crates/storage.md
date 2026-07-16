@@ -94,10 +94,10 @@ pub trait SchemaOperations: Send + Sync {
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
     fn create_sequence(&self, ctx: &StatementContext, schema: &SequenceSchema) -> Result<()>;
     fn drop_sequence(&self, ctx: &StatementContext, sequence: SequenceId) -> Result<()>;
-    fn create_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
-    fn replace_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
-    fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()>;
 }
+
+// Views have no physical storage operation. Their metadata changes only
+// through the catalog's generic change-set path.
 
 pub trait RecoveryOperations: Send + Sync {
     fn reconcile_catalog_change(&self, change_set: &CatalogChangeSet) -> Result<()>;
