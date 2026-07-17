@@ -12,12 +12,19 @@ use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, Storag
 use wal::{FileWalManager, WalManager, WalRecordKind, is_redo_operation};
 
 use crate::app::{AppState, ServerComponents};
-use crate::checkpoint::{CheckpointState, cleanup_relation_generation_files, run_checkpoint};
+use crate::checkpoint::{
+    CheckpointCoordinator, CheckpointState, cleanup_relation_generation_files, run_checkpoint,
+    spawn_checkpoint_worker,
+};
 use crate::config::Config;
+use crate::maintenance::{MaintenanceCoordinator, spawn_maintenance_worker};
 use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
 
 pub fn open_app(config: Config) -> Result<AppState> {
+    config
+        .validate()
+        .map_err(|message| DbError::internal(format!("invalid server configuration: {message}")))?;
     // Shared compression state (`docs/specs/compression.md` §5a/§7): one registry
     // instance is injected into both the at-rest heap store and the WAL FPI path
     // so a file's config is consulted consistently by both; the dict store is the
@@ -49,12 +56,27 @@ pub fn open_app(config: Config) -> Result<AppState> {
 
     // The control record is the redo boundary plus the catalog snapshot.
     let loaded = control.load()?;
-    let checkpoint_lsn = loaded
+    let checkpoint_end_lsn = loaded
         .as_ref()
-        .map(|control| control.checkpoint_lsn)
+        .map(|control| control.checkpoint_end_lsn)
         .unwrap_or(0);
+    let page_redo_lsn = loaded
+        .as_ref()
+        .map(|control| control.page_redo_lsn)
+        .unwrap_or(0);
+    let catalog_redo_lsn = loaded
+        .as_ref()
+        .map(|control| control.catalog_redo_lsn)
+        .unwrap_or(0);
+    let checkpoint_replay_floor = page_redo_lsn.min(catalog_redo_lsn);
     let (replay_floor, durable_end) = wal.retained_range()?;
-    validate_checkpoint_wal_range(checkpoint_lsn, replay_floor, durable_end)?;
+    validate_checkpoint_wal_range(
+        checkpoint_end_lsn,
+        page_redo_lsn,
+        catalog_redo_lsn,
+        replay_floor,
+        durable_end,
+    )?;
     let catalog: Arc<dyn CatalogManager> = match &loaded {
         Some(control) => Arc::new(MemoryCatalog::try_from_durable_snapshot(
             deserialize_catalog(&control.catalog)?,
@@ -100,7 +122,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
     )?;
 
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
-    // record after the checkpoint LSN onto the heap and index pages, regardless of
+    // record at or after the physical redo boundary onto heap and index pages, regardless of
     // the dirtying transaction's outcome. PageLSN gating makes this idempotent;
     // torn/missing pages are zeroed so a FullPageImage/HeapInit re-establishes
     // them. The durable B-tree is recovered the same way (its mutations are
@@ -122,7 +144,6 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // durable Commit/Abort) is a crashed in-flight transaction whose versions are on
     // disk. They are resolved to Aborted below so VACUUM reclaims them before the floor
     // crosses them (`docs/specs/mvcc.md` §8; the FATAL-B resurrection fix).
-    let mut writer_xids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut pending_identity_rebuilds: std::collections::BTreeSet<TableId> =
         std::collections::BTreeSet::new();
     // Allocations are burned independently of transaction outcome. This pass
@@ -134,8 +155,12 @@ pub fn open_app(config: Config) -> Result<AppState> {
         .map(|table| (table.id, table.compression))
         .collect::<std::collections::HashMap<_, _>>();
     let mut recovery_allocator_high_water = common::CatalogAllocatorHighWater::default();
-    for record in wal.replay_from(checkpoint_lsn)? {
-        let record = record?;
+    for entry in wal.replay_entries_from(checkpoint_replay_floor)? {
+        let entry = entry?;
+        if !catalog_prescan_includes(entry.replay_from, catalog_redo_lsn) {
+            continue;
+        }
+        let record = entry.record;
         if let WalRecordKind::CatalogChange { change_set } = &record.kind {
             change_set.validate_shape().map_err(|message| {
                 DbError::internal(format!(
@@ -209,15 +234,39 @@ pub fn open_app(config: Config) -> Result<AppState> {
             );
         }
     }
-    for record in wal.replay_from(checkpoint_lsn)? {
-        let record = record?;
+    for entry in wal.replay_entries_from(checkpoint_replay_floor)? {
+        let entry = entry?;
+        let record = entry.record;
         if !is_redo_operation(&record.kind) {
             // `Commit`/`Abort`/`Checkpoint` are metadata markers, not page
             // mutations; the CLOG already absorbed them at WAL open.
             continue;
         }
-        if record.txn_id != 0 {
-            writer_xids.insert(record.txn_id);
+        let is_physical = matches!(
+            &record.kind,
+            WalRecordKind::HeapInit { .. }
+                | WalRecordKind::HeapInsert { .. }
+                | WalRecordKind::HeapDelete { .. }
+                | WalRecordKind::HeapUpdateHeader { .. }
+                | WalRecordKind::FullPageImage { .. }
+                | WalRecordKind::FullPageImageCompressed { .. }
+        );
+        if is_physical && entry.replay_from < page_redo_lsn {
+            continue;
+        }
+        if matches!(
+            &record.kind,
+            WalRecordKind::CatalogChange { .. } | WalRecordKind::CreateDictionary { .. }
+        ) && entry.replay_from < catalog_redo_lsn
+        {
+            continue;
+        }
+        if matches!(
+            &record.kind,
+            WalRecordKind::SequenceAdvance { .. } | WalRecordKind::SetSequenceValue { .. }
+        ) && entry.replay_from < checkpoint_end_lsn
+        {
+            continue;
         }
         if let WalRecordKind::CatalogChange { change_set } = &record.kind
             && !wal.is_committed(record.txn_id)
@@ -248,7 +297,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
             compression.as_ref(),
             dict_store.as_ref(),
             record.kind,
-            ReplayRecordContext { lsn: record.lsn },
+            ReplayRecordContext {
+                replay_from: entry.replay_from,
+                lsn: record.lsn,
+            },
         )?;
         for table_id in primary_key_rebuilds {
             pending_identity_rebuilds.insert(table_id);
@@ -285,7 +337,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // the floor pinned below it until then, instead of floating past it and resurrecting
     // never-committed data as committed (`docs/specs/mvcc.md` §8). Persisted by the
     // recovery checkpoint below via `clog.dat`.
-    wal.resolve_in_flight_as_aborted(&writer_xids)?;
+    wal.resolve_all_in_flight_as_aborted()?;
     for table_id in pending_identity_rebuilds {
         let Some(schema) = catalog.get_table(table_id)? else {
             continue;
@@ -322,11 +374,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
         compression,
         dict_store,
         concurrency: Arc::new(RwLockConcurrencyController::new()),
-        checkpoint: CheckpointState {
-            last_checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
-            commits_since_checkpoint: AtomicU64::new(0),
-            checkpoints: AtomicU64::new(0),
-        },
+        checkpoint: CheckpointState::new(checkpoint_end_lsn),
+        checkpoint_coordinator: Arc::new(CheckpointCoordinator::default()),
+        maintenance_coordinator: Arc::new(MaintenanceCoordinator::default()),
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
         dead_rows_since_vacuum: AtomicU64::new(0),
@@ -348,22 +398,59 @@ pub fn open_app(config: Config) -> Result<AppState> {
     cleanup_relation_generation_files(&components)?;
     components.storage.set_mode(StorageMode::Normal)?;
 
+    let checkpoint_worker = spawn_checkpoint_worker(&components)?;
+    let (checkpoint_worker, maintenance_worker) = finish_worker_start(
+        &components.checkpoint_coordinator,
+        checkpoint_worker,
+        spawn_maintenance_worker(&components),
+    )?;
     Ok(AppState {
         components: components.clone(),
         query_service: Arc::new(QueryService::new(components)),
+        checkpoint_worker: std::sync::Mutex::new(Some(checkpoint_worker)),
+        maintenance_worker: std::sync::Mutex::new(Some(maintenance_worker)),
     })
 }
 
+fn catalog_prescan_includes(replay_from: common::Lsn, catalog_redo_lsn: common::Lsn) -> bool {
+    replay_from >= catalog_redo_lsn
+}
+
+fn finish_worker_start(
+    checkpoint_coordinator: &CheckpointCoordinator,
+    checkpoint_worker: std::thread::JoinHandle<()>,
+    maintenance_worker: Result<std::thread::JoinHandle<()>>,
+) -> Result<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)> {
+    match maintenance_worker {
+        Ok(maintenance_worker) => Ok((checkpoint_worker, maintenance_worker)),
+        Err(spawn_error) => {
+            checkpoint_coordinator.stop();
+            checkpoint_worker.join().map_err(|_| {
+                DbError::internal(
+                    "checkpoint worker panicked while cleaning up partial worker startup",
+                )
+            })?;
+            Err(spawn_error)
+        }
+    }
+}
+
 fn validate_checkpoint_wal_range(
-    checkpoint_lsn: common::Lsn,
+    checkpoint_end_lsn: common::Lsn,
+    page_redo_lsn: common::Lsn,
+    catalog_redo_lsn: common::Lsn,
     replay_floor: common::Lsn,
     durable_end: common::Lsn,
 ) -> Result<()> {
-    if checkpoint_lsn < replay_floor || checkpoint_lsn > durable_end {
+    if replay_floor > page_redo_lsn.min(catalog_redo_lsn)
+        || page_redo_lsn > checkpoint_end_lsn
+        || catalog_redo_lsn > checkpoint_end_lsn
+        || checkpoint_end_lsn > durable_end
+    {
         return Err(DbError::wal(
             common::SqlState::InternalError,
             format!(
-                "control checkpoint LSN {checkpoint_lsn} is outside retained WAL range \
+                "control checkpoint boundaries are inconsistent with retained WAL range \
                  {replay_floor}..={durable_end}"
             ),
         ));
@@ -405,8 +492,7 @@ struct WalFlushPolicy {
 
 impl FlushPolicy for WalFlushPolicy {
     fn can_flush(&self, info: &PageFlushInfo) -> bool {
-        info.page_lsn
-            .is_none_or(|lsn| lsn <= self.wal.flushed_lsn())
+        info.page_lsn.is_some()
     }
 
     fn ensure_durable(&self) -> Result<()> {
@@ -418,6 +504,7 @@ impl FlushPolicy for WalFlushPolicy {
 }
 
 struct ReplayRecordContext {
+    replay_from: u64,
     lsn: u64,
 }
 
@@ -511,7 +598,12 @@ fn apply_redo(
             if !storage::page_is_valid(guard.data()) {
                 guard.data_mut().fill(0);
             }
-            storage::apply_physical_redo(guard.data_mut(), context.lsn, &kind)?;
+            if storage::apply_physical_redo(guard.data_mut(), context.lsn, &kind)? {
+                guard.publish_position(common::WalPosition::new(
+                    context.replay_from,
+                    context.lsn,
+                )?)?;
+            }
             Ok(())
         }
         WalRecordKind::Commit
@@ -636,10 +728,31 @@ mod tests {
 
     #[test]
     fn checkpoint_must_fall_within_the_durable_retained_wal_range() {
-        assert!(super::validate_checkpoint_wal_range(20, 20, 30).is_ok());
-        assert!(super::validate_checkpoint_wal_range(30, 20, 30).is_ok());
-        assert!(super::validate_checkpoint_wal_range(19, 20, 30).is_err());
-        assert!(super::validate_checkpoint_wal_range(31, 20, 30).is_err());
+        assert!(super::validate_checkpoint_wal_range(20, 20, 20, 20, 30).is_ok());
+        assert!(super::validate_checkpoint_wal_range(30, 20, 25, 20, 30).is_ok());
+        assert!(super::validate_checkpoint_wal_range(20, 20, 21, 19, 30).is_err());
+        assert!(super::validate_checkpoint_wal_range(31, 20, 20, 20, 30).is_err());
+    }
+
+    #[test]
+    fn catalog_prescan_starts_at_the_independent_catalog_boundary() {
+        assert!(!super::catalog_prescan_includes(19, 20));
+        assert!(super::catalog_prescan_includes(20, 20));
+        assert!(super::catalog_prescan_includes(21, 20));
+    }
+
+    #[test]
+    fn maintenance_spawn_failure_stops_and_joins_started_checkpointer() {
+        let coordinator = super::CheckpointCoordinator::default();
+        let checkpoint_worker = std::thread::spawn(|| {});
+        let error = super::finish_worker_start(
+            &coordinator,
+            checkpoint_worker,
+            Err(common::DbError::io("injected maintenance spawn failure")),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("injected maintenance spawn failure"));
+        assert!(coordinator.is_stopped());
     }
 
     fn catalog_change(
@@ -1286,12 +1399,12 @@ mod tests {
             expected_next_txn_id = app.components.next_txn_id.load(Ordering::Acquire);
 
             // Simulate the checkpoint crash window: heap pages, manifest/control, and
-            // CLOG snapshot are durable at checkpoint_lsn, but the Checkpoint marker
+            // CLOG snapshot are durable at the captured checkpoint boundary, but the marker
             // carrying the transaction-id high-water mark was never appended/flushed.
             app.components.wal.flush().unwrap();
             app.components.buffer_pool.flush_dirty_pages().unwrap();
             app.components.store.sync_all().unwrap();
-            let checkpoint_lsn = app.components.wal.flushed_lsn();
+            let checkpoint_end_lsn = app.components.wal.flushed_lsn();
             let mut tables: Vec<_> = app
                 .components
                 .catalog
@@ -1305,9 +1418,20 @@ mod tests {
                 catalog::serialize_catalog(&app.components.catalog.snapshot().unwrap()).unwrap();
             app.components
                 .control
-                .store(checkpoint_lsn, &tables, &catalog_bytes)
+                .store(control::ControlData {
+                    checkpoint_end_lsn,
+                    page_redo_lsn: checkpoint_end_lsn,
+                    catalog_redo_lsn: checkpoint_end_lsn,
+                    dirty_pages: Vec::new(),
+                    tables,
+                    catalog: catalog_bytes,
+                    page_size: buffer::PAGE_SIZE as u32,
+                })
                 .unwrap();
-            app.components.wal.persist_clog(checkpoint_lsn).unwrap();
+            app.components
+                .wal
+                .checkpoint_clog(checkpoint_end_lsn, &[], u64::MAX)
+                .unwrap();
         }
 
         let reopened = AppState::open_for_test(dir.path()).unwrap();
@@ -1675,12 +1799,8 @@ mod tests {
 
     /// FATAL-B regression: a transaction that crashed in flight (its pages were
     /// stolen to disk, but it never got a durable `Commit` or `Abort`) must NEVER
-    /// become visible. Today a later full `VACUUM` followed by a checkpoint floats
-    /// the implicit-committed floor *past* the unresolved xid — because nothing
-    /// resolves a crashed in-flight transaction to `Aborted` and `vacuum_heap` only
-    /// reclaims recorded-aborted creators — so its never-committed rows resurrect as
-    /// committed data. See `clog.rs::live_snapshot` (floor pinned only by recorded
-    /// aborts) and `query/vacuum.rs::full_vacuum_pass` (floor = `next_txn_id`).
+    /// become visible. A later full `VACUUM` followed by a checkpoint must not float
+    /// the implicit-committed floor past an unresolved xid and resurrect its rows.
     ///
     /// Fixed by `resolve_in_flight_as_aborted` at recovery (`open_app`): crashed
     /// in-flight writers are marked `Aborted` in the CLOG (persisted via `clog.dat`
@@ -1757,7 +1877,7 @@ mod tests {
         );
 
         // Full VACUUM advances the vacuum floor to next_txn_id (above the ghost xid);
-        // the checkpoint's `persist_clog` floats the implicit-committed floor up to it.
+        // the checkpoint's CLOG snapshot floats the implicit-committed floor up to it.
         // Nothing ever resolved the ghost to Aborted, so it must STILL be invisible.
         app.query_service.execute_sql("vacuum").unwrap();
         run_checkpoint(&app.components).unwrap();

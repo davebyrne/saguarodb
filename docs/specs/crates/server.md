@@ -55,6 +55,7 @@ pub struct Config {
     pub buffer_pool_frames: usize,
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
+    pub checkpoint_flush_batch_pages: usize,
     pub auto_vacuum_dead_rows: u64,
     pub auto_analyze_changed_rows: u64,
     pub shutdown_timeout_ms: u64,
@@ -73,6 +74,7 @@ Defaults:
 - `buffer_pool_frames = 1024`
 - `checkpoint_every_n_commits = 100`
 - `checkpoint_wal_bytes = 64 * 1024 * 1024`
+- `checkpoint_flush_batch_pages = 256`
 - `auto_vacuum_dead_rows = 10000`
 - `auto_analyze_changed_rows = 10000`
 - `shutdown_timeout_ms = 30000`
@@ -84,11 +86,16 @@ Binary CLI flags:
 
 - `--data-dir <PATH>` sets `Config.data_dir`; default `./data`.
 - `--port <PORT>` sets `Config.port`; default `5433`.
-- `--buffer-pool-frames <N>` sets `Config.buffer_pool_frames`; default `1024`.
+- `--buffer-pool-frames <N>` sets `Config.buffer_pool_frames`; default `1024`, valid range `1..=1,000,000` so the resident dirty set cannot exceed manifest v6's bounded DPT.
 - `--checkpoint-every-n-commits <N>` sets `Config.checkpoint_every_n_commits`; default `100`.
 - `--checkpoint-wal-bytes <BYTES>` sets `Config.checkpoint_wal_bytes`; default `67108864`.
-- `--auto-analyze-changed-rows <N>` sets `Config.auto_analyze_changed_rows`; default `10000`. When at least this many committed changed rows have accumulated, the next checkpoint re-collects statistics for every user table; its catalog change precedes the checkpoint WAL flush, so the manifest absorbs it before the replay floor advances. A manual full `ANALYZE` also resets the counter; `0` disables auto-analyze.
-- `--auto-vacuum-dead-rows <N>` sets `Config.auto_vacuum_dead_rows`; default `10000`. When at least this many committed dead versions have accumulated since the last auto-prune, the next checkpoint folds a VACUUM pass over every user table into itself (Milestone F4b, `mvcc.md` §9). `0` disables this dead-row trigger; pressure from an unreclaimed abort-pinned CLOG window can still force a full pass before the durable status-list limit. Unlike the other numeric flags, `0` is accepted here.
+- `--checkpoint-flush-batch-pages <N>` sets the bounded checkpoint batch size;
+  default `256`, valid range `1..=1_000_000`.
+- `--auto-analyze-changed-rows <N>` enqueues background full ANALYZE after this
+  many committed changed rows; default `10000`, `0` disables the trigger.
+- `--auto-vacuum-dead-rows <N>` enqueues background full VACUUM after this many
+  committed dead versions; default `10000`, `0` disables the workload trigger.
+  CLOG pressure may still enqueue VACUUM.
 - `--shutdown-timeout-ms <MS>` sets `Config.shutdown_timeout_ms`; default `30000`.
 - `--deadlock-timeout-ms <MS>` sets `Config.deadlock_timeout_ms`; default `1000`.
   This is how long a transaction blocked on a row, table, or sequence lock waits
@@ -107,25 +114,34 @@ The binary parses flags with `std::env::args`; do not add a CLI parser dependenc
 3. Initialize the WAL manager.
 4. Initialize the buffer pool with the configured frame count, the `WalFlushPolicy`, and the heap page store as its `PageStore`. `WalFlushPolicy::can_flush` admits a dirty page iff it is **WAL-durable** (`page_lsn ≤ wal.flushed_lsn()`); the earlier committedness gate is dropped (Milestone D1, `mvcc.md` §8), so uncommitted/aborted dirty pages may be flushed/evicted (hidden by the CLOG). `WalFlushPolicy::ensure_durable` (called by the buffer pool's steal path before writing a stolen page) flushes the WAL, giving write-ahead logging for the now-possibly-uncommitted stolen page.
 5. Enable eviction-flush-on-steal (`buffer_pool.enable_stealing()`), immediately after constructing the pool and before loading the control record. The durable on-disk index means recovery rebuilds nothing in memory, so redo may spill and the recovery working set is not bounded by the pool size.
-6. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
+6. Load manifest v6: checkpoint-end, physical/catalog redo boundaries, DPT,
+   page size, and catalog bytes (none for a fresh database).
 7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
 8. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open_with_compression(buffer_pool.clone(), wal.clone(), StorageMode::Recovery, compression.clone())`, sharing the same `CompressionRegistry` instance constructed in step 2.
 9. Call `storage.install_schemas(catalog.list_tables()?)`, `storage.install_index_schemas(indexes)`, and `storage.install_sequences(catalog.list_sequences()?)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain catalog indexes and runtime sequence state. Installing schemas also registers each table's/index's compression config into the shared registry (heap = the table's codec + trained dictionary, index files = the same codec but always dict-less — `docs/specs/compression.md` §4, §5a).
 10. Seed the dictionary resolver from the durable dictionary files, **before redo runs**: for every `(dict_id, table_id, bytes)` returned by `dict_store.load_all()`, call `compression.register_dictionary(dict_id, &bytes)`, then advance the catalog's dictionary-id allocator past the highest loaded id (`catalog.reserve_dictionary_id`). This must precede step 11 so a dict-compressed page envelope or WAL FPI replayed there can already resolve its `dict_id`. An orphaned dictionary file (a crash between the file becoming durable and its `CreateDictionary` WAL record's commit) is loaded and registered the same way — harmless — and its id is burned regardless, so a later allocation never collides with it (`docs/specs/compression.md` §7).
 10a. Validate referenced dictionaries (fail fast): for every table returned by `catalog.list_tables()` whose `active_dict_id` or `toast.active_dict_id` is `Some(id)`, check `compression.has_dictionary(id)`; if `id` is not registered by step 10's seeding, return a structured internal `DbError` naming the table, dict field, and dict id instead of proceeding. This first boot-time check runs after step 10's seeding and before step 11's replay, catching a deleted/missing `.dict` file from the checkpointed catalog loudly and immediately rather than as a later, confusing decode error on first read of a dict-compressed page or TOAST value (`docs/specs/compression.md` §7). It validates only each table's CURRENT active dict fields; a historical dict id referenced by an older `FullPageImageCompressed` WAL record is unchecked but always present too, since dict files are never deleted in v1.
-11. Validate `wal.replay_floor <= control.checkpoint_lsn <= wal.durable_end`; any mismatch is fatal corruption/inconsistent restore rather than an empty replay. Then redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`). First pre-scan every generic `CatalogChange`, including aborted/in-flight transactions, to merge all carried allocator high-water marks and register every table/index physical generation's compression configuration. Physical page records then replay under PageLSN gating regardless of transaction outcome; the CLOG hides aborted/in-flight versions. Before dispatch, `apply_redo` normalizes compressed FPIs to raw `FullPageImage` records using the dictionary resolver seeded in step 10. Apply committed catalog changes in LSN order, atomically validating the complete resulting snapshot and reflecting table/index/sequence objects through `RecoveryOperations`; skip aborted/in-flight metadata but apply each skipped change's allocator reservation immediately so a later exact table before-image observes earlier burned column/FK IDs. Reapply the merged reservation after replay so sparse high-water for a relation created by a later committed change is retained. `CreateDictionary` remains a separate physical prerequisite and is commit-gated. Sequence value records replay unconditionally because sequence advancement is non-transactional. These reservations prevent orphan files or catalog IDs from being reused. Primary-key table-object replacement defers its derived identity-tree rebuild until replay and crashed-writer abort resolution finish. If replay applied records, repeat dictionary-reference validation so committed metadata cannot introduce an unresolved active dictionary.
-12. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, the shared `compression` registry and `dict_store` (steps 2/8/10), concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water), and an empty `active_txns` registry (the WAL manager reconstructed its CLOG on `open` — seeded from the durable `clog.dat` snapshot when present plus a fold of the post-snapshot `Commit`/`Abort` records, else rebuilt from those records).
-13. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
+11. Validate both redo boundaries and checkpoint end against the retained/durable
+    WAL range. Pre-scan positioned catalog entries, then replay from the lesser
+    redo boundary. Gate physical records at `page_redo_lsn`, catalog/dictionary
+    records at `catalog_redo_lsn`, and sequence records at `checkpoint_end_lsn`.
+    Fold transaction status and resolve every remaining CLOG in-progress status
+    to aborted after replay, including xids below physical redo.
+12. Create components with checkpoint state initialized from
+    `checkpoint_end_lsn`; allocator scanning covers every retained record,
+    committed subxids, and checkpoint high-water markers.
+13. If replay changed state, run one synchronous fuzzy checkpoint.
 14. Run relation-generation cleanup once while still in startup: retired generations produced by truncate/drop replay and unreferenced orphan files from aborted prepares are removed only after buffer pin checks, and no user reader can exist yet.
 15. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
 16. Construct query service from `components`.
-17. Start Tokio runtime and bind listener.
+17. After recovery and cleanup, start the checkpoint and maintenance OS threads,
+    then start Tokio and bind the listener.
 
 Recovery mode must not append WAL records.
 
 Recovery computes `next_txn_id` from all retained WAL records by calling
 `WalManager::replay_from(0)`, not `replay_committed_from`. This intentionally scans
-records below the control record's `checkpoint_lsn` when they are still retained:
+records below the control record's `checkpoint_end_lsn` when they are still retained:
 that covers the crash window where the manifest and CLOG snapshot are durable but
 the `Checkpoint` marker carrying the transaction-id high-water has not yet been
 appended/flushed. After a completed checkpoint advances the replay floor to the
@@ -227,7 +243,7 @@ The query path is a real transaction lifecycle; autocommit is an implicit single
   top-level Abort/storage/buffer/SSI cleanup and release all object/shared guards.
   Replace the live transaction with a failed shell so protocol state remains `E`
   until ROLLBACK (or failed-block COMMIT), but no locks depend on client cleanup.
-- **COMMIT**: append `Commit` → `flush` (fsync) → `CLOG=Committed` (set inside `flush`) → `storage.commit_txn`/`buffer_pool.commit` cleanup → deregister → release object locks and the shared checkpoint-participant guard → best-effort checkpoint accounting. A read-only explicit transaction still emits no WAL Commit; if it accessed an object, it simply releases its retained shared guard and locks. The slot returns to `Idle` (`'I'`).
+- **COMMIT**: append `Commit` → `flush` (fsync) → `CLOG=Committed` (set inside `flush`) → `storage.commit_txn`/`buffer_pool.commit` cleanup → deregister → release object locks and the nonblocking write-unit token → best-effort checkpoint accounting. A read-only explicit transaction still emits no WAL Commit; if it accessed an object, it simply releases its retained token and locks. The slot returns to `Idle` (`'I'`).
 - **ROLLBACK** (or any statement error): append `Abort` → `CLOG=Aborted` → deregister → metadata/bookkeeping cleanup → release the write guard → `Idle`. The transaction is deregistered only after the Abort append succeeds; if that append fails, the rollback path is treated as a pre-durable cleanup failure (fatal on normal query paths, returned by direct internal/test calls) and the transaction remains active. Abort is **status-based** (Milestone D1, `mvcc.md` §4 Decision 3): there is no page undo. The transaction's modified tuples stay in the heap, hidden by the CLOG and reclaimed by VACUUM. The `storage.rollback_txn`/`buffer_pool.rollback` calls still run after deregistration; `storage.rollback_txn` restores engine-owned DDL metadata, may remove unpublished truncate replacement files that were never committed, and retires rollback-removed published generations until relation snapshots drain, while `buffer_pool.rollback` is a bookkeeping clear that reclaims no row pages. If that cleanup fails, normal query paths exit fatally rather than returning to service with uncertain metadata; direct internal/test calls surface the error. Abort is not fsync-gated (a transaction with no durable `Commit` is recovered as aborted regardless).
 - **Failed (`'E'`) state**: any statement error inside an explicit block poisons it to `'E'` and does **not** end it. While `'E'`, every statement except `COMMIT`/`ROLLBACK` is rejected with `SqlState::InFailedSqlTransaction` (SQLSTATE `25P02`). `COMMIT` of an `'E'` block issues `ROLLBACK` (returns `Idle`). `COMMIT`/`ROLLBACK` with no open block are no-op warnings that stay `Idle`.
 - **Autocommit**: a data/DDL statement with no open block runs as an implicit `BEGIN…COMMIT` around the one statement (allocate, snapshot, execute, commit-or-abort), preserving the prior external behavior exactly. A single autocommit statement has exactly one snapshot, so Read Committed vs Repeatable Read is functionally moot for it; the session default is **not** threaded into the autocommit single-statement snapshot path.
@@ -255,7 +271,7 @@ generation before-images remain transaction-owned; COMMIT retains the replacemen
 and ROLLBACK restores the originals. See `docs/specs/table-locks.md` §8.
 
 - **Maintenance (`VACUUM [ANALYZE] [table]`, `ANALYZE [table]`, `TRUNCATE [TABLE] <name> [, ...]`, `ALTER TABLE <t> SET (...)`, primary-key ALTER, and foreign-key ADD/generic constraint DROP)**: classified `StatementClass::Maintenance` (`statement_class`) and not bound/planned relationally. VACUUM, ANALYZE, and ALTER maintenance forms remain rejected inside explicit transaction blocks with `FeatureNotSupported`; transactional TRUNCATE is the documented exception and routes through the open transaction. Outside a block, `dispatch` and prepared execution carry the raw parsed statement through `QueryService::run_maintenance`:
-  - `Statement::Vacuum { .. }` → `run_vacuum`, which resolves the targets, allocates/registers one maintenance xid, acquires the shared writer guard and xid-owned `Share` on every target, revalidates, and captures the GC horizon (plus the bounded full-pass floor). Full-target revalidation and floor capture occur in one shared catalog-publication critical section, preventing a newly published table with an older unvacuumed aborted xid from falling below the floor. It first identifies and deletes visible hidden-TOAST chunks using that same xid, then appends/flushes exactly one Commit even when no chunks were deleted. Only after the delete is durable does it prune each parent and hidden relation in the required order. Storage/buffer transaction cleanup and xid deregistration happen after commit, but the relation-lock owner token deliberately retains the same xid grants through the nontransactional prune phase and releases them only when the VACUUM statement ends. Thus table and row waits use one graph node and no target writer enters between cleanup and prune. Pre-commit failure aborts and skips parent pruning; physical-prune failure after the cleanup commit is safe to retry. The maintenance commit does not recursively trigger auto-prune. Command tag `VACUUM`. **F4c:** a FULL pass captures `B = min(next_txn_id, oldest_active_xid)` after locks, while its maintenance xid is active, and advances the floor only after pruning. A single-table VACUUM does not advance the floor.
+  - `Statement::Vacuum { .. }` → `run_vacuum`, which resolves the targets, allocates/registers one maintenance xid, acquires the shared writer guard and xid-owned `Share` on every target, revalidates, and captures the GC horizon (plus the bounded full-pass floor). Full-target revalidation and floor capture occur in one shared catalog-publication critical section, preventing a newly published table with an older unvacuumed aborted xid from falling below the floor. It first identifies and deletes visible hidden-TOAST chunks using that same xid, then appends/flushes exactly one Commit even when no chunks were deleted. Only after the delete is durable does it prune each parent and hidden relation in the required order. Storage/buffer transaction cleanup and xid deregistration happen after commit, but the relation-lock owner token deliberately retains the same xid grants through the nontransactional prune phase and releases them only when the VACUUM statement ends. Thus table and row waits use one graph node and no target writer enters between cleanup and prune. Pre-commit failure aborts and skips parent pruning; physical-prune failure after the cleanup commit is safe to retry. The maintenance commit does not recursively trigger automatic VACUUM. Command tag `VACUUM`. **F4c:** a FULL pass captures `B = min(next_txn_id, oldest_active_xid)` after locks, while its maintenance xid is active, and advances the floor only after pruning. A single-table VACUUM does not advance the floor.
   - `Statement::Analyze { table }` → `run_analyze_pass` (`crates/server/src/query/analyze.rs`, `docs/specs/statistics.md` §5): resolves one named live user table (a hidden/non-user relation reads as undefined) or every user table sorted by id, allocates/registers one maintenance xid, acquires the shared writer guard and xid-owned `AccessShare` on every target with the same acquire-and-revalidate loop as VACUUM (writers keep flowing — only `AccessExclusive` DDL conflicts), captures a registered reader snapshot (its advertised xmin holds back concurrent VACUUM's GC horizon), collects per-table statistics via the streaming sampler with the session's `default_statistics_target`, then — under the catalog publication gate — appends one generic catalog change containing all target statistics before the in-memory catalog update, appends exactly one `Commit`, and holds the gate through its WAL flush. This prevents concurrent ANALYZE from capturing an uncommitted statistics image as its durable before-state; a crash mid-pass applies none of the targets. Statistics updates do not bump `schema_version`, so cached prepared plans stay valid. Command tag `ANALYZE`. `Statement::Vacuum { analyze: true, .. }` chains this pass after `run_vacuum` with the `VACUUM` tag.
   - `Statement::Truncate { .. }` → `run_truncate`, which resolves the complete ordered user-table target list, allocates/registers one maintenance `txn_id`, acquires the shared writer guard, takes xid-owned `AccessExclusive` on every target plus `AccessShare` on incoming FK children, and revalidates before burning storage ids. An incoming child outside the target set is a `2BP01` dependency error; child-only, self, cyclic, and complete parent/child target sets are allowed. The catalog builds every post-truncate schema without publishing; the server appends one generic catalog change for the complete replacement set before storage initializes every empty replacement heap/primary-index/secondary-index file. Before appending/flushing one `Commit`, the server takes the catalog publication gate and `relation_publish_gate` write side and holds both until catalog/storage publish the complete batch, so neither catalog rollback nor snapshot capture can observe a partial publication. Pre-commit failure rolls back every prepared storage generation. After durable batch publication, storage/buffer commit cleanup runs once, the xid is deregistered, lock waiters are awakened, checkpoint accounting runs once, and one best-effort retired-generation cleanup pass follows. Post-commit publication or cleanup failure is fatal because recovery will replay the committed batch. Command tag `TRUNCATE TABLE`.
   - `Statement::AlterTableSetCompression { .. }` → `run_alter_table_compression` (below).
@@ -276,12 +292,15 @@ storage latches. The gate is never held while waiting for an object lock.
   4. **WAL + flush (durable commit point).** Append `CreateDictionary` (only if step 3 trained one), then the generic catalog change carrying the table metadata, then `Commit` — one combined `wal.flush()` after all three (immediate-commit maintenance DDL). The maintenance xid is registered while these records are prepared. Any error or statement cancellation before the commit flush appends `Abort`, rolls back storage/buffer bookkeeping, deregisters the xid, and removes the prepared dictionary from both the resolver and durable dictionary store; its allocated id remains burned.
   5. **Catalog + registry.** Install the new setting into the catalog (`catalog.set_table_compression`, which also reserves `active_dict_id` if `Some`) and into the storage engine's file-compression registry (`storage.set_table_compression`) — heap file plus every live index file of the table.
   6. **Rewrite (an FPI per page).** `storage.rewrite_table_pages(&schema)` re-encodes every initialized target heap/index page, logs/stamps one FPI per page, and returns the deduplicated target file-id set with the touched count.
-  7. **WAL flush (write-ahead of the page flush).** `wal.flush()` makes every rewrite FPI from step 6 durable before any of those pages are written back. This is required because `buffer_pool.flush_dirty_pages()` does not gate on PageLSN at all — it assumes the caller already flushed the WAL — so skipping this step would not produce a loud error; it would let a torn page write precede its FPI being durable, i.e. silent corruption on recovery.
-  8. **Target-file flush, sync, mark clean.** Call
-     `flush_dirty_pages_for_files(file_ids)`, `store.sync_files(file_ids)`, then
-     `mark_files_clean(file_ids)`. Target `AccessExclusive` makes that set stable;
-     unrelated writer frames are never flushed or cleared. Do not mark after error.
-  9. **Release, then checkpoint-account.** The table lock, catalog publication gate, and shared writer guard release strictly before `record_commit_and_maybe_checkpoint_after_durable_commit`, which may acquire the exclusive checkpoint guard. The rewrite's WAL activity therefore counts toward `--checkpoint-wal-bytes` immediately. Command tag `ALTER TABLE`.
+  7. **WAL flush (write-ahead of the page flush).** `wal.flush()` makes every rewrite FPI from step 6 durable before any of those pages are written back. The following buffer flush also calls its `FlushPolicy::ensure_durable()` as a defensive WAL-before-data boundary; this explicit flush remains intentional because it establishes the maintenance phase's durability point before file-scoped I/O begins.
+  8. **Target-file flush, sync, conditional clean.** Call
+     `flush_dirty_pages_for_files(file_ids)`, which reserves against checkpoint
+     flushes, writes and syncs the files, then cleans only unchanged captured
+     generations. Target `AccessExclusive` makes that set stable; unrelated writer
+     frames are never flushed or cleared, and failures retain dirty state.
+  9. **Checkpoint-account.** After publication, accounting may enqueue a
+     background checkpoint; it never waits for checkpoint I/O. Command tag
+     `ALTER TABLE`.
 
   Crash behavior mirrors other immediate-commit DDL: a crash before step 4's flush leaves the DDL uncommitted (CLOG-gated on replay, so it is skipped — see `docs/specs/crates/wal.md`); a persisted-but-unreferenced dictionary file from step 3 is orphaned but harmless. A returned pre-commit error is different from a crash: orderly rollback removes that file and its in-memory registration. A crash during/after the rewrite leaves the catalog change durable and the files holding a self-describing mix of old- and new-encoding pages; a page torn mid-write during step 8's flush is **repaired by redo** replaying that page's FPI from step 6, exactly like any other page-write path — recovery does not depend on the `ALTER` being re-run. The rewrite as a whole is still **not** auto-resumed past whatever page range it reached — re-running the same `ALTER` completes an interrupted (cleanly mixed-encoding) rewrite (`compression.md` §8).
 - **`ALTER TABLE <t> SET (toast = ..., toast_tuple_target = ..., toast_min_value_size = ..., toast_compression = ...)`**: `run_alter_table_toast_options` runs with the shared writer guard, catalog publication gate, and target `AccessExclusive` lock but is **future-write-only**. It updates the table's durable TOAST policy and optional active value dictionary; it does not rewrite existing parent rows and does not rewrite existing hidden TOAST chunks. Existing rows remain readable because every inline-compressed or external value carries its own physical codec, dictionary id, raw length, and CRC metadata.
@@ -297,20 +316,22 @@ storage latches. The gate is never held while waiting for an object lock.
 - **COPY (`COPY <table> [(cols)] FROM STDIN | TO STDOUT`)**: classified `StatementClass::Copy(direction)`. `dispatch` binds the statement and resolves its target. COPY FROM then allocates/registers its autocommit xid (or uses the open transaction xid), acquires/carries the shared writer guard, takes xid-owned `RowExclusive`, and revalidates; COPY TO takes statement- or transaction-owned `AccessShare`. Only then does either direction capture the MVCC/relation snapshot and an immutable catalog/introspection snapshot before returning `BeginCopyIn`/`BeginCopyOut`; all three cross the protocol boundary and remain fixed through stream completion. Autocommit COPY carries its table-lock guard through the streaming worker; an explicit transaction retains its lock through top-level completion unless `ROLLBACK TO` restores a savepoint predating its acquisition. The bound `CopyJob` carries the resolved `TableSchema`, so the worker does not re-read live catalog column/type/default metadata. COPY remains simple-query only. COPY FROM streams into the transaction and commits on `CopyDone`; `CopyFail`, row error, or disconnect aborts. COPY TO scans under its captured statement relation snapshot and autocommit or retained transaction MVCC snapshot. Command tag `COPY n`; a mid-stream error sends `ErrorResponse` without `CopyDone`, and `ReadyForQuery` waits until inbound COPY is drained to its terminator.
 - **Disconnect**: an open transaction held on a dropped `Session` is aborted (status-based: `Abort` record + `CLOG=Aborted` + write-guard release + deregister, no page undo), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry. A disconnect mid-`COPY FROM` drops the channel, so the blocking task sees no `Done` and aborts (no partial commit).
 
-### Concurrency — Stage 2 (concurrent readers AND writers; Milestone E)
+### Concurrency
 
-As of Milestone E2b the global writer lock is **inverted** into a shared-writer / exclusive-checkpoint guard (`common.md`, `mvcc.md` §10 E2b), so write-transactions now run concurrently.
+Transactions and fuzzy checkpoints run concurrently. The retained write-unit
+token is nonblocking and has no checkpoint side.
 
-- **Readers use table locks.** An autocommit plain read takes no controller guard. Before an explicit transaction's first object lock, even for a read, it acquires and retains the shared checkpoint-participant guard. Plain reads take `AccessShare`; a locking SELECT is promoted through the transaction-owned path, takes `RowShare`, and retains tuple locks until statement commit or explicit top-level completion.
+- **Readers use table locks.** Plain reads take `AccessShare`; locking SELECT
+  takes `RowShare` and retains tuple locks to transaction completion.
 - **Writers run concurrently.** Autocommit writes acquire the shared writer guard before object locks. An explicit transaction already holds that same shared side before any retained object lock and reuses it if a later statement writes. It releases the guard at top-level completion. Write-write safety comes from table/row conflicts and storage structural latches.
 - **DDL is catalog-serialized and relation-scoped.** DDL is transactional and
   uses a transaction-local catalog overlay and the shared writer guard,
   the documented object locks, and only then a catalog publication gate so whole-catalog
   rollback cannot overlap another DDL. CREATE INDEX's `Share` lock provides its stable
   target-table chain view; unrelated table readers and writers remain concurrent.
-- **Checkpoint excludes participants.** `run_checkpoint` takes the **EXCLUSIVE** checkpoint guard (`begin_checkpoint`), which drains all in-flight writers plus explicit transactions that retained the shared participant before an object lock, then runs alone — preserving the "no in-flight writer at checkpoint" invariant verbatim (so every transaction below the new replay floor is settled and captured by `persist_clog`'s snapshot, keeping recovery correct without a fuzzy checkpoint). The `acquire-at-most-one-writer-guard-per-transaction` reentrancy tripwire is now a cheap correctness assertion (the shared guard is re-entrant), not a deadlock guard.
-
-Deferred from Milestone E (`mvcc.md` §12): a fully-concurrent / B-link writer protocol and a fuzzy checkpoint (checkpointing with writers in flight).
+- **Checkpoint uses publication fences.** Page guards and sequence publication
+  hold the shared buffer fence. Final checkpoint metadata briefly combines its
+  exclusive side with catalog/relation read gates, then releases them before I/O.
 
 ### Snapshot capture (per isolation)
 
@@ -346,18 +367,20 @@ and takes only its ordinary read locks. EXPLAIN ANALYZE is promoted to the locki
 transaction lifecycle, upgrades the target to `RowShare`, and retains tuple locks
 exactly as executing the locking SELECT would.
 
-Statement guard policy:
+Statement lock/lifecycle policy (the former checkpoint-participant controller is
+now only a compatibility lifetime marker and enforces no exclusion):
 
 - No `ConcurrencyController` guard: autocommit plain SELECT, plain EXPLAIN, and analyzed
   EXPLAIN that does not mutate sequences. Explicit transactions take the shared side before their first
   object lock. Both take `AccessShare` and may wait for relation-changing work.
-- Shared writer/participant guard (`begin_writer`, many concurrent): all writes,
+- Compatibility write-unit marker: all writes,
   locking SELECT, DDL, and WAL-writing maintenance, including analyzed EXPLAIN
   whose SELECT calls `nextval` or `setval`; plus an explicit transaction before
   its first object lock even when that statement is read-only. DDL takes the
   catalog publication gate only after object locks. Plain EXPLAIN never advances
   sequences.
-- Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): actual checkpoint and its internal auto-prune only. Existing readers take no controller guard; relation locks separately exclude conflicting table access.
+- Checkpoint uses no controller guard. Its only exclusive fence is the brief
+  final buffer-publication snapshot; relation locks remain independent.
 
 Simple-query bind discovers relation ids before snapshot capture; execution then
 acquires table locks, revalidates the bound schema, and captures the statement's
@@ -402,9 +425,12 @@ table/index/sequence mutation forms.
 
 If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails before the commit record is durable, the server treats that as fatal. It logs the rollback failure, attempts to flush WAL, and exits instead of returning to service with possibly visible partial statement state.
 
-`storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback and must not restore the catalog. Treat it as a fatal internal error: log it, flush WAL, and terminate the process because recovery will replay the durable commit.
+`storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. Explicit transaction completion invokes them for every live savepoint subxid and then the top-level xid, resolving each transaction-keyed catalog redo pin only after durable catalog/storage publication. Top-level abort rolls back the live subxids in reverse order before the top-level xid; `ROLLBACK TO` continues to settle only the rolled-back subxids. For a valid `txn_id`, cleanup should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback and must not restore the catalog. Treat it as a fatal internal error: log it, flush WAL, and terminate the process because recovery will replay the durable commit.
 
-Checkpoint may run after successful writes according to configured thresholds. It is called after the statement/transaction guard is released because `run_checkpoint` acquires the exclusive checkpoint guard, which must drain all writers (including this connection's, were it still held). If the triggered checkpoint fails, the write remains committed and the query/COPY/COMMIT path still returns success; surfacing the failure as a normal SQL error would invite clients to retry a transaction that already committed. The server logs the checkpoint failure and leaves the commit accounting in a state that lets a later write retry the checkpoint.
+Successful writes update checkpoint counters and may signal the background
+coordinator, but never run or await checkpoint I/O. A later checkpoint failure
+cannot change the already durable client outcome; the request and counters remain
+pending for retry.
 
 `ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>`. Startup uses it for `install_schemas`, `install_index_schemas`, `install_sequences`, and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine`, to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`, and to `StatementContext.sequence_manager` as `Arc<dyn SequenceManager>`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
@@ -418,9 +444,9 @@ A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`
 
 Once an autocommit operation has crossed its durable commit boundary, a later timeout or `CancelRequest` cannot replace its terminal success with an `ErrorResponse`. A completed terminal frame wins a simultaneous cancellation race. If the terminal write is still pending when cancellation is observed, however, the connection closes because the socket may contain a partial frame; the durable database outcome remains successful. This applies to simple and extended execution, completed session resets, and successful autocommit `COPY FROM`; direct or explicit-transaction outcomes remain cancelable until their terminal response.
 
-COPY IN/OUT retains its in-flight shutdown guard while its blocking worker owns database work, then normally releases the guard immediately after joining the worker and restoring transaction state, before terminal socket responses. If a restored explicit transaction still owns a writer guard, the in-flight guard is retained through the response/drain boundary so graceful shutdown times out safely instead of entering a checkpoint that would block behind that transaction. Thus a non-reading client cannot make shutdown skip its final checkpoint after settled autocommit/read-only COPY work or bypass the timeout gate while a write transaction remains open.
+COPY IN/OUT retains its in-flight shutdown guard while its blocking worker owns database work, then normally releases the guard immediately after joining the worker and restoring transaction state, before terminal socket responses. If a restored explicit transaction still owns a write-unit token, the in-flight guard is retained through the response/drain boundary so graceful shutdown does not discard an open session outcome. Thus a non-reading client cannot make shutdown skip its final checkpoint after settled autocommit/read-only COPY work or bypass the timeout gate while a write transaction remains open.
 
-A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the auto-prune dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
+A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the automatic VACUUM dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
 
 ## Checkpoint Orchestration
 
@@ -504,43 +530,61 @@ with later `Commit`/`Abort` records, or rebuilt from retained WAL when no
 snapshot exists; see `docs/specs/crates/wal.md`), separate from this registry
 of still-running transactions.
 
-Checkpoint flushes dirty pages in place to the heap and advances the redo
-boundary; its cost is O(pages changed), not O(database size). Driven by the
-server under the **exclusive checkpoint guard** (E2b), which drains all in-flight
-shared writers and runs alone:
+The checkpoint worker snapshots the current dirty keys and processes fixed-size
+batches without adding later dirties. Each candidate is copied under a nonblocking
+page latch, WAL-forced, written, and file-fsynced; generation comparison then
+cleans it or retains the first redirty boundary.
 
-1. Acquire the exclusive checkpoint guard (`begin_checkpoint`) — waits for all shared writer/explicit-transaction participants to drain, then holds off new participants until the checkpoint returns.
-1a. **Full maintenance (Milestone F4b/F4c, `mvcc.md` §9).** When the dead-row threshold is reached or `wal.needs_clog_maintenance()` reports status pressure, capture `horizon = gc_horizon()` under the checkpoint guard and run the full pass before flushing dirty pages. The CLOG safety trigger remains active when the configured dead-row threshold is zero. Capture the vacuum boundary as `B = min(next_txn_id, oldest_active_xid)`, treating no active xid as `next_txn_id`; an xid registered before blocking on this checkpoint therefore holds the floor back. Advance the floor and reset the counter only after the pass. The same checkpoint flushes/fsyncs the vacuum pages before `persist_clog` may prune aborted entries below `B`, preserving the F4c durability order.
-2. `wal.flush()` (a page's redo must be durable before the page is written).
-3. `buffer_pool.flush_dirty_pages()` — write every flushable dirty page to the heap `PageStore`. With the relaxed flush gate (Milestone D1, `mvcc.md` §8) this spills committed, aborted, and — under Stage 2 — in-flight dirty pages alike; all are WAL-durable after (2), and the CLOG hides the non-committed tuples.
-4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
-5. `checkpoint_lsn = wal.flushed_lsn()`.
-6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point. Before serializing `catalog_bytes`, checkpoint overlays storage's live sequence `(last_value, is_called)` values into the catalog snapshot so the control record contains the current sequence baseline.
-6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` (every transaction outcome plus both floors) before recycling, so it remembers every outcome below the new replay floor (`mvcc.md` §5.4).
-7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark, `wal.flush()`, then `wal.recycle_through(checkpoint_lsn)`. This atomically advances `wal.meta` and unlinks only wholly obsolete 16 MiB segments; it never rewrites retained WAL. It is safe because `persist_clog` ran first and the exclusive guard excludes writers. The vacuum floor bounds only `clog.dat` pruning.
-8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
-9. Relation-generation cleanup: storage attempts to remove truncate/drop-retired generations whose `Arc` snapshots are no longer referenced and untracked orphan files whose buffer frames are not pinned or in transition. Files still tracked by live storage metadata, rollback metadata, or pending retired generations are protected; dropped metadata is not live protection once commit has queued its retired generation.
-10. Release the exclusive checkpoint guard.
+Final metadata capture briefly holds the catalog/relation publication read gates
+and exclusive buffer fence. It snapshots the final DPT, catalog with live sequence
+baseline, pending catalog redo pin, active xids/allocation boundary, and written
+WAL end. Those guards are released before serialization or I/O. The worker then:
 
-The durability-critical ordering is: heap fsync (4) before the control record (6) before WAL replay-floor advancement (7). A crash before the control record falls back to the previous redo boundary, where this cycle's full-page images repair any torn heap writes.
+1. computes physical/catalog redo boundaries and their minimum replay floor;
+2. appends the three-boundary checkpoint marker with xid high-water;
+3. persists CLOG v3 with captured in-progress xids, flushing the marker and
+   authorizing the replay floor;
+4. atomically stores manifest v6 (checkpoint commit point);
+5. advances/recycles segmented WAL and runs best-effort relation cleanup.
+
+Automatic VACUUM and ANALYZE are separate serialized background jobs using the
+same component-level paths and relation locks as their SQL commands.
 
 `checkpoint.rs` exposes component-level APIs, not query-service APIs:
 
 ```rust
 pub struct CheckpointState {
-    pub last_checkpoint_lsn: AtomicU64,
+    pub last_checkpoint_end_lsn: AtomicU64,
+    pub wal_trigger_lsn: AtomicU64, // post-marker baseline for workload pressure
     pub commits_since_checkpoint: AtomicU64,
     pub checkpoints: AtomicU64, // count of completed checkpoints (observability/tests)
+    pub last_busy_or_skipped: AtomicU64,
 }
+
+pub struct CheckpointCoordinator { /* generations, running/stop/error, condvar */ }
 
 pub fn run_checkpoint(components: &ServerComponents) -> Result<()>;
 pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Result<()>;
 pub fn record_commit_and_maybe_checkpoint_after_durable_commit(components: &ServerComponents);
 ```
 
-`run_checkpoint` resets `last_checkpoint_lsn` to the checkpoint LSN and `commits_since_checkpoint` to `0` after the control record and WAL checkpoint marker are durable. `record_commit_and_maybe_checkpoint` is called after each successful write statement, after the statement write guard has been dropped. It increments `commits_since_checkpoint` and triggers `run_checkpoint` when either `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. If checkpoint fails, leave the counters unchanged except for the recorded commit so a later write can retry.
+Commit accounting only calls `CheckpointCoordinator::request`. Requests coalesce;
+a successful pass subtracts only the commit count captured at its start, preserving
+concurrent increments, and immediately requests a follow-up if thresholds remain
+exceeded. WAL-byte accounting starts after the successful pass's own checkpoint
+marker, so checkpoint-generated WAL cannot retrigger an otherwise idle worker.
+If a candidate is momentarily busy, the pass publishes the skipped count and
+requests a follow-up over the next dirty-key snapshot after exponential backoff
+from 100 ms up to 5 seconds, avoiding an I/O-tight loop around a persistently
+latched page. The backoff waits on the coordinator condition variable, so a new
+request or worker stop interrupts it immediately.
+Failure retains request/counters and waits for a signal or bounded retry.
 
-**Auto-prune threshold metric (F4b).** `ServerComponents.dead_rows_since_vacuum: AtomicU64` tracks committed dead versions since the last auto-prune. Each committed `DELETE` row and each committed `UPDATE` row creates one dead version, so the commit paths add the affected-row count from a `DELETE`/`UPDATE` result to this counter **only on a successful, durable commit** (`ServerComponents::add_dead_versions`): the autocommit-write path adds it before `record_commit_and_maybe_checkpoint`; an explicit transaction accumulates each statement's count on the `Transaction` and folds the total in on `COMMIT` (never on `ROLLBACK`/abort — a rolled-back delete/update produces no committed dead version). The counter is purely additive and never requires a scan to decide whether to prune; over-counting (e.g. a version a live snapshot still pins, so not yet reclaimable) only triggers an extra, harmless pass. The checkpoint reads and resets it in step (1a) above. Independently, `WalManager::needs_clog_maintenance` forces the same full pass before an unreclaimed abort-pinned CLOG window reaches the durable format cap, including when the configured dead-row trigger is zero. Commit-only status growth needs no VACUUM because the next snapshot advances the committed floor directly.
+Dead-row and changed-row counters enqueue the independent maintenance worker.
+Each successful full pass subtracts only its captured counter value. CLOG pressure
+prioritizes full VACUUM; checkpoints below the hard format limit do not wait for it.
+Shutdown requests cancellation on an active maintenance pass and joins that worker
+before requesting the final checkpoint.
 
 ## Connection Handling
 
@@ -629,8 +673,7 @@ transaction slot keeps the invariant that a connection acquires the (shared) wri
 guard at most once per transaction, so an extended write on a connection already
 inside a write transaction never acquires a second guard. Under E2b the shared guard
 is re-entrant (a second acquire would not self-deadlock), so this is now a cheap
-correctness assertion — leaking a second guard would keep a writer in flight past
-commit/abort and could stall a checkpoint draining writers. `Sync` sends
+correctness assertion that keeps ownership and cleanup singular. `Sync` sends
 `ReadyForQuery`; `Flush` flushes; `Close` drops a statement or portal and replies
 `CloseComplete`. `Close` is not a timed statement, so stale cancellation recorded
 while the backend was idle does not interrupt its response. An error inside an extended sequence sends `ErrorResponse` and then
@@ -738,14 +781,18 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 ## Acceptance Tests
 
 - Startup with no control record creates empty catalog and empty storage.
-- Startup with a control record loads the redo boundary and catalog.
-- Recovery redoes every record after the control record's checkpoint LSN
-  regardless of transaction outcome, and the CLOG seeded/folded at WAL open
+- Startup with a control record loads its checkpoint-end boundary, independent
+  physical/catalog redo boundaries, DPT, and catalog.
+- Recovery replays positioned physical records inclusively from `page_redo_lsn`,
+  catalog/dictionary records inclusively from `catalog_redo_lsn`, and sequence
+  changes from `checkpoint_end_lsn`, while the CLOG seeded/folded at WAL open
   decides visibility; without `clog.dat`, retained WAL is the reconstruction
   fallback. A transaction in-flight at crash is recovered as aborted.
 - Failed write rolls back buffer pages and does not append commit.
 - Successful write appends commit, flushes WAL, commits buffer before returning.
-- Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.
+- Checkpoint incrementally flushes only its captured dirty-key start set, persists
+  the final DPT and all three boundaries, and advances recycling only through the
+  minimum physical/catalog redo floor.
 - Protocol startup and simple query work over a loopback TCP connection.
 - An extended-protocol Parse/Bind/Describe/Execute/Sync sequence runs a parameterized query over a loopback connection with both text and binary parameter and result encodings.
 - An error inside an extended sequence is reported and the following messages are skipped until Sync, after which the connection is reusable.

@@ -307,11 +307,12 @@ operation; recovery never appends WAL (`docs/specs/crates/wal.md`).
   records before updating live sequence state and returning. This makes a value
   handed to a client durable even if the surrounding transaction later aborts or
   the process crashes before another commit/checkpoint/shutdown flush.
-- **Checkpoint:** `run_checkpoint` (`server/src/checkpoint.rs`) already
-  serializes the catalog under the exclusive guard. It additionally pulls each
-  sequence's current `(last_value, is_called)` from the `SequenceManager` into
-  the snapshot baseline before writing the control record, and WAL recycling
-  proceeds as today.
+- **Checkpoint:** during the short final metadata capture, `run_checkpoint`
+  (`server/src/checkpoint.rs`) holds the catalog and relation-publication read gates
+  plus the checkpoint fence exclusively. It pulls each sequence's current
+  `(last_value, is_called)` from the `SequenceManager` into the snapshot baseline;
+  sequence WAL append plus runtime publication holds the shared fence, so the
+  baseline and `checkpoint_end_lsn` cannot split one publication unit.
 - **Recovery:** load sequence definitions + baseline values from the manifest;
   reserve sequence ids from all catalog allocator high-water values; apply
   committed sequence mutations, and unconditionally

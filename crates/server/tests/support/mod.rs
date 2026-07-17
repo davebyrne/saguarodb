@@ -70,12 +70,42 @@ impl TestServer {
             .load(std::sync::atomic::Ordering::Acquire) as usize
     }
 
-    /// The current dead-versions-since-last-auto-prune accumulator (Milestone F4b).
+    /// The current dead-version accumulator represented by background VACUUM.
     pub fn dead_rows_since_vacuum(&self) -> u64 {
         self.app
             .components
             .dead_rows_since_vacuum
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until the serialized maintenance worker has successfully represented
+    /// all currently accumulated dead versions.
+    pub async fn wait_for_automatic_vacuum(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.dead_rows_since_vacuum() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| common::DbError::internal("timed out waiting for automatic VACUUM"))
+    }
+
+    /// Wait until the serialized maintenance worker has successfully represented
+    /// all currently accumulated row changes in optimizer statistics.
+    pub async fn wait_for_automatic_analyze(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self
+                .app
+                .components
+                .rows_changed_since_analyze
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| common::DbError::internal("timed out waiting for automatic ANALYZE"))
     }
 
     /// Attach resolved FK metadata for executor/concurrency integration tests
@@ -201,6 +231,24 @@ impl TestServer {
         tokio::task::spawn_blocking(move || run_checkpoint(&app.components))
             .await
             .map_err(|err| common::DbError::internal(format!("checkpoint task failed: {err}")))?
+    }
+
+    pub fn catalog_redo_pin(&self) -> Result<Option<common::Lsn>> {
+        self.app
+            .components
+            .storage
+            .catalog_redo_tracker()
+            .oldest_pending()
+    }
+
+    pub fn checkpoint_catalog_bounds(&self) -> Result<(common::Lsn, common::Lsn)> {
+        let control = self
+            .app
+            .components
+            .control
+            .load()?
+            .ok_or_else(|| common::DbError::internal("checkpoint control data is missing"))?;
+        Ok((control.catalog_redo_lsn, control.checkpoint_end_lsn))
     }
 
     /// Wait until normal storage has appended a heap insert for `table`. This is

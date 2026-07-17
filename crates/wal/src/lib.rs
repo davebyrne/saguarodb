@@ -24,7 +24,13 @@ pub use codec::{decode_record, encode_record};
 pub use file::FileWalManager;
 pub use record::{WalRecord, WalRecordKind, is_redo_operation};
 
-use common::{Lsn, Result, TxnId, TxnStatusView};
+use common::{Lsn, Result, TxnId, TxnStatusView, WalPosition};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalEntry {
+    pub replay_from: Lsn,
+    pub record: WalRecord,
+}
 
 /// A WAL manager is also a [`TxnStatusView`] (backed by its in-memory CLOG): the
 /// supertrait lets the storage engine — which already holds an
@@ -46,15 +52,43 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// implicit-committed floor past it, making its rolled-back versions read as
     /// committed (the `Clog::live_snapshot` precondition). `Commit` records, by
     /// contrast, only affect the CLOG once durable (staged pending until `flush`).
-    fn append(&self, record: WalRecord) -> Result<Lsn>;
+    fn append_positioned(&self, record: WalRecord) -> Result<WalPosition>;
+    fn append(&self, record: WalRecord) -> Result<Lsn> {
+        Ok(self.append_positioned(record)?.record_lsn)
+    }
     fn flush(&self) -> Result<Lsn>;
+    fn written_lsn(&self) -> Result<Lsn> {
+        Ok(self.flushed_lsn())
+    }
     /// Replay every retained record after `lsn`, in LSN order. Redo-all recovery
     /// (`docs/specs/mvcc.md` §8) iterates this and applies the page-mutation
     /// records ([`is_redo_operation`]); the CLOG (rebuilt at open) decides
     /// visibility afterwards.
-    fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
+    fn replay_entries_from(
+        &self,
+        replay_from: Lsn,
+    ) -> Result<Box<dyn Iterator<Item = Result<WalEntry>>>> {
+        let mut previous = replay_from;
+        Ok(Box::new(self.replay_from(replay_from)?.map(
+            move |record| {
+                let record = record?;
+                let entry = WalEntry {
+                    replay_from: previous,
+                    record,
+                };
+                previous = entry.record.lsn;
+                Ok(entry)
+            },
+        )))
+    }
+    fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
+        Ok(Box::new(
+            self.replay_entries_from(lsn)?
+                .map(|entry| entry.map(|entry| entry.record)),
+        ))
+    }
     /// Advance the replay floor to the boundary established by the latest
-    /// successful [`WalManager::persist_clog`]. Reusing that boundary token keeps
+    /// successful [`WalManager::checkpoint_clog`]. Reusing that boundary token keeps
     /// recycling O(1) without accepting an arbitrary byte position inside a frame.
     fn recycle_through(&self, lsn: Lsn) -> Result<()>;
     fn flushed_lsn(&self) -> Lsn;
@@ -72,26 +106,24 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// retained range. Positions at or beyond the current end return zero.
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 
-    /// Persist a durable CLOG snapshot (`clog.dat`) covering WAL records through
-    /// `clog_lsn` (`docs/specs/mvcc.md` §5.4). The checkpoint calls this after the
-    /// heap and control record are durable and **before** advancing the WAL replay
-    /// floor, so the snapshot remembers every transaction outcome that becomes
-    /// logically obsolete. `clog_lsn` must equal the current durable WAL end, so
-    /// it is necessarily a frame boundary and becomes the only boundary accepted
-    /// by a subsequent replay-floor advance. It writes the envelope atomically (temp file + rename +
-    /// directory fsync), then prunes the in-memory CLOG to the same live window. Recovery loads
-    /// it at the next open and replays only the post-`clog_lsn` `Commit`/`Abort`
-    /// records on top.
-    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
+    /// Persist the checkpoint transaction-status snapshot and authorize the
+    /// proposed replay floor. Implementations must not authorize recycling when
+    /// durable snapshot replacement fails.
+    fn checkpoint_clog(
+        &self,
+        proposed_replay_floor: Lsn,
+        captured_active: &[TxnId],
+        allocation_boundary: TxnId,
+    ) -> Result<()>;
 
     /// Advance the **vacuum floor** (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c):
-    /// the boundary `B` below which a FULL VACUUM pass (every user table, under the
-    /// exclusive guard) has reclaimed every aborted-creator tuple. The caller
-    /// captures `B = next_txn_id` at the *start* of such a pass (under the guard, so
-    /// no id is allocated mid-pass) and calls this *after* the pass completes; the
+    /// the boundary `B` below which a FULL VACUUM pass (every user table, protected by
+    /// target relation locks and active-xid registration) has reclaimed every
+    /// aborted-creator tuple. The caller captures the allocation and active-xid
+    /// boundaries atomically at the start of the pass and calls this *after* it completes; the
     /// floor takes `max(current, boundary)`.
     ///
-    /// Effect: [`WalManager::persist_clog`]'s snapshot drops the explicit entry of an
+    /// Effect: [`WalManager::checkpoint_clog`]'s snapshot drops the explicit entry of an
     /// aborted transaction whose id is `< vacuum_floor` (its on-disk versions are
     /// reclaimed, so it reads implicit-committed below the floor — vacuously correct),
     /// which bounds how long the durable CLOG must remember it. WAL replay-floor
@@ -100,7 +132,7 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     ///
     /// **Durable across restart when a CLOG snapshot exists.** The vacuum floor is
     /// persisted in the durable CLOG snapshot (`clog.dat`, written by
-    /// [`WalManager::persist_clog`]) and reloaded at open, so a full VACUUM's
+    /// [`WalManager::checkpoint_clog`]) and reloaded at open, so a full VACUUM's
     /// reclamation horizon survives restart. Before a fresh WAL's replay floor has
     /// advanced, an absent snapshot means the floor falls
     /// back to its conservative initial value — safe, since the snapshot simply retains
@@ -138,6 +170,10 @@ pub trait WalManager: Send + Sync + TxnStatusView {
         &self,
         writer_xids: &std::collections::HashSet<u64>,
     ) -> Result<()>;
+
+    fn resolve_all_in_flight_as_aborted(&self) -> Result<()> {
+        self.resolve_in_flight_as_aborted(&std::collections::HashSet::new())
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +183,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use common::{ErrorKind, Lsn, Result, TxnStatusView};
+    use common::{ErrorKind, Lsn, Result, TxnStatus, TxnStatusView};
 
     use super::{
         FileWalManager, WalManager, WalRecord, WalRecordKind, decode_record, encode_record,
@@ -412,6 +448,44 @@ mod tests {
     }
 
     #[test]
+    fn positioned_replay_includes_the_record_at_the_requested_start_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path()).unwrap();
+        let first = wal
+            .append_positioned(WalRecord::insert_for_test(1, 10))
+            .unwrap();
+        let second = wal
+            .append_positioned(WalRecord::insert_for_test(2, 20))
+            .unwrap();
+        assert_eq!(first.record_lsn, second.replay_from);
+
+        let entries = wal
+            .replay_entries_from(second.replay_from)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].replay_from, second.replay_from);
+        assert_eq!(entries[0].record.txn_id, 2);
+    }
+
+    #[test]
+    fn checkpoint_captures_writer_started_after_active_id_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path()).unwrap();
+        wal.append(WalRecord::insert_for_test(40, 1)).unwrap();
+        // The checkpoint captured allocation boundary 40 before xid 40 registered,
+        // but its WAL append completed before the CLOG snapshot acquired WAL state.
+        wal.checkpoint_clog(0, &[], 40).unwrap();
+        drop(wal);
+
+        let reopened = FileWalManager::open(dir.path()).unwrap();
+        assert_eq!(reopened.status(40), TxnStatus::InProgress);
+        reopened.resolve_all_in_flight_as_aborted().unwrap();
+        assert_eq!(reopened.status(40), TxnStatus::Aborted);
+    }
+
+    #[test]
     fn flush_advances_durable_lsn_and_commit_visibility() {
         let dir = tempfile::tempdir().unwrap();
         let wal = FileWalManager::open(dir.path()).unwrap();
@@ -601,7 +675,7 @@ mod tests {
             })
             .unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(recycle_lsn).unwrap();
+        wal.checkpoint_clog(recycle_lsn, &[], u64::MAX).unwrap();
         let retained_lsn = wal.append(WalRecord::insert_for_test(3, 3)).unwrap();
         wal.flush().unwrap();
 
@@ -642,7 +716,7 @@ mod tests {
         let wal = FileWalManager::open(&path).unwrap();
         let boundary = wal.append(WalRecord::insert_for_test(7, 1)).unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(boundary).unwrap();
+        wal.checkpoint_clog(boundary, &[], u64::MAX).unwrap();
 
         assert!(wal.recycle_through(boundary - 1).is_err());
         drop(wal);
@@ -709,7 +783,7 @@ mod tests {
         assert_eq!(end, SEGMENT_PAYLOAD_BYTES);
         assert!(filler_len <= maximum);
         wal.flush().unwrap();
-        wal.persist_clog(end).unwrap();
+        wal.checkpoint_clog(end, &[], u64::MAX).unwrap();
         wal.recycle_through(end).unwrap();
         wal.append(WalRecord::insert_for_test(8, 1)).unwrap();
         drop(wal);
@@ -725,7 +799,7 @@ mod tests {
         let wal = FileWalManager::open(dir.path()).unwrap();
         let boundary = wal.append(WalRecord::insert_for_test(1, 1)).unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(boundary).unwrap();
+        wal.checkpoint_clog(boundary, &[], u64::MAX).unwrap();
         wal.fail_next_parent_sync_for_test("simulated replay-floor sync failure");
 
         assert!(wal.recycle_through(boundary).is_err());
@@ -742,7 +816,7 @@ mod tests {
         let wal = FileWalManager::open(dir.path()).unwrap();
         let boundary = wal.append(WalRecord::insert_for_test(7, 1)).unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(boundary).unwrap();
+        wal.checkpoint_clog(boundary, &[], u64::MAX).unwrap();
         wal.recycle_through(boundary).unwrap();
         drop(wal);
         std::fs::remove_file(dir.path().join("clog.dat")).unwrap();
@@ -766,7 +840,7 @@ mod tests {
             })
             .unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(end).unwrap();
+        wal.checkpoint_clog(end, &[], u64::MAX).unwrap();
         drop(wal);
 
         let segment = segment_path(&wal_dir(&path), 0);
@@ -795,12 +869,12 @@ mod tests {
         let wal = FileWalManager::open(dir.path()).unwrap();
         let first = wal.append(WalRecord::insert_for_test(7, 1)).unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(first).unwrap();
+        wal.checkpoint_clog(first, &[], u64::MAX).unwrap();
         let stale_clog = std::fs::read(dir.path().join("clog.dat")).unwrap();
 
         let second = wal.append(WalRecord::insert_for_test(8, 2)).unwrap();
         wal.flush().unwrap();
-        wal.persist_clog(second).unwrap();
+        wal.checkpoint_clog(second, &[], u64::MAX).unwrap();
         wal.recycle_through(second).unwrap();
         drop(wal);
         std::fs::write(dir.path().join("clog.dat"), stale_clog).unwrap();
@@ -857,7 +931,8 @@ mod tests {
         // Checkpoint order: persist the snapshot (records txn 11 aborted) BEFORE
         // advancing the floor. No VACUUM ran, so the vacuum floor stays at its default and txn
         // 11's explicit `Aborted` entry is kept in the snapshot.
-        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        wal.checkpoint_clog(wal.flushed_lsn(), &[], u64::MAX)
+            .unwrap();
         wal.recycle_through(recycle_at).unwrap();
 
         // Truncation is unconditional: txn 11's `Abort` (lsn 4) and insert (lsn 3) are
@@ -901,7 +976,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let (wal, _abort_lsn, recycle_at) = aborted_across_checkpoint_layout(&path);
-        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        wal.checkpoint_clog(wal.flushed_lsn(), &[], u64::MAX)
+            .unwrap();
         wal.recycle_through(recycle_at).unwrap();
         drop(wal);
 
@@ -913,7 +989,7 @@ mod tests {
             r1.is_aborted(11),
             "the abort survives the recovery floor establisher"
         );
-        r1.persist_clog(r1.flushed_lsn()).unwrap();
+        r1.checkpoint_clog(r1.flushed_lsn(), &[], u64::MAX).unwrap();
         drop(r1);
 
         // Recovery cycle 2: the re-persisted snapshot must STILL record txn 11 aborted.
@@ -928,7 +1004,7 @@ mod tests {
     #[test]
     fn vacuum_floor_drops_a_reclaimed_abort_from_the_next_snapshot() {
         // The vacuum floor bounds the durable CLOG, not WAL recycling: once a full
-        // VACUUM reclaims txn 11's tuples (floor advanced past 11), `persist_clog` drops
+        // VACUUM reclaims txn 11's tuples (floor advanced past 11), the checkpoint drops
         // its explicit `Aborted` entry and it reads implicit-committed (vacuously correct
         // — its tuples are gone). Contrast with the un-vacuumed case above, where the
         // entry is kept.
@@ -939,7 +1015,8 @@ mod tests {
         // A full VACUUM starting at next_txn_id == 13 reclaimed every aborted-creator
         // tuple < 13, including txn 11's.
         wal.set_vacuum_floor(13).unwrap();
-        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        wal.checkpoint_clog(wal.flushed_lsn(), &[], u64::MAX)
+            .unwrap();
         wal.recycle_through(recycle_at).unwrap();
         drop(wal);
 
@@ -963,7 +1040,7 @@ mod tests {
         let wal = FileWalManager::open(&path).unwrap();
 
         wal.append(WalRecord::insert_for_test(10, 1)).unwrap();
-        let checkpoint_lsn = wal
+        let checkpoint_end_lsn = wal
             .append(WalRecord {
                 lsn: 0,
                 txn_id: 10,
@@ -971,13 +1048,16 @@ mod tests {
             })
             .unwrap();
         wal.flush().unwrap();
-        // txn 10 is committed, so its insert (below checkpoint_lsn) is recyclable.
-        wal.persist_clog(checkpoint_lsn).unwrap();
+        // txn 10 is committed, so its insert below the checkpoint end is recyclable.
+        wal.checkpoint_clog(checkpoint_end_lsn, &[], u64::MAX)
+            .unwrap();
         wal.append(WalRecord {
             lsn: 0,
             txn_id: 0,
             kind: WalRecordKind::Checkpoint {
-                redo_lsn: checkpoint_lsn,
+                checkpoint_end_lsn,
+                page_redo_lsn: checkpoint_end_lsn,
+                catalog_redo_lsn: checkpoint_end_lsn,
             },
         })
         .unwrap();
@@ -989,12 +1069,12 @@ mod tests {
         })
         .unwrap();
         wal.flush().unwrap();
-        wal.recycle_through(checkpoint_lsn).unwrap();
+        wal.recycle_through(checkpoint_end_lsn).unwrap();
 
         drop(wal);
         let reopened = FileWalManager::open(&path).unwrap();
         let operations: Vec<_> = reopened
-            .replay_from(checkpoint_lsn)
+            .replay_from(checkpoint_end_lsn)
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap()
@@ -1004,7 +1084,7 @@ mod tests {
 
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].txn_id, 20);
-        assert!(operations[0].lsn > checkpoint_lsn);
+        assert!(operations[0].lsn > checkpoint_end_lsn);
     }
 
     #[test]
@@ -1264,13 +1344,15 @@ mod tests {
             })
             .unwrap();
         reopened.flush().unwrap();
-        reopened.persist_clog(commit_lsn).unwrap();
+        reopened.checkpoint_clog(commit_lsn, &[], u64::MAX).unwrap();
         reopened
             .append(WalRecord {
                 lsn: 0,
                 txn_id: 7,
                 kind: WalRecordKind::Checkpoint {
-                    redo_lsn: commit_lsn,
+                    checkpoint_end_lsn: commit_lsn,
+                    page_redo_lsn: commit_lsn,
+                    catalog_redo_lsn: commit_lsn,
                 },
             })
             .unwrap();

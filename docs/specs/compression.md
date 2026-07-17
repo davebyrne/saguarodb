@@ -323,10 +323,8 @@ Steps 5-8 are post-durable-commit cleanup: any error there is fatal
 rather than a returned statement error, exactly like every other autocommit
 write path (`docs/specs/crates/server.md`), because the DDL already committed
 and misreporting it as failed would be worse than crashing. The shared writer,
-table-lock, and catalog-DDL guards cover steps 2-7 and are released before the post-commit checkpoint
-trigger runs (`record_commit_and_maybe_checkpoint_after_durable_commit`,
-`docs/specs/crates/server.md`) — that call may take the exclusive checkpoint
-guard, so calling it earlier would deadlock — which is also what makes the rewrite's
+table-lock, and catalog-DDL guards cover steps 2-7. Post-commit checkpoint
+accounting only signals the background worker; the rewrite's
 WAL activity in step 6 count toward `--checkpoint-wal-bytes` right away
 instead of waiting on an unrelated later commit to notice it.
 
@@ -374,12 +372,10 @@ dictionary file, which is harmless and whose id startup reserves (§7).
 7. `flush_dirty_pages_for_files(target_file_ids)` flushes only the rewritten pages through the buffer
    pool: `PageStore::write_page` re-encodes each flushable dirty page under
    the just-installed config — the envelope encode step (§5) runs here.
-   Then `store.sync_files(target_file_ids)`, then
-   `buffer_pool.mark_files_clean(target_file_ids)` —
-   `flush_dirty_pages` does not itself mark frames clean (the caller fsyncs
-   via the store and only then calls `mark_all_clean`); skipping it would
-   not lose data, but would leave the rewrite pages dirty. Unrelated writer frames
-   are untouched by all three calls. Release the guards, then
+   The same operation reserves those frames against checkpoint writes, syncs the
+   target files, and conditionally cleans only the captured generations. An I/O
+   failure clears reservations without clearing dirty state. Unrelated writer frames
+   are untouched. Release the guards, then
    trigger the post-commit checkpoint accounting, then return command tag
    `ALTER TABLE`.
 

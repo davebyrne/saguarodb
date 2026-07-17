@@ -68,6 +68,14 @@ impl BlockingFpiWal {
 }
 
 impl WalManager for BlockingFpiWal {
+    fn append_positioned(&self, record: WalRecord) -> common::Result<common::WalPosition> {
+        let record_lsn = self.append(record)?;
+        Ok(common::WalPosition {
+            replay_from: record_lsn.saturating_sub(1),
+            record_lsn,
+        })
+    }
+
     fn append(&self, record: WalRecord) -> common::Result<Lsn> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel) + 1;
         let fpi_file = match &record.kind {
@@ -110,7 +118,12 @@ impl WalManager for BlockingFpiWal {
         Ok(0)
     }
 
-    fn persist_clog(&self, _clog_lsn: Lsn) -> common::Result<()> {
+    fn checkpoint_clog(
+        &self,
+        _proposed_replay_floor: Lsn,
+        _captured_active: &[common::TxnId],
+        _allocation_boundary: common::TxnId,
+    ) -> common::Result<()> {
         Ok(())
     }
 

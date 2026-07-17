@@ -1099,26 +1099,27 @@ pub trait FlushPolicy: Send + Sync {
 }
 ```
 
-`WalFlushPolicy` admits any **WAL-durable** dirty page (`page_lsn ≤ wal.flushed_lsn()`), committed or not (Milestone D1, `mvcc.md` §8): the committedness gate of earlier milestones is dropped because a heap page holds versions from several transactions, and the CLOG hides the non-committed ones. The checkpoint flushes such pages in place to the heap. `ensure_durable` (implemented by `WalFlushPolicy` as `wal.flush`) is called by the buffer pool's steal path before writing a stolen — possibly uncommitted — dirty page, giving write-ahead logging (the page's records reach disk before the page does); the pre-D1 committed-only steal needed no such force.
+`WalFlushPolicy` requires a real PageLSN and admits it once WAL is durable through
+that boundary. Incremental checkpoint batches and steal eviction call
+`ensure_durable` before writing their captured image. Transaction status is not a
+flush condition; CLOG hides noncommitted versions.
 
-## Concurrency Controller
+## Write-Unit Lifetime Token
 
-The controller is the **page/WAL-writer-vs-checkpoint** coordination primitive. DML, DDL, and WAL-writing maintenance take the SHARED side; checkpoint takes the EXCLUSIVE side and drains them. Logical table access is coordinated separately by the server table-lock manager.
+The compatibility controller returns a nonblocking lifetime token used by
+existing transaction cleanup plumbing. It does not coordinate checkpoints and
+never excludes another writer. Logical access is governed by table/row locks,
+storage latches, and publication gates.
 
 ```rust
 pub trait ConcurrencyController: Send + Sync {
-    /// SHARED writer guard — many concurrent page/WAL writers; blocks behind checkpoint.
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
-    /// EXCLUSIVE guard — drains all writers, then runs alone.
-    fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
-    fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard>;
-    /// SHARED guard for a non-writing exclusion participant (default = begin_writer).
     fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
     fn begin_shared_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
 }
 
-pub struct RwLockConcurrencyController { /* lock: Arc<parking_lot::RwLock<()>> */ }
+pub struct RwLockConcurrencyController;
 
 impl RwLockConcurrencyController {
     pub fn new() -> Self;
@@ -1126,11 +1127,8 @@ impl RwLockConcurrencyController {
 
 impl Default for RwLockConcurrencyController { /* delegates to new() */ }
 
-pub struct WriteGuard { /* owned ArcRwLockReadGuard — the SHARED side */ }
-pub struct CheckpointGuard { /* owned ArcRwLockWriteGuard — the EXCLUSIVE side */ }
+pub struct WriteGuard { /* nonblocking lifetime token */ }
 ```
-
-The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. DML, DDL, WAL-writing maintenance, and any explicit transaction before its first retained object lock acquire the SHARED side (`begin_writer` → `read_arc()`); table/sequence locks, the catalog-DDL mutex, row conflicts, and storage latches provide finer exclusion. Autocommit readers take no controller guard. Checkpoint alone acquires the EXCLUSIVE side. Foreground SQL uses cancelable shared/checkpoint forms that poll timed acquisition and return the token's reason-specific `QueryCanceled` error; background checkpoint callers retain the unconditional forms. The shared side is re-entrant, and guards are owned to keep the trait object-safe.
 
 ## Invariants
 

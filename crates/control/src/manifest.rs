@@ -9,23 +9,27 @@
     )
 )]
 
-use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TableId};
+use common::{CheckedSliceReader, DbError, DirtyPageEntry, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
-const MANIFEST_VERSION: u32 = 5;
+const MANIFEST_VERSION: u32 = 6;
 const MANIFEST_HEADER_LEN: usize = 16;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 272 * 1024 * 1024;
 const MAX_MANIFEST_PAYLOAD_BYTES: usize = MAX_MANIFEST_BYTES - MANIFEST_HEADER_LEN;
 const MAX_MANIFEST_TABLES: usize = 65_536;
 const MAX_MANIFEST_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_DIRTY_PAGES: usize = 1_000_000;
 
 /// The durable control record. It is the checkpoint commit point: the redo
-/// boundary (`checkpoint_lsn`), the live table ids, and the catalog snapshot,
+/// boundaries, dirty-page table, live table ids, and catalog snapshot,
 /// written atomically as a single CRC-checked envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlData {
-    pub checkpoint_lsn: Lsn,
+    pub checkpoint_end_lsn: Lsn,
+    pub page_redo_lsn: Lsn,
+    pub catalog_redo_lsn: Lsn,
+    pub dirty_pages: Vec<DirtyPageEntry>,
     pub tables: Vec<TableId>,
     pub catalog: Vec<u8>,
     pub page_size: u32,
@@ -33,7 +37,10 @@ pub struct ControlData {
 
 #[derive(Serialize)]
 struct ControlPayload<'a> {
-    checkpoint_lsn: Lsn,
+    checkpoint_end_lsn: Lsn,
+    page_redo_lsn: Lsn,
+    catalog_redo_lsn: Lsn,
+    dirty_pages: &'a [DirtyPageEntry],
     tables: &'a [TableId],
     catalog: &'a [u8],
     page_size: u32,
@@ -41,12 +48,25 @@ struct ControlPayload<'a> {
 
 #[derive(Deserialize)]
 struct DecodedControlPayload {
-    checkpoint_lsn: Lsn,
+    checkpoint_end_lsn: Lsn,
+    page_redo_lsn: Lsn,
+    catalog_redo_lsn: Lsn,
+    #[serde(deserialize_with = "deserialize_dirty_pages")]
+    dirty_pages: Vec<DirtyPageEntry>,
     #[serde(deserialize_with = "deserialize_tables")]
     tables: Vec<TableId>,
     #[serde(deserialize_with = "deserialize_catalog")]
     catalog: Vec<u8>,
     page_size: u32,
+}
+
+fn deserialize_dirty_pages<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<DirtyPageEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(deserializer, MAX_DIRTY_PAGES, "manifest dirty pages")
 }
 
 fn deserialize_tables<'de, D>(deserializer: D) -> std::result::Result<Vec<TableId>, D::Error>
@@ -79,8 +99,12 @@ pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
         return Err(corrupt_control("control catalog exceeds 64 MiB"));
     }
     validate_sorted_tables(&control.tables)?;
+    validate_redo_boundaries(control)?;
     let payload = ControlPayload {
-        checkpoint_lsn: control.checkpoint_lsn,
+        checkpoint_end_lsn: control.checkpoint_end_lsn,
+        page_redo_lsn: control.page_redo_lsn,
+        catalog_redo_lsn: control.catalog_redo_lsn,
+        dirty_pages: &control.dirty_pages,
         tables: &control.tables,
         catalog: &control.catalog,
         page_size: control.page_size,
@@ -154,12 +178,54 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
     let payload: DecodedControlPayload = serde_json::from_slice(payload_bytes)
         .map_err(|err| corrupt_control(format!("failed to decode control payload: {err}")))?;
     validate_sorted_tables(&payload.tables)?;
-    Ok(ControlData {
-        checkpoint_lsn: payload.checkpoint_lsn,
+    let control = ControlData {
+        checkpoint_end_lsn: payload.checkpoint_end_lsn,
+        page_redo_lsn: payload.page_redo_lsn,
+        catalog_redo_lsn: payload.catalog_redo_lsn,
+        dirty_pages: payload.dirty_pages,
         tables: payload.tables,
         catalog: payload.catalog,
         page_size: payload.page_size,
-    })
+    };
+    validate_redo_boundaries(&control)?;
+    Ok(control)
+}
+
+fn validate_redo_boundaries(control: &ControlData) -> Result<()> {
+    if control.dirty_pages.len() > MAX_DIRTY_PAGES {
+        return Err(corrupt_control("control file has too many dirty pages"));
+    }
+    if control.catalog_redo_lsn > control.checkpoint_end_lsn {
+        return Err(corrupt_control("catalog redo LSN is beyond checkpoint end"));
+    }
+    if control.dirty_pages.windows(2).any(|pair| {
+        matches!(pair, [left, right] if (left.file_id, left.page_num) >= (right.file_id, right.page_num))
+    }) {
+        return Err(corrupt_control(
+            "dirty pages must be sorted by file and page without duplicates",
+        ));
+    }
+    if control
+        .dirty_pages
+        .iter()
+        .any(|entry| entry.rec_lsn > control.checkpoint_end_lsn)
+    {
+        return Err(corrupt_control(
+            "dirty-page redo LSN is beyond checkpoint end",
+        ));
+    }
+    let expected = control
+        .dirty_pages
+        .iter()
+        .map(|entry| entry.rec_lsn)
+        .min()
+        .unwrap_or(control.checkpoint_end_lsn);
+    if control.page_redo_lsn != expected {
+        return Err(corrupt_control(
+            "page redo LSN does not match the dirty-page table",
+        ));
+    }
+    Ok(())
 }
 
 fn read_u32(reader: &mut CheckedSliceReader<'_>, field: &str) -> Result<u32> {
@@ -186,13 +252,18 @@ fn corrupt_control(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use common::DirtyPageEntry;
+
     use super::{
         ControlData, MANIFEST_VERSION, MAX_MANIFEST_PAYLOAD_BYTES, decode_control, encode_control,
     };
 
     fn control() -> ControlData {
         ControlData {
-            checkpoint_lsn: 42,
+            checkpoint_end_lsn: 42,
+            page_redo_lsn: 42,
+            catalog_redo_lsn: 42,
+            dirty_pages: Vec::new(),
             tables: vec![1, 2],
             catalog: b"catalog-bytes".to_vec(),
             page_size: 8192,
@@ -208,7 +279,10 @@ mod tests {
     #[test]
     fn control_round_trips_page_size() {
         let data = ControlData {
-            checkpoint_lsn: 7,
+            checkpoint_end_lsn: 7,
+            page_redo_lsn: 7,
+            catalog_redo_lsn: 7,
+            dirty_pages: Vec::new(),
             tables: vec![1, 2],
             catalog: vec![9, 9],
             page_size: 8192,
@@ -260,7 +334,10 @@ mod tests {
     fn rejects_unsorted_or_duplicate_tables() {
         for tables in [vec![2, 1], vec![1, 1]] {
             let error = encode_control(&ControlData {
-                checkpoint_lsn: 42,
+                checkpoint_end_lsn: 42,
+                page_redo_lsn: 42,
+                catalog_redo_lsn: 42,
+                dirty_pages: Vec::new(),
                 tables,
                 catalog: Vec::new(),
                 page_size: 8192,
@@ -272,10 +349,69 @@ mod tests {
     }
 
     #[test]
+    fn validates_dirty_page_order_and_redo_boundary() {
+        let valid = ControlData {
+            checkpoint_end_lsn: 50,
+            page_redo_lsn: 10,
+            catalog_redo_lsn: 40,
+            dirty_pages: vec![
+                DirtyPageEntry {
+                    file_id: 1,
+                    page_num: 2,
+                    rec_lsn: 20,
+                },
+                DirtyPageEntry {
+                    file_id: 2,
+                    page_num: 0,
+                    rec_lsn: 10,
+                },
+            ],
+            tables: vec![1],
+            catalog: Vec::new(),
+            page_size: 8192,
+        };
+        assert_eq!(
+            decode_control(&encode_control(&valid).unwrap()).unwrap(),
+            valid
+        );
+
+        let mut unsorted = valid.clone();
+        unsorted.dirty_pages.swap(0, 1);
+        assert!(
+            encode_control(&unsorted)
+                .unwrap_err()
+                .message
+                .contains("dirty")
+        );
+
+        let mut duplicate = valid.clone();
+        duplicate.dirty_pages[1].file_id = 1;
+        duplicate.dirty_pages[1].page_num = 2;
+        assert!(
+            encode_control(&duplicate)
+                .unwrap_err()
+                .message
+                .contains("dirty")
+        );
+
+        let mut wrong_redo = valid;
+        wrong_redo.page_redo_lsn = 11;
+        assert!(
+            encode_control(&wrong_redo)
+                .unwrap_err()
+                .message
+                .contains("page redo")
+        );
+    }
+
+    #[test]
     fn decoder_rejects_checksummed_unsorted_or_duplicate_tables() {
         for tables in [vec![2, 1], vec![1, 1]] {
             let payload = serde_json::to_vec(&serde_json::json!({
-                "checkpoint_lsn": 42,
+                "checkpoint_end_lsn": 42,
+                "page_redo_lsn": 42,
+                "catalog_redo_lsn": 42,
+                "dirty_pages": [],
                 "tables": tables,
                 "catalog": [],
                 "page_size": 8192

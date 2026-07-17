@@ -221,14 +221,12 @@ fn resolve_to_raw_fpi(kind: WalRecordKind) -> WalRecordKind {
 fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
     let fixture = Fixture::new();
     fixture.insert_rows(102, 20);
-    // Checkpoint-style flush, then mark everything clean so the following
-    // assertions are about exactly what `rewrite_table_pages` itself does.
-    fixture.buffer.flush_dirty_pages().unwrap();
-    fixture.buffer.mark_all_clean().unwrap();
-
     let pk_file_id = primary_index_file_id(TABLE_ID);
     let secondary_file_id = secondary_index_file_id(note_index().storage_id);
     let files = [TABLE_ID, pk_file_id, secondary_file_id];
+    // Flush the fixture files and mark that bounded set clean so the following
+    // assertions are about exactly what `rewrite_table_pages` itself does.
+    fixture.buffer.flush_dirty_pages_for_files(&files).unwrap();
 
     // Snapshot every initialized page's image before the rewrite.
     let mut before: HashMap<(u32, u32), [u8; buffer::PAGE_SIZE]> = HashMap::new();

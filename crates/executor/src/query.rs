@@ -44,7 +44,7 @@ pub struct ExecutionContext<'a> {
     /// The GC horizon (minimum advertised snapshot `xmin`) captured by the server,
     /// threaded into `CREATE INDEX` for its HOT broken-chain safety check
     /// (`docs/specs/mvcc.md` §10 Milestone H2). For non-DDL statements it is unused;
-    /// the server sets it under the exclusive guard for DDL and to any value
+    /// the server sets it after acquiring the DDL target locks and to any value
     /// otherwise.
     pub gc_horizon: u64,
     /// Set from another connection's `CancelRequest`; the engine polls it

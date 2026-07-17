@@ -470,103 +470,6 @@ fn prune_vacuum_tables(
     Ok(())
 }
 
-/// Vacuum each `table` with F4a's three-phase orchestration
-/// ([`PageBackedStorageEngine::vacuum`]: heap-prune → index-vacuum →
-/// line-pointer-reclaim), reclaiming versions dead to `horizon`. Used by checkpoint
-/// auto-prune; on-demand VACUUM uses xid-owned target locks and its one maintenance
-/// transaction (`docs/specs/mvcc.md` §9/§10 F4a/F4b).
-///
-/// **Caller contract (the no-data-loss safety):** the caller MUST already hold the
-/// EXCLUSIVE checkpoint guard ([`ConcurrencyController::begin_checkpoint`]) and MUST
-/// have captured `horizon` from [`ServerComponents::gc_horizon`] *after* acquiring
-/// that guard. Under the guard no writer runs, and the horizon is the minimum `xmin`
-/// advertised by any live snapshot (including concurrent readers), so every reclaimed
-/// version (`xmax < horizon`) is one no live snapshot can see — identical safety to
-/// the on-demand `VACUUM` (F4a). This helper does not take the guard or capture the
-/// horizon itself, precisely so it cannot be misused to vacuum with an
-/// outside-the-guard horizon.
-fn vacuum_tables(
-    components: &ServerComponents,
-    tables: &[TableSchema],
-    horizon: u64,
-) -> Result<()> {
-    for schema in tables {
-        let cleanup_txn = delete_toast_values_pending_parent_vacuum(components, schema, horizon)?;
-        if schema.toast_table_id.is_some() {
-            components
-                .storage
-                .vacuum_after_toast_cleanup(schema, horizon)?;
-        } else {
-            components.storage.vacuum(schema, horizon)?;
-        }
-        let toast_horizon = cleanup_txn
-            .map(|txn_id| horizon.max(txn_id.saturating_add(1)))
-            .unwrap_or(horizon);
-        components
-            .storage
-            .vacuum_hidden_toast_relation(schema, toast_horizon)?;
-    }
-    Ok(())
-}
-
-fn delete_toast_values_pending_parent_vacuum(
-    components: &ServerComponents,
-    schema: &TableSchema,
-    horizon: u64,
-) -> Result<Option<u64>> {
-    let value_ids = components
-        .storage
-        .toast_value_ids_pending_vacuum(schema, horizon)?;
-    if value_ids.is_empty() {
-        return Ok(None);
-    }
-
-    let txn_id = components
-        .active_txns
-        .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
-    let _object_guard = match components.lock_manager.transaction_owner(txn_id) {
-        Ok(guard) => guard,
-        Err(err) => {
-            rollback_maintenance_txn_or_die(components, txn_id);
-            return Err(err);
-        }
-    };
-    let ctx = StatementContext::new(txn_id)
-        .with_tuple_lock_manager(components.lock_manager.clone())
-        .with_conflict_waiter(
-            components.lock_manager.clone(),
-            Arc::new(QueryCancel::new()),
-        );
-
-    let deleted = match components
-        .storage
-        .delete_toast_values(&ctx, schema, &value_ids)
-    {
-        Ok(deleted) => deleted,
-        Err(err) => {
-            rollback_maintenance_txn_or_die(components, txn_id);
-            return Err(err);
-        }
-    };
-    if deleted == 0 {
-        components.active_txns.deregister(txn_id);
-        components.lock_manager.on_txn_finished();
-        return Ok(None);
-    }
-
-    if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
-        rollback_maintenance_txn_or_die(components, txn_id);
-        return Err(err);
-    }
-    if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
-        fatal_after_durable_maintenance_commit(components, err);
-    }
-    components.active_txns.deregister(txn_id);
-    components.lock_manager.on_txn_finished();
-
-    Ok(Some(txn_id))
-}
-
 pub(super) fn append_and_flush_maintenance_commit(
     components: &ServerComponents,
     txn_id: u64,
@@ -590,11 +493,17 @@ pub(super) fn append_and_flush_maintenance_catalog_change(
     txn_id: u64,
     change_set: common::CatalogChangeSet,
 ) -> Result<()> {
-    components.wal.append(WalRecord {
+    let checkpoint_publication = components.buffer_pool.checkpoint_fence().shared();
+    let position = components.wal.append_positioned(WalRecord {
         lsn: 0,
         txn_id,
         kind: WalRecordKind::CatalogChange { change_set },
     })?;
+    components
+        .storage
+        .catalog_redo_tracker()
+        .register(txn_id, position.replay_from)?;
+    drop(checkpoint_publication);
     if let Err(err) = components.wal.flush() {
         if err.kind == common::ErrorKind::DurabilityOutcomeUnknown {
             fatal_ambiguous_maintenance_commit(err);
@@ -602,29 +511,6 @@ pub(super) fn append_and_flush_maintenance_catalog_change(
         return Err(err);
     }
     Ok(())
-}
-
-pub(super) fn rollback_maintenance_txn_or_die(components: &ServerComponents, txn_id: u64) {
-    if let Err(err) = components.wal.append(WalRecord {
-        lsn: 0,
-        txn_id,
-        kind: WalRecordKind::Abort,
-    }) {
-        if err.kind == common::ErrorKind::DurabilityOutcomeUnknown {
-            fatal_ambiguous_maintenance_commit(err);
-        }
-        eprintln!("failed to append Abort record for maintenance txn {txn_id}: {err}");
-    }
-    components.active_txns.deregister(txn_id);
-    components.lock_manager.on_txn_finished();
-    if let Err(err) = components.storage.rollback_txn(txn_id) {
-        fatal_pre_durable_maintenance_rollback(err);
-    }
-    if let Err(err) = components.buffer_pool.rollback(txn_id) {
-        fatal_pre_durable_maintenance_rollback(DbError::internal(format!(
-            "buffer rollback failed for maintenance txn {txn_id}: {err}",
-        )));
-    }
 }
 
 pub(super) fn cleanup_after_durable_maintenance_commit(
@@ -645,72 +531,9 @@ pub(super) fn fatal_after_durable_maintenance_commit(
     std::process::exit(1);
 }
 
-fn fatal_pre_durable_maintenance_rollback(err: DbError) -> ! {
-    eprintln!("fatal TOAST cleanup rollback failure before durable commit: {err}");
-    std::process::exit(1);
-}
-
 fn fatal_ambiguous_maintenance_commit(err: DbError) -> ! {
     eprintln!("fatal maintenance commit durability outcome unknown: {err}");
     std::process::exit(1);
-}
-
-/// Run a FULL VACUUM pass over every user table AND advance the WAL **vacuum floor**
-/// (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c). Used by the on-demand `VACUUM`
-/// (no table) and the checkpoint auto-prune (F4b) — the two full-pass callers.
-///
-/// The boundary `B = next_txn_id` is captured BEFORE the pass and the floor is
-/// advanced to `B` AFTER it. The capture happens under the exclusive guard the caller
-/// holds (same contract as [`vacuum_tables`]: `horizon` was captured under it), so no
-/// user writer can allocate an id below or during the pass. TOAST cleanup may allocate
-/// committed maintenance xids during the pass; those ids are `>= B` and are not covered
-/// by this floor advance. A full pass leaves EVERY aborted transaction with id `< B`
-/// with NO surviving on-disk reference, as creator OR deleter: `vacuum_heap` RECLAIMS
-/// every aborted-creator tuple (heap + index; aborted-creator reclaim has NO age
-/// requirement) and ABORT-CLEANS every aborted-deleter stamp in place (resetting `xmax →
-/// INVALID`, `t_ctid → INVALID`, and un-HOTing an aborted root — the surviving
-/// predecessor of an aborted UPDATE/DELETE, which stays live and is NOT reclaimed).
-/// Advancing the floor to `B` is therefore safe: the next checkpoint's `persist_clog`
-/// may drop those aborted txns' explicit `Aborted` entries from `clog.dat` and let the
-/// implicit-committed floor cover them (the catalog is NOT MVCC-versioned, so user-table
-/// tuples are the only place an aborted txn's on-disk reference lives). Without the
-/// abort-cleanup, an aborted UPDATE/DELETE's surviving predecessor would keep an `xmax =
-/// T` that reads as an implicit-committed delete once `T`'s entry is dropped from the
-/// snapshot, wrongly removing the row after a crash — the hazard for ALL aborted
-/// UPDATE/DELETE, HOT or non-HOT.
-///
-/// **Durability ordering.** The floor is only ever CONSULTED by `persist_clog`,
-/// which a checkpoint runs AFTER `flush_dirty_pages` + `store.sync_all` — so by the
-/// time the floor is used, every dirty page this pass produced (auto-prune: this same
-/// checkpoint; on-demand: a later checkpoint) is fsynced to the heap. No aborted entry
-/// is dropped from the snapshot while its reclaimed tuples are still only in memory.
-pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> Result<()> {
-    // Capture B BEFORE the pass. An allocated transaction that has not yet become
-    // a checkpoint participant still holds the floor back even though it cannot
-    // have touched a relation.
-    let boundary = components
-        .active_txns
-        .oldest()
-        .unwrap_or_else(|| components.next_txn_id.load(Ordering::Acquire));
-    vacuum_all_user_tables(components, horizon)?;
-    // Advance the floor only AFTER the pass has reclaimed every aborted-creator tuple
-    // below B. Monotonic; persisted in `clog.dat` and reloaded at open (falls back to the
-    // conservative value when no snapshot is present) — see `WalManager::set_vacuum_floor`.
-    components.wal.set_vacuum_floor(boundary)
-}
-
-/// Vacuum every user table in the catalog, for the checkpoint auto-prune path (F4b).
-/// Same caller contract as [`vacuum_tables`]: the exclusive guard is held and
-/// `horizon` was captured under it. This does NOT advance the vacuum floor; callers
-/// that perform a *full* pass and want the floor advanced use [`full_vacuum_pass`].
-fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
-    let tables: Vec<_> = components
-        .catalog
-        .list_tables()?
-        .into_iter()
-        .filter(|schema| matches!(&schema.relation_kind, RelationKind::User))
-        .collect();
-    vacuum_tables(components, &tables, horizon)
 }
 
 #[cfg(test)]

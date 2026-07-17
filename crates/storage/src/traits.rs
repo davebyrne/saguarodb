@@ -301,7 +301,7 @@ pub trait SchemaOperations: Send + Sync {
     ///
     /// `gc_horizon` is the GC horizon (minimum advertised snapshot `xmin`,
     /// [`crate::PageBackedStorageEngine::vacuum`]'s `horizon`); the caller captures it
-    /// under the exclusive guard. It is used for the HOT broken-chain safety check
+    /// after acquiring the target relation locks. It is used for the HOT broken-chain safety check
     /// (`docs/specs/mvcc.md` §10 Milestone H2): a chain with two or more
     /// not-dead-to-all versions whose new-index-column values differ is rejected with
     /// a retryable `SerializationFailure`, because a single root-pointed entry cannot

@@ -62,12 +62,12 @@ trait seams.
 - MVCC tuple visibility, concurrent writers, locking SELECT with four PostgreSQL
   tuple-lock strengths plus NOWAIT/SKIP LOCKED, Read Committed, Repeatable Read,
   and Serializable Snapshot Isolation.
-- Garbage collection via `VACUUM [table]`, coordinated TOAST cleanup, and
-  checkpoint auto-pruning (`--auto-vacuum-dead-rows`).
+- Garbage collection via `VACUUM [table]`, coordinated TOAST cleanup, and a
+  separate automatic maintenance worker (`--auto-vacuum-dead-rows`).
 - Optimizer statistics via `ANALYZE [table]` / `VACUUM ANALYZE` (sampled row
   counts, null fractions, n_distinct, most-common values, histograms), exposed
   through `pg_class.reltuples`/`relpages` and `pg_stats`, refreshed
-  automatically at checkpoints (`--auto-analyze-changed-rows`).
+  automatically by background maintenance (`--auto-analyze-changed-rows`).
 - HOT (heap-only tuples): eligible same-page updates that do not change indexed
   columns skip secondary-index maintenance, and dead HOT chains are pruned in
   place.
@@ -84,8 +84,8 @@ trait seams.
   and WAL full-page-image compression.
 - Physiological redo WAL with full-page-image torn-page protection, one generic
   atomic catalog-change record for metadata, manifest checkpoints, WAL
-  recycling, and crash recovery. Manifest v5 with catalog v3, CLOG v2, and
-  segmented WAL v2 are the current durable formats. The catalog uses stable
+  recycling, and crash recovery. Manifest v6 with catalog v3, CLOG v3, and
+  segmented WAL v3 are the current durable formats. The catalog uses stable
   object/column IDs plus an exact dependency graph;
   older manifest, catalog, and catalog-WAL layouts are rejected rather than
   migrated.
@@ -162,9 +162,10 @@ The server accepts:
 ```text
 --data-dir <PATH>                  default ./data
 --port <PORT>                      default 5433
---buffer-pool-frames <N>           default 1024
+--buffer-pool-frames <N>           default 1024 (max 1000000)
 --checkpoint-every-n-commits <N>   default 100
 --checkpoint-wal-bytes <BYTES>     default 67108864
+--checkpoint-flush-batch-pages <N> default 256
 --auto-vacuum-dead-rows <N>        default 10000 (0 disables dead-row trigger)
 --auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)
 --shutdown-timeout-ms <MS>         default 30000
@@ -220,11 +221,11 @@ map, and reclaimed later by VACUUM.
   and row locks plus per-index and per-heap structural latches; a writer blocked
   on a lock invokes deadlock detection after `--deadlock-timeout-ms`. Conflicts
   can return deadlock error `40P01`, unique violation `23505`, or serialization
-  error `40001`, depending on the committed state and isolation level. Writes,
-  DDL, and WAL-writing maintenance share the checkpoint-participant guard; only
-  checkpoint takes it exclusively and drains page/WAL writers.
+  error `40001`, depending on the committed state and isolation level.
+  Checkpoints do not drain transactions: page publication, relation/catalog
+  publication gates, and short page latches protect their concurrent snapshot.
 - **Garbage collection.** Dead row versions are reclaimed by `VACUUM [table]` and
-  by automatic pruning at checkpoint (`--auto-vacuum-dead-rows`). For tables with
+  by serialized background maintenance (`--auto-vacuum-dead-rows`). For tables with
   TOAST storage, the server coordinates parent-row pruning and hidden TOAST-chunk
   cleanup. HOT (heap-only tuples) lets a same-page `UPDATE` that changes no
   indexed column skip secondary-index work and collapses dead version chains in
@@ -313,11 +314,11 @@ crates/
 Most SQL flows through the same parse, bind, plan, and execute pipeline. Plain read
 statements take an MVCC snapshot and `AccessShare` table locks but no row locks;
 locking SELECT takes `RowShare`, a transaction ID, and selected tuple locks;
-data-changing statements run under a shared writer guard and receive a
+data-changing statements receive a
 transaction ID plus a snapshot for visibility, WAL, table/row locks, and
-conflict detection. DDL and maintenance also use the shared writer guard plus
-relation-specific locks and the catalog publication gate. Checkpoint alone takes
-the exclusive checkpoint guard and drains page/WAL writers.
+conflict detection. DDL and maintenance use relation-specific locks and the
+catalog publication gate. Checkpoints run concurrently and use only short
+publication fences during the final metadata snapshot.
 
 ```text
 client query
@@ -334,10 +335,10 @@ QueryService
     |       |
     |       +-- plain SELECT / EXPLAIN: MVCC snapshot + AccessShare table locks
     |       +-- locking SELECT: txn_id + RowShare + tuple locks + latest-row recheck
-    |       +-- DML / COPY FROM:  shared writer guard + txn_id + table locks + snapshot
+    |       +-- DML / COPY FROM:  txn_id + table locks + snapshot
     |       +-- DDL / maintenance:
-    |                            shared writer guard + object locks/catalog gate
-    |       +-- checkpoint:      exclusive checkpoint guard (drains writers)
+    |                            object locks/catalog gate
+    |       +-- checkpoint:      background fuzzy/incremental pass
     |       +-- transaction, savepoint, SET/SHOW/RESET, DISCARD:
     |                            handled by server session state
     |
@@ -367,9 +368,9 @@ generations until snapshots drain, but heap/index page bytes are not undone.
 
 The data directory contains the write-ahead log, durable CLOG snapshot, control
 record, dictionary files, ephemeral query-spill directory, and physical
-heap/index relation files. `manifest.dat` is the control record: the redo
-boundary (`checkpoint_lsn`), the live table ids, and the serialized catalog,
-written atomically as a single CRC-checked envelope.
+heap/index relation files. `manifest.dat` is the control record: checkpoint-end,
+physical-redo and catalog-redo boundaries, the dirty-page table, live table ids,
+and the serialized catalog, written atomically as one CRC-checked envelope.
 
 Each live table generation has a `storage_id`. The row heap is stored at
 `<storage_id>.heap`, the reserved storage-identity B-tree is stored at
@@ -419,7 +420,7 @@ contain committed, aborted, or still-in-flight row versions.
         | buffer pool     |  dirty pages flushed in place
         +-----------------+
                 |
-                | checkpoint flushes dirty pages, advances the redo boundary
+                | checkpoint flushes captured batches, persists DPT + redo boundaries
                 v
         +-----------------+
         | heap/ files     |  heap + index pages, written in place
@@ -427,61 +428,51 @@ contain committed, aborted, or still-in-flight row versions.
                 |
                 v
         +-----------------+
-        | manifest.dat    |  checkpoint_lsn + catalog snapshot
+        | manifest.dat    |  redo boundaries + DPT + catalog snapshot
         +-----------------+
 ```
 
 ## Checkpointing
 
-Checkpoints are triggered after a configured number of committed statements, a
-configured amount of WAL growth, or graceful shutdown. A checkpoint flushes the
-dirty pages changed since the last one, so its cost is O(pages changed), not
-O(database size).
+An OS-thread coordinator runs checkpoints after a configured number of commits,
+configured WAL growth, an explicit request, recovery, or graceful shutdown.
+Commit paths only enqueue work. Requests coalesce, and writers continue while a
+pass flushes the pages dirty at its start in bounded batches (256 by default).
 
 ```text
 checkpoint
     |
-    +-- take global write guard
+    +-- snapshot the current dirty-page keys
     |
-    +-- flush WAL so every page it describes is durable
+    +-- copy, WAL-force, write, and fsync candidates in bounded batches
     |
-    +-- flush WAL-durable dirty pages in place to heap/index files
+    +-- under short catalog/relation/page-publication fences, capture
+    |       final DPT + catalog + active xids + checkpoint_end_lsn
     |
-    +-- fsync the heap/index files
+    +-- append the Checkpoint marker
     |
-    +-- choose checkpoint_lsn from the WAL high-water mark
+    +-- persist clog.dat v3 and authorize min(page_redo, catalog_redo)
     |
-    +-- write manifest.dat.tmp (checkpoint_lsn + table ids + catalog)
+    +-- atomically replace manifest.dat v6 (checkpoint commit point)
     |
-    +-- fsync manifest.dat.tmp
-    |
-    +-- rename manifest.dat.tmp -> manifest.dat
-    |
-    +-- fsync data directory
-    |
-    +-- persist clog.dat through checkpoint_lsn (atomic write + fsync)
-    |
-    +-- append WAL Checkpoint metadata record and fsync
-    |
-    +-- advance wal.meta floor and recycle wholly obsolete segments
-    |
-    +-- mark buffer pages clean
+    +-- advance wal.meta floor and recycle wholly obsolete WAL v3 segments
 ```
 
-The control record is the commit point: it is written only after the heap and
-index pages it describes are durable. Before the WAL replay floor advances, the
-server also persists `clog.dat` through the new boundary so every transaction
-outcome removed from WAL remains durable. If the server crashes mid-checkpoint,
-recovery falls back to the previous redo boundary, where this cycle's full-page
-images repair any torn page writes.
+The dirty-page table retains each page's earliest unflushed WAL record-start
+boundary. Pages redirtied during I/O stay dirty with a new boundary, and newly
+dirty pages are left for the next pass. The CLOG snapshot records active xids as
+in-progress, so transactions may span a checkpoint safely. Ordinary automatic
+VACUUM and ANALYZE run on a separate worker and never extend checkpoint I/O.
 
 ## Recovery
 
 Startup opens the WAL and its durable `clog.dat` snapshot, enables buffer
 stealing, reads the control record for the redo boundary and catalog, validates
 the dictionary store, pre-scans generic catalog changes to burn all allocated
-IDs and register referenced physical generations, then replays WAL after
-`checkpoint_lsn` onto heap and index pages (redo-all). It atomically applies only
+IDs and register referenced physical generations, then replays positioned WAL
+from the lesser redo boundary. Physical records are gated by `page_redo_lsn`,
+catalog records by `catalog_redo_lsn`, and sequence records by
+`checkpoint_end_lsn`. It atomically applies only
 committed catalog changes in LSN order. The CLOG is seeded from `clog.dat` and folded forward
 with later `Commit`/`Abort` records, including subtransaction commit records; if
 the snapshot is absent, it is rebuilt from retained WAL records. Catalog,
@@ -498,19 +489,20 @@ server startup
     +-- read manifest.dat
     |       |
     |       +-- absent: fresh empty database
-    |       +-- present: load checkpoint_lsn and the serialized catalog
+    |       +-- present: load redo boundaries, DPT, and serialized catalog
     |
     +-- install table, hidden TOAST, secondary-index, and sequence schemas
     |       into storage
     |
-    +-- pre-scan catalog allocator/generation high-water, then replay WAL records
-    |       with LSN > checkpoint_lsn (redo-all); use the CLOG
+    +-- pre-scan catalog allocator/generation high-water, then replay positioned WAL
+    |       from min(page_redo_lsn, catalog_redo_lsn); use the CLOG
     |       seeded/folded at WAL open for transaction visibility
     |       page-LSN gating makes redo idempotent; torn or missing pages are
     |       zeroed so a FullPageImage / FullPageImageCompressed / HeapInit
     |       re-establishes them
     |
-    +-- if replay changed state, run a checkpoint
+    +-- resolve every remaining in-progress xid to aborted; if replay changed
+    |       state, run one synchronous fuzzy checkpoint
     |
     +-- reseed TOAST value-id allocators, then switch storage from recovery mode
     |       to normal mode

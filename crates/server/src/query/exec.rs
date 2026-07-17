@@ -707,7 +707,7 @@ impl QueryService {
                 }
                 // Accumulate this statement's dead-version count on the transaction
                 // (`docs/specs/mvcc.md` §9, F4b). It is folded into the server-wide
-                // auto-prune counter only when the transaction COMMITS durably; on
+                // automatic VACUUM counter only when the transaction COMMITS durably; on
                 // ROLLBACK it is discarded (the dead versions then belong to this
                 // transaction's own aborted writes, not to committed deletes/updates).
                 // A streamed outcome is always a read, which leaves no dead versions.
@@ -1235,7 +1235,7 @@ impl QueryService {
         drop(object_guard);
         drop(guard);
 
-        // Account this committed statement's dead versions toward the auto-prune
+        // Account this committed statement's dead versions toward the automatic VACUUM
         // threshold BEFORE the checkpoint trigger, so a checkpoint fired by this same
         // commit observes the updated count (`docs/specs/mvcc.md` §9, F4b). Only a
         // durable commit reaches here; an aborted statement returned above without

@@ -541,20 +541,13 @@ impl QueryService {
         })
     }
 
-    /// Acquire the SHARED checkpoint-participant guard before an explicit
-    /// transaction's first retained object lock, holding it through top-level
-    /// completion. The guard is shared
-    /// (E2b lock inversion, `docs/specs/mvcc.md` §10 E2b): acquiring it does not
-    /// block on another connection's writer — only on a checkpoint holding the
-    /// exclusive guard.
+    /// Acquire the compatibility write-unit token before an explicit transaction's
+    /// first retained object lock, holding it through top-level completion. The
+    /// token does not block writers or checkpoints.
     ///
     /// Correctness assertion (no longer a deadlock guard): a transaction must hold
-    /// AT MOST ONE writer guard. The shared guard IS re-entrant — re-acquiring it on
-    /// the same thread cannot self-deadlock — so this is a cheap invariant check
-    /// ("one writer guard per transaction"), not a hang-prevention measure. It
-    /// catches a routing regression that would leak a second guard, which would keep
-    /// a writer in flight past commit/abort and could stall a checkpoint waiting to
-    /// drain.
+    /// AT MOST ONE token. This catches routing regressions and keeps transaction
+    /// cleanup ownership explicit.
     pub(super) fn acquire_write_guard(
         &self,
         txn: &mut Transaction,
@@ -573,8 +566,8 @@ impl QueryService {
         Ok(())
     }
 
-    /// Establish the universal explicit-transaction lock order: retain the shared
-    /// checkpoint-participant guard before creating the transaction's single
+    /// Establish the universal explicit-transaction lock order: retain the
+    /// write-unit token before creating the transaction's single
     /// top-level object-lock owner. The same owner is reused by every statement. It
     /// normally releases with the top-level transaction; rollback to a savepoint
     /// captured before owner creation releases it early, and a later statement may
@@ -661,7 +654,11 @@ impl QueryService {
             // Abort the whole family (mirroring the flush-failure path) and drop its
             // SSI state, then surface 40001.
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
+            self.rollback_transaction_family_pre_durable_or_die(
+                txn_id,
+                &txn.live_subxids,
+                txn.relation_generation_changed,
+            );
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
@@ -672,7 +669,11 @@ impl QueryService {
         // committed transaction into an error.
         if let Err(err) = cancel.check() {
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
+            self.rollback_transaction_family_pre_durable_or_die(
+                txn_id,
+                &txn.live_subxids,
+                txn.relation_generation_changed,
+            );
             self.ssi_finish(txn_id, isolation, false);
             return Err(err);
         }
@@ -699,8 +700,9 @@ impl QueryService {
             Ok(guards) => guards,
             Err(err) => {
                 self.abort_subxids(&txn.live_subxids);
-                self.rollback_transaction_pre_durable_or_die(
+                self.rollback_transaction_family_pre_durable_or_die(
                     txn_id,
+                    &txn.live_subxids,
                     txn.relation_generation_changed,
                 );
                 self.ssi_finish(txn_id, isolation, false);
@@ -722,8 +724,9 @@ impl QueryService {
                 Ok(snapshot) => Some(snapshot),
                 Err(err) => {
                     self.abort_subxids(&txn.live_subxids);
-                    self.rollback_transaction_pre_durable_or_die(
+                    self.rollback_transaction_family_pre_durable_or_die(
                         txn_id,
+                        &txn.live_subxids,
                         txn.relation_generation_changed,
                     );
                     self.ssi_finish(txn_id, isolation, false);
@@ -740,6 +743,7 @@ impl QueryService {
             // metadata) so its effects are hidden by the CLOG. Abort is status-based
             // — no page-content undo (`docs/specs/mvcc.md` §4 Decision 3).
             self.abort_subxids(&txn.live_subxids);
+            self.cleanup_subxids_pre_durable_or_die(&txn.live_subxids);
             self.rollback_pre_durable_or_die(txn_id, None);
             drop(relation_publication);
             drop(catalog_publication);
@@ -759,7 +763,7 @@ impl QueryService {
             self.fatal_after_durable_commit(err);
         }
 
-        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+        if let Err(err) = self.cleanup_after_durable_commit_family(txn_id, &txn.live_subxids) {
             self.fatal_after_durable_commit(err);
         }
         // The CLOG marked the top + every committed subxid `Committed` at flush;
@@ -782,7 +786,7 @@ impl QueryService {
             super::truncate::best_effort_retired_generation_cleanup(&self.components);
         }
 
-        // Fold the committed transaction's dead versions into the auto-prune counter
+        // Fold the committed transaction's dead versions into the automatic VACUUM counter
         // BEFORE the checkpoint trigger (`docs/specs/mvcc.md` §9, F4b): only a durable
         // commit reaches here, so an aborted transaction never advances the counter.
         self.components.add_dead_versions(dead_versions);
@@ -823,7 +827,11 @@ impl QueryService {
         // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
         // VACUUM-reclaimable), then the top-level transaction.
         self.abort_subxids(&txn.live_subxids);
-        self.rollback_transaction_pre_durable_or_die(txn_id, txn.relation_generation_changed);
+        self.rollback_transaction_family_pre_durable_or_die(
+            txn_id,
+            &txn.live_subxids,
+            txn.relation_generation_changed,
+        );
         // Drop the serializable transaction's SSI state (its reads/writes are void).
         self.ssi_finish(txn_id, isolation, false);
         // `txn` drops here, releasing the exclusive write guard.
@@ -840,8 +848,9 @@ impl QueryService {
             .collect();
         if txn.has_writes {
             self.abort_subxids(&txn.live_subxids);
-            self.rollback_transaction_pre_durable_or_die(
+            self.rollback_transaction_family_pre_durable_or_die(
                 txn.txn_id,
+                &txn.live_subxids,
                 txn.relation_generation_changed,
             );
         } else {
@@ -1347,6 +1356,31 @@ impl QueryService {
         super::truncate::best_effort_retired_generation_cleanup(&self.components);
     }
 
+    fn cleanup_subxids_pre_durable_or_die(&self, subxids: &[u64]) {
+        for &subxid in subxids.iter().rev() {
+            if let Err(err) = self.components.storage.rollback_txn(subxid) {
+                self.fatal_pre_durable_rollback_failure(DbError::internal(format!(
+                    "storage rollback failed for subxid {subxid}: {err}",
+                )));
+            }
+            if let Err(err) = self.components.buffer_pool.rollback(subxid) {
+                self.fatal_pre_durable_rollback_failure(DbError::internal(format!(
+                    "buffer rollback failed for subxid {subxid}: {err}",
+                )));
+            }
+        }
+    }
+
+    fn rollback_transaction_family_pre_durable_or_die(
+        &self,
+        txn_id: u64,
+        subxids: &[u64],
+        has_transactional_truncate: bool,
+    ) {
+        self.cleanup_subxids_pre_durable_or_die(subxids);
+        self.rollback_transaction_pre_durable_or_die(txn_id, has_transactional_truncate);
+    }
+
     pub(super) fn rollback_pre_durable(
         &self,
         txn_id: u64,
@@ -1402,6 +1436,14 @@ impl QueryService {
             })?;
         }
         Ok(())
+    }
+
+    fn cleanup_after_durable_commit_family(&self, txn_id: u64, subxids: &[u64]) -> Result<()> {
+        for &subxid in subxids {
+            self.components.storage.commit_txn(subxid)?;
+            self.components.buffer_pool.commit(subxid)?;
+        }
+        self.cleanup_after_durable_commit(txn_id)
     }
 
     pub(super) fn cleanup_after_durable_commit(&self, txn_id: u64) -> Result<()> {

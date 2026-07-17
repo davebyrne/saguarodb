@@ -7,6 +7,7 @@ use std::time::Duration;
 use catalog::{CatalogManager, MemoryCatalog};
 use common::{
     KeyRange, QueryCancel, RelationKind, SqlState, StatementContext, ToastCompression, ToastMode,
+    TxnStatus,
 };
 use storage::SchemaOperations;
 use support::{
@@ -47,6 +48,59 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
             vec![Some("1".to_string()), Some("Ada".to_string())],
             vec![Some("2".to_string()), Some("Grace".to_string())],
         ]
+    );
+}
+
+#[tokio::test]
+async fn clog_replacement_before_manifest_keeps_vacuumed_abort_invisible() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key)")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+
+        let aborted_xid = server.app().components.next_txn_id.load(Ordering::Acquire);
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("insert into t (id) values (1)").await;
+        conn.ok("rollback").await;
+        conn.close().await;
+        assert_eq!(
+            server.app().components.wal.status(aborted_xid),
+            TxnStatus::Aborted
+        );
+
+        server.simple_query("vacuum").await.unwrap();
+        let components = &server.app().components;
+        let (active, allocation_boundary) = components
+            .active_txns
+            .checkpoint_snapshot(|| components.next_txn_id.load(Ordering::Acquire));
+        let old_replay_floor = components.wal.retained_range().unwrap().0;
+        // Simulate the specified crash window: the new CLOG has replaced the old
+        // one, but manifest replacement has not committed the fuzzy checkpoint.
+        components
+            .wal
+            .checkpoint_clog(old_replay_floor, &active, allocation_boundary)
+            .unwrap();
+        assert_eq!(
+            components.wal.status(aborted_xid),
+            TxnStatus::Committed,
+            "VACUUM removed every durable reference before the abort became implicit"
+        );
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select count(*) from t")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("0".to_string())]],
+        "old-manifest recovery replays the later VACUUM FPI after the aborted insert"
     );
 }
 
@@ -2737,12 +2791,9 @@ async fn aborted_autocommit_statement_stays_invisible_after_restart() {
     );
 }
 
-/// Checkpoint-vs-writer under concurrent writers, then crash + recover (E2b). While
-/// several writer connections insert committed rows, a checkpoint fires concurrently:
-/// it takes the EXCLUSIVE guard, drains every in-flight (shared) writer, and runs
-/// alone — so it must complete with no "unflushable dirty page" error (the preserved
-/// "no in-flight writer at checkpoint" invariant). One extra transaction is left
-/// uncommitted at the "crash" (the process drops without COMMIT). After restart the
+/// Fuzzy checkpoint versus concurrent writers, then crash and recover. Several
+/// writer connections continue committing while checkpoints run, and one explicit
+/// transaction remains open across every checkpoint. After restart the
 /// committed rows all survive and the uncommitted one is invisible (in-flight-at-
 /// crash = aborted) — confirming the inverted lock keeps the Milestone-D guarantees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2759,6 +2810,13 @@ async fn checkpoint_concurrent_with_writers_then_crash_recovers_consistently() {
             setup.ok("create table t (id integer primary key)").await;
         }
 
+        // Keep an uncommitted writer open across every checkpoint. Its physical
+        // changes may be flushed, but the captured CLOG in-progress entry must keep
+        // them invisible and recovery must resolve it to aborted after the crash.
+        let mut dangling = Connection::connect(&server).await.unwrap();
+        dangling.ok("begin").await;
+        dangling.ok("insert into t (id) values (100000)").await;
+
         // Writer tasks insert disjoint committed key ranges (autocommit per row), so
         // many short write transactions are in flight while the checkpoint fires.
         let mut writers = Vec::new();
@@ -2774,31 +2832,21 @@ async fn checkpoint_concurrent_with_writers_then_crash_recovers_consistently() {
             }));
         }
 
-        // Fire checkpoints concurrently with the writers. Each must complete cleanly
-        // (a drained, no-in-flight-writer body); `force_checkpoint` propagates any
-        // "unflushable dirty page" error, so a panic here would fail the test.
+        // Fire checkpoints concurrently with both the open transaction and the
+        // committing writers. A transaction-long global checkpoint lock would deadlock
+        // this test; the fuzzy checkpoint must finish using short publication fences.
         for _ in 0..3 {
             server
                 .force_checkpoint()
                 .await
-                .expect("checkpoint drains writers and completes cleanly under concurrency");
+                .expect("fuzzy checkpoint completes while writers remain active");
         }
 
         for handle in writers {
             handle.await.expect("writer task finished");
         }
 
-        // Leave one transaction UNCOMMITTED at the crash: open it and insert a
-        // sentinel row (id 100000), then "crash" without committing. Note we do NOT
-        // checkpoint while this writer is open: a checkpoint takes the EXCLUSIVE guard
-        // and would (correctly) block waiting for this in-flight writer's SHARED guard
-        // to drain. Recovery replays the in-flight insert's WAL records under redo-all
-        // and the CLOG hides them (in-flight-at-crash = aborted), so the sentinel is
-        // invisible after restart regardless of whether its page reached the heap.
-        let mut dangling = Connection::connect(&server).await.unwrap();
-        dangling.ok("begin").await;
-        dangling.ok("insert into t (id) values (100000)").await;
-        // "Crash": drop the connection and the server without committing `dangling`.
+        // "Crash": drop the open transaction and server without committing it.
         dangling.close().await;
         // The server (and its Arc) is dropped at the end of this scope.
     }

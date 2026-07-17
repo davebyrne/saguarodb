@@ -4,7 +4,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use common::{DbError, FIRST_NORMAL_XID, Lsn, Result, TxnId, TxnStatus, TxnStatusView};
+use common::{
+    DbError, FIRST_NORMAL_XID, Lsn, Result, SqlState, TxnId, TxnStatus, TxnStatusView, WalPosition,
+};
 
 use crate::clog_file::{ClogSnapshot, MAX_CLOG_FILE_BYTES, decode_clog, encode_clog};
 use crate::codec::{HEADER_LEN, encode_record_at, frame_len_from_header};
@@ -15,7 +17,7 @@ use crate::segment::{
     discover_end, initialize, load_meta, open_segment, recycle_orphaned_segments, recycle_segments,
     segment_path, sync_dir, truncate_stream, wal_dir, write_meta_with_outcome,
 };
-use crate::{Clog, WalManager, WalRecord, WalRecordKind, decode_record};
+use crate::{Clog, WalEntry, WalManager, WalRecord, WalRecordKind, decode_record};
 
 pub struct FileWalManager {
     data_dir: PathBuf,
@@ -84,9 +86,14 @@ impl FileWalManager {
 
         let clog_path = data_dir.join("clog.dat");
         let snapshot = load_clog_snapshot(&clog_path)?;
-        let recycle_boundary = snapshot.as_ref().map(|snapshot| snapshot.clog_lsn);
+        let recycle_boundary = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.authorized_replay_floor);
         let (mut clog, vacuum_floor, clog_loaded_from_snapshot, clog_lsn) = match snapshot {
-            Some(snapshot) if snapshot.clog_lsn < meta.replay_floor => {
+            Some(snapshot)
+                if snapshot.clog_lsn < meta.replay_floor
+                    || snapshot.authorized_replay_floor < meta.replay_floor =>
+            {
                 return Err(wal_error(
                     "CLOG snapshot does not cover the retained WAL replay floor",
                 ));
@@ -236,10 +243,28 @@ impl FileWalManager {
 }
 
 impl WalManager for FileWalManager {
-    fn append(&self, record: WalRecord) -> Result<Lsn> {
+    fn append_positioned(&self, record: WalRecord) -> Result<WalPosition> {
         let mut state = self.lock_raw_state()?;
+        let is_settlement = matches!(
+            record.kind,
+            WalRecordKind::Commit | WalRecordKind::CommitWithSubxids { .. } | WalRecordKind::Abort
+        );
+        if represents_transaction(&record)
+            && !is_settlement
+            && state.clog.must_backpressure_new_writer(record.txn_id)
+        {
+            return Err(DbError::wal(
+                SqlState::ProgramLimitExceeded,
+                "transaction status window is pinned by an active writer; retry after older transactions finish",
+            ));
+        }
         if matches!(record.kind, WalRecordKind::Abort) {
             state.clog.set_aborted(record.txn_id);
+        } else if represents_transaction(&record) {
+            // Make every writer explicit before its first record can be absorbed
+            // by a concurrent checkpoint CLOG snapshot. This includes transactions
+            // allocated after the checkpoint's active-id/allocation capture.
+            state.clog.set_in_progress(record.txn_id);
         }
         if let Some(error) = &state.poisoned {
             return Err(error.clone());
@@ -283,7 +308,7 @@ impl WalManager for FileWalManager {
             _ => {}
         }
         state.written_lsn = record.lsn;
-        Ok(record.lsn)
+        WalPosition::new(start, record.lsn)
     }
 
     fn flush(&self) -> Result<Lsn> {
@@ -363,11 +388,18 @@ impl WalManager for FileWalManager {
         Ok(state.flushed_lsn)
     }
 
-    fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
+    fn written_lsn(&self) -> Result<Lsn> {
+        Ok(self.lock_state()?.written_lsn)
+    }
+
+    fn replay_entries_from(
+        &self,
+        replay_from: Lsn,
+    ) -> Result<Box<dyn Iterator<Item = Result<WalEntry>>>> {
         let state = self.lock_state()?;
         Ok(Box::new(WalReplay {
             reader: SegmentReader::new(self.wal_dir.clone(), state.replay_floor, state.written_lsn),
-            threshold: lsn.max(state.replay_floor),
+            threshold: replay_from.max(state.replay_floor),
             done: false,
         }))
     }
@@ -476,23 +508,45 @@ impl WalManager for FileWalManager {
         Ok(())
     }
 
+    fn resolve_all_in_flight_as_aborted(&self) -> Result<()> {
+        self.lock_state()?.clog.resolve_all_in_progress_as_aborted();
+        Ok(())
+    }
+
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
         let mut state = self.lock_state()?;
         state.vacuum_floor = state.vacuum_floor.max(boundary);
         Ok(())
     }
 
-    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()> {
-        let mut state = self.lock_state()?;
-        if clog_lsn != state.flushed_lsn {
-            return Err(wal_error(
-                "CLOG snapshot boundary must equal the current durable WAL end",
-            ));
-        }
-        let snapshot = state.clog.live_snapshot(clog_lsn, state.vacuum_floor);
+    fn checkpoint_clog(
+        &self,
+        proposed_replay_floor: Lsn,
+        captured_active: &[TxnId],
+        allocation_boundary: TxnId,
+    ) -> Result<()> {
+        self.flush()?;
+        let snapshot = {
+            let state = self.lock_state()?;
+            if proposed_replay_floor < state.replay_floor
+                || proposed_replay_floor > state.flushed_lsn
+            {
+                return Err(wal_error(
+                    "proposed CLOG replay floor is outside the durable WAL range",
+                ));
+            }
+            state.clog.live_snapshot(
+                state.flushed_lsn,
+                proposed_replay_floor,
+                state.vacuum_floor,
+                captured_active,
+                allocation_boundary,
+            )
+        };
         write_clog_file(&self.clog_path(), &snapshot)?;
+        let mut state = self.lock_state()?;
         state.clog.prune_to(snapshot.committed_floor);
-        state.recycle_boundary = Some(clog_lsn);
+        state.recycle_boundary = Some(snapshot.authorized_replay_floor);
         Ok(())
     }
 }
@@ -513,16 +567,22 @@ struct WalReplay {
 }
 
 impl Iterator for WalReplay {
-    type Item = Result<WalRecord>;
+    type Item = Result<WalEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
         loop {
+            let replay_from = self.reader.position();
             match read_frame(&mut self.reader) {
-                Ok(Some(record)) if record.lsn <= self.threshold => {}
-                Ok(Some(record)) => return Some(Ok(record)),
+                Ok(Some(_record)) if replay_from < self.threshold => {}
+                Ok(Some(record)) => {
+                    return Some(Ok(WalEntry {
+                        replay_from,
+                        record,
+                    }));
+                }
                 Ok(None) => {
                     self.done = true;
                     return None;
@@ -599,6 +659,11 @@ fn fold_status(clog: &mut Clog, record: &WalRecord) {
             }
         }
         WalRecordKind::Abort => clog.set_aborted(record.txn_id),
+        _ if represents_transaction(record)
+            && clog.status(record.txn_id) == TxnStatus::InProgress =>
+        {
+            clog.set_in_progress(record.txn_id);
+        }
         _ => {}
     }
 }

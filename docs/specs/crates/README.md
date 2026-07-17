@@ -22,8 +22,8 @@ This directory decomposes the overview spec into crate-level contracts for the i
 | `executor` | [executor.md](executor.md) | Volcano operators, expression evaluation, DML/DDL execution |
 | `storage` | [storage.md](storage.md) | Page-backed table storage, primary-key B-tree index, row serialization, recovery operations |
 | `buffer` | [buffer.md](buffer.md) | Page cache, RAII guards, dirty tracking, rollback, in-place page flushing |
-| `wal` | [wal.md](wal.md) | Physiological redo WAL, commit/checkpoint records, replay iterator |
-| `control` | [control.md](control.md) | Durable control record (checkpoint commit point): redo boundary, table ids, catalog |
+| `wal` | [wal.md](wal.md) | Positioned physiological redo WAL v3, CLOG v3, segmented recycling |
+| `control` | [control.md](control.md) | Manifest v6 checkpoint commit point: redo boundaries, DPT, table ids, catalog |
 | `protocol` | [protocol.md](protocol.md) | PostgreSQL wire codec and connection state for startup, cancellation, simple query, extended query, and COPY messages |
 | `server` | [server.md](server.md) | Binary wiring, startup/recovery, Tokio listener, blocking query execution |
 
@@ -36,7 +36,9 @@ This directory decomposes the overview spec into crate-level contracts for the i
 - Cargo package names use the `saguarodb-*` prefix, but internal `Cargo.toml` dependencies use short aliases such as `common`, `storage`, and `wal`.
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.
-- Eviction can steal any WAL-durable dirty page (flush, then evict) once stealing is enabled (the server enables it at startup, before redo); checkpoint also flushes dirty pages in place to the heap. The CLOG hides uncommitted or aborted versions that reach disk.
+- Eviction can steal WAL-durable dirty pages. Fuzzy checkpoints concurrently
+  flush their fixed start-set in bounded batches and persist the final DPT; CLOG
+  hides uncommitted or aborted versions that reach disk.
 - SaguaroDB uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal, with PostgreSQL-style in-heap MVCC layered on top (snapshot isolation, concurrent readers and writers, VACUUM; see `../mvcc.md`).
 
 ## Test Strategy

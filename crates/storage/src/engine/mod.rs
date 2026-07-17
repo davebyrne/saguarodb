@@ -34,11 +34,12 @@
 //!    structural latch (an in-place `xmax` stamp allocates no free space and mutates
 //!    a known slot), so it does not participate in this ordering.
 //!
-//! As of Milestone E2b (the shared-writer / exclusive-checkpoint lock inversion)
-//! many writers run concurrently, so these structural latches are now **load-bearing
+//! Many writers and the background checkpointer run concurrently, so these
+//! structural latches are **load-bearing
 //! and genuinely contended**: two writers mutating the same index or heap serialize
 //! on its latch, while writers on different indexes/heaps run in parallel. A
-//! checkpoint takes the exclusive concurrency guard and so never overlaps a writer.
+//! checkpoint copies each candidate under its page latch and then performs I/O
+//! without holding the latch.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -46,12 +47,12 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, DataType, DbError, FileId, IndexId,
-    IndexSchema, Key, KeyRange, Lsn, PageNum, QueryCancel, RelationKind, Result, Row, RowId,
-    SequenceId, SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow,
-    TableId, TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TupleLockAcquire,
-    TupleLockGrantChange, TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnStatus,
-    TxnStatusView, UniqueConflict, Value, WriteConflict, XMAX_ABORTED, XMAX_COMMITTED,
-    classify_unique_conflict, is_visible, write_conflict,
+    IndexSchema, Key, KeyRange, PageNum, QueryCancel, RelationKind, Result, Row, RowId, SequenceId,
+    SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow, TableId,
+    TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TupleLockAcquire, TupleLockGrantChange,
+    TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnStatus, TxnStatusView, UniqueConflict,
+    Value, WriteConflict, XMAX_ABORTED, XMAX_COMMITTED, classify_unique_conflict, is_visible,
+    write_conflict,
 };
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -297,6 +298,7 @@ struct StorageState {
 pub struct PageBackedStorageEngine {
     pub(crate) buffer_pool: Arc<dyn BufferPool>,
     pub(crate) wal: Arc<dyn WalManager>,
+    catalog_redo_tracker: common::CatalogRedoTracker,
     /// Shared file-compression config + dictionary resolver
     /// (`docs/specs/compression.md`): heap/index at-rest envelopes consult it via
     /// `HeapPageStore`, and every WAL full-page image compresses through it
@@ -352,6 +354,7 @@ impl PageBackedStorageEngine {
         Ok(Self {
             buffer_pool,
             wal,
+            catalog_redo_tracker: common::CatalogRedoTracker::default(),
             compression,
             state: Mutex::new(StorageState {
                 mode,
@@ -482,6 +485,10 @@ impl PageBackedStorageEngine {
             .iter()
             .map(|sequence| Ok(sequence.lock_schema()?.clone()))
             .collect()
+    }
+
+    pub fn catalog_redo_tracker(&self) -> common::CatalogRedoTracker {
+        self.catalog_redo_tracker.clone()
     }
 
     pub fn set_mode(&self, mode: StorageMode) -> Result<()> {
@@ -1422,7 +1429,8 @@ impl PageBackedStorageEngine {
     }
 
     /// Evenly-sampled initialized heap page images for dictionary training.
-    /// Caller holds the exclusive guard, so the images are stable.
+    /// Caller holds the target table's `Share` relation lock, so DML cannot mutate
+    /// the sampled pages concurrently.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>> {
         self.sample_heap_pages_inner(schema, cap, None)
     }
@@ -1611,12 +1619,13 @@ impl PageBackedStorageEngine {
                 let _structural = latch.lock();
                 let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
                 let image = *guard.data();
-                let fpi_lsn = self.wal.append(WalRecord {
+                let position = self.wal.append_positioned(WalRecord {
                     lsn: 0,
                     txn_id: VACUUM_TXN,
                     kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
                 })?;
-                page::set_page_lsn(guard.data_mut(), fpi_lsn);
+                page::set_page_lsn(guard.data_mut(), position.record_lsn);
+                guard.publish_position(position)?;
                 touched += 1;
             }
         }
@@ -2085,15 +2094,17 @@ impl PageBackedStorageEngine {
         state: &StorageState,
         ctx: &StatementContext,
         kind: WalRecordKind,
-    ) -> Result<Lsn> {
+    ) -> Result<Option<common::WalPosition>> {
         if state.mode == StorageMode::Normal {
-            self.wal.append(WalRecord {
-                lsn: 0,
-                txn_id: ctx.txn_id,
-                kind,
-            })
+            self.wal
+                .append_positioned(WalRecord {
+                    lsn: 0,
+                    txn_id: ctx.txn_id,
+                    kind,
+                })
+                .map(Some)
         } else {
-            Ok(0)
+            Ok(None)
         }
     }
 
@@ -2609,6 +2620,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // entry.
         let mut state = self.lock_state()?;
         let Some(rollback) = state.rollback.remove(&txn_id) else {
+            self.catalog_redo_tracker.resolve(txn_id)?;
             return Ok(());
         };
         let relation_metadata_changed = !rollback.tables.is_empty() || !rollback.indexes.is_empty();
@@ -2675,12 +2687,14 @@ impl StorageEngine for PageBackedStorageEngine {
         }
         state.retired_generations.extend(superseded_generations);
         drop(state);
-        self.remove_files(unpublished_files)
+        self.remove_files(unpublished_files)?;
+        self.catalog_redo_tracker.resolve(txn_id)
     }
 
     fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let mut state = self.lock_state()?;
         let Some(rollback) = state.rollback.remove(&txn_id) else {
+            self.catalog_redo_tracker.resolve(txn_id)?;
             return Ok(());
         };
         let mut retired = RetiredGeneration {
@@ -2713,7 +2727,8 @@ impl StorageEngine for PageBackedStorageEngine {
             state.retired_generations.push_back(retired);
         }
         state.retired_generations.extend(superseded_generations);
-        Ok(())
+        drop(state);
+        self.catalog_redo_tracker.resolve(txn_id)
     }
 }
 
@@ -2723,20 +2738,27 @@ impl SchemaOperations for PageBackedStorageEngine {
         ctx: &StatementContext,
         change_set: &common::CatalogChangeSet,
     ) -> Result<()> {
+        let checkpoint_publication = self.buffer_pool.checkpoint_fence().shared();
         let state = self.lock_state()?;
-        let lsn = self.append_wal(
+        let position = self.append_wal(
             &state,
             ctx,
             WalRecordKind::CatalogChange {
                 change_set: change_set.clone(),
             },
         )?;
-        if lsn != 0 {
+        drop(state);
+        if let Some(position) = position {
+            self.catalog_redo_tracker
+                .register(ctx.txn_id, position.replay_from)?;
+            drop(checkpoint_publication);
             // Allocator reservations may already name physical files created by
             // the following schema operation. Make the generic change durable
             // even while it remains CLOG-gated and uncommitted, so recovery burns
             // those ids after a failed statement or crash.
             self.wal.flush()?;
+        } else {
+            drop(checkpoint_publication);
         }
         Ok(())
     }
@@ -2941,7 +2963,7 @@ impl SchemaOperations for PageBackedStorageEngine {
         // the live version).
         //
         // **HOT broken-chain safety (fail-fast, H2 — `docs/specs/mvcc.md` §10).** The
-        // caller runs CREATE INDEX under the EXCLUSIVE guard (no concurrent writer), so
+        // caller runs CREATE INDEX with a target relation lock excluding DML, so
         // the physical chain view is stable for the duration of the build. For each
         // chain we examine its physically-present versions; if TWO OR MORE are NOT
         // dead-to-all at `gc_horizon` and DIFFER on the new index's column(s), some
@@ -3118,6 +3140,7 @@ impl SequenceManager for PageBackedStorageEngine {
     }
 
     fn nextval(&self, txn_id: u64, sequence: SequenceId) -> Result<i64> {
+        let _checkpoint_publication = self.buffer_pool.checkpoint_fence().shared();
         let (mode, sequence_state) = self.sequence_handle(sequence)?;
         let mut schema = sequence_state.lock_schema()?;
         let next = next_sequence_value(&schema)?;
@@ -3141,6 +3164,7 @@ impl SequenceManager for PageBackedStorageEngine {
         value: i64,
         is_called: bool,
     ) -> Result<i64> {
+        let _checkpoint_publication = self.buffer_pool.checkpoint_fence().shared();
         let (mode, sequence_state) = self.sequence_handle(sequence)?;
         let mut schema = sequence_state.lock_schema()?;
         validate_sequence_value(&schema, value)?;

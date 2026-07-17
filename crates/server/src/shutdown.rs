@@ -137,6 +137,8 @@ pub async fn run_graceful_shutdown(app: Arc<AppState>) -> Result<()> {
         return Err(err);
     }
 
+    app.stop_maintenance_worker();
+    app.stop_checkpoint_worker();
     if let Err(err) = run_checkpoint(&app.components) {
         eprintln!("checkpoint failed during shutdown: {err}");
     }
@@ -267,10 +269,9 @@ mod tests {
             })
             .unwrap();
         let _in_flight = app.components.shutdown.begin_query().unwrap();
-        // A concurrent writer holds the SHARED writer guard (E2b): the shutdown
-        // checkpoint, which takes the EXCLUSIVE guard, would block behind it. The
-        // timeout on the in-flight query must fire first so shutdown bails out
-        // *before* reaching (and blocking on) that checkpoint.
+        // A concurrent writer holds the compatibility write-unit token. Shutdown
+        // must still time out on the registered in-flight query before stopping
+        // workers and starting its final checkpoint.
         let statement_guard = app.components.concurrency.begin_writer().unwrap();
 
         let shutdown = {

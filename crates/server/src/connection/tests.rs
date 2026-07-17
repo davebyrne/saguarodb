@@ -153,7 +153,7 @@ async fn completed_copy_in_releases_guard_before_terminal_write() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
     let shutdown = app.components.shutdown.clone();
-    let mut session = Session::new(app);
+    let mut session = Session::new(Arc::clone(&app));
     let guard = shutdown.begin_query().unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     let task = tokio::spawn(async move {
@@ -260,8 +260,20 @@ async fn extended_control_error_marks_open_transaction_failed() {
 async fn extended_parse_schema_guard_wait_is_cancelable() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
-    let exclusive = app.components.concurrency.begin_checkpoint().unwrap();
-    let mut session = Session::new(app);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let gate_app = Arc::clone(&app);
+    let gate_holder = std::thread::spawn(move || {
+        let _exclusive = gate_app
+            .components
+            .catalog_publication_gate
+            .write()
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.recv().unwrap();
+    let mut session = Session::new(Arc::clone(&app));
     let cancel = session.cancel.clone();
     let request = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -279,7 +291,8 @@ async fn extended_parse_schema_guard_wait_is_cancelable() {
     assert_eq!(err.code, SqlState::QueryCanceled);
     assert!(!session.prepared.contains_key("blocked"));
     request.await.unwrap();
-    drop(exclusive);
+    release_tx.send(()).unwrap();
+    gate_holder.join().unwrap();
 }
 
 #[test]

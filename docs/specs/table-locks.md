@@ -4,8 +4,8 @@
 
 ## 1. Purpose
 
-SaguaroDB coordinates row conflicts through the server `LockManager`, while DDL
-and maintenance historically used the database-wide writer/checkpoint guard.
+SaguaroDB coordinates row conflicts, DDL, and maintenance through the server
+`LockManager`; checkpoints do not acquire relation locks or a global writer guard.
 Table locks add relation-scoped coordination so operations on unrelated tables
 can proceed independently and so a transaction can safely retain a TRUNCATE
 generation until COMMIT or ROLLBACK.
@@ -18,7 +18,7 @@ Server-side acquisition of related parent/child relation locks is specified with
 FK dependency discovery rather than inferred inside storage.
 
 Table locks do not replace MVCC, page/index structural latches, row-conflict
-waiting, the checkpoint guard, or schema-generation validation. They coordinate
+waiting, checkpoint publication fences, or schema-generation validation. They coordinate
 which operations may use or replace a logical table and participate in the same
 deadlock graph as row waits.
 
@@ -79,8 +79,8 @@ Locks are keyed by logical `TableId`, not physical storage id. Hidden TOAST work
 is protected by the base user table's lock; callers do not separately expose or
 lock hidden relation names.
 
-The same manager also provides the two-mode sequence lifetime lock needed once
-sequence DDL no longer uses the global exclusive guard:
+The same manager also provides the two-mode sequence lifetime lock used now that
+sequence DDL relies on object-specific coordination:
 
 - `SequenceAccess` is shared by `nextval`/`setval` and by DML/default expressions
   that may invoke them, including defaults evaluated while `ALTER TABLE ADD
@@ -140,14 +140,9 @@ set, releasing grants first acquired after the savepoint and downgrading later
 upgrades; `RELEASE` keeps later grants. The owner identity remains transaction
 scoped, so row/relation deadlock edges do not split across subxids.
 
-Before an explicit transaction acquires its first table or sequence lock—even
-for a read—it acquires and retains the shared checkpoint-participant guard through
-top-level completion. This preserves the universal guard-before-object order if a
-later statement writes. Autocommit reads remain guard-free because their
-statement owner cannot later upgrade into a writer. Consequently, checkpoint may
-wait for an explicit transaction that has accessed a catalog object, including an
-idle-in-transaction reader; this is an intentional correctness tradeoff until the
-coarse checkpoint controller itself becomes deadlock-aware.
+The compatibility write-unit token is nonblocking and imposes no ordering with
+object locks. Fuzzy checkpoints may finish while explicit readers or writers are
+idle or active.
 
 Acquisition is reentrant. Requesting a stronger mode upgrades the owner's grant;
 the owner never conflicts with itself. An upgrade may block and participate in
@@ -248,7 +243,8 @@ partial subxid abort notify all waiters; every waiter always rechecks compatibil
 - An explicit transaction retains acquired locks in its `Transaction` state.
 - SQL cursor table locks remain owned by the explicit transaction.
 - Prepared execution revalidates schema versions after lock acquisition.
-- Actual checkpoint still uses the database-wide exclusive checkpoint guard.
+- Checkpoint uses short catalog/relation publication read gates and the buffer
+  publication fence, not transaction-owned relation locks.
 
 Lock ordering is:
 
@@ -264,14 +260,9 @@ No storage/page latch may be held while waiting for a relation lock.
 
 ## 7. DDL and maintenance migration
 
-Migration is operation-by-operation, but no committed rollout state may combine a
-blocking relation-lock request with the exclusive checkpoint guard. Relation locks
-are first installed on every table access path while relation-touching DDL and
-maintenance still use only the legacy guard. They switch atomically to table locks
-only after coverage is complete; at that point they use the shared writer guard so
-checkpoint still drains their WAL/page work, plus the exclusive catalog
-publication gate across provisional catalog mutation. Actual checkpoint remains the
-only data-path operation that waits for the exclusive checkpoint guard.
+DDL and maintenance use relation locks plus the catalog publication gate across
+provisional catalog mutation. Checkpoint final capture takes the read side, so it
+waits only for the current publication unit and never for a transaction or I/O.
 
 - Standalone and transactional multi-table TRUNCATE take `AccessExclusive` on
   every target and `AccessShare` on incoming foreign-key children while the
@@ -395,7 +386,8 @@ earlier weaker grant is restored to its captured mode.
 - Concurrent sequence calls cannot outlive DROP SEQUENCE or an owned-sequence
   cascade; table/sequence mixed cycles are deadlock-detected.
 - After migration, target-table conflicts block while unrelated-table work
-  proceeds; relation-touching operations no longer take the coarse exclusive guard.
+  proceeds; relation-touching operations use object-specific locks rather than
+  coarse global exclusion.
 - Standalone TRUNCATE, ALTER, DROP, CREATE INDEX, and VACUUM retain correctness and
   recovery behavior under their relation modes.
 - Transactional multi-table TRUNCATE commits and rolls back heap, secondary-index,

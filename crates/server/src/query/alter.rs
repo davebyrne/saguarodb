@@ -453,9 +453,8 @@ impl QueryService {
     ///
     /// The shared writer, table lock, and catalog publication guards are scoped to
     /// a block covering pre-commit AND post-commit work, then dropped BEFORE
-    /// [`record_commit_and_maybe_checkpoint_after_durable_commit`] runs — that
-    /// call acquires its own exclusive guard, so calling it while this ALTER
-    /// still held one would deadlock. Calling it at all is this fix: unlike the
+    /// [`record_commit_and_maybe_checkpoint_after_durable_commit`] runs. Calling it
+    /// at all is required because, unlike the
     /// normal `autocommit_bound_write_with_guard` path, ALTER doesn't go through
     /// that helper, so without this explicit call the rewrite's (potentially
     /// large) FullPageImage bytes would never count toward the WAL-bytes
@@ -556,10 +555,8 @@ impl QueryService {
             components.active_txns.deregister(txn_id);
             components.lock_manager.on_txn_finished();
         }
-        // The writer/object/catalog guards dropped when the block above ended.
-        // `record_commit_and_maybe_checkpoint_after_durable_commit` acquires its
-        // own exclusive guard internally, so it must run only now — calling it
-        // while still holding this ALTER's guard would deadlock against itself.
+        // The writer/object/catalog guards dropped when the block above ended; only
+        // then publish the completed rewrite to checkpoint pressure accounting.
         record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
 
         Ok(ExecutionResult::Modified {
@@ -602,8 +599,6 @@ impl QueryService {
         components
             .buffer_pool
             .flush_dirty_pages_for_files(&rewrite.file_ids)?;
-        components.store.sync_files(&rewrite.file_ids)?;
-        components.buffer_pool.mark_files_clean(&rewrite.file_ids)?;
         Ok(())
     }
 

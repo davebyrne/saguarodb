@@ -419,9 +419,8 @@ async fn analyze_runs_through_the_extended_protocol() {
     assert_eq!(stats.row_count, 1);
 }
 
-/// A config that never checkpoints on its own; tests drive checkpoints
-/// explicitly so the auto-analyze gating is deterministic (mirroring the
-/// auto-prune tests in `vacuum.rs`).
+/// A config whose checkpoint thresholds cannot interfere with automatic
+/// ANALYZE assertions.
 fn auto_analyze_config(threshold: u64) -> Config {
     Config {
         buffer_pool_frames: 64,
@@ -435,7 +434,7 @@ fn auto_analyze_config(threshold: u64) -> Config {
 }
 
 #[tokio::test]
-async fn checkpoint_auto_analyze_fires_at_the_changed_rows_threshold() {
+async fn background_analyze_fires_at_the_changed_rows_threshold() {
     let server = TestServer::start_with_config(auto_analyze_config(50))
         .await
         .unwrap();
@@ -450,7 +449,6 @@ async fn checkpoint_auto_analyze_fires_at_the_changed_rows_threshold() {
         insert.push_str(&format!("({id})"));
     }
     conn.ok(&insert).await;
-    server.force_checkpoint().await.unwrap();
     assert_eq!(
         table_statistics(&server, "t"),
         None,
@@ -465,7 +463,7 @@ async fn checkpoint_auto_analyze_fires_at_the_changed_rows_threshold() {
         insert.push_str(&format!("({id})"));
     }
     conn.ok(&insert).await;
-    server.force_checkpoint().await.unwrap();
+    server.wait_for_automatic_analyze().await.unwrap();
     let stats = table_statistics(&server, "t").expect("threshold crossed: statistics collected");
     assert_eq!(stats.row_count, 60);
     assert_eq!(
@@ -480,7 +478,6 @@ async fn checkpoint_auto_analyze_fires_at_the_changed_rows_threshold() {
 
     // Under-threshold churn leaves the statistics alone.
     conn.ok("insert into t (id) values (100)").await;
-    server.force_checkpoint().await.unwrap();
     let stats = table_statistics(&server, "t").unwrap();
     assert_eq!(stats.row_count, 60, "no refresh below the threshold");
 }

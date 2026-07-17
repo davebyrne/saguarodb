@@ -315,8 +315,9 @@ results are unchanged from the pre-MVCC engine.
   VACUUM). It logs its own unconditional `FullPageImage` under the writer's `txn_id`
   (idempotent PageLSN-gated redo; it only reclaims dead-to-all versions, so it is
   correct regardless of the txn's outcome). Lock-free readers re-resolve through line
-  pointers (incl. any new `REDIRECT`), so they stay correct; the writer never takes the
-  exclusive guard. The GC horizon is read from `StatementContext::gc_horizon` (the
+  pointers (incl. any new `REDIRECT`), so they stay correct; the writer relies on the
+  target table/row coordination plus the structural and frame latches, not a global
+  checkpoint guard. The GC horizon is read from `StatementContext::gc_horizon` (the
   server captures `gc_horizon()` for the write); a stale/smaller horizon only prunes
   less, never unsafely. For TOAST-enabled tables, any chain containing an external
   TOAST pointer is left for full VACUUM rather than update-path pruning, so the
@@ -705,9 +706,9 @@ only after the current pass completes F3a for the full dead-TID set.
 The order is the safety invariant: F3b must run only after F3a removed every index
 entry for these TIDs, or `insert_row`'s `UNUSED`-slot reuse could resolve a stale index
 entry to the new tuple (silent corruption). The server's `run_vacuum` calls this under
-the **exclusive** checkpoint guard with the GC horizon captured once after the guard,
-so no writer runs during the pass and the horizon accounts for every live reader
-snapshot — VACUUM reclaims only versions `xmax < horizon` that no current-or-future
+normal `Share` relation locks, with a registered maintenance transaction and a GC
+horizon that accounts for every live reader snapshot. Page and structural latches
+serialize VACUUM with concurrent writers — VACUUM reclaims only versions `xmax < horizon` that no current-or-future
 snapshot can see live (no data loss; see `docs/specs/crates/server.md` and `mvcc.md`
 §9/§10 F4a).
 
@@ -1240,7 +1241,7 @@ At-Rest Page Compression).
 the page-LSN: a record whose effect is already present (`page_lsn(page) >= lsn`) is
 skipped, making replay idempotent. `FullPageImage` is validated to be exactly
 `PAGE_SIZE` bytes before install. Recovery uses it to redo every physical page
-mutation after the checkpoint LSN, regardless of the dirtying transaction's
+mutation at or after the manifest's physical `page_redo_lsn`, regardless of the dirtying transaction's
 outcome; the CLOG decides whether replayed versions are visible. A WAL
 `FullPageImageCompressed` record is normalized to a decompressed raw
 `FullPageImage` by the caller (`server`) before it reaches
@@ -1377,14 +1378,13 @@ into `write_page`'s encode step and `load_page`'s decode step.
   (write-ahead of the page writes) before flushing the buffer pool and
   fsyncing the store so every dirtied page is actually re-encoded under the
   new config (see `docs/specs/crates/server.md` and
-  `docs/specs/compression.md` §8) — `flush_dirty_pages` itself does not gate
-  on PageLSN (it passes `page_lsn: None` and assumes the caller already made
-  the WAL durable), so skipping this flush would not error; it would let a
+  `docs/specs/compression.md` §8) — the file-scoped flush assumes the caller already made
+  the WAL durable, so skipping this flush would not error; it would let a
   torn page write precede its FPI being durable, i.e. silent corruption on
   recovery. It returns `RewriteTablePages { pages_touched, file_ids }`, where
   `file_ids` is the deduplicated heap/identity/catalog-index set visited. The
-  caller holds target `AccessExclusive` and uses file-scoped
-  flush/sync/clean operations for exactly the rewritten heap/index ids. Unrelated
+  caller holds target `AccessExclusive` and uses one file-scoped
+  flush/sync/conditional-clean operation for exactly the rewritten heap/index ids. Unrelated
   writers remain concurrent and their frames are untouched.
 - **Corruption semantics.** An envelope validation failure is a distinct
   structured corruption-class error (`SqlState::InternalError`), never
@@ -1396,7 +1396,11 @@ into `write_page`'s encode step and `load_page`'s decode step.
 
 ## WAL Interaction
 
-Normal data operations append physiological redo records as they mutate pages, stamping the page-LSN with each record's LSN:
+Normal data operations append physiological redo with `append_positioned`.
+While holding the page write guard/shared checkpoint fence, each successful
+mutation chooses FPI versus delta, appends WAL, mutates the page, stamps
+`position.record_lsn`, and publishes the complete `WalPosition` into buffer DPT
+metadata before releasing the guard.
 
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
@@ -1405,13 +1409,20 @@ Normal data operations append physiological redo records as they mutate pages, s
   operations. It may atomically carry tables, hidden relations, indexes,
   sequences, views, schemas, and statistics. Schema operations append only the
   dependent physical page WAL required for relation/index construction.
+- The shared `CatalogRedoTracker` registers the minimum
+  `position.replay_from` for each transaction while the catalog publication write
+  gate is held. Commit resolves every top-level and live savepoint-subxid pin only
+  after catalog/storage publication; top-level rollback resolves that whole family
+  only after restoration finishes. `ROLLBACK TO` resolves the rolled-back subxids
+  after their savepoint restoration.
 - `SchemaOperations::update_table_schema` initializes replacement B-tree pages
   only after the caller has appended the change containing fresh rewrite storage
   ids. Recovery applies committed table/index objects through
   `RecoveryOperations` without appending WAL; physical replacement pages are
   restored from normal page redo records.
-- `SequenceManager::nextval` / `setval` log `SequenceAdvance` /
-  `SetSequenceValue` and flush that WAL before the live value changes. Recovery
+- `SequenceManager::nextval` / `setval` hold the shared checkpoint fence across
+  positioned `SequenceAdvance` / `SetSequenceValue` append, flush, and live-state
+  publication. Recovery
   replays these value records unconditionally against storage's installed
   sequence state.
 - Every full-page image storage logs — heap or index, DML or VACUUM — goes
@@ -1427,7 +1438,9 @@ Server query orchestration appends `Commit` and flushes WAL after the statement 
 The storage engine can be initialized in recovery mode. In recovery mode:
 
 - Normal `StorageEngine` methods are not used.
-- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. Committed `CatalogChange` objects are installed in LSN order and relation/index/sequence replacements are reflected through `RecoveryOperations`.
+- Row recovery is positioned physiological redo. Applied PageLSN-gated
+  mutations publish the replayed position into the runtime DPT so a subsequent
+  synchronous fuzzy checkpoint can make them durable.
 - Sequence value records replay via `RecoveryOperations` regardless of CLOG
   status because sequence advancement is non-transactional.
 - No WAL append occurs.

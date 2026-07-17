@@ -86,14 +86,14 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
-    use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
+    use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData, PageStore};
     use common::{
         CancelReason, ColumnDef, CompressionSetting, ConflictWaiter, DataType, DbError, FileId,
-        INVALID_XID, IndexSchema, Key, KeyRange, Lsn, QueryCancel, RelationKind, Result, Row,
-        SequenceManager, SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression,
-        ToastMode, ToastOptions, TupleLockAcquire, TupleLockGrantChange, TupleLockManager,
-        TupleLockMode, TupleLockTag, TupleLockWaitPolicy, TxnId, TxnStatus, TxnStatusView, Value,
-        toast_schema,
+        FlushPolicy, INVALID_XID, IndexSchema, Key, KeyRange, Lsn, PageFlushInfo, QueryCancel,
+        RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState, StatementContext,
+        TableSchema, ToastCompression, ToastMode, ToastOptions, TupleLockAcquire,
+        TupleLockGrantChange, TupleLockManager, TupleLockMode, TupleLockTag, TupleLockWaitPolicy,
+        TxnId, TxnStatus, TxnStatusView, Value, toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -1280,7 +1280,10 @@ mod tests {
         let harness = StorageHarness::new();
         let ctx = crate::test_statement_context(1);
         harness.create_users_table(&ctx).unwrap();
-        harness.buffer.mark_all_clean().unwrap();
+        harness
+            .buffer
+            .flush_dirty_pages_for_files(&[1, crate::heap::primary_index_file_id(1)])
+            .unwrap();
 
         harness
             .wal
@@ -1340,7 +1343,10 @@ mod tests {
             .storage
             .insert(&ctx, 1, user_row(1, "Ada", true))
             .unwrap();
-        harness.buffer.mark_all_clean().unwrap();
+        harness
+            .buffer
+            .flush_dirty_pages_for_files(&[1, crate::heap::primary_index_file_id(1)])
+            .unwrap();
 
         harness.wal.fail_next_full_page_image();
         let err = harness
@@ -1379,7 +1385,10 @@ mod tests {
             .storage
             .insert(&insert_ctx, 1, user_row(1, "Ada", true))
             .unwrap();
-        harness.buffer.mark_all_clean().unwrap();
+        harness
+            .buffer
+            .flush_dirty_pages_for_files(&[1, crate::heap::primary_index_file_id(1)])
+            .unwrap();
 
         harness.wal.fail_next_full_page_image();
         let delete_ctx = crate::test_statement_context(2);
@@ -1464,6 +1473,18 @@ mod tests {
         crate::page::init_page(page.data_mut(), page_num);
         let slot =
             crate::page::insert_row(page.data_mut(), &legacy_user_row(1, "Ada", true)).unwrap();
+        let setup_position = harness
+            .wal
+            .append_positioned(WalRecord {
+                lsn: 0,
+                txn_id: setup_ctx.txn_id,
+                kind: WalRecordKind::HeapInit {
+                    file_id: 1,
+                    page_num,
+                },
+            })
+            .unwrap();
+        page.publish_position(setup_position).unwrap();
         let location = crate::engine::RowLocation {
             file_id: 1,
             page_num,
@@ -1479,7 +1500,10 @@ mod tests {
         )
         .insert(setup_ctx.txn_id, &Key(vec![Value::Integer(1)]), &location)
         .unwrap();
-        harness.buffer.mark_all_clean().unwrap();
+        harness
+            .buffer
+            .flush_dirty_pages_for_files(&[1, crate::heap::primary_index_file_id(1)])
+            .unwrap();
 
         let before = harness.wal.record_count();
         let err = harness
@@ -1546,6 +1570,112 @@ mod tests {
             logged,
             "create_index should follow a catalog change WAL record"
         );
+    }
+
+    #[test]
+    fn catalog_redo_pin_is_published_inside_checkpoint_fence() {
+        let harness = StorageHarness::new();
+        let (append_entered, release_append) = harness.wal.block_next_catalog_append();
+        let change_set = common::CatalogChangeSet {
+            version: common::CATALOG_CHANGE_SET_VERSION,
+            mutations: Vec::new(),
+            allocator_high_water: common::CatalogAllocatorHighWater::default(),
+        };
+
+        std::thread::scope(|scope| {
+            let storage = &harness.storage;
+            let apply = scope.spawn(move || {
+                storage.apply_catalog_change(&crate::test_statement_context(7), &change_set)
+            });
+            append_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+            let buffer = harness.buffer.clone();
+            let (exclusive_entered_tx, exclusive_entered_rx) = mpsc::channel();
+            let capture = scope.spawn(move || {
+                let _guard = buffer.checkpoint_fence().exclusive();
+                let _ = exclusive_entered_tx.send(());
+            });
+            assert!(
+                exclusive_entered_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "checkpoint capture crossed an appended but unregistered catalog change"
+            );
+
+            release_append.send(()).unwrap();
+            apply.join().unwrap().unwrap();
+            exclusive_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            capture.join().unwrap();
+        });
+
+        assert_eq!(
+            harness
+                .storage
+                .catalog_redo_tracker()
+                .oldest_pending()
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn failed_reclaim_fpi_keeps_resident_page_and_dpt_unchanged() {
+        let harness = StorageHarness::new();
+        harness
+            .create_users_table(&crate::test_statement_context(1))
+            .unwrap();
+        harness
+            .storage
+            .insert(
+                &crate::test_statement_context(2),
+                1,
+                user_row(1, "Ada", true),
+            )
+            .unwrap();
+        assert!(
+            harness
+                .storage
+                .delete(
+                    &crate::test_statement_context(3),
+                    1,
+                    &Key(vec![Value::Integer(1)]),
+                )
+                .unwrap()
+        );
+        let (reclaimed, _) = harness.storage.vacuum_heap(&users_schema(), 4).unwrap();
+        let dead = reclaimed
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!dead.is_empty());
+        harness
+            .storage
+            .vacuum_indexes(&users_schema(), &dead)
+            .unwrap();
+
+        let location = reclaimed[0];
+        let before_page = *harness
+            .buffer
+            .read_page(location.file_id, location.page_num)
+            .unwrap()
+            .data();
+        let before_dpt = harness.buffer.dirty_page_table().unwrap();
+        harness.wal.fail_next_full_page_image();
+
+        let error = harness
+            .storage
+            .reclaim_line_pointers(&users_schema(), &dead)
+            .unwrap_err();
+        assert!(error.message.contains("injected WAL append failure"));
+        let after_page = *harness
+            .buffer
+            .read_page(location.file_id, location.page_num)
+            .unwrap()
+            .data();
+        assert_eq!(after_page, before_page);
+        assert_eq!(harness.buffer.dirty_page_table().unwrap(), before_dpt);
     }
 
     #[test]
@@ -4928,6 +5058,15 @@ mod tests {
         storage: PageBackedStorageEngine,
         buffer: Arc<MemoryBufferPool>,
         wal: Arc<CountingWal>,
+        _dir: tempfile::TempDir,
+    }
+
+    struct AlwaysFlush;
+
+    impl FlushPolicy for AlwaysFlush {
+        fn can_flush(&self, _info: &PageFlushInfo) -> bool {
+            true
+        }
     }
 
     #[derive(Debug, Default)]
@@ -5049,7 +5188,10 @@ mod tests {
 
     impl StorageHarness {
         fn new() -> Self {
-            let buffer = Arc::new(MemoryBufferPool::empty(64));
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn PageStore> =
+                Arc::new(crate::HeapPageStore::open(dir.path().join("data")).unwrap());
+            let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
             let wal = Arc::new(CountingWal::default());
             let storage =
                 PageBackedStorageEngine::open(buffer.clone(), wal.clone(), StorageMode::Normal)
@@ -5058,6 +5200,7 @@ mod tests {
                 storage,
                 buffer,
                 wal,
+                _dir: dir,
             }
         }
 
@@ -5073,6 +5216,7 @@ mod tests {
         flushes: AtomicUsize,
         fail_at: AtomicUsize,
         block_next_flush: std::sync::Mutex<Option<FlushGate>>,
+        block_next_catalog_append: std::sync::Mutex<Option<FlushGate>>,
         fail_next_fpi: std::sync::atomic::AtomicBool,
         fail_next_heap_update_header: std::sync::atomic::AtomicBool,
         fpi_count_by_file: std::sync::Mutex<std::collections::HashMap<FileId, usize>>,
@@ -5101,6 +5245,16 @@ mod tests {
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             *self.block_next_flush.lock().unwrap() = Some(FlushGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            (entered_rx, release_tx)
+        }
+
+        fn block_next_catalog_append(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *self.block_next_catalog_append.lock().unwrap() = Some(FlushGate {
                 entered: entered_tx,
                 release: release_rx,
             });
@@ -5143,6 +5297,21 @@ mod tests {
     }
 
     impl WalManager for CountingWal {
+        fn append_positioned(&self, record: WalRecord) -> Result<common::WalPosition> {
+            let is_catalog_change = matches!(record.kind, WalRecordKind::CatalogChange { .. });
+            let record_lsn = self.append(record)?;
+            if is_catalog_change
+                && let Some(gate) = self.block_next_catalog_append.lock().unwrap().take()
+            {
+                let _ = gate.entered.send(());
+                let _ = gate.release.recv();
+            }
+            Ok(common::WalPosition {
+                replay_from: record_lsn.saturating_sub(1),
+                record_lsn,
+            })
+        }
+
         fn append(&self, record: WalRecord) -> Result<Lsn> {
             let next = self.count.load(Ordering::SeqCst) + 1;
             if self.fail_at.load(Ordering::SeqCst) == next {
@@ -5226,7 +5395,12 @@ mod tests {
             Ok(())
         }
 
-        fn persist_clog(&self, _clog_lsn: Lsn) -> Result<()> {
+        fn checkpoint_clog(
+            &self,
+            _proposed_replay_floor: Lsn,
+            _captured_active: &[TxnId],
+            _allocation_boundary: TxnId,
+        ) -> Result<()> {
             Ok(())
         }
     }

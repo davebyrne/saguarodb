@@ -1070,12 +1070,12 @@ impl PageBackedStorageEngine {
         // page never needs a separate full-page image.
         let mut writable = self.buffer_pool.new_page(file_id, txn_id)?;
         let page_num = writable.page_num();
-        let init_lsn = match self.wal.append(WalRecord {
+        let init_position = match self.wal.append_positioned(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::HeapInit { file_id, page_num },
         }) {
-            Ok(lsn) => lsn,
+            Ok(position) => position,
             Err(err) => {
                 self.buffer_pool.abandon_unpublished_new_page(writable)?;
                 return Err(err);
@@ -1083,9 +1083,9 @@ impl PageBackedStorageEngine {
         };
         // The HeapInit record now durably references this page: it can no longer be
         // abandoned, only reclaimed by VACUUM after its tuples die.
-        writable.publish();
         page::init_page(writable.data_mut(), page_num);
-        page::set_page_lsn(writable.data_mut(), init_lsn);
+        page::set_page_lsn(writable.data_mut(), init_position.record_lsn);
+        writable.publish_position(init_position)?;
         let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, row_bytes)?;
         Ok(RowLocation {
             file_id,
@@ -1118,20 +1118,21 @@ impl PageBackedStorageEngine {
                 txn_id,
                 kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
             };
-            let lsn = match self.wal.append(record) {
-                Ok(lsn) => lsn,
+            let position = match self.wal.append_positioned(record) {
+                Ok(position) => position,
                 Err(err) => {
                     guard.restore_needs_fpi();
                     return Err(err);
                 }
             };
-            page::set_page_lsn(&mut image, lsn);
+            page::set_page_lsn(&mut image, position.record_lsn);
             *guard.data_mut() = image;
+            guard.publish_position(position)?;
             Ok(slot_num)
         } else {
             let mut image = *guard.data();
             let slot_num = page::insert_row(&mut image, row_bytes)?;
-            let lsn = self.wal.append(WalRecord {
+            let position = self.wal.append_positioned(WalRecord {
                 lsn: 0,
                 txn_id,
                 kind: WalRecordKind::HeapInsert {
@@ -1141,8 +1142,9 @@ impl PageBackedStorageEngine {
                     row_bytes: row_bytes.to_vec(),
                 },
             })?;
-            page::set_page_lsn(&mut image, lsn);
+            page::set_page_lsn(&mut image, position.record_lsn);
             *guard.data_mut() = image;
+            guard.publish_position(position)?;
             Ok(slot_num)
         }
     }
@@ -1314,15 +1316,16 @@ impl PageBackedStorageEngine {
                     &image,
                 ),
             };
-            let lsn = match self.wal.append(record) {
-                Ok(lsn) => lsn,
+            let position = match self.wal.append_positioned(record) {
+                Ok(position) => position,
                 Err(err) => {
                     guard.restore_needs_fpi();
                     return Err(err);
                 }
             };
-            page::set_page_lsn(&mut image, lsn);
+            page::set_page_lsn(&mut image, position.record_lsn);
             *guard.data_mut() = image;
+            guard.publish_position(position)?;
         } else {
             let mut image = *guard.data();
             page::set_tuple_header(
@@ -1333,7 +1336,7 @@ impl PageBackedStorageEngine {
                 infomask,
                 page::page_lsn(guard.data()),
             )?;
-            let lsn = self.wal.append(WalRecord {
+            let position = self.wal.append_positioned(WalRecord {
                 lsn: 0,
                 txn_id,
                 kind: WalRecordKind::HeapUpdateHeader {
@@ -1345,8 +1348,9 @@ impl PageBackedStorageEngine {
                     infomask,
                 },
             })?;
-            page::set_page_lsn(&mut image, lsn);
+            page::set_page_lsn(&mut image, position.record_lsn);
             *guard.data_mut() = image;
+            guard.publish_position(position)?;
         }
         Ok(StampOutcome::Stamped)
     }
@@ -1386,8 +1390,8 @@ impl PageBackedStorageEngine {
     ///    insert; only if there is STILL no room does it fall back to a normal update.
     ///    The prune mutates only the single latched page and never marks a root `DEAD`
     ///    (no index vacuum), so lock-free readers — which re-resolve through line
-    ///    pointers, incl. `REDIRECT` — stay correct, and the writer never takes the
-    ///    exclusive guard. A stale/smaller `gc_horizon` only prunes less.
+    ///    pointers, incl. `REDIRECT` — stay correct without global checkpoint
+    ///    exclusion. A stale/smaller `gc_horizon` only prunes less.
     ///
     /// When eligible: write the heap-only successor on the predecessor's page, then
     /// stamp the predecessor `xmax = txn`, `t_ctid → new`, and `HOT_UPDATED` via

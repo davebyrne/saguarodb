@@ -10,8 +10,9 @@ use tokio_rustls::TlsAcceptor;
 use wal::WalManager;
 
 use crate::cancel::CancelRegistry;
-use crate::checkpoint::CheckpointState;
+use crate::checkpoint::{CheckpointCoordinator, CheckpointState};
 use crate::config::Config;
+use crate::maintenance::MaintenanceCoordinator;
 use crate::query::QueryService;
 use crate::registry::ActiveTxnRegistry;
 use crate::shutdown::ShutdownState;
@@ -33,25 +34,24 @@ pub struct ServerComponents {
     pub dict_store: Arc<compress::DictStore>,
     pub concurrency: Arc<dyn ConcurrencyController>,
     pub checkpoint: CheckpointState,
+    pub checkpoint_coordinator: Arc<CheckpointCoordinator>,
+    pub maintenance_coordinator: Arc<MaintenanceCoordinator>,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
     /// Dead MVCC versions produced by committed statements since the last
-    /// auto-prune (`docs/specs/mvcc.md` §9, Milestone F4b). Each committed `DELETE`
+    /// successful automatic VACUUM. Each committed `DELETE`
     /// row and each committed `UPDATE` row creates one dead version; this counts
     /// those (incremented only on a successful commit, never on abort). When a
-    /// checkpoint runs and this reaches `config.auto_vacuum_dead_rows`, the
-    /// checkpoint vacuums every user table under its exclusive guard and resets this
-    /// to 0. A purely additive proxy: it never needs a scan to decide whether to
+    /// threshold enqueues the maintenance worker, which subtracts only the amount
+    /// represented by a successful pass. A purely additive proxy: it never needs a scan to decide whether to
     /// prune, and over-counting (e.g. a version a live snapshot still pins, so it is
     /// not yet reclaimable) only triggers an extra, harmless pass.
     pub dead_rows_since_vacuum: AtomicU64,
     /// Rows changed by committed statements since the last auto-analyze
     /// (`docs/specs/statistics.md` §10): each committed `INSERT`, `UPDATE`,
     /// `DELETE`, and `COPY FROM` row counts once (incremented only on a
-    /// successful commit, never on abort). When a checkpoint runs and this
-    /// reaches `config.auto_analyze_changed_rows`, the checkpoint re-collects
-    /// statistics for every user table under its exclusive guard and resets
-    /// this to 0; a manual full `ANALYZE` (no table) also resets it.
+    /// successful commit, never on abort). The threshold enqueues a separate
+    /// serialized full-ANALYZE job; manual ANALYZE uses the same implementation.
     pub rows_changed_since_analyze: AtomicU64,
     /// In-progress transaction ids. The CLOG (in the WAL manager) records settled
     /// outcomes; this registry tracks which transactions are still running, for
@@ -129,15 +129,21 @@ impl ServerComponents {
             .unwrap_or_else(|| self.next_txn_id.load(Ordering::Acquire))
     }
 
-    /// Add `count` dead MVCC versions to the auto-prune accumulator
+    /// Add `count` dead MVCC versions to the automatic-VACUUM accumulator
     /// (`dead_rows_since_vacuum`, `docs/specs/mvcc.md` §9, Milestone F4b). Called by
     /// the commit paths only on a successful, durable commit (an aborted statement
     /// never reaches the call), so the counter reflects committed dead versions. A
     /// zero `count` is a cheap no-op.
     pub fn add_dead_versions(&self, count: u64) {
         if count != 0 {
-            self.dead_rows_since_vacuum
-                .fetch_add(count, Ordering::Relaxed);
+            let total = self
+                .dead_rows_since_vacuum
+                .fetch_add(count, Ordering::AcqRel)
+                .saturating_add(count);
+            if self.config.auto_vacuum_dead_rows != 0 && total >= self.config.auto_vacuum_dead_rows
+            {
+                self.maintenance_coordinator.request_vacuum();
+            }
         }
     }
 
@@ -147,8 +153,15 @@ impl ServerComponents {
     /// `count` is a cheap no-op.
     pub fn add_changed_rows(&self, count: u64) {
         if count != 0 {
-            self.rows_changed_since_analyze
-                .fetch_add(count, Ordering::Relaxed);
+            let total = self
+                .rows_changed_since_analyze
+                .fetch_add(count, Ordering::AcqRel)
+                .saturating_add(count);
+            if self.config.auto_analyze_changed_rows != 0
+                && total >= self.config.auto_analyze_changed_rows
+            {
+                self.maintenance_coordinator.request_analyze();
+            }
         }
     }
 }
@@ -156,6 +169,39 @@ impl ServerComponents {
 pub struct AppState {
     pub components: Arc<ServerComponents>,
     pub query_service: Arc<QueryService>,
+    pub(crate) checkpoint_worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) maintenance_worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl AppState {
+    pub(crate) fn stop_checkpoint_worker(&self) {
+        self.components.checkpoint_coordinator.stop();
+        let handle = match self.checkpoint_worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    pub(crate) fn stop_maintenance_worker(&self) {
+        self.components.maintenance_coordinator.stop();
+        let handle = match self.maintenance_worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.stop_maintenance_worker();
+        self.stop_checkpoint_worker();
+    }
 }
 
 #[cfg(test)]

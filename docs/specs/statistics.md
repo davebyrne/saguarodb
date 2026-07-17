@@ -22,7 +22,8 @@ defines:
 - **Planner consumption**, staged: cardinality/selectivity estimation with
   `rows=` estimates in `EXPLAIN`, then the first cost-based decisions
   (hash-join build side, seq-vs-index scan choice).
-- **Auto-analyze** at checkpoint behind `--auto-analyze-changed-rows`.
+- **Auto-analyze** on a separate maintenance worker behind
+  `--auto-analyze-changed-rows`.
 
 ### Goals
 
@@ -46,8 +47,8 @@ defines:
 - `ANALYZE <table> (columns...)` column lists; `pg_statistic` raw catalog
   emulation (only the `pg_stats` view);
   `pg_stat_user_tables` / `last_analyze` tracking.
-- A background analyze daemon. Auto-analyze piggybacks on the checkpoint like
-  auto-prune (Milestone H).
+- Parallel maintenance jobs; automatic VACUUM and ANALYZE are serialized by one
+  background maintenance coordinator.
 - Statistics-driven plan invalidation. Prepared statements keep their cached
   plans (and old estimates) until re-prepared; `ANALYZE` does not bump
   `schema_version`.
@@ -116,7 +117,7 @@ Statistics are catalog state, keyed off the schema objects but versioned
 independently of them:
 
 - `CatalogSnapshot` carries `statistics: HashMap<TableId, TableStatistics>` in
-  catalog format v3 inside manifest (`SGMF`) v5. The durable field is required;
+  catalog format v3 inside manifest (`SGMF`) v6. The durable field is required;
   older development formats and incomplete v3 payloads are rejected rather than
   defaulted or migrated.
 - Catalog API: `get_table_statistics(TableId)` and
@@ -360,26 +361,21 @@ Constants (v1 `const`s in `planner::estimate`, GUCs later):
 Index-predicate *eligibility* (literal-only comparands, single column) is
 explicitly unchanged by this project.
 
-## 10. Auto-analyze (Milestone H)
-
-Mirrors checkpoint auto-prune:
+## 10. Background auto-analyze
 
 - `ServerComponents` gains `rows_changed_since_analyze`, incremented on the
   commit path by each committed INSERT/UPDATE/DELETE/COPY row (same hook
   points as `dead_rows_since_vacuum`).
 - New startup option `--auto-analyze-changed-rows <n>` (default `10000`,
   `0` disables).
-- `run_checkpoint` gains a step after auto-prune: when the counter reaches
-  the threshold, re-collect statistics for every user table under the already
-  held exclusive checkpoint guard (one committed maintenance transaction; its
-  generic catalog change precedes the checkpoint's WAL flush so the
-  manifest carries the results), then reset the counter. Uses the built-in
-  default statistics target (no session). A manual full `ANALYZE` (no table)
-  also resets the counter; a single-table ANALYZE does not.
-
-Like auto-prune, this fires only on the commit path, a known limitation shared
-with checkpointing itself. A background scheduler is outside the current
-contract.
+- Crossing the threshold enqueues the serialized maintenance worker. It calls
+  the same component-level full ANALYZE implementation as SQL: normal
+  `AccessShare` target locks, registered snapshots, catalog publication, and a
+  maintenance commit, using the built-in default statistics target.
+- The worker captures the represented counter and subtracts only that amount
+  after success, preserving concurrent increments. Failure retains the request
+  and retries after a bounded notification. Checkpoints neither run nor wait for
+  ordinary ANALYZE.
 
 ## 11. Interactions and invariants
 
@@ -403,7 +399,7 @@ The current implementation includes catalog-v3 statistics storage and generic
 catalog-change recovery, snapshot-visible collection and estimator math,
 `ANALYZE`/`VACUUM ANALYZE`, `default_statistics_target`, system-catalog
 introspection, planner selectivity and row estimates, statistics-informed
-hash-join build-side and seq-vs-index choices, and checkpoint auto-analyze.
+hash-join build-side and seq-vs-index choices, and background auto-analyze.
 Tests cover persistence and crash behavior, estimator distributions, SQL and
 protocol behavior, introspection, plan choices with and without statistics,
 and automatic threshold handling.

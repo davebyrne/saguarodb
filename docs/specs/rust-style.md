@@ -149,7 +149,8 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - Parser, planner, executor, storage, buffer, WAL, control, and catalog crates are synchronous.
 - Tokio belongs at the server and connection boundary.
 - Use `std::sync::{Arc, Mutex, RwLock}` in core crates by default.
-- Use `parking_lot` where SaguaroDB needs owned lock guards, such as `WriteGuard`, `CheckpointGuard`, `PageReadGuard`, and `PageWriteGuard`. `std::sync` guard lifetimes are not suitable for these object-safe owned guard types.
+- Use `parking_lot` where SaguaroDB needs owned page/fence guards, such as
+  `PageReadGuard`, `PageWriteGuard`, and checkpoint publication guards.
 - Use Tokio synchronization primitives only where async code would otherwise block the runtime.
 - Server shared components should be held as `Arc<dyn Trait + Send + Sync>` when they are accessed across owned services or tasks.
 - Prefer references to trait objects for short-lived API calls, such as `&dyn CatalogManager`.
@@ -190,7 +191,8 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 - Let `rustfmt` organize whitespace; keep import lists straightforward.
 - Prefer importing crate-local public types from the crate root when that matches the public API.
-- Use clear domain names: `catalog`, `schema`, `row`, `key`, `txn_id`, `checkpoint_lsn`.
+- Use clear domain names: `catalog`, `schema`, `row`, `key`, `txn_id`,
+  `checkpoint_end_lsn`, `page_redo_lsn`, and `catalog_redo_lsn`.
 - Avoid abbreviations except established database terms such as `LSN`, `DDL`, `DML`, and `WAL`.
 - Use leading-underscore names only for values that are intentionally unused. If a function
   parameter is read, name it directly; do not accept `_name` and immediately rebind it as

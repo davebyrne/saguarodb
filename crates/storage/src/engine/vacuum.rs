@@ -24,8 +24,9 @@ impl PageBackedStorageEngine {
     /// `HOT_UPDATED` + settled `XMAX_*` cleared (preserving `xmin`/`XMIN_*`/`HEAP_ONLY`) —
     /// so a full pass leaves no surviving reference to `T` (as deleter, mirroring the
     /// aborted-creator reclaim), licensing the F4c floor-advance for ALL aborted
-    /// UPDATE/DELETE, not just inserts. VACUUM holds the exclusive guard, so `xmax`'s
-    /// status is settled (never reset an in-progress xmax).
+    /// UPDATE/DELETE, not just inserts. VACUUM's target-table `Share` relation lock
+    /// excludes target DML writers, and cleanup requires a definitively aborted CLOG
+    /// status (never reset an in-progress `xmax`).
     ///
     /// A page that had any dead slot OR any abort-cleanup reset is rewritten — the resets
     /// applied FIRST, then [`page::prune_and_compact`] (dead slots → `DEAD`, survivors
@@ -46,10 +47,9 @@ impl PageBackedStorageEngine {
     ///
     /// **Latching (lock order: structural → frame → WAL).** Per page, takes the
     /// per-heap structural latch then the frame write latch, releasing both before the
-    /// next page (never held across pages). VACUUM runs under the exclusive
-    /// checkpoint guard, so no writer runs during the pass; using the same latch
-    /// order here keeps the page-level primitive consistent with normal heap
-    /// mutations.
+    /// next page (never held across pages). VACUUM uses normal relation locks and
+    /// may overlap unrelated writers and checkpoints; this latch order keeps the
+    /// page-level primitive consistent with normal heap mutations.
     ///
     /// **`vacuum_txn` = 0 (the recovery/maintenance convention).** Pages are dirtied
     /// and logged under txn id `0`, the same id recovery uses for non-transactional
@@ -218,16 +218,17 @@ impl PageBackedStorageEngine {
             page::mark_slots_dead(&mut scratch, &plan.dead_roots)?;
         }
         page::compact(&mut scratch, provisional_lsn)?;
-        let fpi_lsn = self.wal.append(WalRecord {
+        let position = self.wal.append_positioned(WalRecord {
             lsn: 0,
             txn_id,
             kind: fpi_record_kind(&self.compression, file_id, page_num, &scratch),
         })?;
-        page::set_page_lsn(&mut scratch, fpi_lsn);
+        page::set_page_lsn(&mut scratch, position.record_lsn);
         // All steps succeeded: publish the finished image into the live frame in one
         // shot. The frame was never touched before this point, so an earlier error left
         // it intact.
         *guard.data_mut() = scratch;
+        guard.publish_position(position)?;
         Ok(())
     }
     /// Chain-aware HOT prune plan for ONE heap page (`docs/specs/mvcc.md` §9 / §10
@@ -268,8 +269,9 @@ impl PageBackedStorageEngine {
     ///    predecessor) is reset in place (F4c), exactly as before H3.
     ///
     /// Deadness is re-derived per member here under the frame latch via
-    /// [`common::is_dead_to_all`]; VACUUM holds the exclusive guard, so every `xmin`/
-    /// `xmax` status is settled (never reset/redirect against an in-flight txn).
+    /// [`common::is_dead_to_all`]. The captured GC horizon protects in-progress or
+    /// potentially visible versions; abort cleanup additionally requires a
+    /// definitively aborted status.
     pub(super) fn classify_page_for_prune(
         &self,
         schema: &TableSchema,
@@ -562,8 +564,8 @@ impl PageBackedStorageEngine {
     /// If a KEPT (live) chain member's own `xmax` is a DEFINITIVELY aborted deleter —
     /// the surviving predecessor of a non-HOT aborted UPDATE/DELETE — schedule its
     /// in-place abort-cleanup (F4c). Skips a member already scheduled for a reset by
-    /// step 1's abort truncation (its `xmax` would be reset to INVALID). VACUUM holds
-    /// the exclusive guard, so `xmax`'s status is settled.
+    /// step 1's abort truncation (its `xmax` would be reset to INVALID). Cleanup is
+    /// scheduled only when the CLOG reports `xmax` definitively aborted.
     fn maybe_abort_cleanup_kept(
         &self,
         member: &ChainMember,
@@ -730,20 +732,20 @@ impl PageBackedStorageEngine {
             let _heap_guard = latch.lock();
             let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
 
-            // Flip DEAD → UNUSED, then log the reclaimed page as a single unconditional
-            // FullPageImage and stamp the FPI's LSN as the new page-LSN (the
-            // `vacuum_heap` / `btree::log_full_page` pattern). `reclaim_line_pointers`
-            // stamps a provisional LSN; the FPI append overwrites it with the record's
-            // LSN so redo gating is exact.
+            // Build the reclaimed page off-frame so a failed WAL append cannot expose
+            // or later flush an unlogged mutation. After the FPI append succeeds, stamp
+            // its exact PageLSN and publish the image and dirty metadata together.
             let provisional_lsn = page::page_lsn(guard.data());
-            page::reclaim_line_pointers(guard.data_mut(), &slots, provisional_lsn)?;
-            let image = *guard.data();
-            let fpi_lsn = self.wal.append(WalRecord {
+            let mut image = *guard.data();
+            page::reclaim_line_pointers(&mut image, &slots, provisional_lsn)?;
+            let position = self.wal.append_positioned(WalRecord {
                 lsn: 0,
                 txn_id: VACUUM_TXN,
                 kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
             })?;
-            page::set_page_lsn(guard.data_mut(), fpi_lsn);
+            page::set_page_lsn(&mut image, position.record_lsn);
+            *guard.data_mut() = image;
+            guard.publish_position(position)?;
         }
 
         Ok(())
@@ -914,7 +916,7 @@ impl PageBackedStorageEngine {
     /// documented no-op for both, but skipping avoids even the empty-set call).
     ///
     /// **Safety against data loss (the horizon-under-the-guard argument).** The caller
-    /// runs this under the EXCLUSIVE checkpoint guard, so NO writer executes during
+    /// calls this under normal `Share` relation locks, so no target writer executes during
     /// the pass: no committed-deleter can appear mid-pass, and `horizon` is captured
     /// once (after acquiring the guard) as the min advertised `xmin` over all live
     /// snapshots — INCLUDING lock-free readers, which advertise their `xmin`. So every

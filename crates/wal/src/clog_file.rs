@@ -28,7 +28,7 @@ use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState, TxnId};
 use serde::{Deserialize, Serialize};
 
 const CLOG_MAGIC: &[u8; 4] = b"SGCL";
-const CLOG_VERSION: u32 = 2;
+const CLOG_VERSION: u32 = 3;
 const CLOG_HEADER_LEN: usize = 16;
 pub(crate) const MAX_CLOG_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_CLOG_FILE_BYTES: usize = CLOG_HEADER_LEN + MAX_CLOG_PAYLOAD_BYTES;
@@ -47,6 +47,7 @@ pub struct ClogSnapshot {
     /// records. Recovery seeds the CLOG from this snapshot and then replays only
     /// records with `lsn > clog_lsn`, bounding the status-rebuild scan.
     pub clog_lsn: Lsn,
+    pub authorized_replay_floor: Lsn,
     /// The implicit-committed floor (`docs/specs/mvcc.md` §5.4): an unrecorded
     /// normal id strictly below it reads as committed.
     pub committed_floor: TxnId,
@@ -58,17 +59,22 @@ pub struct ClogSnapshot {
     pub committed: Vec<TxnId>,
     /// Explicitly aborted ids in the live window (`>= committed_floor`), sorted.
     pub aborted: Vec<TxnId>,
+    /// Transactions captured active by the checkpoint metadata fence.
+    pub in_progress: Vec<TxnId>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ClogPayload {
     clog_lsn: Lsn,
+    authorized_replay_floor: Lsn,
     committed_floor: TxnId,
     vacuum_floor: TxnId,
     #[serde(deserialize_with = "deserialize_committed")]
     committed: Vec<TxnId>,
     #[serde(deserialize_with = "deserialize_aborted")]
     aborted: Vec<TxnId>,
+    #[serde(deserialize_with = "deserialize_in_progress")]
+    in_progress: Vec<TxnId>,
 }
 
 fn deserialize_committed<'de, D>(deserializer: D) -> std::result::Result<Vec<TxnId>, D::Error>
@@ -93,19 +99,33 @@ where
     )
 }
 
+fn deserialize_in_progress<'de, D>(deserializer: D) -> std::result::Result<Vec<TxnId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    common::deserialize_bounded_vec_named(
+        deserializer,
+        MAX_CLOG_STATUS_COUNT,
+        "in-progress CLOG status list",
+    )
+}
+
 /// Encode a CLOG snapshot into its durable envelope (header + JSON payload).
 pub(crate) fn encode_clog(snapshot: &ClogSnapshot) -> Result<Vec<u8>> {
     if snapshot.committed.len() > MAX_CLOG_STATUS_COUNT
         || snapshot.aborted.len() > MAX_CLOG_STATUS_COUNT
+        || snapshot.in_progress.len() > MAX_CLOG_STATUS_COUNT
     {
         return Err(corrupt_clog("CLOG status list exceeds the item limit"));
     }
     let payload = ClogPayload {
         clog_lsn: snapshot.clog_lsn,
+        authorized_replay_floor: snapshot.authorized_replay_floor,
         committed_floor: snapshot.committed_floor,
         vacuum_floor: snapshot.vacuum_floor,
         committed: snapshot.committed.clone(),
         aborted: snapshot.aborted.clone(),
+        in_progress: snapshot.in_progress.clone(),
     };
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|err| corrupt_clog(format!("failed to encode CLOG payload: {err}")))?;
@@ -178,33 +198,33 @@ pub(crate) fn decode_clog(bytes: &[u8]) -> Result<ClogSnapshot> {
 
     let payload: ClogPayload = serde_json::from_slice(payload_bytes)
         .map_err(|err| corrupt_clog(format!("failed to decode CLOG payload: {err}")))?;
+    if payload.authorized_replay_floor > payload.clog_lsn {
+        return Err(corrupt_clog("authorized replay floor is beyond CLOG LSN"));
+    }
     validate_status_lists(
         payload.committed_floor,
-        &payload.committed,
-        &payload.aborted,
+        [&payload.committed, &payload.aborted, &payload.in_progress],
     )?;
     Ok(ClogSnapshot {
         clog_lsn: payload.clog_lsn,
+        authorized_replay_floor: payload.authorized_replay_floor,
         committed_floor: payload.committed_floor,
         vacuum_floor: payload.vacuum_floor,
         committed: payload.committed,
         aborted: payload.aborted,
+        in_progress: payload.in_progress,
     })
 }
 
 /// Reject a payload whose status lists are not the canonical form
 /// [`ClogSnapshot::live_snapshot`](crate::Clog::live_snapshot) writes: each list
-/// strictly increasing (sorted, no duplicates) and the two disjoint. The CRC
+/// strictly increasing (sorted, no duplicates) and all three mutually disjoint. The CRC
 /// already catches media corruption, so this only fires on an encode-side logic
 /// bug — but an overlap would otherwise resolve silently to `Aborted` on load, so
 /// surfacing it (as `validate_sorted_tables` does for the control record) is cheap
 /// insurance against a same-id-in-both-lists mistake.
-fn validate_status_lists(
-    committed_floor: TxnId,
-    committed: &[TxnId],
-    aborted: &[TxnId],
-) -> Result<()> {
-    for list in [committed, aborted] {
+fn validate_status_lists(committed_floor: TxnId, lists: [&[TxnId]; 3]) -> Result<()> {
+    for list in lists {
         if list
             .windows(2)
             .any(|pair| matches!(pair, [left, right] if left >= right))
@@ -214,30 +234,31 @@ fn validate_status_lists(
             ));
         }
     }
-    if committed
+    if lists
         .iter()
-        .chain(aborted)
+        .flat_map(|list| list.iter())
         .any(|id| *id < committed_floor)
     {
         return Err(corrupt_clog(
             "CLOG explicit status is below the committed floor",
         ));
     }
-    // Both are sorted; a linear merge finds any shared id without allocating.
-    let mut committed = committed.iter().peekable();
-    let mut aborted = aborted.iter().peekable();
-    while let (Some(left), Some(right)) = (committed.peek(), aborted.peek()) {
-        match left.cmp(right) {
-            std::cmp::Ordering::Less => {
-                committed.next();
-            }
-            std::cmp::Ordering::Greater => {
-                aborted.next();
-            }
-            std::cmp::Ordering::Equal => {
-                return Err(corrupt_clog(
-                    "CLOG status lists must not record the same id as both committed and aborted",
-                ));
+    for (left_index, left_list) in lists.iter().enumerate() {
+        for right_list in lists.iter().skip(left_index.saturating_add(1)) {
+            let mut left = left_list.iter().peekable();
+            let mut right = right_list.iter().peekable();
+            while let (Some(left_id), Some(right_id)) = (left.peek(), right.peek()) {
+                match left_id.cmp(right_id) {
+                    std::cmp::Ordering::Less => {
+                        left.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        right.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        return Err(corrupt_clog("CLOG status lists must be mutually disjoint"));
+                    }
+                }
             }
         }
     }
@@ -264,10 +285,12 @@ mod tests {
     fn snapshot() -> ClogSnapshot {
         ClogSnapshot {
             clog_lsn: 42,
+            authorized_replay_floor: 20,
             committed_floor: 10,
             vacuum_floor: 7,
             committed: vec![10, 12, 15],
             aborted: vec![11, 13],
+            in_progress: vec![14],
         }
     }
 
@@ -281,10 +304,12 @@ mod tests {
     fn round_trips_an_empty_window() {
         let empty = ClogSnapshot {
             clog_lsn: 0,
+            authorized_replay_floor: 0,
             committed_floor: 3,
             vacuum_floor: 3,
             committed: Vec::new(),
             aborted: Vec::new(),
+            in_progress: Vec::new(),
         };
         let bytes = encode_clog(&empty).unwrap();
         assert_eq!(decode_clog(&bytes).unwrap(), empty);
@@ -362,7 +387,7 @@ mod tests {
         .unwrap();
 
         let err = decode_clog(&bytes).unwrap_err();
-        assert!(err.message.contains("both committed and aborted"));
+        assert!(err.message.contains("mutually disjoint"));
     }
 
     #[test]
@@ -375,6 +400,17 @@ mod tests {
 
         let err = decode_clog(&bytes).unwrap_err();
         assert!(err.message.contains("below the committed floor"));
+    }
+
+    #[test]
+    fn rejects_replay_floor_beyond_captured_clog_lsn() {
+        let bytes = encode_clog(&ClogSnapshot {
+            authorized_replay_floor: 43,
+            ..snapshot()
+        })
+        .unwrap();
+        let err = decode_clog(&bytes).unwrap_err();
+        assert!(err.message.contains("beyond CLOG LSN"));
     }
 
     #[test]

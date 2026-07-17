@@ -169,6 +169,19 @@ impl ActiveTxnRegistry {
         self.lock().active.iter().copied().collect()
     }
 
+    /// Capture active transaction ids and the allocation boundary under the same
+    /// latch used by transaction allocation.
+    pub fn checkpoint_snapshot<F>(&self, boundary: F) -> (Vec<TxnId>, TxnId)
+    where
+        F: FnOnce() -> TxnId,
+    {
+        let guard = self.lock();
+        let active = guard.active.iter().copied().collect();
+        let allocation_boundary = boundary();
+        drop(guard);
+        (active, allocation_boundary)
+    }
+
     /// The minimum `xmin` advertised by any currently-live snapshot, or `None` if
     /// no snapshot is advertised.
     ///
@@ -297,9 +310,8 @@ impl ActiveTxnRegistry {
 
     /// Capture the active set and allocator boundary without advertising the
     /// snapshot's `xmin`, and without waiting on snapshot exclusion. This is only
-    /// for schema-rewrite DDL after [`begin_snapshot_exclusion`](Self::begin_snapshot_exclusion)
-    /// has drained advertised snapshots and while the exclusive checkpoint guard
-    /// prevents VACUUM from advancing the GC horizon.
+    /// for schema-rewrite tests after snapshot exclusion has drained advertised
+    /// snapshots and relation locks prevent target VACUUM from advancing state.
     #[allow(dead_code)]
     pub(crate) fn capture_unadvertised<F>(&self, boundary: F) -> (Vec<TxnId>, TxnId)
     where
@@ -314,11 +326,8 @@ impl ActiveTxnRegistry {
     /// Block new snapshot captures and wait for already-advertised snapshots to
     /// drain. The returned guard keeps the exclusion active until it is dropped.
     ///
-    /// Schema rewrites that publish a new storage generation must acquire this
-    /// before taking the exclusive checkpoint guard. That order avoids deadlocking
-    /// around open transactions: the DDL waits for already-advertised snapshots first,
-    /// while transactions that already hold a writer guard may still capture the
-    /// statement snapshots they need to finish and release that guard.
+    /// Test-only schema rewrite exclusion waits for advertisements without
+    /// participating in fuzzy checkpoint coordination.
     #[cfg(test)]
     pub(crate) fn begin_snapshot_exclusion(&self) -> SnapshotExclusionGuard {
         let mut guard = self.lock();

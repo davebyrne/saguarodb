@@ -44,7 +44,6 @@ mod truncate;
 mod txn;
 mod vacuum;
 
-pub(crate) use analyze::checkpoint_auto_analyze;
 pub use copy::CopyInChunk;
 pub(crate) use cursor::{CursorFetchStatus, QueryCursorHandle, StartedCursor};
 pub use gucs::SessionGucs;
@@ -53,7 +52,39 @@ pub(crate) use stream::{
 };
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
 use txn::{CapturedSnapshots, ExecutionContextInput, StatementRuntime, TransactionSnapshots};
-pub(crate) use vacuum::full_vacuum_pass;
+
+pub(crate) fn run_automatic_vacuum(
+    components: Arc<ServerComponents>,
+    cancel: Arc<QueryCancel>,
+) -> Result<()> {
+    let represented = components
+        .dead_rows_since_vacuum
+        .load(std::sync::atomic::Ordering::Acquire);
+    let service = QueryService::new(components);
+    service
+        .run_vacuum(
+            Statement::Vacuum {
+                table: None,
+                analyze: false,
+            },
+            &cancel,
+        )
+        .map(|_| ())?;
+    let _ = service.components.dead_rows_since_vacuum.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |current| Some(current.saturating_sub(represented)),
+    );
+    Ok(())
+}
+
+pub(crate) fn run_automatic_analyze(
+    components: Arc<ServerComponents>,
+    cancel: Arc<QueryCancel>,
+) -> Result<()> {
+    let service = QueryService::new(components);
+    service.run_analyze_pass(None, &cancel, gucs::DEFAULT_STATISTICS_TARGET_DEFAULT)
+}
 
 pub struct QueryService {
     components: Arc<ServerComponents>,
@@ -737,9 +768,8 @@ fn split_relation_name(name: &str) -> Option<(Option<String>, String)> {
     ))
 }
 
-/// The shared checkpoint-participant guard held by an autocommit write, DDL, or
-/// WAL-writing maintenance unit. Object locks provide relation-scoped exclusion;
-/// only an actual checkpoint takes the controller's exclusive side.
+/// Compatibility lifetime token held by an autocommit write, DDL, or maintenance
+/// unit. Object locks and storage latches provide the actual exclusion.
 pub(crate) type WriteUnitGuard = WriteGuard;
 
 /// The transaction-block status a session reports to the protocol layer after a
@@ -757,13 +787,10 @@ pub enum SessionTxnStatus {
 
 /// An open explicit transaction's runtime state, held on the connection `Session`
 /// across statements (`docs/specs/mvcc.md` §7.2). Before taking its first retained
-/// object lock it acquires the SHARED checkpoint-participant guard for the whole
-/// transaction. Under the
-/// E2b lock inversion (§7.1 Stage 2, §10 E2b) the writer guard is shared, so many
-/// write-transactions run concurrently; per-row conflict detection (E1) and the
-/// per-index / per-heap structural latches (E2a) provide write-write safety. Only a
-/// checkpoint (the exclusive guard) excludes participants. Autocommit readers
-/// remain controller-guard-free.
+/// object lock it acquires a compatibility write-unit token for the transaction.
+/// Many write transactions run concurrently; per-row conflict detection and the
+/// per-index/per-heap structural latches provide write-write safety. Checkpoints do
+/// not consult this token. Autocommit readers remain controller-token-free.
 pub struct Transaction {
     txn_id: u64,
     /// The transaction's isolation level (`docs/specs/mvcc.md` §6, §10 Milestone
@@ -800,13 +827,12 @@ pub struct Transaction {
     /// the transaction. Subtransactions share this owner; savepoint rollback restores
     /// its captured grant set while release keeps later grants.
     object_locks: Option<ObjectLockGuard>,
-    /// The SHARED checkpoint-participant guard, acquired before the first retained
-    /// object lock and held until COMMIT/ROLLBACK. It is shared with writers; only
-    /// an actual checkpoint waits for it to drain.
+    /// Compatibility write-unit token acquired before the first retained object
+    /// lock and held until COMMIT/ROLLBACK. It excludes neither writers nor checkpoints.
     write_guard: Option<WriteGuard>,
     /// Whether the transaction performed data/sequence writes and therefore needs
     /// WAL commit/abort settlement. Read-only transactions still retain
-    /// `write_guard` as a checkpoint participant once they acquire an object lock.
+    /// `write_guard` as a lifetime marker once they acquire an object lock.
     has_writes: bool,
     /// The Repeatable Read snapshot: captured once at the first statement and
     /// reused. `None` under Read Committed (a fresh snapshot is captured per
@@ -821,7 +847,7 @@ pub struct Transaction {
     rr_advertised: Option<AdvertisedSnapshot>,
     /// Dead MVCC versions this transaction's statements have produced so far
     /// (`docs/specs/mvcc.md` §9, Milestone F4b). Accumulated per write statement, but
-    /// folded into the server-wide auto-prune counter ONLY on a durable COMMIT — on
+    /// folded into the server-wide automatic VACUUM counter ONLY on a durable COMMIT — on
     /// ROLLBACK the transaction's own new versions are the ones that become dead (the
     /// old versions it superseded stay live), so a rolled-back DELETE/UPDATE produces
     /// no committed dead version and this is discarded.
@@ -1692,15 +1718,18 @@ impl QueryService {
                 result_columns,
             });
         }
-        let _schema_guard = self
-            .components
-            .concurrency
-            .begin_shared_cancelable(cancel)?;
-        let _catalog_read = self
-            .components
-            .catalog_publication_gate
-            .read()
-            .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+        let _catalog_read = loop {
+            cancel.check()?;
+            match self.components.catalog_publication_gate.try_read() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(DbError::internal("catalog publication gate poisoned"));
+                }
+            }
+        };
         let catalog: Arc<dyn CatalogManager> = match catalog_snapshot {
             Some(snapshot) => Arc::new(MemoryCatalog::try_from_snapshot(snapshot)?),
             None => self.components.catalog.clone(),
@@ -3550,7 +3579,7 @@ fn exec_or_stream(
 }
 
 /// The number of dead MVCC versions a statement's result implies, for the
-/// auto-prune threshold (`docs/specs/mvcc.md` §9, Milestone F4b). Each committed
+/// automatic VACUUM threshold (`docs/specs/mvcc.md` §9, Milestone F4b). Each committed
 /// `DELETE` row leaves a dead version (the committed-deleted tuple) and each
 /// committed `UPDATE` row leaves a dead version (the superseded old tuple); both
 /// carry their affected-row count in the `Modified` command tag the executor
@@ -3951,8 +3980,9 @@ mod tests {
         CopyInChunk, SessionTxnStatus, object_lock_requests, prepared_schema_versions, slot_status,
     };
     use crate::app::{AppState, ServerComponents};
-    use crate::checkpoint::CheckpointState;
+    use crate::checkpoint::{CheckpointCoordinator, CheckpointState, spawn_checkpoint_worker};
     use crate::config::Config;
+    use crate::maintenance::{MaintenanceCoordinator, spawn_maintenance_worker};
     use crate::registry::ActiveTxnRegistry;
     use crate::shutdown::ShutdownState;
 
@@ -4568,11 +4598,9 @@ mod tests {
             compression,
             dict_store,
             concurrency,
-            checkpoint: CheckpointState {
-                last_checkpoint_lsn: AtomicU64::new(0),
-                commits_since_checkpoint: AtomicU64::new(0),
-                checkpoints: AtomicU64::new(0),
-            },
+            checkpoint: CheckpointState::new(0),
+            checkpoint_coordinator: Arc::new(CheckpointCoordinator::default()),
+            maintenance_coordinator: Arc::new(MaintenanceCoordinator::default()),
             shutdown: Arc::new(ShutdownState::new()),
             next_txn_id: AtomicU64::new(common::ids::FIRST_NORMAL_XID),
             dead_rows_since_vacuum: AtomicU64::new(0),
@@ -4586,9 +4614,13 @@ mod tests {
             cancel_registry: crate::cancel::CancelRegistry::new(),
             session_registry: Arc::new(crate::session_registry::SessionRegistry::new()),
         });
+        let checkpoint_worker = spawn_checkpoint_worker(&components).unwrap();
+        let maintenance_worker = spawn_maintenance_worker(&components).unwrap();
         AppState {
             components: components.clone(),
             query_service: Arc::new(super::QueryService::new(components)),
+            checkpoint_worker: Mutex::new(Some(checkpoint_worker)),
+            maintenance_worker: Mutex::new(Some(maintenance_worker)),
         }
     }
 
@@ -4611,27 +4643,33 @@ mod tests {
             Ok(self.stored.lock().unwrap().clone())
         }
 
-        fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()> {
+        fn store(&self, control: ControlData) -> Result<()> {
             if self.fail_store.load(Ordering::SeqCst) {
                 return Err(DbError::io("injected control store failure"));
             }
-            *self.stored.lock().unwrap() = Some(ControlData {
-                checkpoint_lsn,
-                tables: tables.to_vec(),
-                catalog: catalog.to_vec(),
-                page_size: buffer::PAGE_SIZE as u32,
-            });
+            *self.stored.lock().unwrap() = Some(control);
             Ok(())
         }
     }
 
-    #[derive(Default)]
     struct FailingAbortWal {
         next_lsn: AtomicU64,
         fail_abort: AtomicBool,
         fail_second_truncate: AtomicBool,
         truncate_records: AtomicUsize,
         statuses: Mutex<HashMap<TxnId, TxnStatus>>,
+    }
+
+    impl Default for FailingAbortWal {
+        fn default() -> Self {
+            Self {
+                next_lsn: AtomicU64::new(1),
+                fail_abort: AtomicBool::new(false),
+                fail_second_truncate: AtomicBool::new(false),
+                truncate_records: AtomicUsize::new(0),
+                statuses: Mutex::new(HashMap::new()),
+            }
+        }
     }
 
     impl FailingAbortWal {
@@ -4652,6 +4690,14 @@ mod tests {
     }
 
     impl WalManager for FailingAbortWal {
+        fn append_positioned(&self, record: WalRecord) -> Result<common::WalPosition> {
+            let record_lsn = self.append(record)?;
+            Ok(common::WalPosition {
+                replay_from: record_lsn.saturating_sub(1),
+                record_lsn,
+            })
+        }
+
         fn append(&self, record: WalRecord) -> Result<Lsn> {
             if matches!(record.kind, WalRecordKind::CatalogChange { .. })
                 && self.fail_second_truncate.load(Ordering::SeqCst)
@@ -4716,7 +4762,12 @@ mod tests {
             Ok(0)
         }
 
-        fn persist_clog(&self, _clog_lsn: Lsn) -> Result<()> {
+        fn checkpoint_clog(
+            &self,
+            _proposed_replay_floor: Lsn,
+            _captured_active: &[common::TxnId],
+            _allocation_boundary: common::TxnId,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -4772,6 +4823,17 @@ mod tests {
     }
 
     impl WalManager for FailingCommitWal {
+        fn append_positioned(&self, record: WalRecord) -> Result<common::WalPosition> {
+            if matches!(
+                record.kind,
+                WalRecordKind::Commit | WalRecordKind::CommitWithSubxids { .. }
+            ) && self.fail_next_commit.swap(false, Ordering::SeqCst)
+            {
+                return Err(DbError::io("injected Commit append failure"));
+            }
+            self.inner.append_positioned(record)
+        }
+
         fn append(&self, record: WalRecord) -> Result<Lsn> {
             if matches!(
                 record.kind,
@@ -4806,8 +4868,14 @@ mod tests {
             self.inner.bytes_after(lsn)
         }
 
-        fn persist_clog(&self, clog_lsn: Lsn) -> Result<()> {
-            self.inner.persist_clog(clog_lsn)
+        fn checkpoint_clog(
+            &self,
+            proposed_replay_floor: Lsn,
+            captured_active: &[common::TxnId],
+            allocation_boundary: common::TxnId,
+        ) -> Result<()> {
+            self.inner
+                .checkpoint_clog(proposed_replay_floor, captured_active, allocation_boundary)
         }
 
         fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
@@ -4833,18 +4901,13 @@ mod tests {
     struct RecordingConcurrency {
         inner: RwLockConcurrencyController,
         begin_writer_calls: Arc<AtomicUsize>,
-        begin_checkpoint_calls: Arc<AtomicUsize>,
     }
 
     impl RecordingConcurrency {
-        fn new(
-            begin_writer_calls: Arc<AtomicUsize>,
-            begin_checkpoint_calls: Arc<AtomicUsize>,
-        ) -> Self {
+        fn new(begin_writer_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 inner: RwLockConcurrencyController::new(),
                 begin_writer_calls,
-                begin_checkpoint_calls,
             }
         }
     }
@@ -4853,11 +4916,6 @@ mod tests {
         fn begin_writer(&self) -> Result<common::WriteGuard> {
             self.begin_writer_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.begin_writer()
-        }
-
-        fn begin_checkpoint(&self) -> Result<common::CheckpointGuard> {
-            self.begin_checkpoint_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.begin_checkpoint()
         }
     }
 
@@ -5883,7 +5941,6 @@ mod tests {
     fn autocommit_write_discovers_before_writer_guard_then_acquires_it() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
-        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
         let unguarded_lookup = Arc::new(AtomicBool::new(false));
         let restore_calls = Arc::new(AtomicUsize::new(0));
         let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
@@ -5891,10 +5948,8 @@ mod tests {
             unguarded_lookup.clone(),
             restore_calls,
         ));
-        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
-            begin_writer_calls.clone(),
-            begin_checkpoint_calls,
-        ));
+        let concurrency: Arc<dyn ConcurrencyController> =
+            Arc::new(RecordingConcurrency::new(begin_writer_calls.clone()));
         let config = Config {
             checkpoint_every_n_commits: u64::MAX,
             checkpoint_wal_bytes: u64::MAX,
@@ -5935,7 +5990,6 @@ mod tests {
     fn autocommit_copy_from_acquires_writer_guard_before_protocol_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
-        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
         let unguarded_lookup = Arc::new(AtomicBool::new(false));
         let restore_calls = Arc::new(AtomicUsize::new(0));
         let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
@@ -5943,10 +5997,8 @@ mod tests {
             unguarded_lookup,
             restore_calls,
         ));
-        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
-            begin_writer_calls.clone(),
-            begin_checkpoint_calls,
-        ));
+        let concurrency: Arc<dyn ConcurrencyController> =
+            Arc::new(RecordingConcurrency::new(begin_writer_calls.clone()));
         let config = Config {
             checkpoint_every_n_commits: u64::MAX,
             checkpoint_wal_bytes: u64::MAX,
@@ -5999,10 +6051,9 @@ mod tests {
     }
 
     #[test]
-    fn autocommit_ddl_and_dml_use_shared_writer_guard() {
+    fn autocommit_ddl_and_dml_use_write_unit_token() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
-        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
         let unguarded_lookup = Arc::new(AtomicBool::new(false));
         let restore_calls = Arc::new(AtomicUsize::new(0));
         let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
@@ -6010,10 +6061,8 @@ mod tests {
             unguarded_lookup,
             restore_calls,
         ));
-        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
-            begin_writer_calls.clone(),
-            begin_checkpoint_calls.clone(),
-        ));
+        let concurrency: Arc<dyn ConcurrencyController> =
+            Arc::new(RecordingConcurrency::new(begin_writer_calls.clone()));
         let config = Config {
             checkpoint_every_n_commits: u64::MAX,
             checkpoint_wal_bytes: u64::MAX,
@@ -6035,17 +6084,11 @@ mod tests {
             .execute_sql("create table users (id integer primary key)")
             .unwrap();
         assert_eq!(
-            begin_checkpoint_calls.load(Ordering::SeqCst),
-            0,
-            "only an actual checkpoint should take the exclusive guard"
-        );
-        assert_eq!(
             begin_writer_calls.load(Ordering::SeqCst),
             1,
-            "DDL should take the shared writer guard before object locks"
+            "DDL should take the write-unit token before object locks"
         );
 
-        begin_checkpoint_calls.store(0, Ordering::SeqCst);
         begin_writer_calls.store(0, Ordering::SeqCst);
         app.query_service
             .execute_sql("insert into users (id) values (1)")
@@ -6053,12 +6096,7 @@ mod tests {
         assert_eq!(
             begin_writer_calls.load(Ordering::SeqCst),
             1,
-            "DML should still take the shared writer guard"
-        );
-        assert_eq!(
-            begin_checkpoint_calls.load(Ordering::SeqCst),
-            0,
-            "DML should not serialize through the exclusive guard"
+            "DML should still take the write-unit token"
         );
     }
 
@@ -6531,7 +6569,6 @@ mod tests {
     fn failed_autocommit_dml_does_not_restore_catalog_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
-        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
         let unguarded_lookup = Arc::new(AtomicBool::new(false));
         let restore_calls = Arc::new(AtomicUsize::new(0));
         let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
@@ -6539,10 +6576,8 @@ mod tests {
             unguarded_lookup,
             restore_calls.clone(),
         ));
-        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
-            begin_writer_calls,
-            begin_checkpoint_calls,
-        ));
+        let concurrency: Arc<dyn ConcurrencyController> =
+            Arc::new(RecordingConcurrency::new(begin_writer_calls));
         let config = Config {
             checkpoint_every_n_commits: u64::MAX,
             checkpoint_wal_bytes: u64::MAX,
@@ -7632,11 +7667,8 @@ mod tests {
     async fn sequence_functions_use_session_state_and_write_routing() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
-        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
-        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
-            begin_writer_calls.clone(),
-            begin_checkpoint_calls,
-        ));
+        let concurrency: Arc<dyn ConcurrencyController> =
+            Arc::new(RecordingConcurrency::new(begin_writer_calls.clone()));
         let config = Config {
             checkpoint_every_n_commits: u64::MAX,
             checkpoint_wal_bytes: u64::MAX,

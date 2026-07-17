@@ -156,7 +156,7 @@ precedence.
   with SERIALIZABLE implemented as Serializable Snapshot Isolation
   (`docs/specs/ssi.md`)), the maintenance
   command `VACUUM [ANALYZE] [table]` (non-relational: it does not bind/plan,
-  takes the exclusive guard, and is rejected inside a transaction block; with
+  uses normal target relation locks, and is rejected inside a transaction block; with
   `ANALYZE` the reclamation pass is followed by a statistics-collection pass),
   the maintenance command `ANALYZE [table]` (collect optimizer statistics
   under `AccessShare` target locks; `docs/specs/statistics.md`), and
@@ -184,8 +184,8 @@ precedence.
 - Be conservative with durable formats. WAL, manifest, snapshot, and page/row
   encodings need versioning/checksum behavior consistent with their specs.
 - The typed catalog foundation is an intentional compatibility break: catalog
-  snapshots are v3, manifests are v5, CLOG snapshots are v2, segmented WAL is
-  format v2, and catalog metadata WAL uses only generic
+  snapshots are v3, manifests are v6, CLOG snapshots are v3, segmented WAL is
+  format v3, and catalog metadata WAL uses only generic
   `CatalogChange` records. Do not add migration/defaulting readers for older
   catalog, manifest, or specialized catalog-WAL layouts.
 
@@ -223,12 +223,12 @@ cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev -
 - Defaults are `--data-dir ./data`, `--port 5433`,
   `--buffer-pool-frames 1024`, `--checkpoint-every-n-commits 100`,
   `--checkpoint-wal-bytes 67108864`, `--auto-vacuum-dead-rows 10000`,
-  `--auto-analyze-changed-rows 10000`, `--shutdown-timeout-ms 30000`, and
+  `--checkpoint-flush-batch-pages 256`, `--auto-analyze-changed-rows 10000`,
+  `--shutdown-timeout-ms 30000`, and
   `--deadlock-timeout-ms 1000`.
-  `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead
-  versions since the last auto-prune; `0` disables the dead-row trigger). A full
-  maintenance pass may still run when an unreclaimed abort-pinned CLOG window
-  approaches its durable status limit.
+  `--auto-vacuum-dead-rows` is the background full-VACUUM threshold (committed
+  dead versions since the last successful automatic pass; `0` disables the
+  dead-row trigger). CLOG pressure can still request that maintenance worker.
   `--deadlock-timeout-ms` is how long a writer blocked on a row lock waits before
   the deadlock detector runs (`docs/specs/deadlock.md`).
 - TLS is off by default. Pass both `--tls-cert-file <PATH>` (PEM cert chain) and

@@ -1,143 +1,74 @@
 # `control` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-17
 **Status:** Living crate contract
 
 ## Purpose
 
-`control` owns the durable **control record** — the checkpoint commit point. It
-persists, atomically, the redo boundary (`checkpoint_lsn`), the live table ids,
-and the catalog snapshot. Table data itself lives in mutable heap files
-(`storage::HeapPageStore`) and is flushed in place; this crate no longer writes
-whole-table snapshots.
+`control` owns the atomic manifest that commits a fuzzy checkpoint. Table pages
+remain in mutable heap/index files; the manifest records independent physical
+and catalog redo boundaries plus the dirty-page table (DPT).
 
-## Depends On
-
-- `common`
-- `crc32fast` — payload CRC32 checksum
-- `serde`, `serde_json` — JSON payload (de)serialization
-
-## File Layout
-
-```text
-data/
-  manifest.dat
-  manifest.dat.tmp
-  wal/wal.meta
-  wal/<segment>.wal
-  heap/<TableId>.heap   (owned by storage::HeapPageStore)
-```
-
-`manifest.dat` is the single source of truth for the current checkpoint.
-
-## Control Record
+## Durable Record
 
 ```rust
 pub struct ControlData {
-    pub checkpoint_lsn: Lsn,   // redo boundary: heap reflects flushed page effects <= this LSN
-    pub tables: Vec<TableId>,  // sorted, no duplicates
-    pub catalog: Vec<u8>,      // serialized catalog snapshot
-    pub page_size: u32,        // page size (bytes) the data directory was created with
+    pub checkpoint_end_lsn: Lsn,
+    pub page_redo_lsn: Lsn,
+    pub catalog_redo_lsn: Lsn,
+    pub dirty_pages: Vec<DirtyPageEntry>,
+    pub tables: Vec<TableId>,
+    pub catalog: Vec<u8>,
+    pub page_size: u32,
 }
 ```
 
-With MVCC's relaxed flush gate, the heap may include page effects from committed,
-aborted, and in-flight-at-checkpoint transactions at or below the boundary. The
-CLOG, persisted separately by the checkpoint before WAL recycling, decides which
-versions are visible.
+The envelope is magic `SGMF`, manifest format version 6, a little-endian payload
+length, a CRC32 of the JSON payload, and the payload. Older versions are rejected;
+there is no migration reader. The existing 272 MiB manifest, 64 MiB catalog, and
+65,536-table bounds remain. The DPT is capped at 1,000,000 entries and decoding
+uses bounded, fallible allocation.
 
-The control record uses a versioned binary envelope:
+Validation requires:
 
-- magic: `SGMF` (4 bytes)
-- version: little-endian `u32`, current = `5`
-- payload length: little-endian `u32`
-- payload checksum: little-endian CRC32 over the exact payload bytes
-- payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, `catalog`,
-  and `page_size`
+- sorted, duplicate-free table IDs;
+- DPT ordering by `(file_id, page_num)` with no duplicate page key;
+- every DPT `rec_lsn <= checkpoint_end_lsn`;
+- an empty DPT has `page_redo_lsn == checkpoint_end_lsn`;
+- a nonempty DPT has `page_redo_lsn == min(rec_lsn)`;
+- `catalog_redo_lsn <= checkpoint_end_lsn`.
 
-The opaque `catalog` bytes must contain catalog format v3. Manifest v5 and
-catalog v3 are one compatibility boundary: neither decoder supplies missing
-typed-catalog fields or migrates an older development data directory.
-
-The four header fields form a fixed 16-byte header (`MANIFEST_HEADER_LEN = 16`)
-that precedes the payload.
-
-Decode must reject a file shorter than the 16-byte header, magic mismatch,
-unsupported versions (including versions `1` through `3`), length mismatch, checksum
-mismatch, malformed payload JSON, unsorted table IDs, and duplicate table IDs.
-The manifest envelope is capped at 272 MiB before file materialization; its
-opaque catalog field is capped at 64 MiB and its table-id list at 65,536 entries.
-Bounded visitors reserve these payload vectors fallibly and reject an extra item
-without materializing it. Encoding enforces the same limits.
-Development builds do not migrate older formats; an incompatible or corrupt
-control file surfaces as `SqlState::InternalError` (there is no dedicated
-corruption SQLSTATE) and the data directory must be rebuilt.
-
-`page_size` is forward-compatibility insurance for a future data-dir-creation-
-time page size; today every data directory is created with the compile-time
-`buffer::PAGE_SIZE` (8192). It is validated separately, *after* a successful
-decode (`FileControlStore::open`'s caller supplies the binary's page size, and
-`load` compares it against the stored value): a mismatch is a plain, clean
-startup error naming both values, not corruption — the envelope itself decoded
-fine.
-
-`checkpoint_lsn` is the WAL high-water mark whose effects are reflected in the
-heap. Recovery replays every physical WAL record with `LSN > checkpoint_lsn`
-using page-LSN idempotence regardless of transaction outcome, then applies only
-committed generic `CatalogChange` metadata in LSN order. Non-transactional
-sequence-value records are also replayed independently of commit status.
+The overall retained replay floor is
+`min(page_redo_lsn, catalog_redo_lsn)`. `page_size` must match the binary's
+configured page size after envelope decoding.
 
 ## Public API
 
 ```rust
 pub trait ControlStore: Send + Sync {
     fn load(&self) -> Result<Option<ControlData>>;
-    fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
-}
-
-pub struct FileControlStore { /* data directory, expected page size */ }
-
-impl FileControlStore {
-    pub fn open(data_dir: impl AsRef<std::path::Path>, page_size: u32) -> Result<Self>;
+    fn store(&self, control: ControlData) -> Result<()>;
 }
 ```
 
-## Commit Protocol
+Accepting the complete value prevents callers from supplying mutually
+inconsistent boundaries.
 
-`store` writes the control record atomically:
+## Commit and Crash Semantics
 
-1. write `manifest.dat.tmp`.
-2. fsync `manifest.dat.tmp`.
-3. rename `manifest.dat.tmp` to `manifest.dat`.
-4. fsync `data/`.
+`store` writes and fsyncs `manifest.dat.tmp`, renames it over `manifest.dat`, and
+fsyncs the data directory. The rename plus directory fsync is the checkpoint
+commit point. The server persists the matching CLOG snapshot before `store` and
+advances/recycles segmented WAL only after it succeeds.
 
-The rename is the checkpoint commit point. The caller (server checkpoint) must
-fsync the heap (`PageStore::sync_all`) **before** calling `store`, and must
-advance the WAL replay floor only **after** `store` succeeds.
+- Before replacement, the previous manifest and WAL replay floor remain
+  authoritative. A newly replaced CLOG may be loaded, but WAL retained from that
+  old floor includes the VACUUM FPIs that justify any newly implicit transaction
+  outcome, so replay cannot resurrect reclaimed aborted data.
+- After replacement but before WAL recycling, the new manifest/CLOG are
+  authoritative and retaining extra WAL is harmless.
+- Both old and new manifests are complete CRC-checked records.
 
-## Recovery Behavior
-
-`load` returns `Ok(None)` when no control file exists, otherwise the validated
-`ControlData`. Recovery uses `checkpoint_lsn` as the redo boundary and `catalog`
-to initialize the catalog; heap pages are read separately by the buffer pool's
-`PageStore`. `load` also rejects a `page_size` mismatch between the decoded
-control record and the `page_size` passed to `open` (see above).
-
-## Crash Safety
-
-- Crash before the rename: the previous control record remains current; recovery
-  redoes from the previous `checkpoint_lsn`, where this cycle's full-page images
-  repair any torn heap writes.
-- Crash during the rename: the filesystem yields the old or new control file;
-  both are complete, CRC-checked records.
-- Crash after the rename: the new control record is current.
-
-## Acceptance Tests
-
-- `store` then `load` round-trips `checkpoint_lsn`, tables, catalog, and
-  `page_size`.
-- `load` returns `None` with no control file.
-- `store` overwrites the previous control record.
-- Decode rejects checksum/version/length tampering and unsorted/duplicate tables.
-- `load` rejects a `page_size` mismatch with a clean startup error naming both
-  values (not reported as corruption).
+Recovery validates the three boundaries against the retained durable WAL range,
+loads the catalog snapshot, and replays positioned records from the lesser redo
+boundary according to record class.

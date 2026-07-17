@@ -46,8 +46,8 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
   full heap/index rewrite transactionally; `USING` expressions are unsupported.
 - Optimizer statistics through `ANALYZE [table]` and `VACUUM ANALYZE [table]`:
   collection is sampled, durable in catalog snapshots and WAL, exposed through
-  `pg_class`/`pg_stats`, and refreshed automatically at checkpoints when the
-  configured changed-row threshold is reached (`docs/specs/statistics.md`).
+  `pg_class`/`pg_stats`, and refreshed by the independent background maintenance
+  worker when the configured changed-row threshold is reached (`docs/specs/statistics.md`).
 - A predominantly rule-based planner with statistics-driven cardinality
   estimates and first cost-based choices: sequential versus index scan and the
   hash-join build side. Join order remains the written left-to-right order.
@@ -147,6 +147,17 @@ pub type BindingId = u32;
 pub type PageNum = u32;
 pub type FileId = u32;
 pub type Lsn = u64;
+
+pub struct WalPosition {
+    pub replay_from: Lsn,
+    pub record_lsn: Lsn,
+}
+
+pub struct DirtyPageEntry {
+    pub file_id: FileId,
+    pub page_num: PageNum,
+    pub rec_lsn: Lsn,
+}
 
 /// Physical address of a row on disk
 pub struct RowId {
@@ -426,14 +437,15 @@ pub struct StatementContext {
 /// trait signature.
 pub struct PageFlushInfo {
     pub dirty_txn_id: u64,      // informational; the MVCC gate no longer reads it.
-    pub page_lsn: Option<Lsn>,  // WAL-durability check; checkpoint/steal pass None (WAL flushed first).
+    pub page_lsn: Option<Lsn>,  // latest published page WAL end boundary.
 }
 
 /// Abstraction so the buffer pool can decide whether a dirty page is safe to
 /// flush, without depending on the wal crate. WalFlushPolicy admits any
 /// WAL-durable dirty page (with MVCC the committedness gate is dropped — an
-/// uncommitted/aborted page may be flushed, hidden by the CLOG); checkpoint
-/// flushes them via flush_dirty_pages. The steal path calls `ensure_durable`
+/// uncommitted/aborted page may be flushed, hidden by the CLOG). Checkpoints
+/// snapshot dirty keys and flush bounded batches through `flush_checkpoint_batch`,
+/// conditionally cleaning only an unchanged captured generation. The steal path calls `ensure_durable`
 /// (forces the WAL) before writing a possibly-uncommitted stolen page.
 pub trait FlushPolicy: Send + Sync {
     fn can_flush(&self, info: &PageFlushInfo) -> bool;
@@ -444,45 +456,27 @@ pub trait FlushPolicy: Send + Sync {
 #### Concurrency Controller
 
 ```rust
-/// Coarse checkpoint exclusion. DML, DDL, and WAL-writing maintenance use a
-/// SHARED writer guard; `begin_checkpoint()` yields an EXCLUSIVE guard used by
-/// checkpoint to drain them. Readers take no controller guard; table locks
-/// separately coordinate logical relation access.
-///
-/// Guards are owned types (no lifetime parameter) that hold Arc references
-/// internally and release the guard on Drop. This keeps the trait object-safe
-/// (usable as Box<dyn ConcurrencyController>) and avoids GAT complexity.
-/// The concrete controller uses an RwLock internally: all page/WAL writers share
-/// it and checkpoint takes it exclusively. Readers take no controller guard.
+/// Compatibility write-unit lifetime tokens. These do not coordinate fuzzy
+/// checkpoints or exclude other writers.
 pub trait ConcurrencyController: Send + Sync {
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
-    fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
-    fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard>;
     fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
     fn begin_shared_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
 }
 
-pub struct RwLockConcurrencyController { /* parking_lot::RwLock<()> */ }
+pub struct RwLockConcurrencyController;
 
 impl RwLockConcurrencyController {
     pub fn new() -> Self;
 }
 
-/// Owned shared writer guard. Holds an Arc to the lock internally.
-/// Concurrent writers hold it simultaneously; releases on Drop. Send safe.
-pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
-
-/// Owned exclusive guard for checkpoint. Drains in-flight writers and releases
-/// on Drop. Send safe.
-pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
+pub struct WriteGuard { /* nonblocking lifetime token */ }
 ```
-
-**Design rationale — owned guards over GATs:** All major traits in this system are used as trait objects (`Box<dyn BufferPool>`, `Box<dyn ConcurrencyController>`, etc.). GATs (`type WriteGuard<'a> where Self: 'a`) would make these traits non-object-safe, forcing generics throughout the crate dependency graph. Owned guards with Arc internals add negligible overhead (one Arc clone per guarded statement) and keep the trait boundaries clean. This is the standard pattern in Rust database projects.
 
 Most layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves ordinary DML names to IDs and assigns physical slot positions via the catalog. Selected DDL plans intentionally carry names into execution when current catalog state must be consulted there, such as `CREATE TABLE IF NOT EXISTS`, `DROP TABLE IF EXISTS`, `DROP SEQUENCE IF EXISTS`, and `CREATE TABLE ... SERIAL` owned-sequence naming.
 
-`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. `WalFlushPolicy` admits any WAL-durable dirty page (with MVCC the committedness gate is dropped — uncommitted/aborted pages may be flushed and are hidden by the CLOG); checkpoint uses it via `flush_dirty_pages` to flush dirty pages in place to the heap, and eviction-flush-on-steal uses it (plus `ensure_durable`, which forces the WAL first) to steal dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
+`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. `WalFlushPolicy` admits any WAL-durable dirty page (with MVCC the committedness gate is dropped — uncommitted/aborted pages may be flushed and are hidden by the CLOG). A checkpoint snapshots `checkpoint_dirty_keys`, processes only that start set in bounded `flush_checkpoint_batch` calls, and conditionally cleans a frame only when its captured generation was not redirtied. Eviction-flush-on-steal uses the policy plus `ensure_durable`, which forces the WAL first, to steal dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
 
 ## 3. Wire Protocol
 
@@ -2047,14 +2041,15 @@ Files are named by stable numeric ID, not by user-visible names. This avoids ren
 - `data/heap/<storage_id>.sidx` — a catalog-index generation's B-tree, using a separate tagged `FileId` namespace from heaps and identity indexes.
 
 **Control record (the single source of truth for the current checkpoint):**
-- `data/manifest.dat` — a versioned binary envelope (magic `SGMF`, version, payload length, CRC32 over the payload) whose JSON payload holds the redo boundary `checkpoint_lsn`, sorted table IDs, and the catalog snapshot.
+- `data/manifest.dat` — manifest v6 with checkpoint-end, physical/catalog redo
+  boundaries, DPT, sorted table IDs, page size, and catalog snapshot.
 
 The control record is updated atomically via write-to-temp + fsync + rename (atomic on POSIX) + directory fsync. Recovery reads it to find the redo boundary and catalog. See Checkpoint below for the full protocol.
 
 **Other files:**
 - `data/wal/wal.meta` — CRC-checked replay-floor and durable-end marker
 - `data/wal/<16-hex-digits>.wal` — fixed 16 MiB WAL payload segments
-- `data/clog.dat` — durable transaction-status snapshot (format v2)
+- `data/clog.dat` — durable transaction-status snapshot (format v3)
 
 Table names are purely a catalog-level concept. The storage engine uses stable logical table/index IDs for metadata lookup, then routes page I/O through the current `storage_id` stored in `TableSchema` / `IndexSchema`.
 
@@ -2069,9 +2064,8 @@ pub trait BufferPool: Send + Sync {
     /// Fetch a page for reading. Returns a guard that unpins on drop.
     fn read_page(&self, file_id: FileId, page_num: PageNum) -> Result<PageReadGuard>;
 
-    /// Fetch a page for writing. txn_id identifies the active statement.
-    /// Returns a guard that unpins on drop and automatically marks dirty.
-    /// (With MVCC, abort is status-based — no before-image is saved.)
+    /// Fetch a page for writing. Acquiring the guard does not mark it dirty;
+    /// successful mutation publishes an exact WalPosition through the guard.
     fn write_page(&self, file_id: FileId, page_num: PageNum, txn_id: u64) -> Result<PageWriteGuard>;
 
     /// Allocate a new page in the given file, return it locked for writing.
@@ -2103,11 +2097,13 @@ pub trait BufferPool: Send + Sync {
     /// Iterate all frames (used by checkpoint flushing and the storage page scan). Returns (file_id, page_num, data, is_dirty).
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
 
-    /// Mark all dirty pages as clean (called by checkpoint after flushing them to the heap).
-    fn mark_all_clean(&self) -> Result<()>;
-    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()>;
     fn flush_dirty_pages(&self) -> Result<()>;
     fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()>;
+    fn checkpoint_fence(&self) -> CheckpointFence;
+    fn checkpoint_dirty_keys(&self) -> Result<Vec<(FileId, PageNum)>>;
+    fn dirty_page_table(&self) -> Result<Vec<DirtyPageEntry>>;
+    fn flush_checkpoint_batch(&self, candidates: &[(FileId, PageNum)])
+        -> Result<CheckpointBatchStats>;
     // Recovery redo adds fetch_for_redo; see buffer.md.
 }
 ```
@@ -2122,8 +2118,8 @@ pub struct PageReadGuard { /* Arc<Frame> + latch state */ }
 
 /// Owned write guard for a buffer pool frame. Holds an Arc to the frame
 /// internally. Dereferences to mutable page data (&mut [u8; PAGE_SIZE]).
-/// Marks the page dirty (with the current txn_id), unpins the frame,
-/// and releases the write latch on Drop.
+/// Holds the shared checkpoint fence; unpins the frame and releases the write
+/// latch on Drop. Mutations must publish their WalPosition explicitly.
 pub struct PageWriteGuard { /* Arc<Frame> + latch state */ }
 
 impl PageReadGuard {
@@ -2137,6 +2133,7 @@ impl PageWriteGuard {
     pub fn page_num(&self) -> PageNum;
     pub fn data(&self) -> &[u8; PAGE_SIZE];
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE];
+    pub fn publish_position(&mut self, position: WalPosition) -> Result<()>;
 }
 ```
 
@@ -2149,7 +2146,9 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
 ### Design
 
 - **Frame:** A slot holding one 8KB page. Pool size is configurable (default: 1024 frames = 8MB).
-- **Page descriptor:** Tracks `(file_id, page_number)`, pin count, dirty flag, reference bit, `dirty_txn_id` (the txn that last dirtied it), and `needs_fpi` (whether the next modification must log a full-page image).
+- **Page descriptor:** Tracks identity, pin/reference state, dirty transaction,
+  earliest `rec_lsn`, latest PageLSN, mutation generation, checkpoint capture and
+  redirty metadata, `needs_fpi`, eviction, and checkpoint-flush reservations.
 - **No rollback tracking (MVCC):** the buffer pool keeps no per-transaction page state. Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3): `rollback(txn_id)` undoes nothing and reclaims nothing — a rolled-back transaction's pages (modified or freshly allocated) stay resident as dirty-but-evictable frames, hidden by the CLOG and reclaimed by VACUUM. (The before-image store and new-page rollback tracking that the pre-MVCC model used are retired in Milestone D1.)
 - **PageStore / PageLoader:** The buffer pool is constructed with an `Arc<dyn PageStore>`, which extends the read-only `PageLoader`:
 
@@ -2161,7 +2160,8 @@ pub trait PageLoader: Send + Sync {
 
 On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` is inserted as a clean frame; `None` returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`; loader I/O failures propagate as `ErrorKind::Io`. In production, the server supplies a `HeapPageStore` (a `PageStore`) that reads page `n` of table `file_id` from `data/heap/<file_id>.heap`. `MemoryBufferPool::empty(frame_count)` is a test helper using a never-flush policy and a no-op store that returns `Ok(None)`.
 
-- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_dirty_pages` (checkpoint) consults it per dirty page: `WalFlushPolicy` admits any dirty page whose page-LSN is WAL-durable (with MVCC the committedness check is gone). The same policy gates eviction-flush-on-steal, whose path also calls `ensure_durable` to force the WAL before writing a possibly-uncommitted stolen page.
+- **FlushPolicy:** Both incremental checkpoint batches and eviction force WAL
+  before writing a captured dirty image. Transaction status is not a flush gate.
 
 ### Eviction: Clock Algorithm (Single-Bit)
 
@@ -2188,15 +2188,21 @@ During normal operation the working set is not bound by the pool size: eviction-
 
 ## 9. Control Store
 
-The `control` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable relation-generation heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
+The `control` crate owns manifest v6, the fuzzy-checkpoint commit point. It
+contains independent physical/catalog redo boundaries, the checkpoint-end
+boundary, final DPT, live table IDs, catalog-v3 snapshot, and page size.
 
 ### Trait
 
 ```rust
 pub struct ControlData {
-    pub checkpoint_lsn: Lsn,   // redo boundary
-    pub tables: Vec<TableId>,  // sorted, no duplicates
-    pub catalog: Vec<u8>,      // serialized catalog snapshot
+    pub checkpoint_end_lsn: Lsn,
+    pub page_redo_lsn: Lsn,
+    pub catalog_redo_lsn: Lsn,
+    pub dirty_pages: Vec<DirtyPageEntry>,
+    pub tables: Vec<TableId>,
+    pub catalog: Vec<u8>,
+    pub page_size: u32,
 }
 
 pub trait ControlStore: Send + Sync {
@@ -2204,17 +2210,24 @@ pub trait ControlStore: Send + Sync {
     fn load(&self) -> Result<Option<ControlData>>;
 
     /// Atomically write a new control record (the checkpoint commit point).
-    fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
+    fn store(&self, control: ControlData) -> Result<()>;
 }
 ```
 
-`store` writes `data/manifest.dat` via temp file + fsync + rename + directory fsync. The rename is the checkpoint commit point: the caller must fsync the heap (`PageStore::sync_all`) **before** `store`, and advance the WAL replay floor only **after** it.
+`store` writes `data/manifest.dat` via temp file + fsync + rename + directory
+fsync. The CLOG is durable first; WAL recycling follows a successful manifest.
+If a crash leaves the new CLOG beside the old manifest, the old replay floor keeps
+the WAL FPIs for every VACUUM action that made an abort implicit.
 
-The control record uses the version-5 binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and catalog-v3 bytes. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. Older manifests and catalogs are rejected, not migrated.
+The control record uses the version-6 binary envelope. Decode additionally
+validates a sorted, duplicate-free DPT capped at one million entries and exact
+`page_redo_lsn == min(DPT rec_lsn)` (or checkpoint end for an empty DPT).
 
-### checkpoint_lsn
+### Redo boundaries
 
-`checkpoint_lsn` is the **authoritative redo boundary**: the WAL high-water mark whose effects are reflected in the heap. Recovery reads it from the control record and replays WAL records with `LSN > checkpoint_lsn` (redo-all — see below). The WAL `Checkpoint` record is optional metadata; the control record is authoritative.
+Recovery begins positioned replay at `min(page_redo_lsn, catalog_redo_lsn)`.
+Physical, catalog/dictionary, and sequence records are respectively gated by
+`page_redo_lsn`, `catalog_redo_lsn`, and `checkpoint_end_lsn`.
 
 ## 10. Write-Ahead Log (WAL)
 
@@ -2226,10 +2239,17 @@ Table data lives in mutable per-generation heap files; pages are mutated in the 
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
-- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the durable CLOG snapshot (`clog.dat`) is written, then the WAL replay floor advances and wholly obsolete segments are recycled. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM (`docs/specs/mvcc.md` §5.4/§8).
+- **Fuzzy incremental checkpoint**: a fixed start-of-pass dirty-page set is copied
+  and flushed in bounded batches while writers continue. The final short
+  publication fence captures the remaining DPT and independent physical/catalog
+  redo boundaries. The checkpoint marker and CLOG snapshot become durable before
+  atomic manifest replacement commits the checkpoint; only then may the replay
+  floor advance and obsolete WAL segments be recycled. Uncommitted/aborted dirty
+  pages may be flushed because visibility remains CLOG-controlled.
 
 This gives the invariants:
-1. After a crash, recovery loads the heap as of the last control record and replays redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe. (With MVCC this is redo-all + CLOG visibility.)
+1. After a crash, recovery replays positioned records from the lesser redo
+   boundary; PageLSN gating plus full-page images is idempotent and torn-page-safe.
 2. The WAL captures all operations since the redo boundary.
 3. Checkpoint cost is O(pages changed), not O(database size).
 
@@ -2264,7 +2284,7 @@ This gives the invariants:
 | `CatalogChange` | versioned `CatalogChangeSet`: sorted object mutations with complete `before`/`after` values plus allocator high-water |
 | `Commit` | (empty — marks the transaction as committed) |
 | `Abort` | (empty — marks the transaction as aborted; `txn_id` in the header) |
-| `Checkpoint` | `redo_lsn` — marks a completed checkpoint. The replay floor may advance past earlier WAL records. |
+| `Checkpoint` | `checkpoint_end_lsn`, `page_redo_lsn`, `catalog_redo_lsn` — records the final metadata-capture boundary and the independent physical-page and catalog replay starts. The recyclable replay floor is the minimum of the two redo boundaries. |
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
 | `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
 | `HeapDelete` | `FileId`, `PageNum`, `slot` |
@@ -2277,18 +2297,20 @@ Transaction ids `0..FIRST_NORMAL_XID` (3) are reserved: `INVALID_XID = 0` (no/no
 
 ```rust
 pub trait WalManager: Send + Sync + TxnStatusView {
-    /// Append a record to the WAL buffer (not yet durable).
+    fn append_positioned(&self, record: WalRecord) -> Result<WalPosition>;
     fn append(&self, record: WalRecord) -> Result<Lsn>;
 
     /// Flush all buffered WAL records to disk (fsync). Returns the flushed LSN.
     fn flush(&self) -> Result<Lsn>;
 
-    /// Iterate records from a given LSN (for recovery, redo-all). The iterator is
-    /// fallible — a corrupt record mid-replay returns an error.
-    fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
+    fn written_lsn(&self) -> Result<Lsn>;
+    fn replay_entries_from(
+        &self,
+        replay_from: Lsn,
+    ) -> Result<Box<dyn Iterator<Item = Result<WalEntry>>>>;
 
-    /// Advance the exclusive replay floor after checkpoint. The caller must first
-    /// persist a CLOG snapshot at the current durable end; that exact boundary is
+    /// Advance the replay floor after checkpoint. The caller must first
+    /// persist a CLOG snapshot authorizing that boundary; the exact boundary is
     /// required here and only wholly obsolete segments are unlinked.
     fn recycle_through(&self, lsn: Lsn) -> Result<()>;
 
@@ -2310,7 +2332,12 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// Persist the durable CLOG snapshot (`clog.dat`) at the current durable
     /// frame end; the checkpoint calls this after the control record and before
     /// `recycle_through`.
-    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
+    fn checkpoint_clog(
+        &self,
+        proposed_replay_floor: Lsn,
+        captured_active: &[TxnId],
+        allocation_boundary: TxnId,
+    ) -> Result<()>;
     /// Advance the vacuum floor (Milestone F4c); bounds `clog.dat` pruning.
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
     /// Establish the CLOG implicit-committed floor at recovery (no-op when a durable
@@ -2330,15 +2357,18 @@ fixed 16 MiB segment boundaries; segment headers are outside logical LSN space.
 A filled segment is fsynced before its successor's durable header is installed,
 so crash discovery cannot observe a successor behind a torn earlier segment.
 
-`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap, and (redo-all) applies every page-mutation record, deciding visibility via the CLOG.
+`replay_entries_from(B)` includes the record whose start boundary is exactly
+`B`. Recovery applies record classes only at or above their manifest boundary.
 
 `recycle_through(lsn)` atomically advances the exclusive retained replay floor in
 `wal.meta`, then unlinks only segments wholly below it. It does not rewrite the
-boundary segment or retained records. This is safe because checkpoint persists
-`clog.dat` first and no writer is in flight under the exclusive guard. The CLOG
-snapshot must be taken at the current durable frame end; its exact LSN is the only
-advancing boundary `recycle_through` accepts, preventing a mid-frame replay floor
-without scanning the retained stream.
+boundary segment or retained records. This is safe while writers remain in flight
+because checkpoint first persists a CLOG v3 snapshot containing both its complete
+`clog_lsn` and an independent `authorized_replay_floor`; captured active IDs and
+recorded in-progress outcomes pin the snapshot's committed floor. Only the exact
+authorized floor from the latest successfully installed CLOG snapshot may advance
+`wal.meta`, so recycling cannot pass either manifest redo boundary or discard an
+outcome that the snapshot still needs.
 
 `bytes_after(lsn)` is O(1) server checkpoint accounting over byte-position LSNs.
 
@@ -2352,14 +2382,16 @@ The WAL is the source of durability between checkpoints:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
 - A failed fsync truncates the complete suffix after the prior durable LSN and poisons the live WAL manager, so every concurrent flush waiter fails; the truncation protocol is restart-safe and reopening resumes from the corrected durable stream.
 - If the atomic durable-end marker was renamed but its directory fsync fails, commit outcome is unknown. The WAL returns `DurabilityOutcomeUnknown`; server orchestration exits immediately without rollback or a terminal client response, and recovery resolves whichever marker is durable.
-- The buffer pool holds modified pages in memory until the next checkpoint flushes them to the heap.
-- Each heap page is recoverable from the last checkpoint plus the redo records after it.
+- The buffer pool tracks each modified page in the DPT until a checkpoint batch,
+  eviction, or file-scoped flush makes its captured generation durable.
+- Each heap page is recoverable from its DPT `rec_lsn`/physical redo boundary;
+  catalog replay starts independently at the manifest's catalog redo boundary.
 
 This gives a clean invariant: **after a crash, PageLSN-gated redo-all restores every heap page to its post-boundary state, and the CLOG seeded from `clog.dat` decides visibility. A missing snapshot is tolerated only before the replay floor first advances.**
 
 ### Write Protocol
 
-Data writes, DDL, and WAL-writing maintenance coordinate through the `ConcurrencyController`'s **shared** writer guard, so unrelated operations can run concurrently while checkpoint drains all of them. DML write-write safety comes from table/row-conflict coordination plus per-index and per-heap structural latches (lock order: table → structural → frame → WAL). DDL is transaction-scoped and uses catalog overlays plus schema/name locks so uncommitted catalog changes remain private and commit publication cannot race another catalog change. The protocol for a single autocommit DML statement:
+Data writes, DDL, and WAL-writing maintenance retain a compatibility `ConcurrencyController` writer-lifetime token; it neither serializes writers nor coordinates checkpoints. Short page/sequence publication units use the buffer-owned checkpoint fence instead. DML write-write safety comes from table/row-conflict coordination plus per-index and per-heap structural latches (lock order: table → structural → frame → WAL). DDL is transaction-scoped and uses catalog overlays plus schema/name locks so uncommitted catalog changes remain private and commit publication cannot race another catalog change. The protocol for a single autocommit DML statement:
 
 1. Bind/preflight without mutation to discover table ids.
 2. Assign and register `txn_id`, acquire the shared writer guard through the cancelable timed-poll form, then acquire xid-owned table locks in ascending id order and revalidate. Cancellation returns the token's reason-specific error.
@@ -2370,7 +2402,7 @@ Data writes, DDL, and WAL-writing maintenance coordinate through the `Concurrenc
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
 8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — cleanup-only (the buffer pool tracks no rollback metadata under status-based abort); deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
 9. Drop the shared writer guard
-10. Call best-effort `record_commit_and_maybe_checkpoint(&components)`; it may acquire the exclusive checkpoint guard for a checkpoint
+10. Call best-effort checkpoint accounting; it only enqueues background work.
 11. Return success to the client once the commit is durable and cleanup has completed. If this post-commit checkpoint step fails, log the checkpoint failure and leave the transaction committed; the server must not roll it back or report a normal SQL error for a transaction that already committed.
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback. It logs the fatal internal error, flushes WAL, and terminates because recovery will replay the durable commit.
@@ -2408,30 +2440,37 @@ If any cleanup step fails before the commit record is durable, the server treats
 
 **Why no undo:** an aborted version is hidden by the CLOG check the visibility predicate already performs — the same mechanism snapshot isolation needs — so undoing the page would be redundant work, and (post-D1) impossible once the page has been stolen to disk. VACUUM reclaims the space later.
 
-### Checkpoint
+### Fuzzy Incremental Checkpoint
 
-The checkpoint flushes dirty pages in place to the heap and advances the redo boundary. Cost is O(pages changed), not O(database size). The previous control record stays valid until the new one is committed.
+A single OS-thread worker coalesces threshold requests. Commit paths enqueue and
+return without checkpoint I/O. The pass snapshots dirty keys once and flushes
+them in configurable bounded batches; it does not add pages dirtied later and
+does not drain transactions.
 
-**Checkpoint protocol:**
+For each candidate, the buffer briefly copies the page under its latch, records
+generation/PageLSN, re-arms FPI protection, WAL-forces, writes, and fsyncs the
+represented file. Conditional clean preserves a concurrent redirty at its first
+post-capture `replay_from` boundary.
 
-1. Acquire the exclusive checkpoint guard (`begin_checkpoint`), which drains in-flight writers and explicit transactions that retained the shared checkpoint-participant guard; autocommit readers remain controller-guard-free.
-2. `wal.flush()` — a page's redo must be durable before the page is written.
-3. `buffer_pool.flush_dirty_pages()` — write flushable dirty pages to the heap `PageStore` (committed, aborted, and — under Stage 2 — in-flight alike; all WAL-durable after step 2, and the CLOG hides the non-committed tuples).
-4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
-5. `checkpoint_lsn = wal.flushed_lsn()`.
-6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point (atomic temp + fsync + rename + directory fsync).
-6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` before advancing the replay floor, so it remembers every logically excluded outcome (`mvcc.md` §5.4).
-7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `recycle_through(checkpoint_lsn)` (`persist_clog` ran in step 6b, so every outcome below the floor is durable in `clog.dat`; `mvcc.md` §5.4).
-8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
-9. Attempt relation-generation cleanup: remove unreferenced truncate/drop-retired generations and untracked orphan files only after buffer pin/transition checks. Dropped metadata is not live-file protection once commit has queued the retired generation.
-10. Drop write guard.
+After the batches, checkpoint takes the catalog and relation publication read
+gates and the buffer fence exclusively only long enough to capture the final
+DPT, catalog plus sequence baseline, pending catalog redo pin, active xids and
+allocation boundary, and `checkpoint_end_lsn = wal.written_lsn()`. It computes
+the two redo boundaries and releases every fence before I/O. Durability order is:
 
-**Crash safety analysis:** the ordering is heap fsync (4) → control record (6) → WAL recycling (7).
-- Crash before step 6: the control record is unchanged; recovery falls back to the previous `checkpoint_lsn`, and this cycle's full-page images (logged since that boundary) repair any torn heap write.
-- Crash between steps 6 and 7: the new control record is durable and the heap is consistent; the unrecycled WAL tail replays idempotently under PageLSN gating.
-- Crash after step 7: consistent.
+1. append the three-boundary `Checkpoint` marker;
+2. persist CLOG v3, including captured in-progress xids, and authorize the
+   minimum redo floor;
+3. atomically replace manifest v6 (the commit point);
+4. advance `wal.meta`, recycle wholly obsolete segments, then best-effort clean
+   retired/orphan relation generations.
 
-**Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls best-effort `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. If a post-commit checkpoint attempt fails, the failure is logged and the non-reset counter lets a later write retry. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O.
+Before manifest replacement the prior manifest/floor remain authoritative.
+After replacement, extra unrecycled WAL is harmless. Commit counters subtract
+only the count represented by a successful pass; concurrent commits remain for
+a follow-up request. Failures retain the request and retry only after a bounded
+notification, never in a tight loop. Automatic VACUUM and ANALYZE use a separate
+serialized maintenance worker.
 
 ### Crash Recovery (REDO)
 
@@ -2477,14 +2516,14 @@ impl PageBackedStorageEngine {
 1. Construct the buffer pool and immediately enable eviction-flush-on-steal
    (`buffer.enable_stealing()`), before loading the control record, so redo may
    spill and is not bounded by the pool.
-2. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If
+2. `control.load()` — the three checkpoint boundaries, DPT, and catalog bytes. If
    none: fresh database. WAL open has already seeded the CLOG from `clog.dat`
    when present and folded later transaction outcomes on top.
 3. Initialize storage in recovery mode and the catalog; install table, index,
    and sequence schemas from the catalog snapshot, then seed and validate the
    dictionary resolver.
 4. Pre-scan every post-checkpoint `CatalogChange` to reserve all carried
-   allocators, then redo every record with `LSN > checkpoint_lsn`
+   allocators, then positioned redo from the lesser physical/catalog boundary
    (`WalManager::replay_from`): physical-redo records via `apply_physical_redo`
    (PageLSN-gated; torn/missing pages are zeroed so a
    `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike,
@@ -2503,7 +2542,7 @@ impl PageBackedStorageEngine {
 
 ### Files
 
-`data/wal/` contains CRC-checked format-v2 16 MiB segments and the atomically
+`data/wal/` contains CRC-checked format-v3 16 MiB segments and the atomically
 updated `wal.meta` replay-floor/durable-end marker. Recovery discards physical
 bytes beyond the durable end, then lazily decodes the retained durable stream
 across segment headers rather than loading it into RAM. Legacy data
@@ -2851,12 +2890,12 @@ The `server` crate is the binary entry point.
 3. Construct the buffer pool and immediately enable eviction-flush-on-steal,
    before loading the control record.
 4. Load the control record (`control.load()`): the redo boundary
-   `checkpoint_lsn` and catalog bytes (none if absent).
+   fuzzy-checkpoint boundaries, DPT, and catalog bytes (none if absent).
 5. Initialize the catalog and storage engine in **recovery mode**, then install
    table, index, and sequence schemas from the catalog snapshot.
 6. Load/register durable dictionaries, burn orphan dictionary ids, and validate
    every currently referenced dictionary before redo.
-7. Redo-all for records with `LSN > checkpoint_lsn`: apply physical records
+7. Replay positioned WAL from the lesser redo boundary: apply physical records
    under PageLSN gating regardless of transaction outcome; apply generic catalog
    changes whose transactions the CLOG marks committed; reserve allocator
    high-water from every change; and replay sequence values unconditionally. The seeded/folded CLOG
@@ -2874,7 +2913,10 @@ The `server` crate is the binary entry point.
 
 Recovery computes `next_txn_id` by scanning all logically retained records from `WalManager::replay_from(0)`, including the `Checkpoint` marker's high-water. Scanning from the retained floor covers the crash window after the manifest/CLOG checkpoint is durable but before the marker is appended; after replay-floor advancement, the post-boundary marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. Overflow fails startup with a structured error.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--auto-analyze-changed-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. The two automatic-maintenance thresholds accept `0` to disable their respective workload-counter trigger; pressure from an unreclaimed abort-pinned CLOG window can still force a full VACUUM pass. All other numeric flags must be positive and `--port` is limited to `1..=65535`. TLS is off unless both certificate and key paths are supplied. Invalid input prints usage to stderr and exits with code `2`.
+The server additionally accepts `--checkpoint-flush-batch-pages <N>` (default
+256, range `1..=1_000_000`). Checkpoint thresholds enqueue its OS-thread worker;
+automatic VACUUM/ANALYZE thresholds enqueue a distinct maintenance worker.
+Other defaults and validation are listed in `AGENTS.md` and `server.md`.
 
 `statement_timeout` is session configuration rather than a startup flag. Its
 canonical value is an integer number of milliseconds (`0` disables it), while
@@ -2908,7 +2950,7 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
-- **Read-only statements** (plain `SELECT`, plain EXPLAIN, and analyzed EXPLAIN without sequence mutation): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward. Analyzed EXPLAIN with `nextval`/`setval` follows the write lifecycle instead; plain EXPLAIN never evaluates them.
+- **Read-only statements** (plain `SELECT`, plain EXPLAIN, and analyzed EXPLAIN without sequence mutation): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller token. An explicit transaction retains its nonblocking write-unit token and transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward. Analyzed EXPLAIN with `nextval`/`setval` follows the write lifecycle instead; plain EXPLAIN never evaluates them.
 - **Locking SELECT** is promoted through the transaction-owned lifecycle so it has
   an active xid and retains tuple grants. It takes the shared participant guard
   and `RowShare`, captures its snapshot, materializes the result while resolving
@@ -2917,9 +2959,15 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): bind to discover relations, allocate/register the autocommit xid (or use the explicit transaction's top xid), acquire the shared writer guard, then acquire xid-owned table locks and revalidate before snapshot capture. Targets use `RowExclusive`; read sources and FK-related parent/child tables use `AccessShare`. Child INSERT/COPY FROM/UPDATE locks outgoing parents; parent DELETE locks all incoming children, while parent UPDATE and an upsert update arm lock only children whose referenced columns overlap an assignment. Dependency discovery is repeated after acquisition, and prepared identities include all related tables present at prepare time. Row and table waits share the same graph node and deadlock manager.
 - **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): transaction-scoped. Explicit transactions retain their catalog overlay and schema/name/table/sequence locks through commit or rollback; `ROLLBACK TO` instead restores both the overlay and the lock-grant snapshot captured at that savepoint. Autocommit uses the same lifecycle for one statement. Catalog changes become globally visible only after the transaction's commit record is durable. The publication gate makes the combined catalog snapshot visible atomically; object modes scope data/lifetime access.
 - **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE takes `AccessExclusive` on targets plus `AccessShare` on incoming FK children, and ALTER takes `AccessExclusive`. Both standalone and transactional TRUNCATE reject an incoming child outside the complete target set with `2BP01`, while allowing child-only, self, cyclic, and complete sets. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback, while `ROLLBACK TO` restores both to the savepoint snapshot.
-- Shared writer guards are held for the operation lifetime. Actual checkpoint alone takes the exclusive guard and drains all page/WAL writers. `WalFlushPolicy` admits any WAL-durable page; uncommitted/aborted pages may reach the heap but remain hidden by CLOG.
+- Write-unit tokens are held for the operation lifetime but do not participate in
+  checkpointing. A checkpoint overlaps writers and uses only page latches,
+  publication gates, and the short buffer-owned fence. `WalFlushPolicy` admits any
+  WAL-durable page; uncommitted/aborted pages may reach the heap but remain hidden
+  by CLOG.
 
-The concrete `ConcurrencyController` is an `RwLock`: all page/WAL writers take it shared and `begin_checkpoint()` takes it exclusively. Foreground waits use cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no controller guard. Table locks coordinate relation access and the catalog publication gate serializes catalog undo.
+The retained `ConcurrencyController` is a nonblocking write-unit lifetime token;
+it has no checkpoint side. Table/row locks, storage latches, publication gates,
+and the buffer checkpoint fence provide concurrency control.
 
 **Other latches:**
 - **Buffer pool:** Frame-level read/write latches managed by page guards.
@@ -2959,7 +3007,7 @@ Loaded from command-line args only. There is no environment-variable or config-f
 ## 13. Future Work (Designed For, Not Implemented)
 
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
-- **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
+- **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol is future work. Row-level blocking, deadlock detection, and fuzzy incremental checkpoints are already implemented by the server.
 - **Full Cost-Based Optimizer:** The current hybrid planner has cardinality
   estimation plus cost-based scan and hash-build-side choices. Join reordering,
   alternative join enumeration, and a general cost search remain future work.

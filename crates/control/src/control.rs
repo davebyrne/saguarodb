@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use common::{DbError, Lsn, Result, SqlState, TableId};
+use common::{DbError, Result, SqlState};
 
 use crate::ControlData;
 use crate::manifest::{MAX_MANIFEST_BYTES, decode_control, encode_control};
@@ -14,9 +14,11 @@ pub trait ControlStore: Send + Sync {
     fn load(&self) -> Result<Option<ControlData>>;
 
     /// Atomically write a new control record. This is the durable commit point of
-    /// a checkpoint: it must run only after heap pages are fsynced and before the
-    /// WAL replay floor is advanced and obsolete segments are recycled.
-    fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
+    /// a checkpoint: pages captured by the incremental flush pass must be fsynced,
+    /// while every remaining dirty page is represented by the manifest DPT and its
+    /// physical redo boundary. The record is published before the WAL replay floor
+    /// is advanced and obsolete segments are recycled.
+    fn store(&self, control: ControlData) -> Result<()>;
 }
 
 pub struct FileControlStore {
@@ -72,23 +74,13 @@ impl ControlStore for FileControlStore {
         }
     }
 
-    fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()> {
-        let mut table_copy = Vec::new();
-        table_copy
-            .try_reserve_exact(tables.len())
-            .map_err(|_| DbError::io("cannot allocate control table list"))?;
-        table_copy.extend_from_slice(tables);
-        let mut catalog_copy = Vec::new();
-        catalog_copy
-            .try_reserve_exact(catalog.len())
-            .map_err(|_| DbError::io("cannot allocate control catalog buffer"))?;
-        catalog_copy.extend_from_slice(catalog);
-        let control = ControlData {
-            checkpoint_lsn,
-            tables: table_copy,
-            catalog: catalog_copy,
-            page_size: self.page_size,
-        };
+    fn store(&self, control: ControlData) -> Result<()> {
+        if control.page_size != self.page_size {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "control page size does not match the configured page size",
+            ));
+        }
         let bytes = encode_control(&control)?;
         let tmp_path = self.manifest_tmp_path();
         {
@@ -195,6 +187,7 @@ fn fsync_dir(path: &Path) -> Result<()> {
 mod tests {
     use std::fs::OpenOptions;
 
+    use crate::ControlData;
     use crate::manifest::MAX_MANIFEST_BYTES;
 
     use super::{ControlStore, FileControlStore};
@@ -203,7 +196,17 @@ mod tests {
     fn load_rejects_page_size_mismatch_with_clean_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileControlStore::open(dir.path(), 8192).unwrap();
-        store.store(1, &[], &[]).unwrap();
+        store
+            .store(ControlData {
+                checkpoint_end_lsn: 1,
+                page_redo_lsn: 1,
+                catalog_redo_lsn: 1,
+                dirty_pages: Vec::new(),
+                tables: Vec::new(),
+                catalog: Vec::new(),
+                page_size: 8192,
+            })
+            .unwrap();
 
         let mismatched = FileControlStore::open(dir.path(), 16384).unwrap();
         let err = mismatched.load().unwrap_err();

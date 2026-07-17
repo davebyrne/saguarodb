@@ -45,9 +45,8 @@ async fn statement_timeout_cancels_vacuum_waiting_for_writers() {
     maintenance.ok("vacuum timeout_vacuum").await.rows();
 }
 
-/// A config with a known checkpoint cadence and auto-vacuum threshold for the F4b
-/// tests. Checkpoints are NOT fired automatically by commits (cadence is huge); the
-/// tests drive them explicitly via `force_checkpoint`, so the gating is deterministic.
+/// A config with checkpoint thresholds disabled so tests observe the independent
+/// maintenance worker directly.
 fn auto_vacuum_config(threshold: u64) -> Config {
     Config {
         buffer_pool_frames: 64,
@@ -559,7 +558,7 @@ async fn primary_key_rejects_duplicate_after_hot_update_and_vacuum() {
 /// The horizon-safety invariant at the server level. While a snapshot advertises an
 /// old `xmin`, the GC horizon is pinned at or below that `xmin` even after a delete
 /// commits and the id allocator advances well past it — so VACUUM (which captures
-/// the horizon under the exclusive guard) cannot advance past a version the live
+/// the horizon after registering its maintenance xid and locking its targets) cannot advance past a version the live
 /// snapshot still sees. This is the mechanism that prevents VACUUM from reclaiming a
 /// version a reader needs.
 #[tokio::test]
@@ -705,14 +704,13 @@ async fn vacuumed_state_survives_restart() {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone F4b — auto-prune dead versions at checkpoint behind a threshold.
+// Background automatic VACUUM threshold behavior.
 // ---------------------------------------------------------------------------
 
-/// Threshold gating. With churn BELOW the threshold, a checkpoint does NOT auto-prune
-/// (the dead-rows accumulator is left untouched); once enough churn crosses the
-/// threshold, the next checkpoint auto-prunes and resets the accumulator to zero.
+/// Work below the threshold stays accumulated. Crossing it wakes the maintenance
+/// worker without requiring or waiting for a checkpoint.
 #[tokio::test]
-async fn checkpoint_auto_prunes_only_above_the_threshold() {
+async fn background_vacuum_runs_only_above_the_threshold() {
     // Threshold of 5 committed dead versions.
     let server = TestServer::start_with_config(auto_vacuum_config(5))
         .await
@@ -732,27 +730,25 @@ async fn checkpoint_auto_prunes_only_above_the_threshold() {
     }
     assert_eq!(server.dead_rows_since_vacuum(), 3, "three dead versions");
 
-    // A checkpoint with the count below the threshold does NOT auto-prune: the
-    // accumulator is untouched (a prune would have reset it to 0).
+    // A checkpoint is independent and leaves the below-threshold counter alone.
     server.force_checkpoint().await.unwrap();
     assert_eq!(
         server.dead_rows_since_vacuum(),
         3,
-        "below-threshold checkpoint leaves the accumulator unchanged (no auto-prune)"
+        "below-threshold checkpoint leaves the maintenance counter unchanged"
     );
 
     // More deletes push the count to 5 (>= threshold).
     for id in 3..5 {
         conn.ok(&format!("delete from t where id = {id}")).await;
     }
-    assert_eq!(server.dead_rows_since_vacuum(), 5);
-
-    // Now a checkpoint auto-prunes and resets the accumulator to 0.
-    server.force_checkpoint().await.unwrap();
+    // The triggering commit returns independently; wait explicitly for the
+    // maintenance worker rather than coupling completion to checkpoint I/O.
+    server.wait_for_automatic_vacuum().await.unwrap();
     assert_eq!(
         server.dead_rows_since_vacuum(),
         0,
-        "crossing the threshold makes the checkpoint auto-prune and reset the counter"
+        "crossing the threshold completes background VACUUM"
     );
 
     // The surviving rows are exactly the non-deleted ids; the deleted ones stay gone.
@@ -771,11 +767,11 @@ async fn checkpoint_auto_prunes_only_above_the_threshold() {
     );
 }
 
-/// A threshold of 0 disables dead-row-triggered auto-prune: below CLOG safety pressure,
-/// checkpoints do not auto-prune regardless
-/// of how much churn accumulates.
+/// A threshold of 0 disables dead-row-triggered automatic VACUUM below CLOG
+/// safety pressure, regardless of how much churn accumulates or how often the
+/// independent checkpointer runs.
 #[tokio::test]
-async fn auto_prune_disabled_when_threshold_is_zero() {
+async fn automatic_vacuum_disabled_when_threshold_is_zero() {
     let server = TestServer::start_with_config(auto_vacuum_config(0))
         .await
         .unwrap();
@@ -799,15 +795,16 @@ async fn auto_prune_disabled_when_threshold_is_zero() {
     );
 }
 
-/// Space stays bounded under sustained DELETE+INSERT churn across many checkpoints,
+/// Space stays bounded under sustained DELETE+INSERT churn while background
+/// maintenance and checkpoints run independently,
 /// with NO operator `VACUUM`. After a warmup that establishes the heap's working-set
 /// size, a long churn loop (each iteration deletes a row, inserts a fresh one, and
-/// periodically checkpoints) must not let the heap grow unboundedly: the auto-prune
+/// periodically checkpoints) must not let the heap grow unboundedly: the automatic VACUUM
 /// reclaims dead versions and `insert_row` reuses the freed slots, so the heap page
 /// count stabilizes.
 #[tokio::test]
 async fn sustained_churn_keeps_heap_bounded_without_operator_vacuum() {
-    // Low threshold so every churn batch triggers an auto-prune at the next checkpoint.
+    // Low threshold so every churn batch triggers background VACUUM.
     let server = TestServer::start_with_config(auto_vacuum_config(10))
         .await
         .unwrap();
@@ -823,11 +820,12 @@ async fn sustained_churn_keeps_heap_bounded_without_operator_vacuum() {
         ))
         .await;
     }
+    server.wait_for_automatic_vacuum().await.unwrap();
     server.force_checkpoint().await.unwrap();
     let baseline_pages = server.heap_page_count("churn");
 
     // Sustained churn: 600 delete+insert pairs (15x the working set), checkpointing
-    // every 20 iterations so auto-prune runs repeatedly. The live-row count stays 40
+    // every 20 iterations while automatic VACUUM runs independently. The live-row count stays 40
     // the whole time; only the id rolls forward (`next_id = 40 + i`), so without
     // reclamation the heap would grow without bound.
     for i in 0..600 {
@@ -843,6 +841,7 @@ async fn sustained_churn_keeps_heap_bounded_without_operator_vacuum() {
             server.force_checkpoint().await.unwrap();
         }
     }
+    server.wait_for_automatic_vacuum().await.unwrap();
     server.force_checkpoint().await.unwrap();
 
     // The live set is still exactly 40 rows.
@@ -851,7 +850,7 @@ async fn sustained_churn_keeps_heap_bounded_without_operator_vacuum() {
 
     // Space is bounded: after 600 churn pairs the heap is no larger than a small
     // constant over its warmed-up baseline (reclaimed slots are reused). Without
-    // auto-prune the heap would have grown by ~600 tuples' worth of pages.
+    // automatic VACUUM the heap would have grown by ~600 tuples' worth of pages.
     let final_pages = server.heap_page_count("churn");
     assert!(
         final_pages <= baseline_pages + 2,
@@ -860,12 +859,12 @@ async fn sustained_churn_keeps_heap_bounded_without_operator_vacuum() {
     );
 }
 
-/// Auto-prune does not change query results: the visible row set and the bank-SUM
-/// invariant are identical whether auto-prune fires or is disabled. Two servers run
-/// the same DELETE/UPDATE+INSERT workload — one with auto-prune ON (low threshold,
-/// frequent checkpoints), one with it OFF (threshold 0) — and must agree exactly.
+/// Automatic VACUUM does not change query results: the visible row set and the bank-SUM
+/// invariant are identical whether automatic VACUUM fires or is disabled. Two servers run
+/// the same DELETE/UPDATE+INSERT workload — one with automatic VACUUM ON (low threshold,
+/// periodic independent checkpoints), one with it OFF (threshold 0) — and must agree exactly.
 #[tokio::test]
-async fn auto_prune_does_not_change_visible_results() {
+async fn automatic_vacuum_does_not_change_visible_results() {
     async fn run_workload(threshold: u64) -> (Vec<Vec<Option<String>>>, i64) {
         let server = TestServer::start_with_config(auto_vacuum_config(threshold))
             .await
@@ -914,26 +913,26 @@ async fn auto_prune_does_not_change_visible_results() {
         (rows, sum)
     }
 
-    let (rows_on, sum_on) = run_workload(5).await; // auto-prune ON
-    let (rows_off, sum_off) = run_workload(0).await; // auto-prune OFF
+    let (rows_on, sum_on) = run_workload(5).await; // automatic VACUUM ON
+    let (rows_off, sum_off) = run_workload(0).await; // automatic VACUUM OFF
 
     assert_eq!(
         rows_on, rows_off,
-        "the visible row set is identical with auto-prune on vs off"
+        "the visible row set is identical with automatic VACUUM on vs off"
     );
     assert_eq!(sum_on, sum_off, "the bank-SUM invariant matches");
     assert_eq!(
         sum_on, 2000,
-        "the bank invariant holds across auto-pruning checkpoints (transfers + no-net churn)"
+        "the bank invariant holds across automatic maintenance (transfers + no-net churn)"
     );
 }
 
-/// Safety via the checkpoint trigger (mirrors the on-demand horizon-pin test, F4a).
+/// Safety via the background maintenance trigger (mirrors the on-demand horizon-pin test, F4a).
 /// A live snapshot advertises an old `xmin`, pinning the GC horizon below a committed
-/// delete. An auto-pruning checkpoint captures the horizon UNDER its guard, so it must
-/// NOT reclaim a version that snapshot still sees — exactly like on-demand VACUUM.
+/// delete. Background VACUUM captures that horizon while holding normal relation locks,
+/// so it must not reclaim a version that snapshot still sees.
 #[tokio::test]
-async fn auto_prune_checkpoint_respects_a_live_snapshot_horizon() {
+async fn background_vacuum_respects_a_live_snapshot_horizon() {
     let server = TestServer::start_with_config(auto_vacuum_config(1))
         .await
         .unwrap();
@@ -964,16 +963,15 @@ async fn auto_prune_checkpoint_respects_a_live_snapshot_horizon() {
             .await;
     }
 
-    // While the snapshot is held, the horizon is pinned at (or below) its xmin. An
-    // auto-pruning checkpoint captures exactly this horizon under the guard.
+    // While the snapshot is held, the horizon is pinned at (or below) its xmin.
     assert!(
         components.gc_horizon() <= pinned,
         "the held snapshot pins the horizon below the advanced allocator"
     );
+    server.wait_for_automatic_vacuum().await.unwrap();
     server.force_checkpoint().await.unwrap();
 
-    // Dropping the advertisement lets the horizon advance; the deferred reclamation can
-    // now happen at the next auto-pruning checkpoint.
+    // Dropping the advertisement lets later maintenance use a newer horizon.
     drop(held);
     assert!(
         components.gc_horizon() > pinned,
@@ -981,7 +979,7 @@ async fn auto_prune_checkpoint_respects_a_live_snapshot_horizon() {
     );
 
     // The visible data is consistent throughout: id 1 is deleted (never resurrected by
-    // the auto-prune), id 2 and the later inserts survive.
+    // the automatic VACUUM), id 2 and the later inserts survive.
     let remaining = conn
         .ok("select id from users order by id")
         .await
@@ -992,15 +990,14 @@ async fn auto_prune_checkpoint_respects_a_live_snapshot_horizon() {
     assert_eq!(remaining.first(), Some(&Some("2".to_string())));
     assert!(
         !remaining.contains(&Some("1".to_string())),
-        "the committed delete of id 1 stays invisible across the auto-pruning checkpoint"
+        "the committed delete of id 1 stays invisible across background VACUUM and checkpoint"
     );
 }
 
-/// An auto-pruning checkpoint, then crash + restart: the reclaimed state is durable
-/// (the vacuum FPIs replay from this checkpoint), live data is intact, and deleted
-/// data stays gone — with NO operator `VACUUM`, only the auto-prune at checkpoint.
+/// Background VACUUM followed by a checkpoint and restart preserves reclaimed
+/// state, live data, and committed deletes without operator maintenance.
 #[tokio::test]
-async fn auto_pruned_state_survives_restart() {
+async fn automatic_vacuum_state_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = auto_vacuum_config(3);
     config.data_dir = dir.path().to_path_buf();
@@ -1018,24 +1015,24 @@ async fn auto_pruned_state_survives_restart() {
             ))
             .await;
         }
-        // Delete the three 'gone' rows (>= threshold 3), then force a checkpoint that
-        // auto-prunes them and flushes the vacuum FPIs durably.
+        // Delete the three 'gone' rows, wait for background VACUUM, then checkpoint
+        // its resulting DPT state durably.
         conn.ok("delete from users where name = 'gone'").await;
-        assert_eq!(server.dead_rows_since_vacuum(), 3);
+        server.wait_for_automatic_vacuum().await.unwrap();
         server.force_checkpoint().await.unwrap();
         assert_eq!(
             server.dead_rows_since_vacuum(),
             0,
-            "the checkpoint auto-pruned the deleted rows"
+            "background VACUUM represented the deleted rows"
         );
-        // Reuse a reclaimed slot after the auto-prune to exercise reclaim + insert
+        // Reuse a reclaimed slot after the automatic VACUUM to exercise reclaim + insert
         // replay through recovery.
         conn.ok("insert into users (id, name) values (100, 'keep')")
             .await;
         // The drop here triggers a graceful shutdown.
     }
 
-    // Restart from the same data dir: recovery replays the auto-prune FPIs and the
+    // Restart from the same data dir: recovery replays the automatic VACUUM FPIs and the
     // reclaim+reuse insert.
     let server = TestServer::start_with_config(config).await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
@@ -1064,7 +1061,7 @@ async fn auto_pruned_state_survives_restart() {
         .rows();
     assert!(
         gone.is_empty(),
-        "auto-pruned 'gone' rows stay gone after restart"
+        "automatic VACUUMd 'gone' rows stay gone after restart"
     );
     let keep = conn
         .ok("select id from users where name = 'keep' order by id")

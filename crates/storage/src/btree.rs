@@ -807,15 +807,17 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     ) -> Result<()> {
         let Some(txn_id) = mode.wal_txn_id() else {
             *guard.data_mut() = image;
+            guard.publish_recovery_derived(crate::page::page_lsn(guard.data()))?;
             return Ok(());
         };
-        let lsn = self.wal.append(WalRecord {
+        let position = self.wal.append_positioned(WalRecord {
             lsn: 0,
             txn_id,
             kind: fpi_record_kind(self.compression, self.file_id, guard.page_num(), &image),
         })?;
-        crate::page::set_page_lsn(&mut image, lsn);
+        crate::page::set_page_lsn(&mut image, position.record_lsn);
         *guard.data_mut() = image;
+        guard.publish_position(position)?;
         Ok(())
     }
 
@@ -1255,6 +1257,14 @@ mod tests {
     }
 
     impl WalManager for FailingWal {
+        fn append_positioned(&self, record: WalRecord) -> common::Result<common::WalPosition> {
+            let record_lsn = self.append(record)?;
+            Ok(common::WalPosition {
+                replay_from: record_lsn.saturating_sub(1),
+                record_lsn,
+            })
+        }
+
         fn append(&self, record: WalRecord) -> common::Result<Lsn> {
             let next = self.next_lsn.load(Ordering::SeqCst);
             if self.fail_at.load(Ordering::SeqCst) == next {
@@ -1302,7 +1312,12 @@ mod tests {
             Ok(0)
         }
 
-        fn persist_clog(&self, _clog_lsn: Lsn) -> common::Result<()> {
+        fn checkpoint_clog(
+            &self,
+            _proposed_replay_floor: Lsn,
+            _captured_active: &[common::TxnId],
+            _allocation_boundary: common::TxnId,
+        ) -> common::Result<()> {
             Ok(())
         }
 
@@ -1525,7 +1540,7 @@ mod tests {
             value += 1;
             assert!(value < 20, "root leaf did not fill quickly");
         }
-        buffer.mark_all_clean().unwrap();
+        buffer.flush_dirty_pages_for_files(&[INDEX_FILE]).unwrap();
 
         wal.fail_next_append();
         let err = tree

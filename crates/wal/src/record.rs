@@ -47,7 +47,9 @@ pub enum WalRecordKind {
     /// `txn_id` = the subxid), reusing this record.
     Abort,
     Checkpoint {
-        redo_lsn: Lsn,
+        checkpoint_end_lsn: Lsn,
+        page_redo_lsn: Lsn,
+        catalog_redo_lsn: Lsn,
     },
     /// Physiological redo: initialize a fresh heap page.
     HeapInit {

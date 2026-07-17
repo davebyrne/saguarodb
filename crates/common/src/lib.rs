@@ -16,6 +16,7 @@ pub mod bytea;
 pub mod cancel;
 pub mod catalog_change;
 pub mod checked_bytes;
+mod checkpoint;
 pub mod concurrency;
 pub mod context;
 pub mod copy;
@@ -53,9 +54,8 @@ pub use catalog_change::{
     CatalogObject, CatalogObjectId, DependencyEdge, DependencyType, MAX_CATALOG_CHANGE_MUTATIONS,
 };
 pub use checked_bytes::{CheckedSliceReader, SliceReadError, SliceReadErrorKind};
-pub use concurrency::{
-    CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
-};
+pub use checkpoint::CatalogRedoTracker;
+pub use concurrency::{ConcurrencyController, RwLockConcurrencyController, WriteGuard};
 pub use context::{
     CatalogIntrospectionProvider, ConflictWaiter, GucSetting, RuntimeValueSet, RuntimeValueSetId,
     RuntimeValueSetRegistry, SequenceManager, SessionActivityRow, SessionInfo,
@@ -75,9 +75,10 @@ pub use functions::{
     scalar_function_id, scalar_function_id_matches, scalar_function_result_pg_type,
 };
 pub use ids::{
-    BindingId, ColumnId, ColumnObjectId, ConstraintId, FIRST_NORMAL_XID, FIRST_USER_SCHEMA_ID,
-    FROZEN_XID, FileId, FunctionId, INVALID_XID, IndexId, Lsn, PRIMARY_KEY_INDEX_ID,
-    PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId, TableId, TxnId,
+    BindingId, ColumnId, ColumnObjectId, ConstraintId, DirtyPageEntry, FIRST_NORMAL_XID,
+    FIRST_USER_SCHEMA_ID, FROZEN_XID, FileId, FunctionId, INVALID_XID, IndexId, Lsn,
+    PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, PageNum, RowId, SchemaId, SequenceId, TableId, TxnId,
+    WalPosition,
 };
 pub use interval::Interval;
 pub use locking::{

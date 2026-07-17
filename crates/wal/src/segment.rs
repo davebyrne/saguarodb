@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use common::{CheckedSliceReader, DbError, Lsn, Result, SqlState};
 
-pub(crate) const WAL_FORMAT_VERSION: u32 = 2;
+pub(crate) const WAL_FORMAT_VERSION: u32 = 3;
 pub(crate) const SEGMENT_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const SEGMENT_MAGIC: &[u8; 4] = b"SGWS";
 pub(crate) const SEGMENT_HEADER_LEN: u64 = 32;

@@ -575,7 +575,14 @@ not diverge between ALTER validation and later DML.
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. Plain SELECT and non-sequence-mutating EXPLAIN take no autocommit `ConcurrencyController` guard but do take `AccessShare` on referenced tables. Locking SELECT takes the shared participant guard and target `RowShare` through the transaction-owned path. Analyzed EXPLAIN containing `nextval` or `setval` uses the existing write classification, sequence locks, WAL lifecycle, and autocommit commit; plain EXPLAIN never evaluates sequence expressions. DML, COPY FROM, DDL, and WAL-writing maintenance acquire `ConcurrencyController::begin_writer`; DDL additionally takes the catalog publication gate. Table modes are `RowExclusive` for DML targets, `Share` for CREATE INDEX/VACUUM, and `AccessExclusive` for DROP/ALTER/TRUNCATE. Actual checkpoint alone takes `begin_checkpoint`. Shared writer and table-lock guards live for the full statement. Transaction-owned grants normally live through top-level completion; `ROLLBACK TO SAVEPOINT` restores the earlier captured grant set. See `docs/specs/crates/server.md` and `docs/specs/table-locks.md`.
+Statement guards are owned by server query orchestration, not by the executor.
+Plain SELECT and non-sequence-mutating EXPLAIN take `AccessShare`; locking SELECT
+takes `RowShare`. DML targets use `RowExclusive`, CREATE INDEX/VACUUM use `Share`,
+and DROP/ALTER/TRUNCATE use `AccessExclusive`. DDL also takes the catalog
+publication gate. The compatibility write-unit token is nonblocking, and fuzzy
+checkpoint coordination is entirely outside executor through page/publication
+fences. Transaction-owned grants live through top-level completion unless
+`ROLLBACK TO SAVEPOINT` restores an earlier grant set.
 
 ## Acceptance Tests
 

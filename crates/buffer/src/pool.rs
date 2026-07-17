@@ -3,7 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use common::{DbError, FileId, FlushPolicy, PageFlushInfo, PageNum, Result, SqlState};
+use common::{
+    DbError, DirtyPageEntry, FileId, FlushPolicy, PageFlushInfo, PageNum, Result, SqlState,
+    WalPosition,
+};
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
 
 use crate::{PAGE_SIZE, PageData, PageInfo, PageLoader, PageStore};
@@ -11,6 +14,31 @@ use crate::{PAGE_SIZE, PageData, PageInfo, PageLoader, PageStore};
 type PageKey = (FileId, PageNum);
 type PageReadLatch = ArcRwLockReadGuard<RawRwLock, PageData>;
 type PageWriteLatch = ArcRwLockWriteGuard<RawRwLock, PageData>;
+pub type CheckpointSharedGuard = ArcRwLockReadGuard<RawRwLock, ()>;
+pub type CheckpointExclusiveGuard = ArcRwLockWriteGuard<RawRwLock, ()>;
+
+#[derive(Clone, Default)]
+pub struct CheckpointFence {
+    inner: Arc<RwLock<()>>,
+}
+
+impl CheckpointFence {
+    pub fn shared(&self) -> CheckpointSharedGuard {
+        self.inner.read_arc()
+    }
+
+    pub fn exclusive(&self) -> CheckpointExclusiveGuard {
+        self.inner.write_arc()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointBatchStats {
+    pub attempted: usize,
+    pub flushed: usize,
+    pub busy_or_skipped: usize,
+    pub redirtied: usize,
+}
 
 pub struct PageReadGuard {
     file_id: FileId,
@@ -53,8 +81,12 @@ pub struct PageWriteGuard {
     page_num: PageNum,
     frame: Arc<Frame>,
     guard: PageWriteLatch,
+    _checkpoint_publication: CheckpointSharedGuard,
+    txn_id: u64,
     unpublished_new: bool,
     published: bool,
+    #[cfg(test)]
+    test_mutated: bool,
 }
 
 impl PageWriteGuard {
@@ -75,6 +107,10 @@ impl PageWriteGuard {
     /// [`PageWriteGuard::publish`] once its existence is durably logged — writing
     /// bytes here is not what makes it unabandonable.
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        #[cfg(test)]
+        {
+            self.test_mutated = true;
+        }
         &mut self.guard.0
     }
 
@@ -102,10 +138,37 @@ impl PageWriteGuard {
     pub fn restore_needs_fpi(&self) {
         self.frame.needs_fpi.store(true, Ordering::Release);
     }
+
+    /// Publish a completed page mutation and its exact WAL boundaries before the
+    /// write latch and checkpoint-fence share are released.
+    pub fn publish_position(&mut self, position: WalPosition) -> Result<()> {
+        self.frame.publish_mutation(self.txn_id, position)?;
+        self.published = true;
+        Ok(())
+    }
+
+    /// Mark a page rebuilt from already-validated durable catalog state during
+    /// recovery. The zero redo pin is conservative; the synchronous recovery
+    /// checkpoint flushes the page and removes it before publishing a manifest.
+    pub fn publish_recovery_derived(&mut self, page_lsn: u64) -> Result<()> {
+        self.frame.publish_mutation(
+            self.txn_id,
+            WalPosition {
+                replay_from: 0,
+                record_lsn: page_lsn,
+            },
+        )?;
+        self.published = true;
+        Ok(())
+    }
 }
 
 impl Drop for PageWriteGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.test_mutated && !self.published && !self.unpublished_new {
+            panic!("mutated existing page dropped without publishing its WAL position");
+        }
         self.frame.unpin();
     }
 }
@@ -138,10 +201,6 @@ pub trait BufferPool: Send + Sync {
     fn page_count(&self, file_id: FileId) -> Result<PageNum>;
     fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()>;
     fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool;
-    fn mark_all_clean(&self) -> Result<()>;
-    /// Mark resident frames belonging to `file_ids` clean after those files alone
-    /// have been flushed and fsynced.
-    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()>;
     /// Abort cleanup is status-based (`docs/specs/mvcc.md` §4 Decision 3): no
     /// page bytes are undone and freshly allocated pages are not reclaimed. Clears
     /// only per-transaction bookkeeping.
@@ -149,13 +208,21 @@ pub trait BufferPool: Send + Sync {
     fn commit(&self, txn_id: u64) -> Result<()>;
 
     /// Write every flushable dirty page (per the flush policy) to its home in the
-    /// `PageStore`, regardless of whether its dirtying transaction committed. Does
-    /// not fsync or mark frames clean; the caller fsyncs via the store and then
-    /// calls `mark_all_clean`. Used by checkpoint (`docs/specs/mvcc.md` §8).
+    /// `PageStore`, regardless of whether its dirtying transaction committed.
+    /// Does not fsync or mark frames clean.
     fn flush_dirty_pages(&self) -> Result<()>;
     /// Flush dirty resident frames belonging to `file_ids` without touching
-    /// unrelated writer frames. The caller has already made their WAL durable.
+    /// unrelated writer frames, fsync those files, and conditionally mark the
+    /// captured generations clean. The caller has already made their WAL durable.
     fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()>;
+
+    fn checkpoint_fence(&self) -> CheckpointFence;
+    fn checkpoint_dirty_keys(&self) -> Result<Vec<(FileId, PageNum)>>;
+    fn dirty_page_table(&self) -> Result<Vec<DirtyPageEntry>>;
+    fn flush_checkpoint_batch(
+        &self,
+        candidates: &[(FileId, PageNum)],
+    ) -> Result<CheckpointBatchStats>;
 
     /// Obtain a writable frame for recovery redo, creating a zeroed frame when the
     /// page is absent from the store (a new page being re-established). The frame
@@ -187,6 +254,7 @@ pub struct MemoryBufferPool {
     /// When true, eviction may flush a WAL-durable dirty page to its home and evict
     /// it (steal). Off until the server enables it during startup.
     stealing: AtomicBool,
+    checkpoint_fence: CheckpointFence,
 }
 
 impl MemoryBufferPool {
@@ -201,6 +269,7 @@ impl MemoryBufferPool {
             store,
             state: Mutex::new(PoolState::default()),
             stealing: AtomicBool::new(false),
+            checkpoint_fence: CheckpointFence::default(),
         }
     }
 
@@ -296,6 +365,7 @@ impl MemoryBufferPool {
                 let data = victim.data.read().clone();
                 self.store
                     .write_page(victim.file_id, victim.page_num, &data)
+                    .and_then(|()| self.store.sync_files(&[victim.file_id]))
             });
             if let Err(err) = flush_result {
                 // Abort the eviction: clear `evicting` so the frame is usable again,
@@ -332,13 +402,11 @@ impl MemoryBufferPool {
     /// "read `page_count` → `ensure_next_page_at_least`" pair is atomic against any
     /// concurrent pool-lock holder (another `new_page`/`load_page` advancing the
     /// counter, or a steal removing a frame). Seeding happens at most once per file
-    /// (`extent_seeded`). Independently, the only on-disk extender of `file_id`
-    /// besides this seed is (a) the checkpoint's `flush_dirty_pages`, which runs
-    /// alone under the EXCLUSIVE guard so no writer — hence no seed — is concurrent,
-    /// and (b) steal-eviction writing a stolen dirty page, whose page number was
-    /// already allocated by a prior `new_page(file_id)` that already seeded
-    /// `file_id` — so a steal of `file_id` implies `file_id` is already seeded and
-    /// cannot grow it out from under a first seed. (Pre-E2b this read happened
+    /// (`extent_seeded`). Checkpoint, file-scoped, and steal writes can extend a
+    /// file only for a frame that was previously loaded or allocated; both paths
+    /// seed or advance this counter before such a frame can be flushed. Those
+    /// extenders therefore imply that `file_id` is already seeded and cannot grow
+    /// it out from under its first seed. (Pre-E2b this read happened
     /// OUTSIDE the lock, justified only by the now-removed single global writer
     /// guard; the lock-held read makes the seed self-contained.)
     fn ensure_extent_seeded(&self, file_id: FileId) -> Result<()> {
@@ -384,7 +452,7 @@ impl MemoryBufferPool {
         &self,
         file_id: FileId,
         page_num: PageNum,
-        txn_id: u64,
+        _txn_id: u64,
         data: PageData,
     ) -> Result<Arc<Frame>> {
         self.with_room(|state| {
@@ -393,7 +461,6 @@ impl MemoryBufferPool {
                 return Ok(None);
             };
             state.advance_next_page_num(file_id, page_num);
-            frame.mark_dirty(txn_id);
             frame.pin();
             Ok(Some(frame))
         })
@@ -424,14 +491,13 @@ impl MemoryBufferPool {
         &self,
         file_id: FileId,
         page_num: PageNum,
-        txn_id: u64,
+        _txn_id: u64,
     ) -> ResidentLookup {
         let state = self.state.lock();
         match state.frames.get(&(file_id, page_num)) {
             Some(frame) if frame.evicting.load(Ordering::Acquire) => ResidentLookup::Evicting,
             Some(frame) => {
                 let frame = frame.clone();
-                frame.mark_dirty(txn_id);
                 frame.pin();
                 ResidentLookup::Found(frame)
             }
@@ -465,6 +531,14 @@ impl MemoryBufferPool {
                         retry = true;
                         break;
                     }
+                    if frame.checkpoint_flushing.load(Ordering::Acquire) {
+                        frame.evicting.store(false, Ordering::Release);
+                        dirty.iter().for_each(|reserved: &Arc<Frame>| {
+                            reserved.evicting.store(false, Ordering::Release);
+                        });
+                        retry = true;
+                        break;
+                    }
                     dirty.push(frame.clone());
                 }
                 dirty
@@ -474,11 +548,15 @@ impl MemoryBufferPool {
             }
             std::thread::yield_now();
         };
+        let file_scoped = files.is_some();
         let flush_result = (|| {
+            if !dirty.is_empty() {
+                self.flush_policy.ensure_durable()?;
+            }
             for frame in &dirty {
                 let info = PageFlushInfo {
                     dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
-                    page_lsn: None,
+                    page_lsn: frame.dirty_meta.lock().latest_page_lsn,
                 };
                 if !self.flush_policy.can_flush(&info) {
                     return Err(Self::storage_internal_error(
@@ -486,15 +564,43 @@ impl MemoryBufferPool {
                     ));
                 }
                 let data = frame.data.read().clone();
+                if file_scoped {
+                    let mut meta = frame.dirty_meta.lock();
+                    meta.bulk_flush = Some(BulkFlushState {
+                        captured_generation: meta.generation,
+                        captured_page_lsn: meta.latest_page_lsn,
+                    });
+                }
                 self.store
                     .write_page(frame.file_id, frame.page_num, &data)?;
             }
             Ok(())
         })();
-        for frame in dirty {
-            frame.evicting.store(false, Ordering::Release);
+        if flush_result.is_err() || !file_scoped {
+            clear_bulk_flush_reservations(&dirty);
         }
         flush_result
+    }
+
+    fn abort_bulk_flush_for_files(&self, files: &HashSet<FileId>) {
+        let state = self.state.lock();
+        for frame in state.frames.values() {
+            if files.contains(&frame.file_id) {
+                frame.dirty_meta.lock().bulk_flush = None;
+                frame.evicting.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    fn finish_bulk_flush_for_files(&self, file_ids: &[FileId]) -> Result<()> {
+        let files = file_ids.iter().copied().collect::<HashSet<_>>();
+        let state = self.state.lock();
+        for frame in state.frames.values() {
+            if files.contains(&frame.file_id) {
+                frame.finish_bulk_flush()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -529,7 +635,13 @@ impl BufferPool for MemoryBufferPool {
         loop {
             match self.prepare_write_frame(file_id, page_num, txn_id) {
                 ResidentLookup::Found(frame) => {
-                    return Ok(write_guard(file_id, page_num, frame));
+                    return Ok(write_guard(
+                        file_id,
+                        page_num,
+                        txn_id,
+                        frame,
+                        &self.checkpoint_fence,
+                    ));
                 }
                 ResidentLookup::Evicting => {
                     std::thread::yield_now();
@@ -545,7 +657,13 @@ impl BufferPool for MemoryBufferPool {
                             )));
                         }
                     };
-                    return Ok(write_guard(file_id, page_num, frame));
+                    return Ok(write_guard(
+                        file_id,
+                        page_num,
+                        txn_id,
+                        frame,
+                        &self.checkpoint_fence,
+                    ));
                 }
             }
         }
@@ -561,7 +679,6 @@ impl BufferPool for MemoryBufferPool {
                 .reusable_page(file_id)
                 .unwrap_or_else(|| state.next_page_num(file_id));
             let frame = state.insert_fresh_frame(file_id, page_num)?;
-            frame.mark_dirty(txn_id);
             state.mark_page_allocated(file_id, page_num);
             // Under status-based abort (`docs/specs/mvcc.md` §4 Decision 3) a
             // freshly allocated page is NOT reclaimed on rollback: it carries the
@@ -573,7 +690,13 @@ impl BufferPool for MemoryBufferPool {
             frame.pin();
             Ok(Some((page_num, frame)))
         })?;
-        Ok(new_page_write_guard(file_id, page_num, frame))
+        Ok(new_page_write_guard(
+            file_id,
+            page_num,
+            txn_id,
+            frame,
+            &self.checkpoint_fence,
+        ))
     }
 
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()> {
@@ -650,25 +773,6 @@ impl BufferPool for MemoryBufferPool {
         self.state.lock().is_page_abandoned(file_id, page_num)
     }
 
-    fn mark_all_clean(&self) -> Result<()> {
-        let state = self.state.lock();
-        for frame in state.frames.values() {
-            frame.mark_clean();
-        }
-        Ok(())
-    }
-
-    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()> {
-        let files = file_ids.iter().copied().collect::<HashSet<_>>();
-        let state = self.state.lock();
-        for frame in state.frames.values() {
-            if files.contains(&frame.file_id) {
-                frame.mark_clean();
-            }
-        }
-        Ok(())
-    }
-
     fn rollback(&self, _txn_id: u64) -> Result<()> {
         // Status-based abort (`docs/specs/mvcc.md` §4 Decision 3, §11, Milestone
         // D1): there is NO page undo and NO page reclamation. An aborting
@@ -710,6 +814,7 @@ impl BufferPool for MemoryBufferPool {
             };
             if frame.pin_count.load(Ordering::Acquire) != 0
                 || frame.evicting.load(Ordering::Acquire)
+                || frame.checkpoint_flushing.load(Ordering::Acquire)
             {
                 return Ok(false);
             }
@@ -737,7 +842,172 @@ impl BufferPool for MemoryBufferPool {
 
     fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()> {
         let files = file_ids.iter().copied().collect::<HashSet<_>>();
-        self.flush_dirty_pages_in(Some(&files))
+        self.flush_dirty_pages_in(Some(&files))?;
+        if let Err(err) = self.store.sync_files(file_ids) {
+            self.abort_bulk_flush_for_files(&files);
+            return Err(err);
+        }
+        self.finish_bulk_flush_for_files(file_ids)
+    }
+
+    fn checkpoint_fence(&self) -> CheckpointFence {
+        self.checkpoint_fence.clone()
+    }
+
+    fn checkpoint_dirty_keys(&self) -> Result<Vec<(FileId, PageNum)>> {
+        let state = self.state.lock();
+        let mut keys = state
+            .frames
+            .iter()
+            .filter_map(|(key, frame)| frame.is_dirty().then_some(*key))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        Ok(keys)
+    }
+
+    fn dirty_page_table(&self) -> Result<Vec<DirtyPageEntry>> {
+        let state = self.state.lock();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve(state.frames.len())
+            .map_err(|_| Self::storage_internal_error("cannot allocate dirty-page table"))?;
+        for frame in state.frames.values() {
+            if !frame.is_dirty() {
+                continue;
+            }
+            let meta = frame.dirty_meta.lock();
+            let Some(rec_lsn) = meta.rec_lsn else {
+                return Err(Self::storage_internal_error(
+                    "dirty frame has no published WAL redo boundary",
+                ));
+            };
+            entries.push(DirtyPageEntry {
+                file_id: frame.file_id,
+                page_num: frame.page_num,
+                rec_lsn,
+            });
+        }
+        entries.sort_unstable();
+        Ok(entries)
+    }
+
+    fn flush_checkpoint_batch(
+        &self,
+        candidates: &[(FileId, PageNum)],
+    ) -> Result<CheckpointBatchStats> {
+        let mut stats = CheckpointBatchStats {
+            attempted: candidates.len(),
+            ..CheckpointBatchStats::default()
+        };
+        let mut represented_files = candidates
+            .iter()
+            .map(|(file_id, _)| *file_id)
+            .collect::<Vec<_>>();
+        represented_files.sort_unstable();
+        represented_files.dedup();
+        let frames = {
+            let state = self.state.lock();
+            candidates
+                .iter()
+                .filter_map(|key| {
+                    let frame = state.frames.get(key)?.clone();
+                    if frame.evicting.load(Ordering::Acquire)
+                        || frame
+                            .checkpoint_flushing
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return None;
+                    }
+                    Some(frame)
+                })
+                .collect::<Vec<_>>()
+        };
+        stats.busy_or_skipped = candidates.len().saturating_sub(frames.len());
+        let mut captured = Vec::new();
+        for frame in frames {
+            let Some(data) = frame.data.try_write_arc() else {
+                frame.checkpoint_flushing.store(false, Ordering::Release);
+                stats.busy_or_skipped = stats.busy_or_skipped.saturating_add(1);
+                continue;
+            };
+            if !frame.is_dirty() {
+                drop(data);
+                frame.checkpoint_flushing.store(false, Ordering::Release);
+                stats.busy_or_skipped = stats.busy_or_skipped.saturating_add(1);
+                continue;
+            }
+            let mut meta = frame.dirty_meta.lock();
+            let Some(page_lsn) = meta.latest_page_lsn else {
+                drop(meta);
+                drop(data);
+                frame.checkpoint_flushing.store(false, Ordering::Release);
+                clear_checkpoint_reservations(&captured);
+                return Err(Self::storage_internal_error(
+                    "dirty checkpoint candidate has no PageLSN",
+                ));
+            };
+            meta.checkpoint_flush = Some(CheckpointFlushState {
+                captured_generation: meta.generation,
+                captured_page_lsn: page_lsn,
+                first_redirty_lsn: None,
+            });
+            frame.needs_fpi.store(true, Ordering::Release);
+            let image = data.clone();
+            drop(meta);
+            drop(data);
+            captured.push(CheckpointCaptured { frame, image });
+        }
+
+        let io_result = (|| {
+            if !captured.is_empty() {
+                self.flush_policy.ensure_durable()?;
+            }
+            for page in &captured {
+                self.store
+                    .write_page(page.frame.file_id, page.frame.page_num, &page.image)?;
+            }
+            self.store.sync_files(&represented_files)
+        })();
+        if let Err(err) = io_result {
+            clear_checkpoint_reservations(&captured);
+            return Err(err);
+        }
+
+        for page in &captured {
+            let mut meta = page.frame.dirty_meta.lock();
+            let Some(flush) = meta.checkpoint_flush.take() else {
+                drop(meta);
+                clear_checkpoint_reservations(&captured);
+                return Err(Self::storage_internal_error(
+                    "checkpoint flush reservation disappeared",
+                ));
+            };
+            if meta.generation == flush.captured_generation
+                && meta.latest_page_lsn == Some(flush.captured_page_lsn)
+                && flush.first_redirty_lsn.is_none()
+            {
+                meta.rec_lsn = None;
+                meta.latest_page_lsn = None;
+                page.frame.dirty.store(false, Ordering::Release);
+                page.frame.dirty_txn_id.store(0, Ordering::Release);
+                stats.flushed = stats.flushed.saturating_add(1);
+            } else {
+                let Some(redirty_lsn) = flush.first_redirty_lsn else {
+                    drop(meta);
+                    clear_checkpoint_reservations(&captured);
+                    return Err(Self::storage_internal_error(
+                        "checkpoint candidate changed without a published WAL position",
+                    ));
+                };
+                meta.rec_lsn = Some(redirty_lsn);
+                stats.redirtied = stats.redirtied.saturating_add(1);
+            }
+            page.frame
+                .checkpoint_flushing
+                .store(false, Ordering::Release);
+        }
+        Ok(stats)
     }
 
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard> {
@@ -747,7 +1017,13 @@ impl BufferPool for MemoryBufferPool {
         loop {
             match self.prepare_write_frame(file_id, page_num, RECOVERY_TXN) {
                 ResidentLookup::Found(frame) => {
-                    return Ok(write_guard(file_id, page_num, frame));
+                    return Ok(write_guard(
+                        file_id,
+                        page_num,
+                        RECOVERY_TXN,
+                        frame,
+                        &self.checkpoint_fence,
+                    ));
                 }
                 ResidentLookup::Evicting => {
                     std::thread::yield_now();
@@ -759,10 +1035,37 @@ impl BufferPool for MemoryBufferPool {
                         .unwrap_or_default();
                     let frame =
                         self.insert_loaded_write_page(file_id, page_num, RECOVERY_TXN, data)?;
-                    return Ok(write_guard(file_id, page_num, frame));
+                    return Ok(write_guard(
+                        file_id,
+                        page_num,
+                        RECOVERY_TXN,
+                        frame,
+                        &self.checkpoint_fence,
+                    ));
                 }
             }
         }
+    }
+}
+
+struct CheckpointCaptured {
+    frame: Arc<Frame>,
+    image: PageData,
+}
+
+fn clear_checkpoint_reservations(captured: &[CheckpointCaptured]) {
+    for page in captured {
+        page.frame.dirty_meta.lock().checkpoint_flush = None;
+        page.frame
+            .checkpoint_flushing
+            .store(false, Ordering::Release);
+    }
+}
+
+fn clear_bulk_flush_reservations(frames: &[Arc<Frame>]) {
+    for frame in frames {
+        frame.dirty_meta.lock().bulk_flush = None;
+        frame.evicting.store(false, Ordering::Release);
     }
 }
 
@@ -898,7 +1201,7 @@ impl PoolState {
             file_id,
             page_num,
             PageData::default(),
-            true,
+            false,
             false,
         ));
         self.frames.insert(key, frame.clone());
@@ -945,7 +1248,9 @@ impl PoolState {
                 continue;
             };
 
-            if frame.pin_count.load(Ordering::Acquire) != 0 {
+            if frame.pin_count.load(Ordering::Acquire) != 0
+                || frame.checkpoint_flushing.load(Ordering::Acquire)
+            {
                 self.advance_clock_hand();
                 continue;
             }
@@ -962,7 +1267,7 @@ impl PoolState {
             if stealing {
                 let info = PageFlushInfo {
                     dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
-                    page_lsn: None,
+                    page_lsn: frame.dirty_meta.lock().latest_page_lsn,
                 };
                 if flush_policy.can_flush(&info) {
                     // Reserve across the unlocked flush. `pin_count == 0` here (checked
@@ -1010,6 +1315,7 @@ struct Frame {
     pin_count: AtomicUsize,
     dirty: AtomicBool,
     dirty_txn_id: AtomicU64,
+    dirty_meta: Mutex<DirtyMeta>,
     reference_bit: AtomicBool,
     needs_fpi: AtomicBool,
     /// Set under the pool lock when a steal reserves this dirty frame for an
@@ -1020,6 +1326,29 @@ struct Frame {
     /// writer lock previously masked. Cleared if the eviction is aborted (the frame
     /// got re-pinned); a removed frame drops, so the flag need not be reset there.
     evicting: AtomicBool,
+    checkpoint_flushing: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DirtyMeta {
+    rec_lsn: Option<u64>,
+    latest_page_lsn: Option<u64>,
+    generation: u64,
+    checkpoint_flush: Option<CheckpointFlushState>,
+    bulk_flush: Option<BulkFlushState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckpointFlushState {
+    captured_generation: u64,
+    captured_page_lsn: u64,
+    first_redirty_lsn: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BulkFlushState {
+    captured_generation: u64,
+    captured_page_lsn: Option<u64>,
 }
 
 impl Frame {
@@ -1037,9 +1366,11 @@ impl Frame {
             pin_count: AtomicUsize::new(0),
             dirty: AtomicBool::new(dirty),
             dirty_txn_id: AtomicU64::new(0),
+            dirty_meta: Mutex::new(DirtyMeta::default()),
             reference_bit: AtomicBool::new(true),
             needs_fpi: AtomicBool::new(needs_fpi),
             evicting: AtomicBool::new(false),
+            checkpoint_flushing: AtomicBool::new(false),
         }
     }
 
@@ -1052,17 +1383,66 @@ impl Frame {
         self.pin_count.fetch_sub(1, Ordering::AcqRel);
     }
 
-    fn mark_dirty(&self, txn_id: u64) {
+    fn publish_mutation(&self, txn_id: u64, position: WalPosition) -> Result<()> {
+        let mut meta = self.dirty_meta.lock();
+        meta.generation = meta
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("page mutation generation overflow"))?;
+        if meta.rec_lsn.is_none() {
+            meta.rec_lsn = Some(position.replay_from);
+        }
+        meta.latest_page_lsn = Some(position.record_lsn);
+        if let Some(flush) = meta.checkpoint_flush.as_mut() {
+            flush.first_redirty_lsn = Some(
+                flush
+                    .first_redirty_lsn
+                    .map_or(position.replay_from, |lsn| lsn.min(position.replay_from)),
+            );
+        }
         self.dirty.store(true, Ordering::Release);
         self.dirty_txn_id.store(txn_id, Ordering::Release);
+        Ok(())
     }
 
     fn mark_clean(&self) {
+        let mut meta = self.dirty_meta.lock();
+        meta.rec_lsn = None;
+        meta.latest_page_lsn = None;
+        meta.checkpoint_flush = None;
         self.dirty.store(false, Ordering::Release);
         self.dirty_txn_id.store(0, Ordering::Release);
         // A clean page is on disk; its next modification must log a full-page
         // image so a torn write can be repaired during redo.
         self.needs_fpi.store(true, Ordering::Release);
+    }
+
+    fn finish_bulk_flush(&self) -> Result<()> {
+        if self.checkpoint_flushing.load(Ordering::Acquire) {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "cannot mark a page clean during checkpoint flush",
+            ));
+        }
+        let mut meta = self.dirty_meta.lock();
+        if let Some(flush) = meta.bulk_flush.take() {
+            if meta.generation == flush.captured_generation
+                && meta.latest_page_lsn == flush.captured_page_lsn
+            {
+                meta.rec_lsn = None;
+                meta.latest_page_lsn = None;
+                meta.checkpoint_flush = None;
+                self.dirty.store(false, Ordering::Release);
+                self.dirty_txn_id.store(0, Ordering::Release);
+                self.needs_fpi.store(true, Ordering::Release);
+            }
+            self.evicting.store(false, Ordering::Release);
+            return Ok(());
+        }
+        // This frame was not part of the captured file flush. It may have become
+        // dirty while the captured images were being written/fsynced, so it must
+        // retain its DPT state for a later flush.
+        Ok(())
     }
 
     fn is_dirty(&self) -> bool {
@@ -1080,27 +1460,47 @@ fn read_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageRead
     }
 }
 
-fn write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageWriteGuard {
+fn write_guard(
+    file_id: FileId,
+    page_num: PageNum,
+    txn_id: u64,
+    frame: Arc<Frame>,
+    checkpoint_fence: &CheckpointFence,
+) -> PageWriteGuard {
     let guard = frame.data.write_arc();
     PageWriteGuard {
         file_id,
         page_num,
         frame,
         guard,
+        _checkpoint_publication: checkpoint_fence.shared(),
+        txn_id,
         unpublished_new: false,
         published: false,
+        #[cfg(test)]
+        test_mutated: false,
     }
 }
 
-fn new_page_write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageWriteGuard {
+fn new_page_write_guard(
+    file_id: FileId,
+    page_num: PageNum,
+    txn_id: u64,
+    frame: Arc<Frame>,
+    checkpoint_fence: &CheckpointFence,
+) -> PageWriteGuard {
     let guard = frame.data.write_arc();
     PageWriteGuard {
         file_id,
         page_num,
         frame,
         guard,
+        _checkpoint_publication: checkpoint_fence.shared(),
+        txn_id,
         unpublished_new: true,
         published: false,
+        #[cfg(test)]
+        test_mutated: false,
     }
 }
 
@@ -1145,11 +1545,67 @@ impl PageStore for NoopPageStore {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     use common::{DbError, ErrorKind, FileId, PageNum, Result, SqlState};
 
     use super::*;
+
+    fn position(replay_from: u64, record_lsn: u64) -> WalPosition {
+        WalPosition {
+            replay_from,
+            record_lsn,
+        }
+    }
+
+    fn publish_test_position(page: &mut PageWriteGuard) {
+        page.publish_position(position(10, 20)).unwrap();
+    }
+
+    #[test]
+    fn dirty_page_table_keeps_first_record_start_until_durable_flush() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store);
+        {
+            let mut page = pool.new_page(7, 11).unwrap();
+            page.data_mut()[0] = 1;
+            page.publish_position(position(10, 20)).unwrap();
+        }
+        {
+            let mut page = pool.write_page(7, 0, 12).unwrap();
+            page.data_mut()[0] = 2;
+            page.publish_position(position(20, 30)).unwrap();
+        }
+
+        assert_eq!(
+            pool.dirty_page_table().unwrap(),
+            vec![DirtyPageEntry {
+                file_id: 7,
+                page_num: 0,
+                rec_lsn: 10,
+            }]
+        );
+        let stats = pool.flush_checkpoint_batch(&[(7, 0)]).unwrap();
+        assert_eq!(stats.attempted, 1);
+        assert_eq!(stats.flushed, 1);
+        assert!(pool.dirty_page_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkpoint_batch_skips_a_busy_page_without_blocking() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store);
+        let mut page = pool.new_page(9, 11).unwrap();
+        page.data_mut()[0] = 1;
+        page.publish_position(position(30, 40)).unwrap();
+
+        let stats = pool.flush_checkpoint_batch(&[(9, 0)]).unwrap();
+        assert_eq!(stats.attempted, 1);
+        assert_eq!(stats.flushed, 0);
+        assert_eq!(stats.busy_or_skipped, 1);
+        assert_eq!(pool.dirty_page_table().unwrap()[0].rec_lsn, 30);
+    }
 
     #[test]
     fn rollback_does_not_undo_in_place_modifications_and_leaves_them_dirty() {
@@ -1165,16 +1621,19 @@ mod tests {
         {
             let mut page = pool.new_page(1, txn).unwrap();
             page.data_mut()[0] = 10;
+            publish_test_position(&mut page);
         }
         pool.commit(txn).unwrap();
 
         {
             let mut page = pool.write_page(1, 0, 12).unwrap();
             page.data_mut()[0] = 20;
+            publish_test_position(&mut page);
         }
         {
             let mut page = pool.write_page(1, 0, 12).unwrap();
             page.data_mut()[0] = 30;
+            publish_test_position(&mut page);
         }
 
         pool.rollback(12).unwrap();
@@ -1203,6 +1662,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 77).unwrap();
             page.data_mut()[0] = 99;
+            publish_test_position(&mut page);
         }
 
         pool.rollback(77).unwrap();
@@ -1306,12 +1766,14 @@ mod tests {
     }
 
     #[test]
-    fn commit_leaves_page_dirty_until_mark_all_clean() {
-        let pool = MemoryBufferPool::empty(8);
+    fn commit_leaves_page_dirty_until_scoped_clean() {
+        let pool =
+            MemoryBufferPool::new(8, Box::new(FlushAll), Arc::new(CapturingStore::default()));
 
         {
             let mut page = pool.new_page(1, 1).unwrap();
             page.data_mut()[0] = 1;
+            publish_test_position(&mut page);
         }
         pool.commit(1).unwrap();
 
@@ -1319,21 +1781,23 @@ mod tests {
         assert_eq!(pages.len(), 1);
         assert!(pages[0].is_dirty);
 
-        pool.mark_all_clean().unwrap();
+        pool.flush_dirty_pages_for_files(&[1]).unwrap();
 
         let pages: Vec<_> = pool.iter_pages().unwrap().collect();
         assert!(!pages[0].is_dirty);
     }
 
     #[test]
-    fn mark_all_clean_makes_previously_dirty_pages_evictable() {
-        let pool = MemoryBufferPool::empty(1);
+    fn scoped_clean_makes_previously_dirty_pages_evictable() {
+        let pool =
+            MemoryBufferPool::new(1, Box::new(FlushAll), Arc::new(CapturingStore::default()));
         {
             let mut page = pool.new_page(1, 1).unwrap();
             page.data_mut()[0] = 1;
+            publish_test_position(&mut page);
         }
         pool.commit(1).unwrap();
-        pool.mark_all_clean().unwrap();
+        pool.flush_dirty_pages_for_files(&[1]).unwrap();
 
         pool.load_page(1, 1, data_with_first_byte(2)).unwrap();
 
@@ -1354,6 +1818,7 @@ mod tests {
         {
             let mut page = pool.write_page(1, 0, 1).unwrap();
             page.data_mut()[0] = 9;
+            publish_test_position(&mut page);
         }
 
         pool.rollback(1).unwrap();
@@ -1407,6 +1872,7 @@ mod tests {
         {
             let mut page = pool.write_page(1, 0, 77).unwrap();
             page.data_mut()[0] = 9;
+            publish_test_position(&mut page);
         }
 
         pool.load_page(1, 0, data_with_first_byte(2)).unwrap();
@@ -1453,6 +1919,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 1).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
 
         let err = pool.load_page(1, 1, PageData::default()).unwrap_err();
@@ -1467,6 +1934,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 1).unwrap();
             page.data_mut()[0] = 55;
+            publish_test_position(&mut page);
         }
 
         let pages: Vec<_> = pool.iter_pages().unwrap().collect();
@@ -1496,6 +1964,7 @@ mod tests {
             let mut page = pool.write_page(2, 5, 99).unwrap();
             assert_eq!(page.data()[0], 88);
             page.data_mut()[0] = 99;
+            publish_test_position(&mut page);
         }
 
         assert_eq!(loader.calls(), vec![(2, 5)]);
@@ -1629,9 +2098,25 @@ mod tests {
         }
     }
 
+    struct DurabilityTrackingFlush {
+        durable: Arc<AtomicBool>,
+    }
+
+    impl FlushPolicy for DurabilityTrackingFlush {
+        fn can_flush(&self, _info: &common::PageFlushInfo) -> bool {
+            true
+        }
+
+        fn ensure_durable(&self) -> Result<()> {
+            self.durable.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct CapturingStore {
         writes: Mutex<Vec<(FileId, PageNum, PageData)>>,
+        durable: Option<Arc<AtomicBool>>,
     }
 
     impl PageLoader for CapturingStore {
@@ -1642,6 +2127,13 @@ mod tests {
 
     impl PageStore for CapturingStore {
         fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()> {
+            if self
+                .durable
+                .as_ref()
+                .is_some_and(|durable| !durable.load(Ordering::Acquire))
+            {
+                return Err(DbError::io("page write preceded WAL durability"));
+            }
             self.writes
                 .lock()
                 .unwrap()
@@ -1673,6 +2165,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 5).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(5).unwrap();
 
@@ -1686,16 +2179,39 @@ mod tests {
     }
 
     #[test]
+    fn flush_dirty_pages_forces_wal_before_page_store_write() {
+        let durable = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(CapturingStore {
+            writes: Mutex::new(Vec::new()),
+            durable: Some(durable.clone()),
+        });
+        let pool = MemoryBufferPool::new(
+            8,
+            Box::new(DurabilityTrackingFlush { durable }),
+            store.clone(),
+        );
+        {
+            let mut page = pool.new_page(1, 5).unwrap();
+            page.data_mut()[0] = 42;
+            page.publish_position(position(10, 20)).unwrap();
+        }
+
+        pool.flush_dirty_pages().unwrap();
+
+        assert_eq!(store.writes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn scoped_flush_and_clean_leave_unrelated_dirty_frame_untouched() {
         let store = Arc::new(CapturingStore::default());
         let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
         for file_id in [1, 2] {
             let mut page = pool.new_page(file_id, 5).unwrap();
             page.data_mut()[0] = file_id as u8;
+            publish_test_position(&mut page);
         }
 
         pool.flush_dirty_pages_for_files(&[1]).unwrap();
-        pool.mark_files_clean(&[1]).unwrap();
 
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
@@ -1725,6 +2241,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 5).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(5).unwrap();
         let read = pool.read_page(1, 0).unwrap();
@@ -1749,6 +2266,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 7).unwrap();
             page.data_mut()[0] = 9;
+            publish_test_position(&mut page);
         }
         // The txn aborts (status-based: its allocated page is dropped on rollback),
         // so instead model an in-place modification of a committed page that then
@@ -1757,6 +2275,7 @@ mod tests {
         {
             let mut page = pool.write_page(1, 0, 8).unwrap();
             page.data_mut()[0] = 99;
+            publish_test_position(&mut page);
         }
         pool.rollback(8).unwrap();
 
@@ -1774,12 +2293,12 @@ mod tests {
         {
             let mut page = pool.new_page(1, 5).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(5).unwrap();
 
         // A dirty page that the policy refuses (not WAL-durable) must fail loudly,
-        // never be silently dropped (it would be lost by the subsequent
-        // mark_all_clean).
+        // never be silently dropped before a later scoped clean.
         let err = pool.flush_dirty_pages().unwrap_err();
         assert_eq!(err.kind, ErrorKind::Storage);
         assert!(store.writes.lock().unwrap().is_empty());
@@ -1849,11 +2368,12 @@ mod tests {
         {
             let mut page = pool.new_page(7, 5).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
+            page.publish_position(position(10, 20)).unwrap();
         }
-        pool.commit(5).unwrap();
 
         let flushing_pool = pool.clone();
-        let handle = std::thread::spawn(move || flushing_pool.flush_dirty_pages());
+        let handle = std::thread::spawn(move || flushing_pool.flush_checkpoint_batch(&[(7, 0)]));
         let (entered_lock, entered_cvar) = &*entered;
         let mut has_entered = entered_lock.lock().unwrap();
         while !*has_entered {
@@ -1873,6 +2393,110 @@ mod tests {
 
         assert!(pool.discard_file_if_unpinned(7).unwrap());
         assert_eq!(store.writes.lock().unwrap().as_slice(), &[(7, 0)]);
+    }
+
+    #[test]
+    fn file_scoped_flush_waits_for_checkpoint_and_writes_redirtied_image_last() {
+        use std::sync::{Condvar, Mutex as StdMutex};
+
+        struct ImageBlockingStore {
+            entered: Arc<(StdMutex<bool>, Condvar)>,
+            release: Arc<(StdMutex<bool>, Condvar)>,
+            writes: Mutex<Vec<PageData>>,
+        }
+
+        impl PageLoader for ImageBlockingStore {
+            fn load_page(&self, _file_id: FileId, _page_num: PageNum) -> Result<Option<PageData>> {
+                Ok(None)
+            }
+        }
+
+        impl PageStore for ImageBlockingStore {
+            fn write_page(
+                &self,
+                _file_id: FileId,
+                _page_num: PageNum,
+                data: &PageData,
+            ) -> Result<()> {
+                let first = {
+                    let mut writes = self.writes.lock().unwrap();
+                    writes.push(data.clone());
+                    writes.len() == 1
+                };
+                if first {
+                    let (entered_lock, entered_cvar) = &*self.entered;
+                    *entered_lock.lock().unwrap() = true;
+                    entered_cvar.notify_one();
+                    let (release_lock, release_cvar) = &*self.release;
+                    let mut release = release_lock.lock().unwrap();
+                    while !*release {
+                        release = release_cvar.wait(release).unwrap();
+                    }
+                }
+                Ok(())
+            }
+
+            fn sync_all(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
+                Ok(0)
+            }
+
+            fn remove_file(&self, _file_id: FileId) -> Result<()> {
+                Ok(())
+            }
+
+            fn list_file_ids(&self) -> Result<Vec<FileId>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let entered = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let store = Arc::new(ImageBlockingStore {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            writes: Mutex::new(Vec::new()),
+        });
+        let pool = Arc::new(MemoryBufferPool::new(8, Box::new(FlushAll), store.clone()));
+        {
+            let mut page = pool.new_page(7, 5).unwrap();
+            page.data_mut()[0] = 1;
+            page.publish_position(position(10, 20)).unwrap();
+        }
+
+        let checkpoint_pool = Arc::clone(&pool);
+        let checkpoint =
+            std::thread::spawn(move || checkpoint_pool.flush_checkpoint_batch(&[(7, 0)]));
+        let (entered_lock, entered_cvar) = &*entered;
+        let mut has_entered = entered_lock.lock().unwrap();
+        while !*has_entered {
+            has_entered = entered_cvar.wait(has_entered).unwrap();
+        }
+        drop(has_entered);
+
+        {
+            let mut page = pool.write_page(7, 0, 6).unwrap();
+            page.data_mut()[0] = 2;
+            page.publish_position(position(20, 30)).unwrap();
+        }
+        let bulk_pool = Arc::clone(&pool);
+        let bulk = std::thread::spawn(move || bulk_pool.flush_dirty_pages_for_files(&[7]));
+
+        let (release_lock, release_cvar) = &*release;
+        *release_lock.lock().unwrap() = true;
+        release_cvar.notify_one();
+        let checkpoint_stats = checkpoint.join().unwrap().unwrap();
+        bulk.join().unwrap().unwrap();
+
+        assert_eq!(checkpoint_stats.redirtied, 1);
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0[0], 1);
+        assert_eq!(writes[1].0[0], 2);
+        assert!(pool.dirty_page_table().unwrap().is_empty());
     }
 
     /// A `PageStore` that both records writes and serves them back, so eviction
@@ -1949,6 +2573,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 7).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(7).unwrap();
 
@@ -1956,6 +2581,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 8).unwrap();
             page.data_mut()[0] = 99;
+            publish_test_position(&mut page);
         }
         pool.commit(8).unwrap();
 
@@ -1973,6 +2599,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 7).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(7).unwrap();
 
@@ -1992,6 +2619,7 @@ mod tests {
         {
             let mut page = pool.new_page(1, 7).unwrap();
             page.data_mut()[0] = 42;
+            publish_test_position(&mut page);
         }
         pool.commit(7).unwrap();
 
@@ -2012,6 +2640,7 @@ mod tests {
             {
                 let mut page = pool.new_page(1, txn).unwrap();
                 page.data_mut()[0] = i;
+                publish_test_position(&mut page);
             }
             pool.commit(txn).unwrap();
         }
@@ -2030,6 +2659,7 @@ mod tests {
             let mut page = pool.fetch_for_redo(3, 0).unwrap();
             assert_eq!(page.data()[0], 0);
             page.data_mut()[0] = 7;
+            page.publish_recovery_derived(1).unwrap();
         }
 
         assert_eq!(pool.read_page(3, 0).unwrap().data()[0], 7);
@@ -2089,6 +2719,7 @@ mod tests {
                     let stamp = ((t << 4) ^ i) as u8;
                     page.data_mut()[0] = stamp;
                     page.data_mut()[1] = t as u8;
+                    publish_test_position(&mut page);
                     let page_num = page.page_num();
                     drop(page); // unpin so the frame is steal-eligible
                     pages.push((page_num, stamp));

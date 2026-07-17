@@ -383,7 +383,7 @@ impl PageBackedStorageEngine {
     /// the new index's key — and by [`Self::unique_conflict_kind`] to examine every
     /// physically-present version sharing an index key. The walk is a pure read whose
     /// physical view is stable because it holds the page read latch for its duration
-    /// (`create_index` additionally runs under the exclusive guard). A `DEAD`/`UNUSED`
+    /// (`create_index` additionally holds a target relation lock excluding DML). A `DEAD`/`UNUSED`
     /// root resolves to no versions (`Ok(vec![])`); a corrupt chain (cycle, bad
     /// redirect, non-NORMAL HOT successor) is a structured error, never a spin.
     pub(super) fn collect_chain_versions(

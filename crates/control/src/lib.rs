@@ -15,20 +15,32 @@ mod control;
 mod manifest;
 
 pub use control::{ControlStore, FileControlStore};
-pub use manifest::ControlData;
+pub use manifest::{ControlData, MAX_DIRTY_PAGES};
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlStore, FileControlStore};
+    use super::{ControlData, ControlStore, FileControlStore};
+
+    fn control(lsn: u64, tables: Vec<u32>, catalog: &[u8]) -> ControlData {
+        ControlData {
+            checkpoint_end_lsn: lsn,
+            page_redo_lsn: lsn,
+            catalog_redo_lsn: lsn,
+            dirty_pages: Vec::new(),
+            tables,
+            catalog: catalog.to_vec(),
+            page_size: 8192,
+        }
+    }
 
     #[test]
     fn store_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileControlStore::open(dir.path(), 8192).unwrap();
-        store.store(55, &[1, 2], b"catalog").unwrap();
+        store.store(control(55, vec![1, 2], b"catalog")).unwrap();
 
         let loaded = store.load().unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_lsn, 55);
+        assert_eq!(loaded.checkpoint_end_lsn, 55);
         assert_eq!(loaded.tables, vec![1, 2]);
         assert_eq!(loaded.catalog, b"catalog");
         assert!(dir.path().join("manifest.dat").exists());
@@ -45,11 +57,11 @@ mod tests {
     fn store_overwrites_previous_control_record() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileControlStore::open(dir.path(), 8192).unwrap();
-        store.store(10, &[1], b"old").unwrap();
-        store.store(20, &[1, 3], b"new").unwrap();
+        store.store(control(10, vec![1], b"old")).unwrap();
+        store.store(control(20, vec![1, 3], b"new")).unwrap();
 
         let loaded = store.load().unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_lsn, 20);
+        assert_eq!(loaded.checkpoint_end_lsn, 20);
         assert_eq!(loaded.tables, vec![1, 3]);
         assert_eq!(loaded.catalog, b"new");
     }

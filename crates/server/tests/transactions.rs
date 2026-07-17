@@ -2,7 +2,7 @@ mod support;
 
 use std::time::Duration;
 
-use common::{Snapshot, StatementContext};
+use common::{Snapshot, SqlState, StatementContext};
 use support::{Connection, TestServer};
 
 /// `BEGIN; INSERT; SELECT (sees own insert); COMMIT;` then a new transaction
@@ -55,6 +55,77 @@ async fn begin_insert_rollback_is_invisible() {
     let rows = conn.ok("select id from users").await.rows();
     assert!(rows.is_empty(), "rolled-back insert is invisible");
     assert_eq!(server.active_txn_count(), 0);
+}
+
+#[tokio::test]
+async fn committed_savepoint_ddl_releases_catalog_redo_pin() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("begin").await;
+    conn.ok("savepoint ddl").await;
+    conn.ok("create table savepoint_committed (id integer primary key)")
+        .await;
+    assert!(server.catalog_redo_pin().unwrap().is_some());
+    conn.ok("release savepoint ddl").await;
+    conn.ok("commit").await;
+
+    assert_eq!(server.catalog_redo_pin().unwrap(), None);
+    server.force_checkpoint().await.unwrap();
+    let (catalog_redo_lsn, checkpoint_end_lsn) = server.checkpoint_catalog_bounds().unwrap();
+    assert_eq!(catalog_redo_lsn, checkpoint_end_lsn);
+    conn.ok("select * from savepoint_committed").await;
+}
+
+#[tokio::test]
+async fn aborted_savepoint_ddl_releases_catalog_redo_pin() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("begin").await;
+    conn.ok("savepoint ddl").await;
+    conn.ok("create table savepoint_aborted (id integer primary key)")
+        .await;
+    assert!(server.catalog_redo_pin().unwrap().is_some());
+    conn.ok("release savepoint ddl").await;
+    conn.ok("rollback").await;
+
+    assert_eq!(server.catalog_redo_pin().unwrap(), None);
+    server.force_checkpoint().await.unwrap();
+    let (catalog_redo_lsn, checkpoint_end_lsn) = server.checkpoint_catalog_bounds().unwrap();
+    assert_eq!(catalog_redo_lsn, checkpoint_end_lsn);
+    let outcome = conn.query("select * from savepoint_aborted").await.unwrap();
+    let error = match outcome.result {
+        Err(error) => error,
+        Ok(_) => panic!("rolled-back savepoint table remained visible"),
+    };
+    assert_eq!(error.code, SqlState::UndefinedTable);
+}
+
+#[tokio::test]
+async fn checkpoint_marker_does_not_retrigger_low_wal_threshold() {
+    let server = TestServer::start_with_config(saguarodb_server::config::Config {
+        checkpoint_every_n_commits: u64::MAX,
+        checkpoint_wal_bytes: 1,
+        ..saguarodb_server::config::Config::default()
+    })
+    .await
+    .unwrap();
+    server
+        .simple_query("create table checkpoint_once (id integer primary key)")
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.checkpoint_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial WAL-pressure checkpoint completes");
+    let completed = server.checkpoint_count();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.checkpoint_count(), completed);
 }
 
 /// Failed state: `BEGIN; <bad statement → error>; SELECT (rejected 25P02);
@@ -351,8 +422,8 @@ async fn disconnect_mid_transaction_aborts_cleanly() {
     // The abort runs in the connection task's drop; poll the registry until empty.
     wait_until(Duration::from_secs(2), || server.active_txn_count() == 0).await;
 
-    // The uncommitted row is invisible, and a fresh writer (which must acquire the
-    // exclusive guard) succeeds — proving the guard was released, not leaked.
+    // The uncommitted row is invisible, and a fresh writer succeeds — proving the
+    // dropped session released its transaction-scoped resources.
     let mut b = Connection::connect(&server).await.unwrap();
     assert!(b.ok("select id from users").await.rows().is_empty());
     b.ok("insert into users (id) values (2)").await;
@@ -624,14 +695,10 @@ async fn read_only_transaction_is_non_blocking_while_a_writer_is_open() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
-/// Checkpoint-vs-writer (E2b): a forced checkpoint runs WHILE several writer
-/// connections hammer the database. The checkpoint takes the EXCLUSIVE guard, so it
-/// drains all in-flight writers and runs alone — it must complete with no
-/// "unflushable dirty page" error, and afterward every committed row is intact. This
-/// exercises the preserved Milestone-D "no in-flight writer at checkpoint" invariant
-/// under concurrent writers.
+/// A forced fuzzy checkpoint runs while several connections keep committing.
+/// It must terminate under sustained writes and preserve every committed row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn checkpoint_drains_concurrent_writers_and_stays_consistent() {
+async fn fuzzy_checkpoint_with_concurrent_writers_stays_consistent() {
     use std::sync::Arc;
 
     let server = Arc::new(TestServer::start().await.unwrap());
@@ -655,13 +722,13 @@ async fn checkpoint_drains_concurrent_writers_and_stays_consistent() {
         }));
     }
 
-    // Fire a checkpoint concurrently with the writers. It must complete cleanly (its
-    // `flush_dirty_pages` would Err on an unflushable page); it drains writers via
-    // the exclusive guard. Run a couple to overlap more of the writers' lifetimes.
+    // Fire checkpoints concurrently with the writers. Each fixed candidate pass
+    // must terminate without draining the writers.
     for _ in 0..2 {
-        server.force_checkpoint().await.expect(
-            "checkpoint must complete cleanly while writers run (drained, no unflushable page)",
-        );
+        server
+            .force_checkpoint()
+            .await
+            .expect("checkpoint must complete cleanly while writers continue");
     }
 
     for handle in writers {

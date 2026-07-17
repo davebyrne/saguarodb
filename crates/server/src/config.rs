@@ -8,15 +8,12 @@ pub struct Config {
     pub buffer_pool_frames: usize,
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
-    /// Auto-prune threshold: when a checkpoint runs and at least this many dead
-    /// versions have accumulated since the last auto-prune, the checkpoint runs a
-    /// VACUUM pass over every user table under its exclusive guard before flushing
-    /// dirty pages (`docs/specs/mvcc.md` §9, Milestone F4b). `0` disables
-    /// the dead-row trigger; pressure from an unreclaimed abort-pinned CLOG window
-    /// can still force a full pass.
+    pub checkpoint_flush_batch_pages: usize,
+    /// Background full-VACUUM threshold. `0` disables the workload trigger;
+    /// CLOG pressure may still request maintenance.
     pub auto_vacuum_dead_rows: u64,
-    /// Checkpoint auto-analyze threshold (`docs/specs/statistics.md` §10):
-    /// committed changed rows since the last auto-analyze. `0` disables.
+    /// Background full-ANALYZE threshold: committed changed rows since the last
+    /// successful automatic pass. `0` disables.
     pub auto_analyze_changed_rows: u64,
     pub shutdown_timeout_ms: u64,
     /// How long a writer blocked on an in-progress row-lock holder waits before the
@@ -35,6 +32,7 @@ impl Default for Config {
             buffer_pool_frames: 1024,
             checkpoint_every_n_commits: 100,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
+            checkpoint_flush_batch_pages: 256,
             auto_vacuum_dead_rows: 10000,
             auto_analyze_changed_rows: 10000,
             shutdown_timeout_ms: 30000,
@@ -46,6 +44,29 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        self.tls_files()?;
+        if self.buffer_pool_frames == 0 || self.buffer_pool_frames > control::MAX_DIRTY_PAGES {
+            return Err(format!(
+                "--buffer-pool-frames must be in 1..={}",
+                control::MAX_DIRTY_PAGES
+            ));
+        }
+        if !(1..=control::MAX_DIRTY_PAGES).contains(&self.checkpoint_flush_batch_pages) {
+            return Err(format!(
+                "--checkpoint-flush-batch-pages must be in 1..={}",
+                control::MAX_DIRTY_PAGES
+            ));
+        }
+        if self.checkpoint_every_n_commits == 0 {
+            return Err("--checkpoint-every-n-commits must be positive".to_string());
+        }
+        if self.checkpoint_wal_bytes == 0 {
+            return Err("--checkpoint-wal-bytes must be positive".to_string());
+        }
+        Ok(())
+    }
+
     /// Resolve the configured TLS material. Returns `Ok(Some((cert, key)))` when
     /// TLS is enabled, `Ok(None)` when it is disabled, and `Err` when exactly one
     /// of the cert/key paths is set (TLS needs both or neither). This is the
@@ -103,6 +124,16 @@ where
                 let value = next_value(&mut args, "--checkpoint-wal-bytes")?;
                 config.checkpoint_wal_bytes = parse_positive_u64(&value, "--checkpoint-wal-bytes")?;
             }
+            "--checkpoint-flush-batch-pages" => {
+                let value = next_value(&mut args, "--checkpoint-flush-batch-pages")?;
+                let pages = parse_positive_usize(&value, "--checkpoint-flush-batch-pages")?;
+                if pages > 1_000_000 {
+                    return Err(
+                        "--checkpoint-flush-batch-pages must be at most 1000000".to_string()
+                    );
+                }
+                config.checkpoint_flush_batch_pages = pages;
+            }
             "--auto-vacuum-dead-rows" => {
                 // 0 disables the dead-row trigger, not the CLOG safety trigger.
                 let value = next_value(&mut args, "--auto-vacuum-dead-rows")?;
@@ -135,7 +166,7 @@ where
         }
     }
 
-    config.tls_files()?;
+    config.validate()?;
 
     Ok(ConfigAction::Run(config))
 }
@@ -150,6 +181,7 @@ pub fn usage(program: &str) -> String {
            --buffer-pool-frames <N>           default 1024\n\
            --checkpoint-every-n-commits <N>   default 100\n\
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
+           --checkpoint-flush-batch-pages <N> default 256\n\
            --auto-vacuum-dead-rows <N>        default 10000 (0 disables dead-row trigger)\n\
            --auto-analyze-changed-rows <N>    default 10000 (0 disables auto-analyze)\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
@@ -220,6 +252,7 @@ mod tests {
         assert_eq!(config.buffer_pool_frames, 1024);
         assert_eq!(config.checkpoint_every_n_commits, 100);
         assert_eq!(config.checkpoint_wal_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.checkpoint_flush_batch_pages, 256);
         assert_eq!(config.auto_vacuum_dead_rows, 10000);
         assert_eq!(config.auto_analyze_changed_rows, 10000);
         assert_eq!(config.shutdown_timeout_ms, 30000);
@@ -276,6 +309,8 @@ mod tests {
             "5",
             "--checkpoint-wal-bytes",
             "4096",
+            "--checkpoint-flush-batch-pages",
+            "17",
             "--auto-vacuum-dead-rows",
             "250",
             "--shutdown-timeout-ms",
@@ -293,6 +328,7 @@ mod tests {
         assert_eq!(config.buffer_pool_frames, 32);
         assert_eq!(config.checkpoint_every_n_commits, 5);
         assert_eq!(config.checkpoint_wal_bytes, 4096);
+        assert_eq!(config.checkpoint_flush_batch_pages, 17);
         assert_eq!(config.auto_vacuum_dead_rows, 250);
         assert_eq!(config.shutdown_timeout_ms, 99);
         assert_eq!(config.deadlock_timeout_ms, 250);
@@ -316,6 +352,46 @@ mod tests {
     fn rejects_zero_numeric_values() {
         assert!(parse_args(["saguarodb", "--port", "0"]).is_err());
         assert!(parse_args(["saguarodb", "--checkpoint-wal-bytes", "0"]).is_err());
+    }
+
+    #[test]
+    fn buffer_pool_frame_limit_matches_manifest_dpt_limit() {
+        assert!(
+            parse_args([
+                "saguarodb",
+                "--buffer-pool-frames",
+                &control::MAX_DIRTY_PAGES.to_string(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse_args([
+                "saguarodb",
+                "--buffer-pool-frames",
+                &control::MAX_DIRTY_PAGES.saturating_add(1).to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn programmatic_checkpoint_thresholds_must_be_positive() {
+        assert!(
+            Config {
+                checkpoint_every_n_commits: 0,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Config {
+                checkpoint_wal_bytes: 0,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

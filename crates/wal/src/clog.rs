@@ -27,6 +27,14 @@ fn status_pressure_needs_maintenance(status_count: usize, floor_is_pinned: bool)
     status_count >= CLOG_MAINTENANCE_STATUS_COUNT && floor_is_pinned
 }
 
+fn status_pressure_blocks_new_writer(
+    status_count: usize,
+    writer_is_known: bool,
+    active_writer_exists: bool,
+) -> bool {
+    status_count >= CLOG_MAINTENANCE_STATUS_COUNT && !writer_is_known && active_writer_exists
+}
+
 /// In-memory map `txn_id -> TxnStatus`.
 ///
 /// Reserved transaction ids below [`FIRST_NORMAL_XID`] (`INVALID_XID`, the
@@ -88,6 +96,16 @@ impl Clog {
         status_pressure_needs_maintenance(self.statuses.len(), floor_is_pinned)
     }
 
+    pub(crate) fn must_backpressure_new_writer(&self, txn_id: TxnId) -> bool {
+        status_pressure_blocks_new_writer(
+            self.statuses.len(),
+            self.statuses.contains_key(&txn_id),
+            self.statuses
+                .values()
+                .any(|status| *status == TxnStatus::InProgress),
+        )
+    }
+
     /// The status of `txn_id`. Reserved ids (`< FIRST_NORMAL_XID`) are always
     /// committed; an unrecorded normal id below the implicit-committed floor is
     /// committed (its outcome is covered by the durable CLOG floor even if its old
@@ -136,6 +154,14 @@ impl Clog {
         self.statuses.insert(txn_id, TxnStatus::Aborted);
     }
 
+    pub fn resolve_all_in_progress_as_aborted(&mut self) {
+        for status in self.statuses.values_mut() {
+            if *status == TxnStatus::InProgress {
+                *status = TxnStatus::Aborted;
+            }
+        }
+    }
+
     /// Seed a fresh CLOG from a durable [`ClogSnapshot`] loaded at recovery: the
     /// persisted floor plus the live-window statuses. The caller then folds the
     /// post-`clog_lsn` `Commit`/`Abort` records on top (`docs/specs/mvcc.md` §5.4).
@@ -147,6 +173,9 @@ impl Clog {
         }
         for &id in &snapshot.aborted {
             statuses.insert(id, TxnStatus::Aborted);
+        }
+        for &id in &snapshot.in_progress {
+            statuses.insert(id, TxnStatus::InProgress);
         }
         Self {
             statuses,
@@ -163,19 +192,22 @@ impl Clog {
     /// committed, or an aborted transaction whose on-disk versions a full VACUUM
     /// reclaimed (`docs/specs/mvcc.md` §5.4) — so it is omitted. The floor is
     /// monotonic, so a smaller `vacuum_floor` never lowers it. `clog_lsn` records how
-    /// far the persisted statuses have absorbed the WAL. Only `Committed`/`Aborted`
-    /// outcomes are persisted; transient `InProgress` entries are omitted.
+    /// far the persisted statuses have absorbed the WAL. `Committed`, `Aborted`,
+    /// and captured `InProgress` entries are persisted explicitly in CLOG v3.
     ///
     /// The caller persists this snapshot and then applies [`Clog::prune_to`] — so a
     /// failed durable write never leaves the in-memory floor advanced past on-disk.
     ///
-    /// **Precondition:** the caller must hold the exclusive checkpoint guard, so no
-    /// write transaction is in flight. The floor is pinned only by *recorded*
-    /// `Aborted` ids (the CLOG holds no entry for an unresolved transaction); were a
-    /// writer in flight below a later aborted id, the floor could advance past it and
-    /// its still-uncommitted on-disk versions would wrongly read as committed. The
-    /// exclusive checkpoint guard is what guarantees this cannot happen.
-    pub fn live_snapshot(&self, clog_lsn: Lsn, vacuum_floor: TxnId) -> ClogSnapshot {
+    /// Captured active IDs and recorded in-progress statuses pin the floor, so this
+    /// snapshot is valid while write transactions remain in flight.
+    pub fn live_snapshot(
+        &self,
+        clog_lsn: Lsn,
+        authorized_replay_floor: Lsn,
+        vacuum_floor: TxnId,
+        captured_active: &[TxnId],
+        allocation_boundary: TxnId,
+    ) -> ClogSnapshot {
         let oldest_status_requiring_explicit_entry = self
             .statuses
             .iter()
@@ -191,13 +223,19 @@ impl Clog {
             .copied()
             .max()
             .map_or(self.committed_floor, |id| id.saturating_add(1));
+        let oldest_active = captured_active.iter().copied().min();
         let floor = oldest_status_requiring_explicit_entry
+            .into_iter()
+            .chain(oldest_active)
+            .min()
             .unwrap_or(settled_boundary)
+            .min(allocation_boundary)
             .max(self.committed_floor)
             .max(FIRST_NORMAL_XID);
 
         let mut committed = Vec::new();
         let mut aborted = Vec::new();
+        let mut in_progress = Vec::new();
         for (id, status) in &self.statuses {
             if *id < floor {
                 continue;
@@ -205,18 +243,27 @@ impl Clog {
             match status {
                 TxnStatus::Committed => committed.push(*id),
                 TxnStatus::Aborted => aborted.push(*id),
-                TxnStatus::InProgress => {}
+                TxnStatus::InProgress => in_progress.push(*id),
+            }
+        }
+        for &id in captured_active {
+            if id >= floor && self.status(id) == TxnStatus::InProgress && !in_progress.contains(&id)
+            {
+                in_progress.push(id);
             }
         }
         committed.sort_unstable();
         aborted.sort_unstable();
+        in_progress.sort_unstable();
 
         ClogSnapshot {
             clog_lsn,
+            authorized_replay_floor,
             committed_floor: floor,
             vacuum_floor,
             committed,
             aborted,
+            in_progress,
         }
     }
 
@@ -246,7 +293,8 @@ mod tests {
     use common::{FIRST_NORMAL_XID, FROZEN_XID, INVALID_XID, Lsn, TxnId, TxnStatus};
 
     use super::{
-        CLOG_MAINTENANCE_STATUS_COUNT, Clog, ClogSnapshot, status_pressure_needs_maintenance,
+        CLOG_MAINTENANCE_STATUS_COUNT, Clog, ClogSnapshot, status_pressure_blocks_new_writer,
+        status_pressure_needs_maintenance,
     };
 
     #[test]
@@ -262,6 +310,30 @@ mod tests {
         assert!(status_pressure_needs_maintenance(
             CLOG_MAINTENANCE_STATUS_COUNT,
             true,
+        ));
+    }
+
+    #[test]
+    fn pressure_blocks_only_new_writers_while_an_active_writer_pins_the_floor() {
+        assert!(!status_pressure_blocks_new_writer(
+            CLOG_MAINTENANCE_STATUS_COUNT - 1,
+            false,
+            true,
+        ));
+        assert!(status_pressure_blocks_new_writer(
+            CLOG_MAINTENANCE_STATUS_COUNT,
+            false,
+            true,
+        ));
+        assert!(!status_pressure_blocks_new_writer(
+            CLOG_MAINTENANCE_STATUS_COUNT,
+            true,
+            true,
+        ));
+        assert!(!status_pressure_blocks_new_writer(
+            CLOG_MAINTENANCE_STATUS_COUNT,
+            false,
+            false,
         ));
     }
 
@@ -340,10 +412,10 @@ mod tests {
         assert!(!clog.is_committed(11));
     }
 
-    /// Compute a snapshot then apply its prune, mirroring how `persist_clog`
+    /// Compute a snapshot then apply its prune, mirroring how `checkpoint_clog`
     /// write-then-mutates. Returns the snapshot.
     fn snapshot_and_prune(clog: &mut Clog, clog_lsn: Lsn, vacuum_floor: TxnId) -> ClogSnapshot {
-        let snapshot = clog.live_snapshot(clog_lsn, vacuum_floor);
+        let snapshot = clog.live_snapshot(clog_lsn, clog_lsn, vacuum_floor, &[], u64::MAX);
         clog.prune_to(snapshot.committed_floor);
         snapshot
     }
@@ -353,7 +425,7 @@ mod tests {
         let mut clog = Clog::new();
         clog.set_committed(10);
         clog.set_committed(20);
-        let snapshot = clog.live_snapshot(99, 15);
+        let snapshot = clog.live_snapshot(99, 99, 15, &[], u64::MAX);
         // The floor it reports is not yet applied: the in-memory floor is unchanged
         // and id 10 still reads from its explicit entry, not the implicit floor.
         assert_eq!(snapshot.committed_floor, 21);
@@ -455,14 +527,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_drops_in_progress_entries() {
+    fn snapshot_retains_in_progress_entries() {
         let mut clog = Clog::new();
         clog.set_in_progress(40);
         clog.set_committed(41);
         let snapshot = snapshot_and_prune(&mut clog, 1, 39);
-        // The transient in-progress entry is never persisted.
+        // Recovery must resolve every captured in-progress transaction to aborted,
+        // including one whose physical records fall below the page redo boundary.
         assert!(!snapshot.committed.contains(&40));
         assert!(!snapshot.aborted.contains(&40));
+        assert_eq!(snapshot.in_progress, vec![40]);
         assert_eq!(snapshot.committed, vec![41]);
     }
 }
