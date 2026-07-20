@@ -156,7 +156,7 @@ ordinary data statements.
 
 `QueryEngine::execute` passes `ctx.statement` to storage and schema operations. It does not allocate transaction IDs, append commit records, flush WAL, or call storage/buffer commit or rollback; server query orchestration owns those statement-level concerns.
 
-`ctx.cancel` is a `QueryCancel` polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops. Its first recorded `CancelReason` selects the `QueryCanceled` message (`due to user request` or `due to statement timeout`). Materializing executor paths use `collect_all_cancelable`, which polls while draining children; scan/filter row-suppression loops and LIMIT offset skipping poll directly; nested-loop and hash join builds poll their outer/inner build loops; aggregate evaluation polls input rows; and the external sorter polls while accepting, sorting, spilling, merging, and emitting records. DISTINCT and set-operation drain/group loops also poll directly. A long blocking `open()` therefore cannot hide an expired statement timer until the full result has been built.
+`ctx.cancel` is a `QueryCancel` polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops. Its first recorded `CancelReason` selects the `QueryCanceled` message (`due to user request` or `due to statement timeout`). Materializing executor paths use `collect_all_cancelable`, which polls while draining children; scan/filter row-suppression loops and LIMIT offset skipping poll directly; nested-loop and hash join builds poll their outer/inner build loops; aggregate evaluation polls input rows; and the external sorter polls while accepting, sorting, spilling, merging, and emitting records. `WindowOp` polls while draining/sorting its child, buffering partitions, advancing tape cursors, and evaluating functions. DISTINCT and set-operation drain/group loops also poll directly. A long blocking `open()` therefore cannot hide an expired statement timer until the full result has been built.
 
 ## Operators
 
@@ -174,6 +174,7 @@ ordinary data statements.
 | `DistinctOp` | Uses bounded external key and ordinal sorts to emit the first input row of each distinct `on_keys` tuple in input order; NULL keys collapse together; clears identity |
 | `LimitOp` | Skips offset, emits count rows, preserves identity |
 | `AggregateOp` | Global aggregates fold directly without a group sort. Grouped aggregates use a bounded external key sort and stream one group at a time through constant-memory non-DISTINCT states; each DISTINCT expression uses a bounded argument sorter sharing the operator budget (metadata/file use scales with the number of DISTINCT expressions), variance uses an online state, and identity is cleared |
+| `WindowOp` | Stable-sorts by synthesized `PARTITION BY ... ASC NULLS LAST` keys followed by the declared window ordering, buffers one partition at a time in a spill tape sharing the sorter's operator budget, and emits source columns plus ranking/distribution/`ntile`/`lag`/`lead` results in expression order. Peer and offset probes are forward-only tape cursors; output preserves identity and sorted stable input order. Frame-respecting functions remain gated with `0A000` until M5 |
 | `SetOpOp` | Uses bounded external key and ordinal sorts for UNION/INTERSECT/EXCEPT distinct and multiset semantics, preserves the established left-to-right output order, and clears identity |
 | `ValuesOp` | Emits literal rows, identity is `None` |
 
@@ -185,7 +186,7 @@ execution error under the same statement-snapshot contract as `SeqScanOp`.
 
 - Scans set `identity = Some(RowIdentity { row_id, xmin, key })`.
 - System scans set `identity = None`; they are read-only virtual relations.
-- Filter, sort, limit, and projection preserve identity.
+- Filter, sort, limit, projection, and window evaluation preserve identity.
 - Join, aggregate, and distinct clear identity.
 - `UPDATE` and `DELETE` require identity on each source row. If a plan produces a row without identity for DML, executor returns `ErrorKind::Internal`.
 
@@ -288,7 +289,7 @@ The evaluator handles:
   its per-row delimiter (a NULL delimiter contributes no separator). Both return
   NULL for an empty effective input and honor aggregate `DISTINCT`.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
-- `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
+- `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` and `WindowCall` must not reach scalar evaluation; logical planning rewrites them before physical execution. Reaching either guard is an internal error.
 - `Parameter` (`$n`) references must be substituted to literals before execution. One reaching the evaluator is an internal error (`"unbound parameter $N reached the executor"`).
 - Subquery expressions (`ScalarSubquery`, `Exists`, `InSubquery`) must be resolved to constants before scalar evaluation; one reaching the evaluator is an internal error. See "Subquery Resolution" below.
 
@@ -598,3 +599,4 @@ fences. Transaction-owned grants live through top-level completion unless
 - Failed write triggers rollback (driven by the server/harness, not the executor) and does not expose partial changes.
 - Scalar expression evaluator implements SQL NULL boolean cases.
 - Aggregate operator computes `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP`, `VARIANCE`/`VAR_SAMP`/`VAR_POP`, `BOOL_AND`, `BOOL_OR`.
+- Window operator resets partitions, recognizes peers (including NULL peers), computes ranking/distribution and uneven `ntile`, applies lag/lead direction/default/NULL rules, preserves stable emission order and identity, and produces identical rows under forced spill. Unit coverage includes cancellation and child open/next/close failures; `e2e_window_*` covers grouped inputs, chained specifications, window-result ordering, derived tables/subqueries, `EXPLAIN ANALYZE`, `22014`, spill, and the M5 frame staging gate.

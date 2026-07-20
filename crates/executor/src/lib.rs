@@ -136,15 +136,28 @@ mod tests {
     }
 
     #[test]
-    fn window_plan_dispatch_returns_structured_feature_error() {
+    fn window_plan_dispatch_executes_row_number() {
         let harness = ExecutorHarness::with_users();
-        let error = harness
-            .execute("select row_number() over () from users")
-            .unwrap_err();
-        assert_eq!(error.code, SqlState::FeatureNotSupported);
+        harness
+            .execute("insert into users (id, name) values (2, 'Grace'), (1, 'Ada')")
+            .unwrap();
+        let result = harness
+            .execute("select id, row_number() over (order by id) from users")
+            .unwrap();
+        let ExecutionResult::Query { columns, rows } = result else {
+            panic!("expected query result");
+        };
+        assert_eq!(columns[1].name, "row_number");
         assert_eq!(
-            error.message,
-            "window function execution is not yet implemented"
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1), Value::Integer(1)]
+                },
+                Row {
+                    values: vec![Value::Integer(2), Value::Integer(2)]
+                },
+            ]
         );
     }
 

@@ -14,6 +14,7 @@ mod spill_row;
 mod system_scan;
 mod table_function;
 mod values;
+mod window;
 
 pub use aggregate::AggregateOp;
 pub use apply::{ApplyOp, LateralApplyOp};
@@ -33,6 +34,7 @@ pub use sort::SortOp;
 pub use system_scan::SystemScanOp;
 pub use table_function::TableFunctionOp;
 pub use values::ValuesOp;
+pub use window::WindowOp;
 
 use common::{Result, StatementContext, Value};
 use planner::BoundExpr;

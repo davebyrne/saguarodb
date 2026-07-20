@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use common::{DbError, ExecRow, Result, Value};
 use spill::{RetainedSize, SpillRecord, codec};
 
+#[derive(Clone)]
 pub(super) struct SpillRow {
     pub row: ExecRow,
     pub keys: Vec<Value>,

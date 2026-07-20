@@ -67,6 +67,8 @@ pub enum SqlState {
     NullValueNotAllowed,
     /// `22013`: a window frame offset is negative.
     InvalidPrecedingOrFollowingSize,
+    /// `22014`: the runtime argument to `ntile` is not greater than zero.
+    InvalidArgumentForNtile,
     /// `22023`: a validly typed argument or option has an invalid value, e.g.
     /// `CREATE SEQUENCE INCREMENT BY 0`.
     InvalidParameterValue,
@@ -165,6 +167,7 @@ impl SqlState {
             SqlState::DivisionByZero => "22012",
             SqlState::NullValueNotAllowed => "22004",
             SqlState::InvalidPrecedingOrFollowingSize => "22013",
+            SqlState::InvalidArgumentForNtile => "22014",
             SqlState::InvalidParameterValue => "22023",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::StringDataRightTruncation => "22001",
@@ -218,6 +221,7 @@ impl SqlState {
             "22012" => SqlState::DivisionByZero,
             "22004" => SqlState::NullValueNotAllowed,
             "22013" => SqlState::InvalidPrecedingOrFollowingSize,
+            "22014" => SqlState::InvalidArgumentForNtile,
             "22023" => SqlState::InvalidParameterValue,
             "22003" => SqlState::NumericValueOutOfRange,
             "22001" => SqlState::StringDataRightTruncation,
@@ -328,6 +332,7 @@ mod tests {
             SqlState::DatatypeMismatch,
             SqlState::DivisionByZero,
             SqlState::InvalidParameterValue,
+            SqlState::InvalidArgumentForNtile,
             SqlState::NumericValueOutOfRange,
             SqlState::StringDataRightTruncation,
             SqlState::InvalidTextRepresentation,

@@ -1,11 +1,12 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress — milestones M0–M3 are complete; implementation
-milestones M4–M6 are pending. Window calls now parse, bind, validate, and lower
-to logical and physical Window nodes with stable result slots and EXPLAIN
-output. Executor dispatch returns a structured `0A000` until M4, so window
-functions remain unavailable for execution. The affected crate specifications,
+**Status:** In progress — milestones M0–M4 are complete; implementation
+milestones M5–M6 are pending. Window calls parse, bind, validate, lower to
+logical and physical Window nodes, and execute the whole-partition ranking,
+distribution, `ntile`, `lag`, and `lead` families with spill-backed ordering.
+Frame-respecting value functions and window aggregates return a structured
+`0A000` staging error until M5. The affected crate specifications,
 `docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
 milestone as listed in §11.
 
@@ -17,10 +18,11 @@ feature and complements `docs/specs/overview.md` and the crate contracts under
 ## 1. Purpose and scope
 
 A window function computes a value for each input row from a partition of the
-query result without collapsing that partition to one row. SaguaroDB currently
-rejects every `OVER` clause. This feature adds PostgreSQL-compatible window
-semantics, backed by the existing external-sort and spill infrastructure so
-correctness does not depend on the input fitting in memory.
+query result without collapsing that partition to one row. SaguaroDB now
+executes the M4 whole-partition families; M5 completes frame-respecting value
+functions and aggregates. The implementation uses the existing external-sort
+and spill infrastructure so correctness does not depend on the input fitting
+in memory.
 
 The supported function set is:
 
@@ -525,7 +527,7 @@ or row context.
   structured staging error. Documentation updated: this spec,
   `docs/specs/crates/planner.md`, and the architecture sections of
   `docs/specs/overview.md` affected by the new plan node.
-- **M4 — `feat(executor): execute ranking and offset window functions`.** Add
+- **M4 — `feat(executor): execute ranking and offset window functions` (complete).** Add
   the WindowOp sorting/partition skeleton and ranking, distribution, ntile,
   lag, and lead execution, including `22014`, spill, cancellation, failure,
   and `e2e_window_*` coverage; frame-respecting functions remain gated.

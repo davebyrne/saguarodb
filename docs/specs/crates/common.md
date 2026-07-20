@@ -649,6 +649,7 @@ pub enum SqlState {
     DivisionByZero,
     NullValueNotAllowed,              // 22004
     InvalidPrecedingOrFollowingSize,  // 22013
+    InvalidArgumentForNtile,          // 22014
     InvalidParameterValue,
     NumericValueOutOfRange,
     StringDataRightTruncation,
@@ -693,7 +694,8 @@ Window binding uses `WindowingError` (`42P20`) for placement, nesting, and
 frame-order violations, `GroupingError` (`42803`) for a window call inside an
 ordinary aggregate argument, `NullValueNotAllowed` (`22004`) for a NULL frame
 offset, and `InvalidPrecedingOrFollowingSize` (`22013`) for a negative frame
-offset.
+offset. Window execution uses `InvalidArgumentForNtile` (`22014`) when the
+partition-initialized, non-NULL `ntile` argument is not greater than zero.
 Foreign-key metadata reserves `23503` (`ForeignKeyViolation`), `42830`
 (`InvalidForeignKey`), and `42710` (`DuplicateObject`). Executor enforcement uses
 `23503` for both a missing referenced parent and an incoming dependent row;

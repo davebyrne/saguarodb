@@ -91,7 +91,11 @@ impl PlanExecutor for SortOp<'_> {
     }
 }
 
-fn compare_keys(left: &[Value], right: &[Value], order_by: &[BoundOrderByItem]) -> Ordering {
+pub(crate) fn compare_keys(
+    left: &[Value],
+    right: &[Value],
+    order_by: &[BoundOrderByItem],
+) -> Ordering {
     for ((left, right), item) in left.iter().zip(right).zip(order_by) {
         let ordering = compare_key_value(left, right, item);
         if ordering != Ordering::Equal {
@@ -101,7 +105,7 @@ fn compare_keys(left: &[Value], right: &[Value], order_by: &[BoundOrderByItem]) 
     Ordering::Equal
 }
 
-fn compare_key_value(left: &Value, right: &Value, item: &BoundOrderByItem) -> Ordering {
+pub(crate) fn compare_key_value(left: &Value, right: &Value, item: &BoundOrderByItem) -> Ordering {
     let nulls_first = item.nulls_first.unwrap_or(!item.ascending);
     match (matches!(left, Value::Null), matches!(right, Value::Null)) {
         (true, true) => return Ordering::Equal,

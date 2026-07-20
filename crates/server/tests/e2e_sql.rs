@@ -5955,3 +5955,296 @@ async fn e2e_explain_analyze_timeout_cancellation_and_execution_error() {
     assert_eq!(tags.iter().filter(|tag| **tag == b'C').count(), 0);
     assert_eq!(tags.last(), Some(&b'Z'));
 }
+
+#[tokio::test]
+async fn e2e_window_row_number_partition_reset() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table window_rows (p integer, k integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into window_rows values (2, 2), (1, 2), (2, 1), (1, 1)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select p, k, row_number() over (partition by p order by k) from window_rows")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("1".into()), Some("1".into())],
+            vec![Some("1".into()), Some("2".into()), Some("2".into())],
+            vec![Some("2".into()), Some("1".into()), Some("1".into())],
+            vec![Some("2".into()), Some("2".into()), Some("2".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_rank_dense_rank_ties() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, rank() over (order by n), dense_rank() over (order by n) \
+             from (values (2), (1), (1), (3)) v(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("1".into()), Some("1".into())],
+            vec![Some("1".into()), Some("1".into()), Some("1".into())],
+            vec![Some("2".into()), Some("3".into()), Some("2".into())],
+            vec![Some("3".into()), Some("4".into()), Some("3".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_percent_rank_cume_dist() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, percent_rank() over (order by n), cume_dist() over (order by n) \
+             from (values (1), (1), (2)) v(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                Some("0".into()),
+                Some("0.6666666666666666".into())
+            ],
+            vec![
+                Some("1".into()),
+                Some("0".into()),
+                Some("0.6666666666666666".into())
+            ],
+            vec![Some("2".into()), Some("1".into()), Some("1".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_ntile_uneven() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query("select n, ntile(3) over (order by n) from generate_series(1, 10) g(n)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    let tiles = rows.iter().map(|row| row[1].clone()).collect::<Vec<_>>();
+    assert_eq!(
+        tiles,
+        vec!["1", "1", "1", "1", "2", "2", "2", "3", "3", "3"]
+            .into_iter()
+            .map(|value| Some(value.to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_ntile_nonpositive_22014() {
+    let server = TestServer::start().await.unwrap();
+    let error = server
+        .simple_query("select ntile(0) over () from (values (1)) v(n)")
+        .await
+        .err()
+        .expect("nonpositive ntile must fail");
+    assert_eq!(error.code, common::SqlState::InvalidArgumentForNtile);
+    assert!(
+        error
+            .message
+            .contains("argument of ntile must be greater than zero")
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_lag_lead_edges_and_default() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, lag(n) over (order by n), lead(n, 2) over (order by n), \
+                    lag(n, 3, n * 10) over (order by n), lag(n, -1) over (order by n) \
+             from generate_series(1, 4) g(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                None,
+                Some("3".into()),
+                Some("10".into()),
+                Some("2".into())
+            ],
+            vec![
+                Some("2".into()),
+                Some("1".into()),
+                Some("4".into()),
+                Some("20".into()),
+                Some("3".into())
+            ],
+            vec![
+                Some("3".into()),
+                Some("2".into()),
+                None,
+                Some("30".into()),
+                Some("4".into())
+            ],
+            vec![
+                Some("4".into()),
+                Some("3".into()),
+                None,
+                Some("1".into()),
+                None
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_over_group_by_aggregate_arg() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select p, count(*), lag(count(*), 1, 0) over (order by p) \
+             from (values (1), (1), (2)) v(p) group by p order by p",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("2".into()), Some("0".into())],
+            vec![Some("2".into()), Some("1".into()), Some("2".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_order_by_window_value() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, row_number() over (order by n desc) as rn \
+             from (values (1), (3), (2)) v(n) order by rn desc",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("3".into())],
+            vec![Some("2".into()), Some("2".into())],
+            vec![Some("3".into()), Some("1".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_two_specs_one_query() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, row_number() over (order by n), row_number() over (order by n desc) \
+             from (values (1), (2), (3)) v(n) order by n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("1".into()), Some("3".into())],
+            vec![Some("2".into()), Some("2".into()), Some("2".into())],
+            vec![Some("3".into()), Some("3".into()), Some("1".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_in_subquery_and_derived_table() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select d.n, d.rn from \
+             (select n, row_number() over (order by n) rn from (values (3), (1), (2)) v(n)) d \
+             where d.rn > (select 1) order by d.rn",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".into()), Some("2".into())],
+            vec![Some("3".into()), Some("3".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_explain_analyze() {
+    let server = TestServer::start().await.unwrap();
+    let explain = explain_text(
+        &server,
+        "explain analyze select row_number() over (order by n) from generate_series(1, 3) g(n)",
+    )
+    .await;
+    assert!(explain.contains("Window"), "{explain}");
+    assert_executed_line(explain_line(&explain, "Window", 0), "rows=3 loops=1");
+}
+
+#[tokio::test]
+async fn e2e_window_spill() {
+    let server = TestServer::start().await.unwrap();
+    server.simple_query("set work_mem = '64kB'").await.unwrap();
+    let rows = server
+        .simple_query(
+            "select n, lag(n) over (order by n) \
+             from generate_series(1, 10000) g(n) order by n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows.len(), 10_000);
+    assert_eq!(rows[0][1], None);
+    assert_eq!(rows[9_999][1].as_deref(), Some("9999"));
+}
+
+#[tokio::test]
+async fn e2e_window_frames_not_yet_implemented() {
+    let server = TestServer::start().await.unwrap();
+    for sql in [
+        "select first_value(n) over (order by n) from (values (1)) v(n)",
+        "select sum(n) over (order by n rows between 1 preceding and current row) \
+         from (values (1)) v(n)",
+    ] {
+        let error = server
+            .simple_query(sql)
+            .await
+            .err()
+            .expect("frame-respecting window function must remain staged");
+        assert_eq!(error.code, common::SqlState::FeatureNotSupported);
+        assert!(
+            error
+                .message
+                .contains("window frames are not yet implemented")
+        );
+    }
+}

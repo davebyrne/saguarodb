@@ -28,7 +28,7 @@ use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinInput, HashJoinOp, IndexScanInput, IndexScanOp,
     LimitOp, LockRowsInput, LockRowsOp, MergeJoinOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp,
-    SetOpOp, SortOp, TableFunctionOp, ValuesOp,
+    SetOpOp, SortOp, TableFunctionOp, ValuesOp, WindowOp,
 };
 use crate::referential::ReferentialIntegrity;
 
@@ -901,10 +901,17 @@ fn build_executor_impl<'a>(
             output_schema.clone(),
             ctx.spill.clone(),
         ))),
-        PhysicalPlan::Window { .. } => Err(DbError::plan(
-            SqlState::FeatureNotSupported,
-            "window function execution is not yet implemented",
-        )),
+        PhysicalPlan::Window {
+            source,
+            spec,
+            functions,
+        } => Ok(Box::new(WindowOp::new(
+            ctx.statement.clone(),
+            child(source, 0)?,
+            spec.clone(),
+            functions.clone(),
+            ctx.spill.clone(),
+        )?)),
         PhysicalPlan::Values {
             rows,
             output_schema,
