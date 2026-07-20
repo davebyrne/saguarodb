@@ -650,6 +650,26 @@ impl Connection {
         Ok(QueryOutcome { result, status })
     }
 
+    /// Execute a named prepared statement with one text-format parameter.
+    pub async fn execute_prepared_text_param(
+        &mut self,
+        name: &str,
+        param: &str,
+    ) -> Result<QueryOutcome> {
+        let mut seq = bind_text_param_bytes("", name, param);
+        seq.extend(execute_bytes(""));
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!(
+                "failed to send extended-protocol prepared execute: {err}"
+            ))
+        })?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
     pub async fn execute_prepared_limited(
         &mut self,
         name: &str,

@@ -6211,6 +6211,105 @@ async fn e2e_window_explain_analyze() {
 }
 
 #[tokio::test]
+async fn e2e_window_extended_protocol_parameter_in_argument() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.prepare(
+        "window_default",
+        "select n, lag(n, 1, $1) over (order by n) from generate_series(1, 3) g(n) order by n",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let rows = conn
+        .execute_prepared_text_param("window_default", "99")
+        .await
+        .unwrap()
+        .rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("99".into())],
+            vec![Some("2".into()), Some("1".into())],
+            vec![Some("3".into()), Some("2".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_over_correlated_where_subquery() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select o.n, row_number() over (order by o.n) \
+             from generate_series(1, 4) o(n) \
+             where exists (select 1 from generate_series(2, 3) i(n) where i.n = o.n) \
+             order by o.n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".into()), Some("1".into())],
+            vec![Some("3".into()), Some("2".into())],
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_window_cancel_request_interrupts_active_query() {
+    let server = TestServer::start().await.unwrap();
+    let mut canceled = Connection::connect(&server).await.unwrap();
+    let (pid, secret) = canceled.backend_key();
+    let query = tokio::spawn(async move {
+        let outcome = canceled
+            .query(
+                "select row_number() over (order by a.n + b.n) \
+                 from generate_series(1, 10000) a(n), generate_series(1, 10000) b(n)",
+            )
+            .await;
+        (canceled, outcome)
+    });
+    let mut observer = Connection::connect(&server).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rows = observer
+                .ok(&format!(
+                    "select state, query from pg_stat_activity where pid = {pid}"
+                ))
+                .await
+                .rows();
+            if rows.iter().any(|row| {
+                row[0].as_deref() == Some("active")
+                    && row[1]
+                        .as_deref()
+                        .is_some_and(|query| query.starts_with("select row_number() over"))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("window query becomes active before cancellation");
+    server.send_cancel(pid, secret).await.unwrap();
+    let (mut canceled, outcome) = tokio::time::timeout(Duration::from_secs(5), query)
+        .await
+        .expect("canceled window query terminates promptly")
+        .unwrap();
+    let outcome = outcome.unwrap();
+    let err = outcome.result.err().expect("window query must be canceled");
+    assert!(err.message.contains("C=57014"), "{err}");
+    assert_eq!(outcome.status, b'I');
+    assert!(
+        canceled.ok("select 1").await.result.is_ok(),
+        "connection remains usable"
+    );
+}
+
+#[tokio::test]
 async fn e2e_window_spill() {
     let server = TestServer::start().await.unwrap();
     server.simple_query("set work_mem = '64kB'").await.unwrap();

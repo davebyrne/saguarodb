@@ -969,6 +969,12 @@ pub enum Expr {
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
+    WindowFunction {
+        name: String,
+        args: Box<[FunctionArg]>,
+        distinct: bool,
+        spec: Box<WindowSpec>,
+    },
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
@@ -1021,7 +1027,7 @@ two-part name's schema on `FromItem::Table`; binder owns resolution.
 
 `FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 
-Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can carry it through (e.g. `COUNT(DISTINCT x)`). Ordinary function names may be unqualified or qualified with `pg_catalog`; `pg_catalog.<function>(...)` normalizes to the same lowercase function name as `<function>(...)`, while other qualified function schemas are rejected. `Select.distinct` records the optional `SELECT DISTINCT` / `DISTINCT ON (...)` modifier.
+Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can carry it through (e.g. `COUNT(DISTINCT x)`). A call with `OVER (...)` is instead an `Expr::WindowFunction`; its `WindowSpec` carries `PARTITION BY`, window `ORDER BY`, and the normalized `ROWS` or `RANGE` frame. Ordinary function names may be unqualified or qualified with `pg_catalog`; `pg_catalog.<function>(...)` normalizes to the same lowercase function name as `<function>(...)`, while other qualified function schemas are rejected. `Select.distinct` records the optional `SELECT DISTINCT` / `DISTINCT ON (...)` modifier.
 
 ### Public API
 
@@ -1305,6 +1311,13 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    WindowCall {
+        func: WindowFunc,
+        args: Vec<BoundExpr>,
+        spec: Box<BoundWindowSpec>,
+        data_type: DataType,
+        nullable: bool,
+    },
     LocalRef {
         slot: usize,
         data_type: DataType,
@@ -1472,7 +1485,8 @@ projection, query ordering, and distinct keys become fixed `LocalRef` slots.
 Window nodes sit before query Sort/Distinct/Projection and lower one-to-one to
 physical Window nodes. Correlated-subquery hoisting restores the precomputed
 Window input width with a narrowing Projection whenever a hoisted Apply widens
-that boundary.
+that boundary. `EXPLAIN` labels the physical node `Window` and includes its
+partition keys, ordering keys, effective frame, and function list.
 
 Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM` and `AVG` accept either numeric type and return it (`AVG(integer)` uses integer division truncated toward zero; `AVG(double precision)` is true division), rejecting non-numeric arguments with `SqlState::DatatypeMismatch`; `MIN` and `MAX` return the argument type and are nullable; `STDDEV`/`VARIANCE` (and their `_SAMP`/`_POP` forms) take a numeric argument and return `DOUBLE PRECISION`; `BOOL_AND`/`BOOL_OR` take a boolean argument and return `BOOLEAN`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for the rest (sample variance/stddev also return `NULL` for a single value).
 
@@ -1698,7 +1712,7 @@ pub trait PlanExecutor {
 }
 ```
 
-A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. The token atomically retains the first `CancelReason` until reset, so a `CancelRequest` on a side connection reports `due to user request` and a statement timer reports `due to statement timeout`. Materializing paths drain children through a cancel-aware collector; blocking join, sort, aggregate, and set-operation work also polls at practical build/scan boundaries so expiration cannot remain hidden until a large `open()` finishes. Row-lock and storage maintenance waits use the same token.
+A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. The token atomically retains the first `CancelReason` until reset, so a `CancelRequest` on a side connection reports `due to user request` and a statement timer reports `due to statement timeout`. Materializing paths drain children through a cancel-aware collector; blocking join, sort, aggregate, window, and set-operation work also polls at practical build/scan boundaries so expiration cannot remain hidden until a large `open()` finishes. Row-lock and storage maintenance waits use the same token.
 
 `next_batch` has a default implementation so operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
 
@@ -1731,11 +1745,12 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | `DistinctOp` | Uses bounded external key and ordinal sorts to retain the first row of each distinct key in input order; NULL keys collapse together and identity is cleared. Blocking operator. |
 | `LimitOp` | Stops pulling after N rows |
 | `AggregateOp` | Folds global aggregates directly; grouped aggregates use a bounded external key sort, online non-DISTINCT states, and bounded per-expression DISTINCT argument sorts sharing one budget; streams one result per group and clears identity. Blocking operator. |
+| `WindowOp` | Stable-sorts by partition and window-order keys with the spill-backed sorter, evaluates ranking, distribution, offset/value functions, and window aggregates over `ROWS`/`RANGE` frames, then restores source order while appending one result column per function. Blocking operator. |
 | `SetOpOp` | Uses bounded external key and ordinal sorts for UNION/INTERSECT/EXCEPT distinct and multiset semantics, preserves left-to-right output order, and clears identity. Blocking operator. |
 
 ### Expression Evaluator
 
-A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, the NULL-safe `IS [NOT] DISTINCT FROM`, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `SUBSTRING`, the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, `MOD`, the string functions `REPLACE`, `POSITION`, `CONCAT`, `LEFT`, `RIGHT`, `EXTRACT(field FROM date/timestamp)`, statement clock functions `CURRENT_TIMESTAMP`/`NOW()`, the PostgreSQL-compatible system information functions `VERSION`, `CURRENT_DATABASE`, `CURRENT_CATALOG`, `CURRENT_SCHEMA`, `CURRENT_USER`, `SESSION_USER`, `USER`, `PG_BACKEND_PID`, and `CURRENT_SETTING(text)`, and PostgreSQL-compatible catalog introspection/probe functions such as `FORMAT_TYPE`, `PG_GET_INDEXDEF`, `PG_GET_EXPR`, `PG_GET_CONSTRAINTDEF`, `PG_TABLE_IS_VISIBLE`, `TO_REGCLASS`, `TO_REGTYPE`, `PG_GET_SERIAL_SEQUENCE`, and `HAS_*_PRIVILEGE` (`COALESCE`/`NULLIF` are desugared to `CASE` by the binder). These scalar functions are dispatched through the scalar function registry in `common` (`docs/specs/crates/common.md`), which pairs each function's bind-time signature check with its evaluator so it is defined once for both the binder and this evaluator. Catalog introspection functions read `StatementContext.catalog_introspection` and propagate provider errors; provider `None` maps to SQL `NULL` for nullable metadata lookups. Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP`, `VARIANCE`/`VAR_SAMP`/`VAR_POP`, `BOOL_AND`, `BOOL_OR`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
+A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, the NULL-safe `IS [NOT] DISTINCT FROM`, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `SUBSTRING`, the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, `MOD`, the string functions `REPLACE`, `POSITION`, `CONCAT`, `LEFT`, `RIGHT`, `EXTRACT(field FROM date/timestamp)`, statement clock functions `CURRENT_TIMESTAMP`/`NOW()`, the PostgreSQL-compatible system information functions `VERSION`, `CURRENT_DATABASE`, `CURRENT_CATALOG`, `CURRENT_SCHEMA`, `CURRENT_USER`, `SESSION_USER`, `USER`, `PG_BACKEND_PID`, and `CURRENT_SETTING(text)`, and PostgreSQL-compatible catalog introspection/probe functions such as `FORMAT_TYPE`, `PG_GET_INDEXDEF`, `PG_GET_EXPR`, `PG_GET_CONSTRAINTDEF`, `PG_TABLE_IS_VISIBLE`, `TO_REGCLASS`, `TO_REGTYPE`, `PG_GET_SERIAL_SEQUENCE`, and `HAS_*_PRIVILEGE` (`COALESCE`/`NULLIF` are desugared to `CASE` by the binder). These scalar functions are dispatched through the scalar function registry in `common` (`docs/specs/crates/common.md`), which pairs each function's bind-time signature check with its evaluator so it is defined once for both the binder and this evaluator. Catalog introspection functions read `StatementContext.catalog_introspection` and propagate provider errors; provider `None` maps to SQL `NULL` for nullable metadata lookups. Aggregate calls are evaluated by `AggregateOp`, and window calls by `WindowOp`; logical planning rewrites both to local result slots, so `BoundExpr::AggregateCall` and `BoundExpr::WindowCall` must not reach scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
 
 Expression semantics:
 

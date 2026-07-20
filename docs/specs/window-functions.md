@@ -1,13 +1,12 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress — milestones M0–M5 are complete; milestone M6 is
-pending. Window calls parse, bind, validate, lower to logical and physical
-Window nodes, and execute ranking, distribution, offset/value functions,
-`ROWS`/`RANGE` frames, and all aggregates with spill-backed ordering.
-The affected crate specifications,
-`docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
-milestone as listed in §11.
+**Status:** Implemented — milestones M0–M6 are complete. Window calls parse,
+bind, validate, lower to logical and physical Window nodes, and execute ranking,
+distribution, offset/value functions, `ROWS`/`RANGE` frames, and all aggregates
+with spill-backed ordering. The affected crate specifications,
+`docs/specs/overview.md`, `README.md`, and `AGENTS.md` reflect the completed
+feature as listed in §11.
 
 This document specifies window functions across the parser, binder, planner,
 executor, and SQL protocol surface. It is the system-level contract for the
@@ -18,9 +17,9 @@ feature and complements `docs/specs/overview.md` and the crate contracts under
 
 A window function computes a value for each input row from a partition of the
 query result without collapsing that partition to one row. SaguaroDB executes
-the whole-partition and frame-respecting families through M5. The implementation uses the existing external-sort
-and spill infrastructure so correctness does not depend on the input fitting
-in memory.
+both whole-partition and frame-respecting families. The implementation uses the
+existing external-sort and spill infrastructure so correctness does not depend
+on the input fitting in memory.
 
 The supported function set is:
 
@@ -378,10 +377,8 @@ sort-then-partition-tape design.
 During `open`, the operator defensively validates frame offsets, drains its
 child into `ExternalSorter<SpillRow>`, and sorts by partition expressions
 `ASC NULLS LAST` followed by the declared window ordering keys. Sorting reuses
-the Sort operator's key comparison. The currently private `compare_keys` and
-`compare_key_value` helpers in `crates/executor/src/ops/sort.rs` must therefore
-be exposed, for example as `pub(crate)`, as part of M4. Drain and sort paths
-poll cancellation.
+the Sort operator's `pub(crate)` `compare_keys` and `compare_key_value` helpers
+in `crates/executor/src/ops/sort.rs`. Drain and sort paths poll cancellation.
 
 During `next`, a partition-at-a-time state machine buffers one complete
 partition into `SpillTape<SpillRow>`, tracks its row count, then evaluates the
@@ -395,9 +392,8 @@ the frame head moves, and per-row collect-aggregate (`array_agg` and
 cursor. Per-row `nth_value.n` can make its target index non-monotone, and its
 lookup path is O(frame width) in the worst case.
 
-The only required spill-crate behavior change is fork/`Clone` for
-`SpillTapeReader`. Both in-memory and disk readers are a position plus shared
-`Arc` state, and the disk reader already seeks for each read.
+`SpillTapeReader` supports fork/`Clone`. Both in-memory and disk readers are a
+position plus shared `Arc` state, and the disk reader seeks for each read.
 
 ### 7.2 Function and frame evaluation
 
@@ -510,37 +506,37 @@ or row context.
 
 ## 11. Milestones
 
-- **M0 — `docs(specs): window functions design`.** Create this full design
+- [x] **M0 — `docs(specs): window functions design`.** Create this full design
   contract. Documentation updated: `docs/specs/window-functions.md` only.
-- **M1 — `feat(parser): parse window function calls` (complete).** Add the parser AST,
+- [x] **M1 — `feat(parser): parse window function calls` (complete).** Add the parser AST,
   conversions, shorthand normalization, and parser rejection matrix; leave a
   binder staging guard. Documentation updated: this spec and
   `docs/specs/crates/parser.md`.
-- **M2 — `feat(planner): bind and validate window function calls` (complete).** Add the
+- [x] **M2 — `feat(planner): bind and validate window function calls` (complete).** Add the
   SQLSTATEs used at bind time, bound types, function and frame validation,
   placement/nesting guards, result typing, `source_width`, all expression-
   walker arms, the durable-view rejection, and a temporary planning guard.
   Documentation updated: this spec, `docs/specs/crates/planner.md`, and
   `docs/specs/crates/common.md`.
-- **M3 — `feat(planner): plan window functions` (complete).** Add logical and physical
+- [x] **M3 — `feat(planner): plan window functions` (complete).** Add logical and physical
   Window nodes, collection/deduplication and LocalRef rewriting, row-estimate
   passthrough, plan walkers, and EXPLAIN registration; execution remains a
   structured staging error. Documentation updated: this spec,
   `docs/specs/crates/planner.md`, and the architecture sections of
   `docs/specs/overview.md` affected by the new plan node.
-- **M4 — `feat(executor): execute ranking and offset window functions` (complete).** Add
+- [x] **M4 — `feat(executor): execute ranking and offset window functions` (complete).** Add
   the WindowOp sorting/partition skeleton and ranking, distribution, ntile,
   lag, and lead execution, including `22014`, spill, cancellation, failure,
   and `e2e_window_*` coverage; frame-respecting functions were left gated for M5.
   Documentation updated: this spec, `docs/specs/crates/common.md`, and
   `docs/specs/crates/executor.md`.
-- **M5 — `feat(executor): window frames and aggregates over windows` (complete).** Add
+- [x] **M5 — `feat(executor): window frames and aggregates over windows` (complete).** Add
   `ROWS`/`RANGE` frames, first/last/nth value, `22016`, all 13 aggregates,
   aggregate snapshots and three execution modes, and SpillTape reader forks.
   Documentation updated: this spec, `docs/specs/crates/common.md`,
   `docs/specs/crates/executor.md`, `docs/specs/crates/spill.md`, the SELECT
   subset in `docs/specs/overview.md`, `README.md`, and `AGENTS.md`.
-- **M6 — `docs/test(sql): window functions polish`.** Mark this spec
+- [x] **M6 — `docs/test(sql): window functions polish` (complete).** Mark this spec
   implemented; finalize the parser/planner/executor sections of
   `docs/specs/overview.md`; add EXPLAIN ANALYZE, extended-protocol, and
   cancellation integration coverage; run the production panic-policy and
