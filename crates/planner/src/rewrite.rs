@@ -458,6 +458,26 @@ fn rewrite_children(
             data_type: data_type.clone(),
             nullable: *nullable,
         },
+        BoundExpr::WindowCall {
+            func,
+            args,
+            spec,
+            data_type,
+            nullable,
+        } => {
+            let mut spec = spec.clone();
+            spec.partition_by = rewrite_vec(&spec.partition_by, f)?;
+            for item in &mut spec.order_by {
+                item.expr = rewrite_expr(&item.expr, f)?;
+            }
+            BoundExpr::WindowCall {
+                func: *func,
+                args: rewrite_vec(args, f)?,
+                spec,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+            }
+        }
         BoundExpr::IsNull {
             expr,
             data_type,

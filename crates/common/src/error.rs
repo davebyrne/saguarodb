@@ -58,7 +58,15 @@ pub enum SqlState {
     /// context from which its concrete type can be inferred.
     IndeterminateDatatype,
     DatatypeMismatch,
+    /// `42P20`: a window function is used or framed incorrectly.
+    WindowingError,
+    /// `42803`: an aggregate/window nesting or grouped-expression rule is violated.
+    GroupingError,
     DivisionByZero,
+    /// `22004`: NULL is not permitted for this value, such as a frame offset.
+    NullValueNotAllowed,
+    /// `22013`: a window frame offset is negative.
+    InvalidPrecedingOrFollowingSize,
     /// `22023`: a validly typed argument or option has an invalid value, e.g.
     /// `CREATE SEQUENCE INCREMENT BY 0`.
     InvalidParameterValue,
@@ -152,7 +160,11 @@ impl SqlState {
             SqlState::DuplicateCursor => "42P03",
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::DatatypeMismatch => "42804",
+            SqlState::WindowingError => "42P20",
+            SqlState::GroupingError => "42803",
             SqlState::DivisionByZero => "22012",
+            SqlState::NullValueNotAllowed => "22004",
+            SqlState::InvalidPrecedingOrFollowingSize => "22013",
             SqlState::InvalidParameterValue => "22023",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::StringDataRightTruncation => "22001",
@@ -201,7 +213,11 @@ impl SqlState {
             "42P03" => SqlState::DuplicateCursor,
             "42P18" => SqlState::IndeterminateDatatype,
             "42804" => SqlState::DatatypeMismatch,
+            "42P20" => SqlState::WindowingError,
+            "42803" => SqlState::GroupingError,
             "22012" => SqlState::DivisionByZero,
+            "22004" => SqlState::NullValueNotAllowed,
+            "22013" => SqlState::InvalidPrecedingOrFollowingSize,
             "22023" => SqlState::InvalidParameterValue,
             "22003" => SqlState::NumericValueOutOfRange,
             "22001" => SqlState::StringDataRightTruncation,

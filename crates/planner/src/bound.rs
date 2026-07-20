@@ -379,6 +379,8 @@ pub enum BoundOnConflict {
 /// result-set column metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundSelect {
+    /// Width of the FROM row immediately after source binding.
+    pub source_width: usize,
     /// The `DISTINCT` modifier, or `None` for no de-duplication.
     pub distinct: Option<BoundDistinct>,
     pub columns: Vec<BoundSelectItem>,

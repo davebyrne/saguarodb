@@ -42,8 +42,8 @@ pub use explain::{
     format_explain, format_explain_analyze,
 };
 pub use expr::{
-    AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinSide,
-    JoinType, UnaryOp,
+    AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundFrameBound, BoundOrderByItem,
+    BoundWindowFrame, BoundWindowSpec, JoinSide, JoinType, UnaryOp, WindowFrameUnits, WindowFunc,
 };
 pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_pg_types, collect_param_types, substitute_params};
@@ -259,6 +259,17 @@ fn expr_sequences(expr: &BoundExpr, scan: SequenceScan) -> bool {
         BoundExpr::AggregateCall { arg, .. } => {
             arg.as_deref().is_some_and(|arg| expr_sequences(arg, scan))
         }
+        BoundExpr::WindowCall { args, spec, .. } => {
+            args.iter().any(|arg| expr_sequences(arg, scan))
+                || spec
+                    .partition_by
+                    .iter()
+                    .any(|expr| expr_sequences(expr, scan))
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_sequences(&item.expr, scan))
+        }
         BoundExpr::InList { expr, list, .. } => {
             expr_sequences(expr, scan) || list.iter().any(|item| expr_sequences(item, scan))
         }
@@ -302,7 +313,7 @@ fn expr_sequences(expr: &BoundExpr, scan: SequenceScan) -> bool {
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog, SystemView};
     use common::{
-        CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
+        CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, DbError, ErrorKind,
         ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression, ToastMode,
         ToastOptions, Value,
     };
@@ -1472,14 +1483,425 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_window_functions_until_m2() {
+    fn planner_stages_window_execution_until_m3() {
         let catalog = MemoryCatalog::empty();
         let stmt = parse("select row_number() over ()").unwrap();
-        let err = bind(&stmt, &catalog).unwrap_err();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let err = logical_plan(&bound).unwrap_err();
 
         assert_eq!(err.kind, ErrorKind::Plan);
         assert_eq!(err.code, SqlState::FeatureNotSupported);
-        assert_eq!(err.message, "window functions are not yet supported");
+        assert_eq!(
+            err.message,
+            "window function execution is not yet implemented"
+        );
+    }
+
+    fn window_bind_error(catalog: &MemoryCatalog, sql: &str) -> DbError {
+        let statement = parse(sql).unwrap();
+        bind(&statement, catalog).unwrap_err()
+    }
+
+    fn first_window_spec(statement: BoundStatement) -> BoundWindowSpec {
+        let BoundStatement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let select = select_of(&query);
+        let Some(item) = select.columns.first() else {
+            panic!("expected a select item");
+        };
+        let BoundExpr::WindowCall { spec, .. } = &item.expr else {
+            panic!("expected a window call");
+        };
+        spec.as_ref().clone()
+    }
+
+    #[test]
+    fn binder_rejects_windows_in_forbidden_clauses() {
+        let catalog = catalog_with_users();
+        for (sql, clause) in [
+            (
+                "select id from users where row_number() over () > 0",
+                "WHERE",
+            ),
+            (
+                "select id from users group by row_number() over ()",
+                "GROUP BY",
+            ),
+            (
+                "select count(*) from users having row_number() over () > 0",
+                "HAVING",
+            ),
+            (
+                "select u.id from users u join users v on row_number() over () > 0",
+                "JOIN ON",
+            ),
+            ("values (row_number() over ())", "VALUES"),
+            (
+                "update users set name = name returning row_number() over ()",
+                "RETURNING",
+            ),
+            ("update users set id = row_number() over ()", "UPDATE SET"),
+            (
+                "insert into users values (1, 'a') on conflict (id) do update set id = row_number() over ()",
+                "ON CONFLICT SET",
+            ),
+            (
+                "select * from generate_series(row_number() over (), 2)",
+                "table-function arguments",
+            ),
+        ] {
+            let err = window_bind_error(&catalog, sql);
+            assert_eq!(err.code, SqlState::WindowingError, "{sql}");
+            assert!(err.message.contains(clause), "{sql}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn binder_validates_window_names_nesting_and_arguments() {
+        let catalog = catalog_with_users();
+        for sql in [
+            "select row_number()",
+            "select abs(1) over ()",
+            "select unknown_fn() over ()",
+        ] {
+            assert_eq!(
+                window_bind_error(&catalog, sql).code,
+                SqlState::WrongObjectType,
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            window_bind_error(
+                &catalog,
+                "select lag(row_number() over ()) over () from users"
+            )
+            .code,
+            SqlState::WindowingError
+        );
+        assert_eq!(
+            window_bind_error(&catalog, "select sum(row_number() over ()) from users").code,
+            SqlState::GroupingError
+        );
+        assert_eq!(
+            window_bind_error(
+                &catalog,
+                "select count(row_number() over ()) over () from users"
+            )
+            .code,
+            SqlState::WindowingError
+        );
+        for (sql, code) in [
+            (
+                "select sum(distinct id) over () from users",
+                SqlState::FeatureNotSupported,
+            ),
+            (
+                "select lag(id, id) over () from users",
+                SqlState::FeatureNotSupported,
+            ),
+            (
+                "select lag(id, 1, name) over () from users",
+                SqlState::DatatypeMismatch,
+            ),
+            ("select ntile('x') over ()", SqlState::DatatypeMismatch),
+            ("select row_number(1) over ()", SqlState::SyntaxError),
+        ] {
+            assert_eq!(window_bind_error(&catalog, sql).code, code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn binder_distinguishes_invalid_lag_offsets_from_non_constant_offsets() {
+        let catalog = catalog_with_users();
+
+        let null_offset = bind(
+            &parse("select lag(id, null) over (), lead(id, null) over () from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = null_offset else {
+            panic!("expected query");
+        };
+        for item in &select_of(&query).columns {
+            let BoundExpr::WindowCall { args, nullable, .. } = &item.expr else {
+                panic!("expected a window call");
+            };
+            assert!(*nullable);
+            assert!(matches!(
+                args.get(1),
+                Some(BoundExpr::Literal {
+                    value: Value::Null,
+                    data_type: DataType::Integer,
+                    nullable: true,
+                })
+            ));
+        }
+
+        let invalid_literal = window_bind_error(&catalog, "select lag(id, 'x') over () from users");
+        assert_eq!(invalid_literal.code, SqlState::DatatypeMismatch);
+        assert_eq!(invalid_literal.message, "lag offset must be an integer");
+
+        let parameter = window_bind_error(&catalog, "select lag(id, $1) over () from users");
+        assert_eq!(parameter.code, SqlState::FeatureNotSupported);
+        assert_eq!(
+            parameter.message,
+            "lag offset must be a bind-time integer constant"
+        );
+    }
+
+    #[test]
+    fn binder_resolves_supported_window_frames() {
+        let catalog = catalog_with_users();
+        let rows = first_window_spec(
+            bind(
+                &parse("select sum(id) over (rows between 2 preceding and 1 following) from users")
+                    .unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.frame.units, WindowFrameUnits::Rows);
+        assert_eq!(rows.frame.start, BoundFrameBound::PrecedingRows(2));
+        assert_eq!(rows.frame.end, BoundFrameBound::FollowingRows(1));
+
+        let numeric = first_window_spec(
+            bind(
+                &parse(
+                    "select sum(id) over (order by cast(id as numeric) range 0.5 preceding) from users",
+                )
+                .unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        );
+        assert_eq!(numeric.frame.units, WindowFrameUnits::Range);
+        assert_eq!(
+            numeric.frame.start,
+            BoundFrameBound::PrecedingRange(Value::Numeric(
+                common::numeric::from_f64(0.5).unwrap()
+            ))
+        );
+        assert_eq!(numeric.frame.end, BoundFrameBound::CurrentRow);
+
+        let temporal = catalog_with_temporal_columns();
+        let timestamp = first_window_spec(
+            bind(
+                &parse("select sum(id) over (order by ts range interval '1 day' preceding) from t")
+                    .unwrap(),
+                &temporal,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            timestamp.frame.start,
+            BoundFrameBound::PrecedingRange(Value::Interval(_))
+        ));
+
+        let ordered_default = first_window_spec(
+            bind(
+                &parse("select row_number() over (order by id) from users").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        );
+        assert_eq!(ordered_default.frame.units, WindowFrameUnits::Range);
+        assert_eq!(
+            ordered_default.frame.start,
+            BoundFrameBound::UnboundedPreceding
+        );
+        assert_eq!(ordered_default.frame.end, BoundFrameBound::CurrentRow);
+
+        let unordered_default = first_window_spec(
+            bind(
+                &parse("select row_number() over () from users").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        );
+        assert_eq!(unordered_default.frame.units, WindowFrameUnits::Range);
+        assert_eq!(
+            unordered_default.frame.start,
+            BoundFrameBound::UnboundedPreceding
+        );
+        assert_eq!(
+            unordered_default.frame.end,
+            BoundFrameBound::UnboundedFollowing
+        );
+    }
+
+    #[test]
+    fn binder_validates_window_frames() {
+        let catalog = catalog_with_users();
+        for sql in [
+            "select sum(id) over (rows between unbounded following and unbounded following) from users",
+            "select sum(id) over (rows between unbounded preceding and unbounded preceding) from users",
+            "select sum(id) over (rows between current row and 1 preceding) from users",
+            "select sum(id) over (rows between 1 following and 1 preceding) from users",
+            "select sum(id) over (rows between 1 following and current row) from users",
+            "select sum(id) over (order by id, name range 1 preceding) from users",
+        ] {
+            assert_eq!(
+                window_bind_error(&catalog, sql).code,
+                SqlState::WindowingError,
+                "{sql}"
+            );
+        }
+        for (sql, code) in [
+            (
+                "select sum(id) over (order by name range 1 preceding) from users",
+                SqlState::FeatureNotSupported,
+            ),
+            (
+                "select sum(id) over (rows -1 preceding) from users",
+                SqlState::InvalidPrecedingOrFollowingSize,
+            ),
+            (
+                "select sum(id) over (rows null preceding) from users",
+                SqlState::NullValueNotAllowed,
+            ),
+            (
+                "select sum(id) over (rows $1 preceding) from users",
+                SqlState::FeatureNotSupported,
+            ),
+            (
+                "select sum(id) over (rows -1.5 preceding) from users",
+                SqlState::DatatypeMismatch,
+            ),
+            (
+                "select sum(id) over (order by cast(id as numeric) range -'x' preceding) from users",
+                SqlState::DatatypeMismatch,
+            ),
+            (
+                "select sum(id) over (order by cast(id as numeric) range -0.5 preceding) from users",
+                SqlState::InvalidPrecedingOrFollowingSize,
+            ),
+        ] {
+            assert_eq!(window_bind_error(&catalog, sql).code, code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn binder_applies_window_grouping_and_subquery_rules() {
+        let catalog = catalog_with_users();
+        let grouped_window = bind(
+            &parse("select sum(count(*)) over () from users group by id").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let err = logical_plan(&grouped_window).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert_eq!(
+            err.message,
+            "window function execution is not yet implemented"
+        );
+        bind(
+            &parse(
+                "select distinct on (sum(count(*)) over ()) sum(count(*)) over () \
+                 from users group by id order by sum(count(*)) over ()",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(
+            window_bind_error(&catalog, "select lag(name) over () from users group by id").code,
+            SqlState::DatatypeMismatch
+        );
+        assert_eq!(
+            window_bind_error(
+                &catalog,
+                "select first_value((select users.id)) over () from users"
+            )
+            .code,
+            SqlState::FeatureNotSupported
+        );
+        bind(
+            &parse("select first_value((select 1)) over () from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn logical_planner_guards_windows_in_distinct_on_before_aggregate_rewrite() {
+        let catalog = catalog_with_users();
+        for sql in [
+            "select distinct on (sum(count(*)) over ()) id from users group by id",
+            "select distinct on (sum(count(*)) over ()) name from users",
+        ] {
+            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+            let err = logical_plan(&bound).unwrap_err();
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "{sql}");
+            assert_eq!(
+                err.message, "window function execution is not yet implemented",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn binder_types_window_function_results() {
+        let catalog = catalog_with_users();
+        let bound = bind(
+            &parse(
+                "select row_number() over (), rank() over (), dense_rank() over (), \
+                 ntile(id) over (), percent_rank() over (), cume_dist() over (), \
+                 lag(name) over (), lead(name) over (), first_value(id) over (), \
+                 last_value(id) over (), nth_value(id, 1) over (), count(*) over () from users",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = bound else {
+            panic!("expected query");
+        };
+        let select = select_of(&query);
+        let expected = [
+            (DataType::Integer, false),
+            (DataType::Integer, false),
+            (DataType::Integer, false),
+            (DataType::Integer, false),
+            (DataType::Double, false),
+            (DataType::Double, false),
+            (DataType::Text, true),
+            (DataType::Text, true),
+            (DataType::Integer, true),
+            (DataType::Integer, true),
+            (DataType::Integer, true),
+            (DataType::Integer, false),
+        ];
+        for (item, (data_type, nullable)) in select.columns.iter().zip(expected) {
+            assert_eq!(item.expr.data_type(), data_type);
+            assert_eq!(item.expr.nullable(), nullable);
+        }
+    }
+
+    #[test]
+    fn binder_rejects_window_locking_and_create_view() {
+        let catalog = catalog_with_users();
+        for sql in [
+            "select row_number() over () from users for update",
+            "create view v as select row_number() over () from users",
+        ] {
+            assert_eq!(
+                window_bind_error(&catalog, sql).code,
+                SqlState::FeatureNotSupported,
+                "{sql}"
+            );
+        }
+        let empty = MemoryCatalog::empty();
+        for sql in [
+            "create table w (id integer default (row_number() over ()))",
+            "create table w (id integer check (row_number() over () > 0))",
+        ] {
+            assert_eq!(
+                window_bind_error(&empty, sql).code,
+                SqlState::WindowingError,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -891,9 +891,36 @@ fn reject_aggregate(expr: &BoundExpr) -> Result<()> {
     Ok(())
 }
 
+fn reject_window(expr: &BoundExpr, message: &str) -> Result<()> {
+    if contains_window(expr) {
+        return Err(plan_error(SqlState::WindowingError, message));
+    }
+    Ok(())
+}
+
+fn contains_window(expr: &BoundExpr) -> bool {
+    if matches!(expr, BoundExpr::WindowCall { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = crate::params::for_each_child(expr, &mut |child| {
+        found |= contains_window(child);
+        Ok(())
+    });
+    found
+}
+
 fn contains_aggregate(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::AggregateCall { .. } => true,
+        BoundExpr::WindowCall { args, spec, .. } => {
+            args.iter().any(contains_aggregate)
+                || spec.partition_by.iter().any(contains_aggregate)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| contains_aggregate(&item.expr))
+        }
         BoundExpr::BinaryOp { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
         }
@@ -945,6 +972,31 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::OuterRef { .. } => false,
+    }
+}
+
+fn reject_aggregate_outside_window(expr: &BoundExpr) -> Result<()> {
+    if contains_aggregate_outside_window(expr) {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "aggregate calls are not allowed here",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_aggregate_outside_window(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::AggregateCall { .. } => true,
+        BoundExpr::WindowCall { .. } => false,
+        _ => {
+            let mut found = false;
+            let _ = crate::params::for_each_child(expr, &mut |child| {
+                found |= contains_aggregate_outside_window(child);
+                Ok(())
+            });
+            found
+        }
     }
 }
 
@@ -1152,6 +1204,12 @@ fn reject_non_constraint_safe(expr: &BoundExpr) -> Result<()> {
             return Err(plan_error(
                 SqlState::FeatureNotSupported,
                 "aggregate functions are not allowed in DEFAULT or CHECK expressions",
+            ));
+        }
+        BoundExpr::WindowCall { .. } => {
+            return Err(plan_error(
+                SqlState::WindowingError,
+                "window functions are not allowed in DEFAULT or CHECK expressions",
             ));
         }
         BoundExpr::Parameter { .. } => {

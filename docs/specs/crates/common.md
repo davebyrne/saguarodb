@@ -644,7 +644,11 @@ pub enum SqlState {
     DuplicateTable,
     DuplicateCursor,
     DatatypeMismatch,
+    WindowingError,                   // 42P20
+    GroupingError,                    // 42803
     DivisionByZero,
+    NullValueNotAllowed,              // 22004
+    InvalidPrecedingOrFollowingSize,  // 22013
     InvalidParameterValue,
     NumericValueOutOfRange,
     StringDataRightTruncation,
@@ -685,6 +689,11 @@ pub type Result<T> = std::result::Result<T, DbError>;
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
 `SqlState::code` is the single source of truth for PostgreSQL wire SQLSTATE
 strings, and `SqlState::from_code` is the reverse parser for known codes.
+Window binding uses `WindowingError` (`42P20`) for placement, nesting, and
+frame-order violations, `GroupingError` (`42803`) for a window call inside an
+ordinary aggregate argument, `NullValueNotAllowed` (`22004`) for a NULL frame
+offset, and `InvalidPrecedingOrFollowingSize` (`22013`) for a negative frame
+offset.
 Foreign-key metadata reserves `23503` (`ForeignKeyViolation`), `42830`
 (`InvalidForeignKey`), and `42710` (`DuplicateObject`). Executor enforcement uses
 `23503` for both a missing referenced parent and an incoming dependent row;

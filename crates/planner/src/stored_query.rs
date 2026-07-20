@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use catalog::{CatalogManager, SystemView};
 use common::{
-    BindingId, ColumnDef, ColumnInfo, DbError, FunctionId, Result, STORED_QUERY_VERSION,
+    BindingId, ColumnDef, ColumnInfo, DbError, FunctionId, Result, STORED_QUERY_VERSION, SqlState,
     StoredColumnReference, StoredCorrelatedColumn, StoredDistinct, StoredFrom, StoredJoinType,
     StoredOrderBy, StoredQueryBinOp, StoredQueryBody, StoredQueryColumn, StoredQueryExpr,
     StoredQueryUnaryOp, StoredQueryV1, StoredRangeColumn, StoredRowLock, StoredSelect,
@@ -393,6 +393,12 @@ fn store_expr(
         },
         BoundExpr::Parameter { .. } => {
             return Err(DbError::internal("parameter in resolved view query"));
+        }
+        BoundExpr::WindowCall { .. } => {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "window functions are not supported in CREATE VIEW",
+            ));
         }
         BoundExpr::InputRef {
             input,
@@ -819,15 +825,14 @@ fn lower_query(
     let mut ranges = BTreeMap::new();
     let body = match &query.body {
         StoredQueryBody::Select(select) => {
+            let mut source_width = 0;
             let from = select
                 .from
                 .as_ref()
-                .map(|from| {
-                    let mut next_slot = 0;
-                    lower_from(catalog, from, &mut ranges, &mut next_slot, depth + 1)
-                })
+                .map(|from| lower_from(catalog, from, &mut ranges, &mut source_width, depth + 1))
                 .transpose()?;
             BoundQueryBody::Select(Box::new(BoundSelect {
+                source_width,
                 distinct: select
                     .distinct
                     .as_ref()

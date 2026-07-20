@@ -250,6 +250,7 @@ pub struct OutputColumn { pub name: String, pub data_type: DataType, pub nullabl
 // impl BoundQuery { fn output_schema(&self) -> &[ColumnInfo]; fn output_columns(&self) -> Vec<OutputColumn>; }
 
 pub struct BoundSelect {
+    pub source_width: usize,             // FROM-row width captured immediately after binding
     pub distinct: Option<BoundDistinct>,  // All | On(keys)
     pub columns: Vec<BoundSelectItem>,
     pub from: Option<BoundFrom>,          // None for a FROM-less SELECT (`SELECT 1`)
@@ -306,6 +307,10 @@ pub enum BoundFrom {
     },
 }
 ```
+
+`source_width` is zero for a FROM-less SELECT and otherwise records the complete
+bound FROM-row width before projection, grouping, or expression rewriting. M3
+uses this fixed boundary as the base slot count for non-aggregate window plans.
 
 For `CREATE TABLE`, binder defaults an absent `compression` option to
 `CompressionSetting::None`. It merges `Statement::CreateTable.toast` into
@@ -405,6 +410,13 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    WindowCall {
+        func: WindowFunc,
+        args: Vec<BoundExpr>,
+        spec: Box<BoundWindowSpec>,
+        data_type: DataType,
+        nullable: bool,
+    },
     LocalRef {
         slot: usize,
         data_type: DataType,
@@ -476,6 +488,37 @@ pub enum BoundExpr {
         nullable: bool,
     },
 }
+
+pub enum WindowFunc {
+    RowNumber, Rank, DenseRank, Ntile, PercentRank, CumeDist,
+    Lag, Lead, FirstValue, LastValue, NthValue,
+    Aggregate(AggregateFunc),
+}
+
+pub enum WindowFrameUnits { Rows, Range }
+
+pub enum BoundFrameBound {
+    UnboundedPreceding,
+    PrecedingRows(u64),
+    PrecedingRange(Value),
+    CurrentRow,
+    FollowingRows(u64),
+    FollowingRange(Value),
+    UnboundedFollowing,
+}
+
+pub struct BoundWindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: BoundFrameBound,
+    pub end: BoundFrameBound,
+}
+
+pub struct BoundWindowSpec {
+    pub partition_by: Vec<BoundExpr>,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub frame: BoundWindowFrame,
+}
+
 ```
 
 Every `BoundExpr` variant carries its resolved output `data_type` and `nullable` value. Binder assigns these fields before logical planning, and logical/physical planning preserves them when rewriting expressions. `slot` is the runtime access path for `InputRef` and `LocalRef`; `input` and `column` are for debugging, EXPLAIN, and future rebinding. A `Value::Null` literal is typed by context during binding; if no context can determine a valid `DataType`, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression, and rejects the expression only when the list also provides no type context.
@@ -490,6 +533,11 @@ Expression metadata rules:
 - `Case`: binder-selected result type; nullable when any selected result expression is nullable or no `ELSE` exists.
 - `Cast`: target type; nullable matches the input expression.
 - `AggregateCall` and `LocalRef`: use the aggregate/group output metadata assigned by logical planning.
+- `WindowCall`: the binder resolves the function family, arguments, effective
+  frame, result type, and nullability. `ROWS` offsets are stored as `u64` and
+  `RANGE` offsets as typed `Value`s. Window calls bind only in SELECT output,
+  query `ORDER BY`, and DISTINCT keys; execution remains behind the M2 staging
+  `0A000` guard until window plan nodes arrive in M3.
 - `ScalarSubquery`, `Exists`, `InSubquery`: the binder binds the inner SELECT in a fresh, uncorrelated scope (it does not see the outer query's columns). A scalar subquery and the right side of `IN` must produce exactly one output column (else `SqlState::SyntaxError`); a scalar subquery's type is that column's type and it is always nullable. `EXISTS` is a non-null boolean. For `IN`/`NOT IN`, the left operand is type-checked against the subquery's column type (no implicit casts; mismatch is `SqlState::DatatypeMismatch`). These variants are constants with respect to the outer query, so the outer aggregate/grouping analyses treat them as leaves (only `InSubquery`'s left operand participates in the outer scope). Logical/physical planning preserve the inner `BoundQuery` unchanged; the executor plans and runs it.
 
 ## Shared Plan Expression Types

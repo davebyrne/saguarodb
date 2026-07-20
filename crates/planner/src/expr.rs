@@ -88,6 +88,13 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    WindowCall {
+        func: WindowFunc,
+        args: Vec<BoundExpr>,
+        spec: Box<BoundWindowSpec>,
+        data_type: DataType,
+        nullable: bool,
+    },
     LocalRef {
         slot: usize,
         data_type: DataType,
@@ -321,6 +328,53 @@ pub enum AggregateFunc {
     StringAgg,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile,
+    PercentRank,
+    CumeDist,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Aggregate(AggregateFunc),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundFrameBound {
+    UnboundedPreceding,
+    PrecedingRows(u64),
+    PrecedingRange(Value),
+    CurrentRow,
+    FollowingRows(u64),
+    FollowingRange(Value),
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundWindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: BoundFrameBound,
+    pub end: BoundFrameBound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundWindowSpec {
+    pub partition_by: Vec<BoundExpr>,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub frame: BoundWindowFrame,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundOrderByItem {
     pub expr: BoundExpr,
@@ -339,6 +393,7 @@ impl BoundExpr {
             | BoundExpr::Currval { data_type, .. }
             | BoundExpr::Setval { data_type, .. }
             | BoundExpr::AggregateCall { data_type, .. }
+            | BoundExpr::WindowCall { data_type, .. }
             | BoundExpr::LocalRef { data_type, .. }
             | BoundExpr::OuterRef { data_type, .. }
             | BoundExpr::IsNull { data_type, .. }
@@ -372,6 +427,7 @@ impl BoundExpr {
             | BoundExpr::Currval { nullable, .. }
             | BoundExpr::Setval { nullable, .. }
             | BoundExpr::AggregateCall { nullable, .. }
+            | BoundExpr::WindowCall { nullable, .. }
             | BoundExpr::LocalRef { nullable, .. }
             | BoundExpr::OuterRef { nullable, .. }
             | BoundExpr::IsNull { nullable, .. }

@@ -86,6 +86,9 @@ fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> R
             "aggregate {} reached executor scalar evaluation",
             aggregate_name(*func)
         ))),
+        BoundExpr::WindowCall { .. } => Err(DbError::internal(
+            "window function reached scalar evaluation",
+        )),
         BoundExpr::IsNull { expr, .. } => Ok(Value::Boolean(matches!(
             eval_expr_inner(ctx, expr, row)?,
             Value::Null

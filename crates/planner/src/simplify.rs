@@ -510,6 +510,25 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             data_type,
             nullable,
         },
+        BoundExpr::WindowCall {
+            func,
+            args,
+            mut spec,
+            data_type,
+            nullable,
+        } => {
+            spec.partition_by = spec.partition_by.into_iter().map(fold_expr).collect();
+            for item in &mut spec.order_by {
+                item.expr = fold_expr(item.expr.clone());
+            }
+            BoundExpr::WindowCall {
+                func,
+                args: args.into_iter().map(fold_expr).collect(),
+                spec,
+                data_type,
+                nullable,
+            }
+        }
         BoundExpr::IsNull {
             expr,
             data_type,

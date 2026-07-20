@@ -1,9 +1,14 @@
 use common::{ColumnDef, DataType, DbError, PgType, Result, SqlState, Value};
-use parser::{Expr, FunctionArg, Query};
+use parser::{Expr, FunctionArg, Query, WindowSpec};
 
-use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, CorrelatedColumn, UnaryOp};
+use crate::{
+    AggregateFunc, BinOp, BoundExpr, BoundFrameBound, BoundOrderByItem, BoundQuery,
+    BoundWindowFrame, BoundWindowSpec, CorrelatedColumn, UnaryOp, WindowFrameUnits, WindowFunc,
+};
 
-use super::{BindContext, Binding, input_ref, plan_error, reject_aggregate, require_type};
+use super::{
+    BindContext, Binding, input_ref, plan_error, reject_aggregate, reject_window, require_type,
+};
 
 pub(super) fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
     let bound = bind_expr(ctx, expr, Some(DataType::Boolean))?;
@@ -37,10 +42,12 @@ fn bind_expr_with_pg_type(
             args,
             distinct,
         } => bind_function(ctx, name, args, *distinct),
-        Expr::WindowFunction { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "window functions are not yet supported",
-        )),
+        Expr::WindowFunction {
+            name,
+            args,
+            distinct,
+            spec,
+        } => bind_window_function(ctx, name, args, *distinct, spec),
         Expr::Array(elements) => bind_array(ctx, elements, expected),
         Expr::ArraySubscript { array, subscripts } => bind_array_subscript(ctx, array, subscripts),
         Expr::Any { left, op, array } => bind_any(ctx, left, op.clone(), array),
@@ -733,7 +740,13 @@ fn bind_function(
 ) -> Result<BoundExpr> {
     let name = name.to_ascii_lowercase();
     if let Some(func) = aggregate_func(&name) {
-        return bind_aggregate(ctx, func, args, distinct);
+        return bind_aggregate(ctx, func, args, distinct, false);
+    }
+    if window_func(&name).is_some() {
+        return Err(plan_error(
+            SqlState::WrongObjectType,
+            format!("window function {name} requires an OVER clause"),
+        ));
     }
     if distinct {
         return Err(plan_error(
@@ -1017,7 +1030,26 @@ fn bind_aggregate(
     func: AggregateFunc,
     args: &[FunctionArg],
     distinct: bool,
+    allow_nested_aggregate: bool,
 ) -> Result<BoundExpr> {
+    let (arg, data_type, nullable) =
+        aggregate_parts(ctx, func, args, distinct, allow_nested_aggregate)?;
+    Ok(BoundExpr::AggregateCall {
+        func,
+        arg,
+        distinct,
+        data_type,
+        nullable,
+    })
+}
+
+fn aggregate_parts(
+    ctx: &mut BindContext,
+    func: AggregateFunc,
+    args: &[FunctionArg],
+    distinct: bool,
+    allow_nested_aggregate: bool,
+) -> Result<(Option<Box<BoundExpr>>, DataType, bool)> {
     let arg = if func == AggregateFunc::StringAgg {
         let [FunctionArg::Expr(value), FunctionArg::Expr(delimiter)] = args else {
             return Err(plan_error(
@@ -1029,8 +1061,12 @@ fn bind_aggregate(
         let delimiter = bind_expr(ctx, delimiter, Some(DataType::Text))?;
         require_type(&value, DataType::Text)?;
         require_type(&delimiter, DataType::Text)?;
-        reject_aggregate(&value)?;
-        reject_aggregate(&delimiter)?;
+        if !allow_nested_aggregate {
+            reject_aggregate(&value)?;
+            reject_aggregate(&delimiter)?;
+            reject_window_in_aggregate(&value)?;
+            reject_window_in_aggregate(&delimiter)?;
+        }
         reject_outer_only_aggregate_arg(&value)?;
         reject_outer_only_aggregate_arg(&delimiter)?;
         Some(Box::new(BoundExpr::Array {
@@ -1057,7 +1093,10 @@ fn bind_aggregate(
             }
             [FunctionArg::Expr(expr)] => {
                 let arg = bind_expr(ctx, expr, None)?;
-                reject_aggregate(&arg)?;
+                if !allow_nested_aggregate {
+                    reject_aggregate(&arg)?;
+                    reject_window_in_aggregate(&arg)?;
+                }
                 reject_outer_only_aggregate_arg(&arg)?;
                 Some(Box::new(arg))
             }
@@ -1168,13 +1207,540 @@ fn bind_aggregate(
         AggregateFunc::StringAgg => (DataType::Text, true),
     };
 
-    Ok(BoundExpr::AggregateCall {
+    Ok((arg, data_type, nullable))
+}
+
+fn window_func(name: &str) -> Option<WindowFunc> {
+    match name {
+        "row_number" => Some(WindowFunc::RowNumber),
+        "rank" => Some(WindowFunc::Rank),
+        "dense_rank" => Some(WindowFunc::DenseRank),
+        "ntile" => Some(WindowFunc::Ntile),
+        "percent_rank" => Some(WindowFunc::PercentRank),
+        "cume_dist" => Some(WindowFunc::CumeDist),
+        "lag" => Some(WindowFunc::Lag),
+        "lead" => Some(WindowFunc::Lead),
+        "first_value" => Some(WindowFunc::FirstValue),
+        "last_value" => Some(WindowFunc::LastValue),
+        "nth_value" => Some(WindowFunc::NthValue),
+        _ => None,
+    }
+}
+
+fn bind_window_function(
+    ctx: &mut BindContext,
+    name: &str,
+    args: &[FunctionArg],
+    distinct: bool,
+    spec: &WindowSpec,
+) -> Result<BoundExpr> {
+    let name = name.to_ascii_lowercase();
+    let func = window_func(&name)
+        .or_else(|| aggregate_func(&name).map(WindowFunc::Aggregate))
+        .ok_or_else(|| {
+            plan_error(
+                SqlState::WrongObjectType,
+                format!("OVER specified, but {name} is not a window function nor an aggregate"),
+            )
+        })?;
+    if distinct {
+        if matches!(func, WindowFunc::Aggregate(_)) {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "DISTINCT is not supported for window aggregates",
+            ));
+        }
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("window function {name} does not support DISTINCT"),
+        ));
+    }
+
+    let (args, data_type, nullable) = match func {
+        WindowFunc::Aggregate(aggregate) => {
+            let (arg, data_type, nullable) = aggregate_parts(ctx, aggregate, args, false, true)?;
+            (
+                arg.into_iter().map(|arg| *arg).collect(),
+                data_type,
+                nullable,
+            )
+        }
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist => {
+            require_window_arity(&name, args, 0, 0)?;
+            let data_type = if matches!(func, WindowFunc::PercentRank | WindowFunc::CumeDist) {
+                DataType::Double
+            } else {
+                DataType::Integer
+            };
+            (Vec::new(), data_type, false)
+        }
+        WindowFunc::Ntile => {
+            let exprs = window_expr_args(&name, args, 1, 1)?;
+            let [arg] = exprs.as_slice() else {
+                return Err(DbError::internal("validated NTILE arity changed"));
+            };
+            let arg = bind_expr(ctx, arg, Some(DataType::Integer))?;
+            require_type(&arg, DataType::Integer)?;
+            let nullable = arg.nullable();
+            (vec![arg], DataType::Integer, nullable)
+        }
+        WindowFunc::Lag | WindowFunc::Lead => bind_lag_lead(ctx, &name, args)?,
+        WindowFunc::FirstValue | WindowFunc::LastValue => {
+            let exprs = window_expr_args(&name, args, 1, 1)?;
+            let [arg] = exprs.as_slice() else {
+                return Err(DbError::internal("validated value-window arity changed"));
+            };
+            let arg = bind_expr(ctx, arg, None)?;
+            let data_type = arg.data_type();
+            (vec![arg], data_type, true)
+        }
+        WindowFunc::NthValue => {
+            let exprs = window_expr_args(&name, args, 2, 2)?;
+            let [value, n] = exprs.as_slice() else {
+                return Err(DbError::internal("validated NTH_VALUE arity changed"));
+            };
+            let value = bind_expr(ctx, value, None)?;
+            let n = bind_expr(ctx, n, Some(DataType::Integer))?;
+            require_type(&n, DataType::Integer)?;
+            let data_type = value.data_type();
+            (vec![value, n], data_type, true)
+        }
+    };
+
+    for arg in &args {
+        reject_window(arg, "window function calls cannot be nested")?;
+        reject_correlated_window_subquery(arg)?;
+    }
+    let spec = bind_window_spec(ctx, spec)?;
+    Ok(BoundExpr::WindowCall {
         func,
-        arg,
-        distinct,
+        args,
+        spec: Box::new(spec),
         data_type,
         nullable,
     })
+}
+
+fn require_window_arity(name: &str, args: &[FunctionArg], min: usize, max: usize) -> Result<()> {
+    if (min..=max).contains(&args.len()) {
+        return Ok(());
+    }
+    let expected = if min == max {
+        format!("exactly {min}")
+    } else {
+        format!("between {min} and {max}")
+    };
+    Err(plan_error(
+        SqlState::SyntaxError,
+        format!("window function {name} expects {expected} arguments"),
+    ))
+}
+
+fn window_expr_args<'a>(
+    name: &str,
+    args: &'a [FunctionArg],
+    min: usize,
+    max: usize,
+) -> Result<Vec<&'a Expr>> {
+    require_window_arity(name, args, min, max)?;
+    expr_args(name, args)
+}
+
+fn bind_lag_lead(
+    ctx: &mut BindContext,
+    name: &str,
+    args: &[FunctionArg],
+) -> Result<(Vec<BoundExpr>, DataType, bool)> {
+    let exprs = window_expr_args(name, args, 1, 3)?;
+    let Some(value) = exprs.first() else {
+        return Err(DbError::internal("validated LAG/LEAD arity changed"));
+    };
+    let value = bind_expr(ctx, value, None)?;
+    let data_type = value.data_type();
+    let mut bound = vec![value];
+    if let Some(offset) = exprs.get(1) {
+        if matches!(offset, Expr::Literal(Value::Null)) {
+            bound.push(BoundExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Integer,
+                nullable: true,
+            });
+        } else {
+            let value = integer_constant(offset).ok_or_else(|| {
+                if literal_constant(offset) {
+                    plan_error(
+                        SqlState::DatatypeMismatch,
+                        format!("{name} offset must be an integer"),
+                    )
+                } else {
+                    plan_error(
+                        SqlState::FeatureNotSupported,
+                        format!("{name} offset must be a bind-time integer constant"),
+                    )
+                }
+            })?;
+            bound.push(BoundExpr::Literal {
+                value: Value::Integer(value),
+                data_type: DataType::Integer,
+                nullable: false,
+            });
+        }
+    }
+    if let Some(default) = exprs.get(2) {
+        let default = bind_expr(ctx, default, Some(data_type.clone()))?;
+        require_type(&default, data_type.clone())?;
+        bound.push(default);
+    }
+    Ok((bound, data_type, true))
+}
+
+fn literal_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_))
+        || matches!(
+            expr,
+            Expr::UnaryOp {
+                op: parser::UnaryOp::Neg,
+                expr,
+            } if matches!(expr.as_ref(), Expr::Literal(_))
+        )
+}
+
+fn integer_constant(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Value::Integer(value)) => Some(*value),
+        Expr::UnaryOp {
+            op: parser::UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Value::Integer(value)) => value.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn bind_window_spec(ctx: &mut BindContext, spec: &WindowSpec) -> Result<BoundWindowSpec> {
+    let mut partition_by = Vec::with_capacity(spec.partition_by.len());
+    for expr in &spec.partition_by {
+        let expr = bind_expr(ctx, expr, None)?;
+        reject_window(&expr, "window function calls cannot be nested")?;
+        reject_correlated_window_subquery(&expr)?;
+        partition_by.push(expr);
+    }
+    let mut order_by = Vec::with_capacity(spec.order_by.len());
+    for item in &spec.order_by {
+        let expr = bind_expr(ctx, &item.expr, None)?;
+        reject_window(&expr, "window function calls cannot be nested")?;
+        reject_correlated_window_subquery(&expr)?;
+        order_by.push(BoundOrderByItem {
+            expr,
+            ascending: item.ascending,
+            nulls_first: item.nulls_first,
+        });
+    }
+    let frame = resolve_window_frame(ctx, spec.frame.as_ref(), &order_by)?;
+    Ok(BoundWindowSpec {
+        partition_by,
+        order_by,
+        frame,
+    })
+}
+
+fn resolve_window_frame(
+    ctx: &mut BindContext,
+    frame: Option<&parser::WindowFrame>,
+    order_by: &[BoundOrderByItem],
+) -> Result<BoundWindowFrame> {
+    let Some(frame) = frame else {
+        return Ok(BoundWindowFrame {
+            units: WindowFrameUnits::Range,
+            start: BoundFrameBound::UnboundedPreceding,
+            end: if order_by.is_empty() {
+                BoundFrameBound::UnboundedFollowing
+            } else {
+                BoundFrameBound::CurrentRow
+            },
+        });
+    };
+    validate_frame_order(&frame.start, &frame.end)?;
+    let units = match frame.units {
+        parser::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        parser::WindowFrameUnits::Range => WindowFrameUnits::Range,
+    };
+    let has_offset = matches!(
+        frame.start,
+        parser::WindowFrameBound::Preceding(_) | parser::WindowFrameBound::Following(_)
+    ) || matches!(
+        frame.end,
+        parser::WindowFrameBound::Preceding(_) | parser::WindowFrameBound::Following(_)
+    );
+    let range_type = if units == WindowFrameUnits::Range && has_offset {
+        let [key] = order_by else {
+            return Err(plan_error(
+                SqlState::WindowingError,
+                "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+            ));
+        };
+        Some(match key.expr.data_type() {
+            DataType::Integer => DataType::Integer,
+            DataType::Numeric { .. } => DataType::Numeric {
+                precision: None,
+                scale: 0,
+            },
+            DataType::Double => DataType::Double,
+            DataType::Real => DataType::Real,
+            DataType::Date | DataType::Timestamp | DataType::TimestampTz => DataType::Interval,
+            other => {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {other:?}"
+                    ),
+                ));
+            }
+        })
+    } else {
+        None
+    };
+    Ok(BoundWindowFrame {
+        units,
+        start: bind_frame_bound(ctx, &frame.start, units, range_type.as_ref())?,
+        end: bind_frame_bound(ctx, &frame.end, units, range_type.as_ref())?,
+    })
+}
+
+fn validate_frame_order(
+    start: &parser::WindowFrameBound,
+    end: &parser::WindowFrameBound,
+) -> Result<()> {
+    let invalid = matches!(start, parser::WindowFrameBound::UnboundedFollowing)
+        || matches!(end, parser::WindowFrameBound::UnboundedPreceding)
+        || (matches!(start, parser::WindowFrameBound::CurrentRow)
+            && matches!(end, parser::WindowFrameBound::Preceding(_)))
+        || (matches!(start, parser::WindowFrameBound::Following(_))
+            && matches!(end, parser::WindowFrameBound::Preceding(_)))
+        || (matches!(start, parser::WindowFrameBound::Following(_))
+            && matches!(end, parser::WindowFrameBound::CurrentRow));
+    if invalid {
+        return Err(plan_error(
+            SqlState::WindowingError,
+            "window frame start cannot be after frame end",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_frame_bound(
+    _ctx: &mut BindContext,
+    bound: &parser::WindowFrameBound,
+    units: WindowFrameUnits,
+    range_type: Option<&DataType>,
+) -> Result<BoundFrameBound> {
+    let (expr, preceding) = match bound {
+        parser::WindowFrameBound::UnboundedPreceding => {
+            return Ok(BoundFrameBound::UnboundedPreceding);
+        }
+        parser::WindowFrameBound::CurrentRow => return Ok(BoundFrameBound::CurrentRow),
+        parser::WindowFrameBound::UnboundedFollowing => {
+            return Ok(BoundFrameBound::UnboundedFollowing);
+        }
+        parser::WindowFrameBound::Preceding(expr) => (expr.as_ref(), true),
+        parser::WindowFrameBound::Following(expr) => (expr.as_ref(), false),
+    };
+    match units {
+        WindowFrameUnits::Rows => {
+            if matches!(expr, Expr::Literal(Value::Null)) {
+                return Err(plan_error(
+                    SqlState::NullValueNotAllowed,
+                    "window frame offset must not be NULL",
+                ));
+            }
+            let Some(value) = integer_constant(expr) else {
+                if literal_constant(expr) {
+                    return Err(plan_error(
+                        SqlState::DatatypeMismatch,
+                        "ROWS frame offset must be an integer literal",
+                    ));
+                }
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "window frame offset must be a literal",
+                ));
+            };
+            let value = u64::try_from(value).map_err(|_| {
+                plan_error(
+                    SqlState::InvalidPrecedingOrFollowingSize,
+                    "window frame offset must not be negative",
+                )
+            })?;
+            Ok(if preceding {
+                BoundFrameBound::PrecedingRows(value)
+            } else {
+                BoundFrameBound::FollowingRows(value)
+            })
+        }
+        WindowFrameUnits::Range => {
+            let value = signed_literal(expr)?.ok_or_else(|| {
+                if literal_constant(expr) {
+                    plan_error(
+                        SqlState::DatatypeMismatch,
+                        "RANGE frame offset has the wrong literal type",
+                    )
+                } else {
+                    plan_error(
+                        SqlState::FeatureNotSupported,
+                        "window frame offset must be a literal",
+                    )
+                }
+            })?;
+            if matches!(value, Value::Null) {
+                return Err(plan_error(
+                    SqlState::NullValueNotAllowed,
+                    "window frame offset must not be NULL",
+                ));
+            }
+            let expected = range_type.ok_or_else(|| {
+                DbError::internal("RANGE offset bound has no resolved offset type")
+            })?;
+            let value = resolve_range_offset_literal(value, expected)?;
+            if value_is_negative(&value) {
+                return Err(plan_error(
+                    SqlState::InvalidPrecedingOrFollowingSize,
+                    "window frame offset must not be negative",
+                ));
+            }
+            Ok(if preceding {
+                BoundFrameBound::PrecedingRange(value)
+            } else {
+                BoundFrameBound::FollowingRange(value)
+            })
+        }
+    }
+}
+
+fn resolve_range_offset_literal(value: Value, expected: &DataType) -> Result<Value> {
+    let resolved = match (value, expected) {
+        (Value::Integer(value), DataType::Integer) => Some(Value::Integer(value)),
+        (Value::Integer(value), DataType::Numeric { .. }) => {
+            Some(Value::Numeric(common::numeric::from_i64(value)))
+        }
+        (Value::Float(value), DataType::Numeric { .. }) => {
+            common::numeric::from_f64(value.get()).map(Value::Numeric)
+        }
+        (Value::Numeric(value), DataType::Numeric { .. }) => Some(Value::Numeric(value)),
+        (Value::Float(value), DataType::Double) => Some(Value::Float(value)),
+        (Value::Float(value), DataType::Real) => {
+            common::float::parse_real(&value.get().to_string())
+                .map(common::OrderedF32::new)
+                .map(Value::Real)
+        }
+        (Value::Real(value), DataType::Real) => Some(Value::Real(value)),
+        (Value::Integer(value), DataType::Double) => value
+            .to_string()
+            .parse::<f64>()
+            .ok()
+            .map(common::OrderedF64::new)
+            .map(Value::Float),
+        (Value::Numeric(value), DataType::Double) => common::numeric::to_f64(&value)
+            .map(common::OrderedF64::new)
+            .map(Value::Float),
+        (Value::Integer(value), DataType::Real) => value
+            .to_string()
+            .parse::<f32>()
+            .ok()
+            .map(common::OrderedF32::new)
+            .map(Value::Real),
+        (Value::Numeric(value), DataType::Real) => value
+            .to_string()
+            .parse::<f32>()
+            .ok()
+            .map(common::OrderedF32::new)
+            .map(Value::Real),
+        (Value::Interval(value), DataType::Interval) => Some(Value::Interval(value)),
+        _ => None,
+    };
+    resolved.ok_or_else(|| {
+        plan_error(
+            SqlState::DatatypeMismatch,
+            format!("RANGE frame offset cannot be resolved as {expected:?}"),
+        )
+    })
+}
+
+fn signed_literal(expr: &Expr) -> Result<Option<Value>> {
+    match expr {
+        Expr::Literal(value) => Ok(Some(value.clone())),
+        Expr::UnaryOp {
+            op: parser::UnaryOp::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Value::Integer(value)) => Ok(value.checked_neg().map(Value::Integer)),
+            Expr::Literal(Value::Float(value)) => {
+                Ok(Some(Value::Float(common::OrderedF64::new(-value.get()))))
+            }
+            Expr::Literal(Value::Real(value)) => {
+                Ok(Some(Value::Real(common::OrderedF32::new(-value.get()))))
+            }
+            Expr::Literal(Value::Numeric(value)) => Ok(Some(Value::Numeric(-*value))),
+            Expr::Literal(Value::Interval(value)) => Ok(value.checked_neg().map(Value::Interval)),
+            Expr::Literal(_) => Ok(None),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn value_is_negative(value: &Value) -> bool {
+    match value {
+        Value::Integer(value) => *value < 0,
+        Value::Float(value) => value.get() < 0.0,
+        Value::Real(value) => value.get() < 0.0,
+        Value::Numeric(value) => value.is_sign_negative() && !value.is_zero(),
+        Value::Interval(value) => *value < common::Interval::ZERO,
+        _ => false,
+    }
+}
+
+fn reject_correlated_window_subquery(expr: &BoundExpr) -> Result<()> {
+    if contains_correlated_subquery(expr)? {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "correlated subqueries in window function arguments or specifications are not supported",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_window_in_aggregate(expr: &BoundExpr) -> Result<()> {
+    if super::contains_window(expr) {
+        return Err(plan_error(
+            SqlState::GroupingError,
+            "window function calls are not allowed in aggregate arguments",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_correlated_subquery(expr: &BoundExpr) -> Result<bool> {
+    match expr {
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. }
+            if !query.correlations.is_empty() =>
+        {
+            return Ok(true);
+        }
+        BoundExpr::InSubquery { query, .. } if !query.correlations.is_empty() => return Ok(true),
+        _ => {}
+    }
+    let mut found = false;
+    crate::params::for_each_child(expr, &mut |child| {
+        found |= contains_correlated_subquery(child)?;
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 /// PostgreSQL attributes an aggregate whose arguments reference ONLY

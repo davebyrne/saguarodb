@@ -19,7 +19,7 @@ use super::query::{
     bind_excluded_binding, bind_query, bind_select_item, bind_table_from_schema,
     select_output_schema,
 };
-use super::{BindContext, CteScope, plan_error, reject_aggregate, require_table};
+use super::{BindContext, CteScope, plan_error, reject_aggregate, reject_window, require_table};
 
 /// Bind `COPY <table> [(cols)] FROM STDIN | TO STDOUT`: resolve the table and the
 /// (possibly defaulted) column list to ids, reusing the INSERT column resolver.
@@ -235,6 +235,10 @@ fn bind_do_update(
         }
         let value = bind_expr(&mut ctx, &assignment.value, Some(column.data_type.clone()))?;
         let value = coerce_assignment_expr(value, column);
+        reject_window(
+            &value,
+            "window functions are not allowed in ON CONFLICT SET",
+        )?;
         reject_aggregate(&value)?;
         validate_assignable(&value, column)?;
         bound_assignments.push((column.id, value));
@@ -244,6 +248,10 @@ fn bind_do_update(
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     if let Some(filter) = &filter {
+        reject_window(
+            filter,
+            "window functions are not allowed in ON CONFLICT WHERE",
+        )?;
         reject_aggregate(filter)?;
     }
 
@@ -275,6 +283,7 @@ fn bind_returning(
         bind_select_item(&mut ctx, item, None, &mut bound_items)?;
     }
     for item in &bound_items {
+        reject_window(&item.expr, "window functions are not allowed in RETURNING")?;
         reject_aggregate(&item.expr)?;
     }
     let output_schema = select_output_schema(&ctx, &bound_items);
@@ -310,6 +319,7 @@ fn bind_insert_values(
                 Some(column.data_type.clone()),
             )?;
             let bound = coerce_assignment_expr(bound, column);
+            reject_window(&bound, "window functions are not allowed in VALUES")?;
             reject_aggregate(&bound)?;
             validate_assignable(&bound, column)?;
             bound_row.push(bound);
@@ -392,6 +402,7 @@ pub(super) fn bind_update(
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     if let Some(filter) = &source_filter {
+        reject_window(filter, "window functions are not allowed in WHERE")?;
         reject_aggregate(filter)?;
     }
 
@@ -407,6 +418,7 @@ pub(super) fn bind_update(
         }
         let value = bind_expr(&mut ctx, &assignment.value, Some(column.data_type.clone()))?;
         let value = coerce_assignment_expr(value, column);
+        reject_window(&value, "window functions are not allowed in UPDATE SET")?;
         reject_aggregate(&value)?;
         validate_assignable(&value, column)?;
         bound_assignments.push((column.id, value));
@@ -418,6 +430,7 @@ pub(super) fn bind_update(
         table: table.id,
         assignments: bound_assignments,
         source: BoundSelect {
+            source_width: ctx.next_slot,
             distinct: None,
             columns: bindings_select_items(&ctx),
             from: Some(from),
@@ -452,12 +465,14 @@ pub(super) fn bind_delete(
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     if let Some(filter) = &source_filter {
+        reject_window(filter, "window functions are not allowed in WHERE")?;
         reject_aggregate(filter)?;
     }
 
     Ok(BoundStatement::Delete {
         table: table.id,
         source: BoundSelect {
+            source_width: ctx.next_slot,
             distinct: None,
             columns: bindings_select_items(&ctx),
             from: Some(from),

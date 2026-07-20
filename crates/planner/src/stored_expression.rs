@@ -300,6 +300,7 @@ fn store_node(expr: &BoundExpr, columns: &[ColumnDef]) -> Result<StoredExpr> {
         },
         BoundExpr::Parameter { .. }
         | BoundExpr::AggregateCall { .. }
+        | BoundExpr::WindowCall { .. }
         | BoundExpr::LocalRef { .. }
         | BoundExpr::OuterRef { .. }
         | BoundExpr::RuntimeInSet { .. }

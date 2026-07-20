@@ -608,6 +608,18 @@ pub(crate) fn for_each_child(
             }
             Ok(())
         }
+        BoundExpr::WindowCall { args, spec, .. } => {
+            for arg in args {
+                f(arg)?;
+            }
+            for expr in &spec.partition_by {
+                f(expr)?;
+            }
+            for item in &spec.order_by {
+                f(&item.expr)?;
+            }
+            Ok(())
+        }
         BoundExpr::InList { expr, list, .. } => {
             f(expr)?;
             for item in list {
@@ -707,6 +719,18 @@ fn for_each_child_mut(
         BoundExpr::AggregateCall { arg, .. } => {
             if let Some(arg) = arg {
                 f(arg)?;
+            }
+            Ok(())
+        }
+        BoundExpr::WindowCall { args, spec, .. } => {
+            for arg in args {
+                f(arg)?;
+            }
+            for expr in &mut spec.partition_by {
+                f(expr)?;
+            }
+            for item in &mut spec.order_by {
+                f(&mut item.expr)?;
             }
             Ok(())
         }

@@ -1,7 +1,7 @@
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result, SchemaId,
-    SequenceOptions, StoredQueryV1, TableId, ToastOptions,
+    SequenceOptions, SqlState, StoredQueryV1, TableId, ToastOptions,
 };
 
 use crate::{
@@ -588,6 +588,11 @@ fn plan_select_body(
         for item in order_by {
             collect_aggregates(&item.expr, &mut aggregates);
         }
+        if let Some(BoundDistinct::On(keys)) = &select.distinct {
+            for key in keys {
+                collect_aggregates(key, &mut aggregates);
+            }
+        }
 
         let output_schema = aggregate_output_schema(&select.group_by, &aggregates);
         plan = LogicalPlan::Aggregate {
@@ -629,9 +634,15 @@ fn plan_select_body(
             .iter()
             .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
             .collect::<Result<Vec<_>>>()?;
-        // DISTINCT ON keys may reference grouped columns (the binder rejects
-        // aggregates in them), so they get the same grouped-expression rewrite
-        // as the projection expressions.
+        if matches!(
+            &select.distinct,
+            Some(BoundDistinct::On(keys)) if keys.iter().any(contains_window)
+        ) {
+            return Err(window_execution_not_implemented());
+        }
+        // DISTINCT ON keys may reference grouped columns and aggregates inside
+        // window arguments, so they get the same grouped-expression rewrite as
+        // the projection expressions.
         let distinct_keys = match &select.distinct {
             None => None,
             Some(BoundDistinct::All) => Some(expressions.clone()),
@@ -641,8 +652,28 @@ fn plan_select_body(
                     .collect::<Result<Vec<_>>>()?,
             ),
         };
+        if expressions.iter().any(contains_window)
+            || order_by.iter().any(|item| contains_window(&item.expr))
+            || distinct_keys
+                .as_ref()
+                .is_some_and(|keys| keys.iter().any(contains_window))
+        {
+            return Err(window_execution_not_implemented());
+        }
         plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     } else {
+        if select
+            .columns
+            .iter()
+            .any(|item| contains_window(&item.expr))
+            || order_by.iter().any(|item| contains_window(&item.expr))
+            || matches!(
+                &select.distinct,
+                Some(BoundDistinct::On(exprs)) if exprs.iter().any(contains_window)
+            )
+        {
+            return Err(window_execution_not_implemented());
+        }
         if !order_by.is_empty() {
             plan = LogicalPlan::Sort {
                 source: Box::new(plan),
@@ -681,6 +712,13 @@ fn plan_select_body(
     }
 
     Ok(apply_limit(plan, limit, offset))
+}
+
+fn window_execution_not_implemented() -> DbError {
+    DbError::plan(
+        SqlState::FeatureNotSupported,
+        "window function execution is not yet implemented",
+    )
 }
 
 /// Stack the optional `Distinct` node below the `Projection`. `Distinct` sits
@@ -1029,6 +1067,17 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
             };
             if !output.iter().any(|existing| existing == &aggregate) {
                 output.push(aggregate);
+            }
+        }
+        BoundExpr::WindowCall { args, spec, .. } => {
+            for arg in args {
+                collect_aggregates(arg, output);
+            }
+            for expr in &spec.partition_by {
+                collect_aggregates(expr, output);
+            }
+            for item in &spec.order_by {
+                collect_aggregates(&item.expr, output);
             }
         }
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -1414,6 +1463,33 @@ fn rewrite_aggregate_expr(
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
+        BoundExpr::WindowCall {
+            func,
+            args,
+            spec,
+            data_type,
+            nullable,
+        } => {
+            let mut spec = spec.clone();
+            spec.partition_by = spec
+                .partition_by
+                .iter()
+                .map(|expr| rewrite_aggregate_expr(expr, group_by, aggregates))
+                .collect::<Result<Vec<_>>>()?;
+            for item in &mut spec.order_by {
+                item.expr = rewrite_aggregate_expr(&item.expr, group_by, aggregates)?;
+            }
+            Ok(BoundExpr::WindowCall {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|expr| rewrite_aggregate_expr(expr, group_by, aggregates))
+                    .collect::<Result<Vec<_>>>()?,
+                spec,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+            })
+        }
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
@@ -1477,6 +1553,14 @@ fn rewrite_query_correlations(
 pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::AggregateCall { .. } => true,
+        BoundExpr::WindowCall { args, spec, .. } => {
+            args.iter().any(contains_aggregate)
+                || spec.partition_by.iter().any(contains_aggregate)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| contains_aggregate(&item.expr))
+        }
         BoundExpr::BinaryOp { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
         }
@@ -1526,4 +1610,16 @@ pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }
+}
+
+pub(crate) fn contains_window(expr: &BoundExpr) -> bool {
+    if matches!(expr, BoundExpr::WindowCall { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = crate::params::for_each_child(expr, &mut |child| {
+        found |= contains_window(child);
+        Ok(())
+    });
+    found
 }

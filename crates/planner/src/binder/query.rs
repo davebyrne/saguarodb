@@ -13,7 +13,8 @@ use crate::{
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::{
     BindContext, Binding, CteBinding, CteScope, OuterLink, PendingCorrelation, contains_aggregate,
-    input_ref, plan_error, reject_aggregate, require_type,
+    input_ref, plan_error, reject_aggregate, reject_aggregate_outside_window, reject_window,
+    require_type,
 };
 
 /// Bind a query expression: bind any `WITH` CTEs into a child scope, then bind the
@@ -149,6 +150,19 @@ fn bind_row_lock(
     let Some(lock) = lock else {
         return Ok(None);
     };
+    if select
+        .columns
+        .iter()
+        .any(|item| super::contains_window(&item.expr))
+        || order_by
+            .iter()
+            .any(|item| super::contains_window(&item.expr))
+    {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "row locking is not supported with window functions",
+        ));
+    }
     if select.distinct.is_some()
         || !select.group_by.is_empty()
         || select.having.is_some()
@@ -683,6 +697,7 @@ fn bind_values<'a>(
             let mut ctx = BindContext::with_outer(catalog, declared, search_path, outer.clone());
             ctx.cte_scope = ctes.clone();
             let bound = bind_expr(&mut ctx, expr, Some(data_type.clone()))?;
+            reject_window(&bound, "window functions are not allowed in VALUES")?;
             reject_aggregate(&bound)?;
             require_type(&bound, data_type)?;
             bound_row.push(bound);
@@ -725,12 +740,14 @@ fn bind_select<'a>(
         apply_outer_join_nullability(&mut ctx, &from)?;
         Some(from)
     };
+    let source_width = ctx.next_slot;
     let filter = select
         .filter
         .as_ref()
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     if let Some(filter) = &filter {
+        reject_window(filter, "window functions are not allowed in WHERE")?;
         reject_aggregate(filter)?;
     }
 
@@ -739,6 +756,7 @@ fn bind_select<'a>(
         .iter()
         .map(|expr| {
             let bound = bind_expr(&mut ctx, expr, None)?;
+            reject_window(&bound, "window functions are not allowed in GROUP BY")?;
             reject_aggregate(&bound)?;
             Ok(bound)
         })
@@ -764,6 +782,9 @@ fn bind_select<'a>(
         .as_ref()
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
+    if let Some(having) = &having {
+        reject_window(having, "window functions are not allowed in HAVING")?;
+    }
     let order_by = bind_order_by(&mut ctx, order_by, &columns)?;
     let distinct = bind_distinct(&mut ctx, select.distinct.as_ref(), &columns, &order_by)?;
 
@@ -788,6 +809,7 @@ fn bind_select<'a>(
 
     Ok((
         BoundSelect {
+            source_width,
             distinct,
             columns,
             from,
@@ -1018,6 +1040,7 @@ pub(super) fn bind_from_item(
             };
             ctx.on_scope_start = saved_on_scope;
             if let Some(condition) = &condition {
+                reject_window(condition, "window functions are not allowed in JOIN ON")?;
                 reject_aggregate(condition)?;
             }
             Ok(BoundFrom::Join {
@@ -1097,6 +1120,10 @@ fn bind_table_function(
         ));
     }
     for arg in &bound_args {
+        reject_window(
+            arg,
+            "window functions are not allowed in table-function arguments",
+        )?;
         reject_aggregate(arg)?;
     }
     let visible_name = alias.unwrap_or(name).to_string();
@@ -1578,7 +1605,7 @@ fn bind_distinct(
                 .iter()
                 .map(|expr| {
                     let bound = bind_expr(ctx, expr, None)?;
-                    reject_aggregate(&bound)?;
+                    reject_aggregate_outside_window(&bound)?;
                     Ok(bound)
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1675,6 +1702,18 @@ fn validate_aggregate_usage(
 
 fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()> {
     if matches!(expr, BoundExpr::AggregateCall { .. }) {
+        return Ok(());
+    }
+    if let BoundExpr::WindowCall { args, spec, .. } = expr {
+        for arg in args {
+            validate_grouped_expr(arg, group_by)?;
+        }
+        for expr in &spec.partition_by {
+            validate_grouped_expr(expr, group_by)?;
+        }
+        for item in &spec.order_by {
+            validate_grouped_expr(&item.expr, group_by)?;
+        }
         return Ok(());
     }
     // A subquery's body is its own scope; only its correlation entries (and
@@ -1796,7 +1835,7 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::InSubquery { .. } => Ok(()),
-        BoundExpr::AggregateCall { .. } => Ok(()),
+        BoundExpr::AggregateCall { .. } | BoundExpr::WindowCall { .. } => Ok(()),
     }
 }
 
@@ -1831,6 +1870,14 @@ fn references_input(expr: &BoundExpr) -> bool {
             value, is_called, ..
         } => references_input(value) || is_called.as_deref().is_some_and(references_input),
         BoundExpr::AggregateCall { arg, .. } => arg.as_deref().is_some_and(references_input),
+        BoundExpr::WindowCall { args, spec, .. } => {
+            args.iter().any(references_input)
+                || spec.partition_by.iter().any(references_input)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| references_input(&item.expr))
+        }
         BoundExpr::InList { expr, list, .. } => {
             references_input(expr) || list.iter().any(references_input)
         }

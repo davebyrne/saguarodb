@@ -1,10 +1,11 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress — milestones M0–M1 are complete; implementation
-milestones M2–M6 are pending. Window calls now parse into a dedicated AST node,
-but the binder rejects them with `0A000`, so window functions remain unavailable
-for execution. The affected crate specifications,
+**Status:** In progress — milestones M0–M2 are complete; implementation
+milestones M3–M6 are pending. Window calls now parse, bind, and receive complete
+placement, nesting, typing, and frame validation, but logical planning rejects
+them with a temporary `0A000`, so window functions remain unavailable for
+execution. The affected crate specifications,
 `docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
 milestone as listed in §11.
 
@@ -512,7 +513,7 @@ or row context.
   conversions, shorthand normalization, and parser rejection matrix; leave a
   binder staging guard. Documentation updated: this spec and
   `docs/specs/crates/parser.md`.
-- **M2 — `feat(planner): bind and validate window function calls`.** Add the
+- **M2 — `feat(planner): bind and validate window function calls` (complete).** Add the
   SQLSTATEs used at bind time, bound types, function and frame validation,
   placement/nesting guards, result typing, `source_width`, all expression-
   walker arms, the durable-view rejection, and a temporary planning guard.

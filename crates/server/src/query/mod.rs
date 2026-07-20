@@ -2898,6 +2898,17 @@ fn collect_expr_objects(expr: &BoundExpr, references: &mut BoundObjectReferences
             }
         }
         BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_objects(arg, references)?,
+        BoundExpr::WindowCall { args, spec, .. } => {
+            for arg in args {
+                collect_expr_objects(arg, references)?;
+            }
+            for expr in &spec.partition_by {
+                collect_expr_objects(expr, references)?;
+            }
+            for item in &spec.order_by {
+                collect_expr_objects(&item.expr, references)?;
+            }
+        }
         BoundExpr::InList { expr, list, .. } => {
             collect_expr_objects(expr, references)?;
             for item in list {
