@@ -44,7 +44,9 @@ trait seams.
   `OFFSET`, scalar / `[NOT] IN` / `[NOT] EXISTS` subqueries — correlated in
   `WHERE`, the select list, and `HAVING`, with equality shapes decorrelated to
   hash semi/anti joins — and `LATERAL` derived tables
-  (`docs/specs/subqueries.md`). `unnest(array)` and integer
+  (`docs/specs/subqueries.md`), plus window functions with `ROWS`/`RANGE`
+  frames, ranking, offset/value functions, and aggregates over windows
+  (`docs/specs/window-functions.md`). `unnest(array)` and integer
   `generate_series(...)` are implicitly lateral table functions.
 - Data types include integer widths and serial families, boolean, text and
   bounded character types, date/time/timestamp/timestamptz/interval, bytea,
@@ -93,8 +95,7 @@ trait seams.
 SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, or time-travel
 queries. Important follow-on areas include a fuller cost-based optimizer (join
-reordering, multi-column index ranges), recursive queries, window functions,
-advanced index options
+reordering, multi-column index ranges), recursive queries, advanced index options
 (partial/expression/concurrent/include indexes), and more complete sequence and
 constraint DDL.
 

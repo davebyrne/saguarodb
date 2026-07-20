@@ -1,8 +1,16 @@
-use common::{ColumnInfo, DbError, ExecRow, Result, Row, SqlState, StatementContext, Value};
-use planner::{BoundExpr, BoundOrderByItem, BoundWindowSpec, WindowFunc, WindowFuncExpr};
+use std::cmp::Ordering;
+
+use common::{
+    ColumnInfo, DbError, Decimal, ExecRow, Result, Row, SqlState, StatementContext, Value,
+};
+use planner::{
+    AggregateExpr, AggregateFunc, BoundExpr, BoundFrameBound, BoundOrderByItem, BoundWindowSpec,
+    WindowFrameUnits, WindowFunc, WindowFuncExpr,
+};
 use spill::{ExternalSorter, SortedStream, SpillConfig, SpillContext, SpillTape, SpillTapeReader};
 
 use crate::eval_expr;
+use crate::ops::aggregate::AggregateState;
 use crate::ops::sort::compare_keys;
 use crate::ops::spill_row::SpillRow;
 use crate::query::{PlanExecutor, close_after, open_executor};
@@ -37,6 +45,29 @@ enum RuntimeFunction {
         default: Option<BoundExpr>,
         cursor: Option<usize>,
     },
+    FirstValue {
+        value: BoundExpr,
+    },
+    LastValue {
+        value: BoundExpr,
+    },
+    NthValue {
+        value: BoundExpr,
+        n: BoundExpr,
+    },
+    Aggregate {
+        aggregate: AggregateExpr,
+        mode: AggregateMode,
+        collect: bool,
+        cache_peers: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateMode {
+    WholePartition,
+    Growing,
+    Sliding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +82,7 @@ struct OffsetKey {
     amount: u64,
 }
 
+#[derive(Clone)]
 struct TapeCursor {
     reader: SpillTapeReader<SpillRow>,
     next_index: u64,
@@ -101,12 +133,28 @@ struct PartitionState {
     current: TapeCursor,
     peer_probe: TapeCursor,
     offsets: Vec<(OffsetKey, TapeCursor)>,
+    frame_start: TapeCursor,
+    frame_end: TapeCursor,
+    range_start_probe: TapeCursor,
+    range_end_probe: TapeCursor,
+    frame_start_index: u64,
+    frame_end_index: u64,
     count: u64,
     emit_index: u64,
     peer_start: u64,
     peer_end: u64,
     dense_rank: u64,
     ntile: Vec<Option<Value>>,
+    aggregates: Vec<Option<AggregateRuntime>>,
+}
+
+struct AggregateRuntime {
+    state: Option<AggregateState>,
+    feed: TapeCursor,
+    fed: u64,
+    frame_start: u64,
+    cached_peer_end: Option<u64>,
+    cached_value: Option<Value>,
 }
 
 impl WindowOp<'_> {
@@ -129,7 +177,7 @@ impl WindowOp<'_> {
                 column_id: None,
                 pg_type: None,
             });
-            runtime.push(runtime_function(function, &mut offset_keys)?);
+            runtime.push(runtime_function(function, &spec, &mut offset_keys)?);
         }
 
         Ok(WindowOp {
@@ -197,28 +245,66 @@ impl WindowOp<'_> {
 
         let current = TapeCursor::new(tape.reader()?);
         let peer_probe = TapeCursor::new(tape.reader()?);
+        let frame_start = TapeCursor::new(tape.reader()?);
+        let frame_end = TapeCursor::new(tape.reader()?);
+        let range_start_probe = TapeCursor::new(tape.reader()?);
+        let range_end_probe = TapeCursor::new(tape.reader()?);
         let mut offsets = Vec::new();
         for key in &self.offset_keys {
             offsets.push((*key, TapeCursor::new(tape.reader()?)));
         }
         let mut ntile = vec![None; self.functions.len()];
+        let mut aggregates = Vec::with_capacity(self.functions.len());
+        let aggregate_spill_ctx = self
+            .spill_ctx
+            .as_ref()
+            .ok_or_else(|| DbError::internal("window spill context is missing"))?
+            .clone();
         for (index, function) in self.functions.iter().enumerate() {
             if let RuntimeFunction::Ntile { arg } = function {
                 let value = eval_expr(&self.ctx, arg, &first_row)?;
                 ntile[index] = Some(validate_ntile(value)?);
             }
+            let runtime = match function {
+                RuntimeFunction::Aggregate {
+                    aggregate,
+                    mode,
+                    collect,
+                    ..
+                } => Some(AggregateRuntime {
+                    state: if *collect || matches!(mode, AggregateMode::Sliding) {
+                        None
+                    } else {
+                        Some(AggregateState::new(aggregate, aggregate_spill_ctx.clone())?)
+                    },
+                    feed: TapeCursor::new(tape.reader()?),
+                    fed: 0,
+                    frame_start: 0,
+                    cached_peer_end: None,
+                    cached_value: None,
+                }),
+                _ => None,
+            };
+            aggregates.push(runtime);
         }
         self.partition = Some(PartitionState {
             _tape: tape,
             current,
             peer_probe,
             offsets,
+            frame_start,
+            frame_end,
+            range_start_probe,
+            range_end_probe,
+            frame_start_index: 0,
+            frame_end_index: 0,
             count,
             emit_index: 0,
             peer_start: 0,
             peer_end: 0,
             dense_rank: 0,
             ntile,
+            aggregates,
         });
         Ok(true)
     }
@@ -233,6 +319,7 @@ impl PlanExecutor for WindowOp<'_> {
         self.stream = None;
         self.pending = None;
         self.partition = None;
+        validate_frame_offsets(&self.spec)?;
         let spill_ctx = self.spill.for_operator(self.ctx.cancel.clone());
         self.spill_ctx = Some(spill_ctx.clone());
 
@@ -304,6 +391,21 @@ impl PlanExecutor for WindowOp<'_> {
                 self.spec.partition_by.len(),
                 self.spec.order_by.len(),
             )?;
+            let (frame_start, frame_end) = frame_bounds(
+                &self.ctx,
+                &self.spec,
+                partition,
+                &record,
+                self.spec.partition_by.len(),
+            )?;
+            if frame_start < partition.count {
+                partition
+                    .frame_start
+                    .advance_to(frame_start)?
+                    .ok_or_else(|| {
+                        DbError::internal("window frame-start cursor ended inside partition")
+                    })?;
+            }
             let mut values = record.row.row.values.clone();
             values
                 .try_reserve(self.functions.len())
@@ -316,6 +418,11 @@ impl PlanExecutor for WindowOp<'_> {
                     function_index,
                     partition,
                     &record.row,
+                    frame_start,
+                    frame_end,
+                    self.spill_ctx
+                        .as_ref()
+                        .ok_or_else(|| DbError::internal("window spill context is missing"))?,
                 )?);
             }
             partition.emit_index = partition
@@ -340,6 +447,7 @@ impl PlanExecutor for WindowOp<'_> {
 
 fn runtime_function(
     function: &WindowFuncExpr,
+    spec: &BoundWindowSpec,
     offset_keys: &mut Vec<OffsetKey>,
 ) -> Result<RuntimeFunction> {
     Ok(match function.func {
@@ -398,14 +506,39 @@ fn runtime_function(
                 cursor,
             }
         }
-        WindowFunc::FirstValue
-        | WindowFunc::LastValue
-        | WindowFunc::NthValue
-        | WindowFunc::Aggregate(_) => {
-            return Err(DbError::plan(
-                SqlState::FeatureNotSupported,
-                "window frames are not yet implemented",
-            ));
+        WindowFunc::FirstValue => RuntimeFunction::FirstValue {
+            value: required_arg(&function.args, 0, "first_value")?.clone(),
+        },
+        WindowFunc::LastValue => RuntimeFunction::LastValue {
+            value: required_arg(&function.args, 0, "last_value")?.clone(),
+        },
+        WindowFunc::NthValue => RuntimeFunction::NthValue {
+            value: required_arg(&function.args, 0, "nth_value")?.clone(),
+            n: required_arg(&function.args, 1, "nth_value")?.clone(),
+        },
+        WindowFunc::Aggregate(func) => {
+            let aggregate = AggregateExpr {
+                func,
+                arg: function.args.first().cloned(),
+                distinct: false,
+                data_type: function.data_type.clone(),
+                nullable: function.nullable,
+            };
+            let collect = matches!(func, AggregateFunc::ArrayAgg | AggregateFunc::StringAgg);
+            let mode = if is_whole_partition_frame(spec) {
+                AggregateMode::WholePartition
+            } else if matches!(spec.frame.start, BoundFrameBound::UnboundedPreceding) {
+                AggregateMode::Growing
+            } else {
+                AggregateMode::Sliding
+            };
+            RuntimeFunction::Aggregate {
+                aggregate,
+                mode,
+                collect,
+                cache_peers: matches!(spec.frame.units, WindowFrameUnits::Range)
+                    && matches!(spec.frame.end, BoundFrameBound::CurrentRow),
+            }
         }
     })
 }
@@ -432,6 +565,340 @@ fn validate_ntile(value: Value) -> Result<Value> {
         )),
         _ => Err(DbError::internal("ntile argument is not an integer")),
     }
+}
+
+fn is_whole_partition_frame(spec: &BoundWindowSpec) -> bool {
+    matches!(spec.frame.start, BoundFrameBound::UnboundedPreceding)
+        && matches!(spec.frame.end, BoundFrameBound::UnboundedFollowing)
+}
+
+fn validate_frame_offsets(spec: &BoundWindowSpec) -> Result<()> {
+    for bound in [&spec.frame.start, &spec.frame.end] {
+        let value = match bound {
+            BoundFrameBound::PrecedingRange(value) | BoundFrameBound::FollowingRange(value) => {
+                value
+            }
+            _ => continue,
+        };
+        if matches!(value, Value::Null) {
+            return Err(DbError::execute(
+                SqlState::NullValueNotAllowed,
+                "frame offset must not be null",
+            ));
+        }
+        let negative = match value {
+            Value::Integer(value) => *value < 0,
+            Value::Numeric(value) => *value < Decimal::ZERO,
+            Value::Float(value) => value.0 < 0.0,
+            Value::Real(value) => value.0 < 0.0,
+            Value::Interval(value) => *value < common::Interval::ZERO,
+            _ => {
+                return Err(DbError::internal(
+                    "RANGE frame offset has an unsupported runtime type",
+                ));
+            }
+        };
+        if negative {
+            return Err(DbError::execute(
+                SqlState::InvalidPrecedingOrFollowingSize,
+                "frame starting offset must not be negative",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn frame_bounds(
+    ctx: &StatementContext,
+    spec: &BoundWindowSpec,
+    partition: &mut PartitionState,
+    current: &SpillRow,
+    partition_key_count: usize,
+) -> Result<(u64, u64)> {
+    match spec.frame.units {
+        WindowFrameUnits::Rows => Ok((
+            rows_bound(
+                &spec.frame.start,
+                partition.emit_index,
+                partition.count,
+                false,
+            )?,
+            rows_bound(&spec.frame.end, partition.emit_index, partition.count, true)?,
+        )),
+        WindowFrameUnits::Range => {
+            if spec.order_by.is_empty() {
+                let boundary = |bound: &BoundFrameBound, end: bool| match bound {
+                    BoundFrameBound::UnboundedPreceding => Ok(0),
+                    BoundFrameBound::CurrentRow => Ok(if end { partition.count } else { 0 }),
+                    BoundFrameBound::UnboundedFollowing => Ok(partition.count),
+                    _ => Err(DbError::internal(
+                        "offset RANGE frame unexpectedly has no order key",
+                    )),
+                };
+                return Ok((
+                    boundary(&spec.frame.start, false)?,
+                    boundary(&spec.frame.end, true)?,
+                ));
+            }
+            let order_key = current
+                .keys
+                .get(partition_key_count)
+                .ok_or_else(|| DbError::internal("RANGE frame order key is missing"))?;
+            let start = range_bound(
+                ctx,
+                &spec.frame.start,
+                false,
+                spec,
+                order_key,
+                partition_key_count,
+                partition.peer_start,
+                partition.peer_end,
+                partition.count,
+                &mut partition.range_start_probe,
+                &mut partition.frame_start_index,
+            )?;
+            let end = range_bound(
+                ctx,
+                &spec.frame.end,
+                true,
+                spec,
+                order_key,
+                partition_key_count,
+                partition.peer_start,
+                partition.peer_end,
+                partition.count,
+                &mut partition.range_end_probe,
+                &mut partition.frame_end_index,
+            )?;
+            Ok((start, end))
+        }
+    }
+}
+
+fn rows_bound(bound: &BoundFrameBound, index: u64, count: u64, end: bool) -> Result<u64> {
+    let inclusive = |target: u64| -> Result<u64> {
+        if end {
+            target
+                .checked_add(1)
+                .map(|value| value.min(count))
+                .ok_or_else(|| DbError::internal("ROWS frame boundary overflow"))
+        } else {
+            Ok(target.min(count))
+        }
+    };
+    match bound {
+        BoundFrameBound::UnboundedPreceding => Ok(0),
+        BoundFrameBound::PrecedingRows(offset) => match index.checked_sub(*offset) {
+            Some(target) => inclusive(target),
+            None => Ok(0),
+        },
+        BoundFrameBound::CurrentRow => inclusive(index),
+        BoundFrameBound::FollowingRows(offset) => match index.checked_add(*offset) {
+            Some(target) => inclusive(target),
+            None => Ok(count),
+        },
+        BoundFrameBound::UnboundedFollowing => Ok(count),
+        BoundFrameBound::PrecedingRange(_) | BoundFrameBound::FollowingRange(_) => {
+            Err(DbError::internal("RANGE offset found in ROWS frame"))
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RangeThreshold {
+    BelowAll,
+    Value(Value),
+    AboveAll,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn range_bound(
+    ctx: &StatementContext,
+    bound: &BoundFrameBound,
+    end: bool,
+    spec: &BoundWindowSpec,
+    current_key: &Value,
+    key_index: usize,
+    peer_start: u64,
+    peer_end: u64,
+    count: u64,
+    cursor: &mut TapeCursor,
+    probe_index: &mut u64,
+) -> Result<u64> {
+    match bound {
+        BoundFrameBound::UnboundedPreceding => Ok(0),
+        BoundFrameBound::UnboundedFollowing => Ok(count),
+        BoundFrameBound::CurrentRow => Ok(if end { peer_end } else { peer_start }),
+        BoundFrameBound::PrecedingRange(offset) | BoundFrameBound::FollowingRange(offset) => {
+            if matches!(current_key, Value::Null) {
+                return Ok(if end { peer_end } else { peer_start });
+            }
+            let order = spec
+                .order_by
+                .first()
+                .ok_or_else(|| DbError::internal("offset RANGE frame has no order key"))?;
+            let preceding = matches!(bound, BoundFrameBound::PrecedingRange(_));
+            let add = preceding != order.ascending;
+            let threshold = range_threshold(current_key, offset, add)?;
+            while *probe_index < count {
+                ctx.cancel.check()?;
+                let row = cursor
+                    .advance_to(*probe_index)?
+                    .ok_or_else(|| DbError::internal("RANGE frame probe ended inside partition"))?;
+                let candidate = row
+                    .keys
+                    .get(key_index)
+                    .ok_or_else(|| DbError::internal("RANGE frame probe order key is missing"))?;
+                if matches!(candidate, Value::Null) {
+                    if order.nulls_first.unwrap_or(!order.ascending) {
+                        *probe_index = probe_index
+                            .checked_add(1)
+                            .ok_or_else(|| DbError::internal("RANGE frame probe index overflow"))?;
+                        continue;
+                    }
+                    return Ok(*probe_index);
+                }
+                let comparison = compare_range_candidate(candidate, &threshold, order)?;
+                if comparison == Ordering::Greater || (!end && comparison == Ordering::Equal) {
+                    return Ok(*probe_index);
+                }
+                *probe_index = probe_index
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::internal("RANGE frame probe index overflow"))?;
+            }
+            Ok(count)
+        }
+        BoundFrameBound::PrecedingRows(_) | BoundFrameBound::FollowingRows(_) => {
+            Err(DbError::internal("ROWS offset found in RANGE frame"))
+        }
+    }
+}
+
+fn range_threshold(key: &Value, offset: &Value, add: bool) -> Result<RangeThreshold> {
+    let overflow = || {
+        if add {
+            RangeThreshold::AboveAll
+        } else {
+            RangeThreshold::BelowAll
+        }
+    };
+    let value = match (key, offset) {
+        (Value::Integer(key), Value::Integer(offset)) => {
+            let value = if add {
+                key.checked_add(*offset)
+            } else {
+                key.checked_sub(*offset)
+            };
+            return Ok(value.map_or_else(overflow, |value| {
+                RangeThreshold::Value(Value::Integer(value))
+            }));
+        }
+        (Value::Numeric(key), Value::Numeric(offset)) => {
+            let value = if add {
+                key.checked_add(*offset)
+            } else {
+                key.checked_sub(*offset)
+            };
+            return Ok(value.map_or_else(overflow, |value| {
+                RangeThreshold::Value(Value::Numeric(value))
+            }));
+        }
+        (Value::Float(key), Value::Float(offset)) => {
+            let raw = if add {
+                key.0 + offset.0
+            } else {
+                key.0 - offset.0
+            };
+            if raw.is_infinite() {
+                return Ok(overflow());
+            }
+            Value::Float(raw.into())
+        }
+        (Value::Real(key), Value::Real(offset)) => {
+            let raw = if add {
+                key.0 + offset.0
+            } else {
+                key.0 - offset.0
+            };
+            if raw.is_infinite() {
+                return Ok(overflow());
+            }
+            Value::Real(raw.into())
+        }
+        (Value::Timestamp(key), Value::Interval(offset)) => {
+            let Some(value) = shift_range_timestamp(*key, *offset, add) else {
+                return Ok(overflow());
+            };
+            Value::Timestamp(value)
+        }
+        (Value::TimestampTz(key), Value::Interval(offset)) => {
+            let Some(value) = shift_range_timestamp(*key, *offset, add) else {
+                return Ok(overflow());
+            };
+            Value::TimestampTz(value)
+        }
+        (Value::Date(days), Value::Interval(offset)) => {
+            const MICROS_PER_DAY: i64 = 86_400_000_000;
+            let Some(micros) = days.checked_mul(MICROS_PER_DAY) else {
+                return Ok(overflow());
+            };
+            let Some(value) = shift_range_timestamp(micros, *offset, add) else {
+                return Ok(overflow());
+            };
+            Value::Timestamp(value)
+        }
+        _ => {
+            return Err(DbError::internal(
+                "RANGE frame key and offset runtime types do not match",
+            ));
+        }
+    };
+    Ok(RangeThreshold::Value(value))
+}
+
+fn shift_range_timestamp(micros: i64, offset: common::Interval, add: bool) -> Option<i64> {
+    let offset = if add {
+        Some(offset)
+    } else {
+        offset.checked_neg()
+    }?;
+    common::datetime::add_interval_to_timestamp(micros, &offset)
+}
+
+fn compare_range_candidate(
+    candidate: &Value,
+    threshold: &RangeThreshold,
+    order: &BoundOrderByItem,
+) -> Result<Ordering> {
+    let natural = match threshold {
+        RangeThreshold::BelowAll => Ordering::Greater,
+        RangeThreshold::AboveAll => Ordering::Less,
+        RangeThreshold::Value(Value::Timestamp(threshold))
+            if matches!(candidate, Value::Date(_)) =>
+        {
+            const MICROS_PER_DAY: i64 = 86_400_000_000;
+            let Value::Date(days) = candidate else {
+                return Err(DbError::internal("date RANGE candidate changed type"));
+            };
+            let micros = days
+                .checked_mul(MICROS_PER_DAY)
+                .ok_or_else(|| DbError::internal("date RANGE candidate overflow"))?;
+            micros.cmp(threshold)
+        }
+        RangeThreshold::Value(threshold) => {
+            if std::mem::discriminant(candidate) != std::mem::discriminant(threshold) {
+                return Err(DbError::internal(
+                    "RANGE frame comparison would cross value variants",
+                ));
+            }
+            candidate.cmp(threshold)
+        }
+    };
+    Ok(if order.ascending {
+        natural
+    } else {
+        natural.reverse()
+    })
 }
 
 fn update_peer_group(
@@ -465,12 +932,16 @@ fn update_peer_group(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_function(
     ctx: &StatementContext,
     function: &RuntimeFunction,
     function_index: usize,
     partition: &mut PartitionState,
     current: &ExecRow,
+    frame_start: u64,
+    frame_end: u64,
+    spill_ctx: &SpillContext,
 ) -> Result<Value> {
     match function {
         RuntimeFunction::RowNumber => integer_value(
@@ -543,7 +1014,250 @@ fn evaluate_function(
                     .map_or(Ok(Value::Null), |default| eval_expr(ctx, default, current)),
             }
         }
+        RuntimeFunction::FirstValue { value } => evaluate_frame_value(
+            ctx,
+            &mut partition.frame_start,
+            value,
+            frame_start,
+            frame_end,
+        ),
+        RuntimeFunction::LastValue { value } => {
+            if frame_start >= frame_end {
+                return Ok(Value::Null);
+            }
+            let target = frame_end
+                .checked_sub(1)
+                .ok_or_else(|| DbError::internal("window frame end underflow"))?;
+            let row = partition
+                .frame_end
+                .advance_to(target)?
+                .ok_or_else(|| DbError::internal("window frame-last cursor ended early"))?;
+            eval_expr(ctx, value, &row.row)
+        }
+        RuntimeFunction::NthValue { value, n } => {
+            let n = eval_expr(ctx, n, current)?;
+            let Value::Integer(n) = n else {
+                if matches!(n, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                return Err(DbError::internal("nth_value argument is not an integer"));
+            };
+            if n < 1 {
+                return Err(DbError::execute(
+                    SqlState::InvalidArgumentForNthValue,
+                    "argument of nth_value must be greater than zero",
+                ));
+            }
+            let offset = u64::try_from(n)
+                .map_err(|_| DbError::internal("positive nth_value argument conversion failed"))?
+                .checked_sub(1)
+                .ok_or_else(|| DbError::internal("nth_value offset underflow"))?;
+            let Some(target) = frame_start.checked_add(offset) else {
+                return Ok(Value::Null);
+            };
+            if target >= frame_end {
+                return Ok(Value::Null);
+            }
+            let mut lookup = partition.frame_start.clone();
+            let row = lookup
+                .advance_to(target)?
+                .ok_or_else(|| DbError::internal("nth_value cursor ended inside frame"))?;
+            eval_expr(ctx, value, &row.row)
+        }
+        RuntimeFunction::Aggregate {
+            aggregate,
+            mode,
+            collect,
+            cache_peers,
+        } => {
+            let frame_cursor = partition.frame_start.clone();
+            let runtime = partition
+                .aggregates
+                .get_mut(function_index)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| DbError::internal("window aggregate runtime is missing"))?;
+            evaluate_window_aggregate(
+                ctx,
+                aggregate,
+                *mode,
+                *collect,
+                *cache_peers,
+                runtime,
+                frame_cursor,
+                frame_start,
+                frame_end,
+                partition.peer_end,
+                spill_ctx,
+            )
+        }
     }
+}
+
+fn evaluate_frame_value(
+    ctx: &StatementContext,
+    cursor: &mut TapeCursor,
+    value: &BoundExpr,
+    frame_start: u64,
+    frame_end: u64,
+) -> Result<Value> {
+    if frame_start >= frame_end {
+        return Ok(Value::Null);
+    }
+    let row = cursor
+        .advance_to(frame_start)?
+        .ok_or_else(|| DbError::internal("window frame-value cursor ended early"))?;
+    eval_expr(ctx, value, &row.row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_window_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    mode: AggregateMode,
+    collect: bool,
+    cache_peers: bool,
+    runtime: &mut AggregateRuntime,
+    frame_cursor: TapeCursor,
+    frame_start: u64,
+    frame_end: u64,
+    peer_end: u64,
+    spill_ctx: &SpillContext,
+) -> Result<Value> {
+    if collect {
+        return recompute_aggregate(
+            ctx,
+            aggregate,
+            frame_cursor,
+            frame_start,
+            frame_end,
+            spill_ctx,
+        );
+    }
+    match mode {
+        AggregateMode::WholePartition => {
+            if let Some(value) = &runtime.cached_value {
+                return Ok(value.clone());
+            }
+            feed_state_range(
+                ctx,
+                aggregate,
+                runtime
+                    .state
+                    .as_mut()
+                    .ok_or_else(|| DbError::internal("whole-partition state is missing"))?,
+                &mut runtime.feed,
+                runtime.fed,
+                frame_end,
+            )?;
+            runtime.fed = frame_end;
+            let value = runtime
+                .state
+                .as_ref()
+                .ok_or_else(|| DbError::internal("whole-partition state is missing"))?
+                .snapshot()?;
+            runtime.cached_value = Some(value.clone());
+            Ok(value)
+        }
+        AggregateMode::Growing => {
+            if cache_peers
+                && runtime.cached_peer_end == Some(peer_end)
+                && let Some(value) = &runtime.cached_value
+            {
+                return Ok(value.clone());
+            }
+            feed_state_range(
+                ctx,
+                aggregate,
+                runtime
+                    .state
+                    .as_mut()
+                    .ok_or_else(|| DbError::internal("growing aggregate state is missing"))?,
+                &mut runtime.feed,
+                runtime.fed,
+                frame_end,
+            )?;
+            runtime.fed = frame_end;
+            let value = runtime
+                .state
+                .as_ref()
+                .ok_or_else(|| DbError::internal("growing aggregate state is missing"))?
+                .snapshot()?;
+            runtime.cached_peer_end = Some(peer_end);
+            runtime.cached_value = Some(value.clone());
+            Ok(value)
+        }
+        AggregateMode::Sliding => {
+            if runtime.state.is_none() || runtime.frame_start != frame_start {
+                runtime.state = Some(AggregateState::new(aggregate, spill_ctx.clone())?);
+                runtime.feed = frame_cursor;
+                runtime.fed = frame_start;
+                runtime.frame_start = frame_start;
+            }
+            feed_state_range(
+                ctx,
+                aggregate,
+                runtime
+                    .state
+                    .as_mut()
+                    .ok_or_else(|| DbError::internal("sliding aggregate state is missing"))?,
+                &mut runtime.feed,
+                runtime.fed,
+                frame_end,
+            )?;
+            runtime.fed = frame_end;
+            runtime
+                .state
+                .as_ref()
+                .ok_or_else(|| DbError::internal("sliding aggregate state is missing"))?
+                .snapshot()
+        }
+    }
+}
+
+fn recompute_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    mut cursor: TapeCursor,
+    frame_start: u64,
+    frame_end: u64,
+    spill_ctx: &SpillContext,
+) -> Result<Value> {
+    let mut state = AggregateState::new(aggregate, spill_ctx.clone())?;
+    feed_state_range(
+        ctx,
+        aggregate,
+        &mut state,
+        &mut cursor,
+        frame_start,
+        frame_end,
+    )?;
+    state.finish()
+}
+
+fn feed_state_range(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    state: &mut AggregateState,
+    cursor: &mut TapeCursor,
+    mut index: u64,
+    end: u64,
+) -> Result<()> {
+    while index < end {
+        ctx.cancel.check()?;
+        let row = cursor
+            .advance_to(index)?
+            .ok_or_else(|| DbError::internal("window aggregate cursor ended inside frame"))?;
+        let value = aggregate
+            .arg
+            .as_ref()
+            .map(|arg| eval_expr(ctx, arg, &row.row))
+            .transpose()?;
+        state.step(value.as_ref())?;
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("window aggregate feed index overflow"))?;
+    }
+    Ok(())
 }
 
 fn ntile_value(index: u64, count: u64, tiles: i64) -> Result<Value> {
@@ -1086,8 +1800,22 @@ mod tests {
                 DataType::Text,
                 true,
             ),
+            function(
+                WindowFunc::Aggregate(AggregateFunc::Sum),
+                vec![input(1, DataType::Integer)],
+                DataType::Integer,
+                true,
+            ),
         ];
-        let window_spec = spec(vec![input(0, DataType::Integer)], vec![order(1)]);
+        let window_spec = BoundWindowSpec {
+            partition_by: vec![input(0, DataType::Integer)],
+            order_by: vec![order(1)],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: BoundFrameBound::PrecedingRows(2),
+                end: BoundFrameBound::FollowingRows(2),
+            },
+        };
         let (large, _) = run(
             values.clone(),
             window_spec.clone(),
@@ -1218,22 +1946,553 @@ mod tests {
     }
 
     #[test]
-    fn frame_respecting_functions_are_staged() {
-        let error = WindowOp::new(
-            StatementContext::new(1),
-            Box::new(source(vec![], Arc::new(AtomicUsize::new(0)))),
-            spec(vec![], vec![]),
-            vec![function(
+    fn default_range_frame_includes_peers_for_values_and_running_sum() {
+        let input_rows = vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("a".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("b".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Text("c".into()),
+            ],
+        ];
+        let functions = vec![
+            function(
                 WindowFunc::FirstValue,
+                vec![input(2, DataType::Text)],
+                DataType::Text,
+                true,
+            ),
+            function(
+                WindowFunc::LastValue,
+                vec![input(2, DataType::Text)],
+                DataType::Text,
+                true,
+            ),
+            function(
+                WindowFunc::NthValue,
+                vec![
+                    input(2, DataType::Text),
+                    literal(Value::Integer(2), DataType::Integer),
+                ],
+                DataType::Text,
+                true,
+            ),
+            function(
+                WindowFunc::Aggregate(AggregateFunc::Sum),
                 vec![input(1, DataType::Integer)],
                 DataType::Integer,
+                true,
+            ),
+        ];
+        let (output, _) = run(
+            input_rows,
+            spec(vec![], vec![order(1)]),
+            functions,
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.row.values[3..].to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    Value::Text("a".into()),
+                    Value::Text("b".into()),
+                    Value::Text("b".into()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Text("a".into()),
+                    Value::Text("b".into()),
+                    Value::Text("b".into()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Text("a".into()),
+                    Value::Text("c".into()),
+                    Value::Text("b".into()),
+                    Value::Integer(5),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn default_range_frame_null_key_includes_partition_prefix() {
+        let string_agg_args = BoundExpr::Array {
+            elements: vec![
+                input(2, DataType::Text),
+                literal(Value::Text(",".into()), DataType::Text),
+            ],
+            dimensions: vec![2],
+            element_type: DataType::Text,
+            data_type: DataType::Array(common::ArrayType::new(DataType::Text).unwrap()),
+            nullable: false,
+        };
+        let (output, _) = run(
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("1".into()),
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Text("2".into()),
+                ],
+                vec![Value::Integer(1), Value::Null, Value::Null],
+            ],
+            spec(vec![], vec![order(1)]),
+            vec![
+                function(
+                    WindowFunc::FirstValue,
+                    vec![input(1, DataType::Integer)],
+                    DataType::Integer,
+                    true,
+                ),
+                function(
+                    WindowFunc::Aggregate(AggregateFunc::StringAgg),
+                    vec![string_agg_args],
+                    DataType::Text,
+                    true,
+                ),
+            ],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.row.values[3..].to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![Value::Integer(1), Value::Text("1".into())],
+                vec![Value::Integer(1), Value::Text("1,2".into())],
+                vec![Value::Integer(1), Value::Text("1,2".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn whole_range_frame_null_key_uses_unbounded_bounds() {
+        let window_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![BoundOrderByItem {
+                expr: input(1, DataType::Integer),
+                ascending: false,
+                nulls_first: Some(true),
+            }],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Range,
+                start: BoundFrameBound::UnboundedPreceding,
+                end: BoundFrameBound::UnboundedFollowing,
+            },
+        };
+        let (output, _) = run(
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("one".into()),
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Text("two".into()),
+                ],
+                vec![Value::Integer(1), Value::Null, Value::Text("null".into())],
+            ],
+            window_spec,
+            vec![
+                function(
+                    WindowFunc::Aggregate(AggregateFunc::Sum),
+                    vec![input(1, DataType::Integer)],
+                    DataType::Integer,
+                    true,
+                ),
+                function(
+                    WindowFunc::LastValue,
+                    vec![input(2, DataType::Text)],
+                    DataType::Text,
+                    true,
+                ),
+            ],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.row.values[3..].to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![Value::Integer(3), Value::Text("one".into())],
+                vec![Value::Integer(3), Value::Text("one".into())],
+                vec![Value::Integer(3), Value::Text("one".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_moving_and_empty_frames_and_nth_error() {
+        let moving_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![order(1)],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: BoundFrameBound::PrecedingRows(1),
+                end: BoundFrameBound::FollowingRows(1),
+            },
+        };
+        let sum = function(
+            WindowFunc::Aggregate(AggregateFunc::Sum),
+            vec![input(1, DataType::Integer)],
+            DataType::Integer,
+            true,
+        );
+        let values = (1..=3)
+            .map(|value| {
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(value),
+                    Value::Text("x".into()),
+                ]
+            })
+            .collect();
+        let (moving, _) = run(
+            values,
+            moving_spec,
+            vec![sum.clone()],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            moving
+                .iter()
+                .map(|row| row.row.values[3].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Integer(3), Value::Integer(6), Value::Integer(5)]
+        );
+
+        let empty_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![order(1)],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: BoundFrameBound::FollowingRows(2),
+                end: BoundFrameBound::FollowingRows(3),
+            },
+        };
+        let (empty, _) = run(
+            vec![vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("x".into()),
+            ]],
+            empty_spec,
+            vec![
+                sum,
+                function(
+                    WindowFunc::Aggregate(AggregateFunc::Count),
+                    vec![],
+                    DataType::Integer,
+                    false,
+                ),
+            ],
+            SpillConfig::default(),
+        );
+        assert_eq!(empty[0].row.values[3..], [Value::Null, Value::Integer(0)]);
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut op = WindowOp::new(
+            StatementContext::new(1),
+            Box::new(source(
+                vec![vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("x".into()),
+                ]],
+                closes,
+            )),
+            spec(vec![], vec![order(1)]),
+            vec![function(
+                WindowFunc::NthValue,
+                vec![
+                    input(2, DataType::Text),
+                    literal(Value::Integer(0), DataType::Integer),
+                ],
+                DataType::Text,
                 true,
             )],
             SpillConfig::default(),
         )
-        .err()
-        .expect("first_value is staged until M5");
-        assert_eq!(error.code, SqlState::FeatureNotSupported);
-        assert_eq!(error.message, "window frames are not yet implemented");
+        .unwrap();
+        op.open().unwrap();
+        assert_eq!(
+            op.next().unwrap_err().code,
+            SqlState::InvalidArgumentForNthValue
+        );
+    }
+
+    #[test]
+    fn range_integer_offsets_follow_sort_direction_null_peers_and_overflow_clamps() {
+        let range_spec = |ascending| BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![BoundOrderByItem {
+                expr: input(1, DataType::Integer),
+                ascending,
+                nulls_first: Some(false),
+            }],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Range,
+                start: BoundFrameBound::PrecedingRange(Value::Integer(1)),
+                end: BoundFrameBound::CurrentRow,
+            },
+        };
+        let sum = function(
+            WindowFunc::Aggregate(AggregateFunc::Sum),
+            vec![input(1, DataType::Integer)],
+            DataType::Integer,
+            true,
+        );
+        let values = vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("a".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Text("b".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(4),
+                Value::Text("c".into()),
+            ],
+            vec![Value::Integer(1), Value::Null, Value::Text("d".into())],
+        ];
+        let (ascending, _) = run(
+            values.clone(),
+            range_spec(true),
+            vec![sum.clone()],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.row.values[3].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Integer(4),
+                Value::Null
+            ]
+        );
+        let (descending, _) = run(values, range_spec(false), vec![sum], SpillConfig::default());
+        assert_eq!(
+            descending
+                .iter()
+                .map(|row| row.row.values[3].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(4),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Null
+            ]
+        );
+
+        let overflow_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![order(1)],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Range,
+                start: BoundFrameBound::CurrentRow,
+                end: BoundFrameBound::FollowingRange(Value::Integer(1)),
+            },
+        };
+        let (overflow, _) = run(
+            vec![vec![
+                Value::Integer(1),
+                Value::Integer(i64::MAX),
+                Value::Text("x".into()),
+            ]],
+            overflow_spec,
+            vec![function(
+                WindowFunc::Aggregate(AggregateFunc::Count),
+                vec![],
+                DataType::Integer,
+                false,
+            )],
+            SpillConfig::default(),
+        );
+        assert_eq!(overflow[0].row.values[3], Value::Integer(1));
+    }
+
+    #[test]
+    fn sliding_min_max_recompute_values_that_leave_the_frame() {
+        let moving_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![order(1)],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: BoundFrameBound::PrecedingRows(1),
+                end: BoundFrameBound::CurrentRow,
+            },
+        };
+        let values = vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("c".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Text("a".into()),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Text("b".into()),
+            ],
+        ];
+        let (output, _) = run(
+            values,
+            moving_spec,
+            vec![
+                function(
+                    WindowFunc::Aggregate(AggregateFunc::Min),
+                    vec![input(2, DataType::Text)],
+                    DataType::Text,
+                    true,
+                ),
+                function(
+                    WindowFunc::Aggregate(AggregateFunc::Max),
+                    vec![input(2, DataType::Text)],
+                    DataType::Text,
+                    true,
+                ),
+            ],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.row.values[3..].to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![Value::Text("c".into()), Value::Text("c".into())],
+                vec![Value::Text("a".into()), Value::Text("c".into())],
+                vec![Value::Text("a".into()), Value::Text("b".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_boundary_helpers_cover_zero_huge_offsets_and_typed_range_thresholds() {
+        assert_eq!(
+            rows_bound(&BoundFrameBound::PrecedingRows(0), 2, 4, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            rows_bound(&BoundFrameBound::PrecedingRows(u64::MAX), 2, 4, false).unwrap(),
+            0
+        );
+        assert_eq!(
+            rows_bound(&BoundFrameBound::FollowingRows(u64::MAX), 2, 4, true).unwrap(),
+            4
+        );
+
+        let numeric = Decimal::new(25, 1);
+        let offset = Decimal::new(5, 1);
+        assert!(matches!(
+            range_threshold(&Value::Numeric(numeric), &Value::Numeric(offset), false).unwrap(),
+            RangeThreshold::Value(Value::Numeric(value)) if value == Decimal::new(20, 1)
+        ));
+        let interval = common::Interval::new(0, 1, 0);
+        assert!(matches!(
+            range_threshold(
+                &Value::Timestamp(172_800_000_000),
+                &Value::Interval(interval),
+                false,
+            )
+            .unwrap(),
+            RangeThreshold::Value(Value::Timestamp(86_400_000_000))
+        ));
+        let date_threshold = range_threshold(
+            &Value::Date(2),
+            &Value::Interval(common::Interval::new(0, 1, 0)),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            date_threshold,
+            RangeThreshold::Value(Value::Timestamp(86_400_000_000))
+        ));
+    }
+
+    #[test]
+    fn range_nulls_first_are_excluded_and_null_row_uses_its_peer_group() {
+        let window_spec = BoundWindowSpec {
+            partition_by: vec![],
+            order_by: vec![BoundOrderByItem {
+                expr: input(1, DataType::Integer),
+                ascending: true,
+                nulls_first: Some(true),
+            }],
+            frame: BoundWindowFrame {
+                units: WindowFrameUnits::Range,
+                start: BoundFrameBound::PrecedingRange(Value::Integer(1)),
+                end: BoundFrameBound::CurrentRow,
+            },
+        };
+        let (output, _) = run(
+            vec![
+                vec![Value::Integer(1), Value::Null, Value::Text("a".into())],
+                vec![Value::Integer(1), Value::Null, Value::Text("b".into())],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("c".into()),
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Text("d".into()),
+                ],
+            ],
+            window_spec,
+            vec![function(
+                WindowFunc::Aggregate(AggregateFunc::Count),
+                vec![],
+                DataType::Integer,
+                false,
+            )],
+            SpillConfig::default(),
+        );
+        assert_eq!(
+            output
+                .iter()
+                .map(|row| row.row.values[3].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Integer(2),
+            ]
+        );
     }
 }

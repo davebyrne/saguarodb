@@ -6228,23 +6228,266 @@ async fn e2e_window_spill() {
 }
 
 #[tokio::test]
-async fn e2e_window_frames_not_yet_implemented() {
+async fn e2e_window_frames_are_implemented() {
     let server = TestServer::start().await.unwrap();
-    for sql in [
-        "select first_value(n) over (order by n) from (values (1)) v(n)",
-        "select sum(n) over (order by n rows between 1 preceding and current row) \
-         from (values (1)) v(n)",
-    ] {
-        let error = server
-            .simple_query(sql)
-            .await
-            .err()
-            .expect("frame-respecting window function must remain staged");
-        assert_eq!(error.code, common::SqlState::FeatureNotSupported);
-        assert!(
-            error
-                .message
-                .contains("window frames are not yet implemented")
-        );
-    }
+    let rows = server
+        .simple_query(
+            "select first_value(n) over (order by n), \
+                    sum(n) over (order by n rows between 1 preceding and current row) \
+             from (values (1), (2)) v(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("1".into())],
+            vec![Some("1".into()), Some("3".into())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_running_sum_default_frame_peers() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select k, sum(v) over (order by k) from \
+             (values (1, 2), (1, 3), (2, 5)) t(k, v)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows[0][1].as_deref(), Some("5"));
+    assert_eq!(rows[1][1].as_deref(), Some("5"));
+    assert_eq!(rows[2][1].as_deref(), Some("10"));
+}
+
+#[tokio::test]
+async fn e2e_window_range_null_key_respects_non_offset_bounds() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select k, \
+                    first_value(k) over (order by k), \
+                    string_agg(v, ',') over (order by k), \
+                    sum(k) over (order by k desc range between unbounded preceding and unbounded following), \
+                    last_value(v) over (order by k desc range between unbounded preceding and unbounded following) \
+             from (values (1, '1'), (2, '2'), (null, null)) t(k, v) \
+             order by k",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                Some("1".into()),
+                Some("1".into()),
+                Some("3".into()),
+                Some("1".into()),
+            ],
+            vec![
+                Some("2".into()),
+                Some("1".into()),
+                Some("1,2".into()),
+                Some("3".into()),
+                Some("1".into()),
+            ],
+            vec![
+                None,
+                Some("1".into()),
+                Some("1,2".into()),
+                Some("3".into()),
+                Some("1".into()),
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_rows_frame_moving_avg() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select avg(n) over (order by n rows between 1 preceding and 1 following) \
+             from (values (1), (2), (3)) t(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into())],
+            vec![Some("2".into())],
+            vec![Some("2".into())]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_rows_frame_empty() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select sum(n) over (order by n rows between 2 following and 3 following), \
+                    count(*) over (order by n rows between 2 following and 3 following) \
+             from (values (1)) t(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![None, Some("0".into())]]);
+}
+
+#[tokio::test]
+async fn e2e_window_range_offset_numeric() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select sum(k) over (order by k range between 1 preceding and current row) \
+             from (values (1::numeric), (2::numeric), (4::numeric)) t(k)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into())],
+            vec![Some("3".into())],
+            vec![Some("4".into())]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_range_offset_interval() {
+    let server = TestServer::start().await.unwrap();
+    let timestamp_rows = server
+        .simple_query(
+            "select count(*) over (order by k range between interval '1 day' preceding and current row) \
+             from (values (timestamp '2024-01-01'), (timestamp '2024-01-02'), \
+                          (timestamp '2024-01-04')) t(k)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        timestamp_rows,
+        vec![
+            vec![Some("1".into())],
+            vec![Some("2".into())],
+            vec![Some("1".into())]
+        ]
+    );
+    let date_rows = server
+        .simple_query(
+            "select count(*) over (order by k range between interval '1 day' preceding and current row) \
+             from (values (date '2024-01-01'), (date '2024-01-02'), (date '2024-01-04')) t(k)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(date_rows, timestamp_rows);
+}
+
+#[tokio::test]
+async fn e2e_window_first_last_nth() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select first_value(n) over (order by n rows between 1 preceding and 1 following), \
+                    last_value(n) over (order by n rows between 1 preceding and 1 following), \
+                    nth_value(n, 2) over (order by n rows between 1 preceding and 1 following) \
+             from (values (1), (2), (3)) t(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows[1],
+        vec![Some("1".into()), Some("3".into()), Some("2".into())]
+    );
+}
+
+#[tokio::test]
+async fn e2e_window_nth_value_nonpositive_22016() {
+    let server = TestServer::start().await.unwrap();
+    let error = server
+        .simple_query("select nth_value(n, 0) over () from (values (1)) t(n)")
+        .await
+        .err()
+        .expect("nonpositive nth_value must fail");
+    assert_eq!(error.code, common::SqlState::InvalidArgumentForNthValue);
+}
+
+#[tokio::test]
+async fn e2e_window_last_value_default_frame() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select v, last_value(v) over (order by k) from \
+             (values (1, 'a'), (1, 'b'), (2, 'c')) t(k, v)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows[0][1].as_deref(), Some("b"));
+    assert_eq!(rows[1][1].as_deref(), Some("b"));
+    assert_eq!(rows[2][1].as_deref(), Some("c"));
+}
+
+#[tokio::test]
+async fn e2e_window_string_agg_array_agg_over() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select string_agg(v, ',') over (order by k rows between 1 preceding and current row), \
+                    array_agg(v) over (order by k rows between 1 preceding and current row) \
+             from (values (1, 'a'), (2, 'b'), (3, 'c')) t(k, v)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows[2][0].as_deref(), Some("b,c"));
+    assert_eq!(rows[2][1].as_deref(), Some("{b,c}"));
+}
+
+#[tokio::test]
+async fn e2e_window_all_aggregates_over_frames() {
+    let server = TestServer::start().await.unwrap();
+    let rows = server
+        .simple_query(
+            "select stddev_samp(n) over (order by n rows between 1 preceding and current row), \
+                    bool_and(b) over (order by n rows between 1 preceding and current row), \
+                    var_samp(n) over (order by n rows between 1 preceding and current row) \
+             from (values (1, true), (2, false), (3, true)) t(n, b)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows[1][0].as_deref(), Some("0.7071067811865476"));
+    assert_eq!(rows[1][1].as_deref(), Some("f"));
+    assert_eq!(rows[1][2].as_deref(), Some("0.5"));
+}
+
+#[tokio::test]
+async fn e2e_window_frame_spill() {
+    let server = TestServer::start().await.unwrap();
+    server.simple_query("set work_mem = '64kB'").await.unwrap();
+    let rows = server
+        .simple_query(
+            "select sum(n) over (order by n rows between 10 preceding and 10 following) \
+             from generate_series(1, 10000) g(n)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows.len(), 10_000);
+    assert_eq!(rows[0][0].as_deref(), Some("66"));
 }

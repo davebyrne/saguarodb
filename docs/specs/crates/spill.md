@@ -21,8 +21,11 @@ executor operators and future storage/index builders can reuse it.
   limit so progress remains possible. Retained row data never grows with total
   input; binary run consolidation retains at most logarithmic small run metadata
   and anonymous file handles.
-- Tapes migrate atomically from memory to anonymous files. Readers have
-  independent logical positions and may be interleaved. Files are query-local,
+- Tapes migrate atomically from memory to anonymous files. `SpillTapeReader` is
+  cloneable: each clone forks the current logical position while sharing the
+  underlying `Arc`-backed memory records or disk file. Forked readers may be
+  advanced and interleaved independently; disk reads seek to the reader's own
+  position before decoding. Files are query-local,
   are never fsynced or WAL-logged, and disappear when their handles are dropped.
 - Spill files use `SGSP`, version `1`, length-framed records, and explicit binary
   encodings that preserve every `Value`, including non-finite floats and signed

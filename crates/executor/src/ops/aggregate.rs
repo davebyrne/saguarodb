@@ -303,7 +303,7 @@ impl PlanExecutor for AggregateOp<'_> {
     }
 }
 
-enum AggregateState {
+pub(crate) enum AggregateState {
     Count(i64),
     Integer {
         sum: i64,
@@ -347,13 +347,13 @@ enum AggregateState {
     },
 }
 
-enum CollectKind {
+pub(crate) enum CollectKind {
     Array(DataType),
     String,
 }
 
 impl AggregateState {
-    fn new(aggregate: &AggregateExpr, spill_ctx: SpillContext) -> Result<Self> {
+    pub(crate) fn new(aggregate: &AggregateExpr, spill_ctx: SpillContext) -> Result<Self> {
         Ok(match aggregate.func {
             AggregateFunc::Count => Self::Count(0),
             AggregateFunc::Sum | AggregateFunc::Avg => {
@@ -443,7 +443,7 @@ impl AggregateState {
         })
     }
 
-    fn step(&mut self, value: Option<&Value>) -> Result<()> {
+    pub(crate) fn step(&mut self, value: Option<&Value>) -> Result<()> {
         match self {
             Self::Count(count) => {
                 if value.is_none_or(|value| !matches!(value, Value::Null)) {
@@ -542,7 +542,66 @@ impl AggregateState {
         Ok(())
     }
 
-    fn finish(self) -> Result<Value> {
+    pub(crate) fn snapshot(&self) -> Result<Value> {
+        match self {
+            Self::Collect { .. } => Err(DbError::internal(
+                "collect aggregate state does not support snapshots",
+            )),
+            Self::Count(count) => Ok(Value::Integer(*count)),
+            Self::Integer { count: 0, .. }
+            | Self::Float { count: 0, .. }
+            | Self::Real { count: 0, .. }
+            | Self::Numeric { count: 0, .. } => Ok(Value::Null),
+            Self::Integer { sum, count, avg } => {
+                Ok(Value::Integer(if *avg { *sum / *count } else { *sum }))
+            }
+            Self::Float { sum, count, avg } => Ok(Value::Float(
+                (if *avg { *sum / *count as f64 } else { *sum }).into(),
+            )),
+            Self::Real { sum, count, avg } => Ok(Value::Real(
+                (if *avg { *sum / *count as f32 } else { *sum }).into(),
+            )),
+            Self::Numeric { sum, count, avg } => {
+                if *avg {
+                    Ok(Value::Numeric(
+                        sum.checked_div(Decimal::from(*count))
+                            .ok_or_else(numeric_overflow)?,
+                    ))
+                } else {
+                    Ok(Value::Numeric(*sum))
+                }
+            }
+            Self::MinMax { value, .. } => Ok(value.clone().unwrap_or(Value::Null)),
+            Self::Variance {
+                count,
+                m2,
+                sample,
+                stddev,
+                ..
+            } => {
+                if (*sample && *count < 2) || (!*sample && *count == 0) {
+                    Ok(Value::Null)
+                } else {
+                    let divisor = if *sample {
+                        count
+                            .checked_sub(1)
+                            .ok_or_else(|| DbError::internal("variance sample count underflow"))?
+                            as f64
+                    } else {
+                        *count as f64
+                    };
+                    let variance = *m2 / divisor;
+                    Ok(Value::Float(
+                        (if *stddev { variance.sqrt() } else { variance }).into(),
+                    ))
+                }
+            }
+            Self::Bool { seen: false, .. } => Ok(Value::Null),
+            Self::Bool { value, .. } => Ok(Value::Boolean(*value)),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<Value> {
         Ok(match self {
             Self::Collect { tape, kind } => return finish_collection(tape, kind),
             Self::Count(count) => Value::Integer(count),

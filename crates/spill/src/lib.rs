@@ -709,6 +709,16 @@ pub struct SpillTapeReader<T: SpillRecord> {
     ctx: SpillContext,
 }
 
+impl<T: SpillRecord + Clone> Clone for SpillTapeReader<T> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            ctx: self.ctx.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 enum TapeReaderStorage<T> {
     Memory {
         records: Arc<SharedRecords<T>>,
@@ -1487,6 +1497,28 @@ mod tests {
         assert_eq!(second.next_record().unwrap(), Some(Number(0)));
         assert_eq!(first.next_record().unwrap(), Some(Number(2)));
         assert_eq!(second.next_record().unwrap(), Some(Number(1)));
+    }
+
+    #[test]
+    fn forked_disk_reader_replays_full_sequence_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SpillConfig::new(MIN_WORK_MEM_BYTES, dir.path().into());
+        let mut tape = SpillTape::new(config.for_operator(Arc::new(QueryCancel::new())));
+        for value in 0..1000 {
+            tape.push(Number(value)).unwrap();
+        }
+        tape.finish().unwrap();
+        assert!(config.stats.files_created() > 0);
+
+        let first = tape.reader().unwrap();
+        let mut readers = [first.clone(), first];
+        for reader in &mut readers {
+            let mut values = Vec::new();
+            while let Some(value) = reader.next_record().unwrap() {
+                values.push(value.0);
+            }
+            assert_eq!(values, (0..1000).collect::<Vec<_>>());
+        }
     }
 
     #[test]

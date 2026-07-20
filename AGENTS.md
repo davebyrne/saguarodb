@@ -134,7 +134,9 @@ precedence.
   `[NOT] EXISTS (SELECT ...)` — in expressions, correlated in `WHERE`, the
   select list, and `HAVING` (equality shapes run as semi/anti joins), derived
   tables `FROM (SELECT ...) AS alias [(cols)]`, and `[LEFT JOIN] LATERAL`
-  derived tables — `docs/specs/subqueries.md`), top-level single-base-table
+  derived tables — `docs/specs/subqueries.md`; and window functions with
+  `ROWS`/`RANGE` frames, ranking, offset/value functions, and all aggregates —
+  `docs/specs/window-functions.md`), top-level single-base-table
   locking `SELECT ... FOR UPDATE | FOR NO KEY UPDATE | FOR SHARE | FOR KEY SHARE
   [OF table] [NOWAIT | SKIP LOCKED]`, `UPDATE`, `DELETE`,
   `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (produces a result set

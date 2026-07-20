@@ -1,12 +1,11 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress — milestones M0–M4 are complete; implementation
-milestones M5–M6 are pending. Window calls parse, bind, validate, lower to
-logical and physical Window nodes, and execute the whole-partition ranking,
-distribution, `ntile`, `lag`, and `lead` families with spill-backed ordering.
-Frame-respecting value functions and window aggregates return a structured
-`0A000` staging error until M5. The affected crate specifications,
+**Status:** In progress — milestones M0–M5 are complete; milestone M6 is
+pending. Window calls parse, bind, validate, lower to logical and physical
+Window nodes, and execute ranking, distribution, offset/value functions,
+`ROWS`/`RANGE` frames, and all aggregates with spill-backed ordering.
+The affected crate specifications,
 `docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
 milestone as listed in §11.
 
@@ -18,9 +17,8 @@ feature and complements `docs/specs/overview.md` and the crate contracts under
 ## 1. Purpose and scope
 
 A window function computes a value for each input row from a partition of the
-query result without collapsing that partition to one row. SaguaroDB now
-executes the M4 whole-partition families; M5 completes frame-respecting value
-functions and aggregates. The implementation uses the existing external-sort
+query result without collapsing that partition to one row. SaguaroDB executes
+the whole-partition and frame-respecting families through M5. The implementation uses the existing external-sort
 and spill infrastructure so correctness does not depend on the input fitting
 in memory.
 
@@ -105,8 +103,11 @@ A frame selects a range of rows relative to the current row inside its
 partition. It never crosses a partition boundary. `ROWS` bounds are physical
 row positions in window order. `RANGE CURRENT ROW` expands to the current
 row's complete peer group. A `RANGE` offset compares the single ordering key
-against a direction-aware threshold; a row with a NULL ordering key gets its
-NULL peer group as its frame.
+against a direction-aware threshold. For an offset `PRECEDING` or `FOLLOWING`
+bound, a row with a NULL ordering key uses its NULL peer-group boundary:
+`peer_start` for a start bound and `peer_end` for an end bound. This NULL-key
+rule does not alter `UNBOUNDED PRECEDING`, `UNBOUNDED FOLLOWING`, or `CURRENT
+ROW` bounds.
 
 When `ORDER BY` is present and no frame is written, the effective frame is:
 
@@ -530,10 +531,10 @@ or row context.
 - **M4 — `feat(executor): execute ranking and offset window functions` (complete).** Add
   the WindowOp sorting/partition skeleton and ranking, distribution, ntile,
   lag, and lead execution, including `22014`, spill, cancellation, failure,
-  and `e2e_window_*` coverage; frame-respecting functions remain gated.
+  and `e2e_window_*` coverage; frame-respecting functions were left gated for M5.
   Documentation updated: this spec, `docs/specs/crates/common.md`, and
   `docs/specs/crates/executor.md`.
-- **M5 — `feat(executor): window frames and aggregates over windows`.** Add
+- **M5 — `feat(executor): window frames and aggregates over windows` (complete).** Add
   `ROWS`/`RANGE` frames, first/last/nth value, `22016`, all 13 aggregates,
   aggregate snapshots and three execution modes, and SpillTape reader forks.
   Documentation updated: this spec, `docs/specs/crates/common.md`,
