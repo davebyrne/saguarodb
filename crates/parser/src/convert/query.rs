@@ -8,7 +8,8 @@ use crate::{
 
 use super::expr::{convert_expr, convert_function_arg};
 use super::{
-    function_name, ident_name, parse_error, relation_name, simple_object_name, unsupported,
+    feature_not_supported, function_name, ident_name, parse_error, relation_name,
+    simple_object_name, unsupported,
 };
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
@@ -194,6 +195,10 @@ pub(super) fn convert_set_expr_to_query(set_expr: sql::SetExpr) -> Result<Query>
 }
 
 fn convert_select(select: sql::Select) -> Result<Select> {
+    if !select.named_window.is_empty() {
+        return feature_not_supported("named windows (WINDOW clause) are not supported");
+    }
+
     if select.top.is_some()
         || select.into.is_some()
         || !select.lateral_views.is_empty()
@@ -201,7 +206,6 @@ fn convert_select(select: sql::Select) -> Result<Select> {
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.connect_by.is_some()
@@ -500,19 +504,18 @@ fn convert_order_by(order_by: sql::OrderBy) -> Result<Vec<OrderByItem>> {
         return unsupported("unsupported ORDER BY form");
     };
 
-    expressions
-        .iter()
-        .map(|item| {
-            if item.with_fill.is_some() {
-                return unsupported("unsupported ORDER BY form");
-            }
-            Ok(OrderByItem {
-                expr: convert_expr(&item.expr)?,
-                ascending: item.options.asc.unwrap_or(true),
-                nulls_first: item.options.nulls_first,
-            })
-        })
-        .collect()
+    expressions.iter().map(convert_order_by_expr).collect()
+}
+
+pub(super) fn convert_order_by_expr(item: &sql::OrderByExpr) -> Result<OrderByItem> {
+    if item.with_fill.is_some() {
+        return unsupported("unsupported ORDER BY form");
+    }
+    Ok(OrderByItem {
+        expr: convert_expr(&item.expr)?,
+        ascending: item.options.asc.unwrap_or(true),
+        nulls_first: item.options.nulls_first,
+    })
 }
 
 fn convert_limit_clause(

@@ -1951,7 +1951,7 @@ fn output_pg_type(ctx: &BindContext, expr: &BoundExpr) -> PgType {
 fn derive_alias(expr: &Expr) -> String {
     match expr {
         Expr::ColumnRef { column, .. } => column.clone(),
-        Expr::Function { name, .. } => name.clone(),
+        Expr::Function { name, .. } | Expr::WindowFunction { name, .. } => name.clone(),
         _ => "?column?".to_string(),
     }
 }

@@ -1,6 +1,6 @@
 # `parser` Crate Specification
 
-**Date:** 2026-07-04
+**Date:** 2026-07-19
 **Status:** Living crate contract
 
 ## Purpose
@@ -268,6 +268,28 @@ pub struct OrderByItem {
     pub nulls_first: Option<bool>,
 }
 
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
+    pub frame: Option<WindowFrame>,
+}
+
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+pub enum WindowFrameUnits { Rows, Range }
+
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
 pub enum Expr {
     Literal(Value),
     Placeholder(u32), // extended-protocol parameter `$n` (1-based)
@@ -278,6 +300,12 @@ pub enum Expr {
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
+    WindowFunction {
+        name: String,
+        args: Box<[FunctionArg]>,
+        distinct: bool,
+        spec: Box<WindowSpec>,
+    },
     Array(Vec<Expr>), // ARRAY[expr, ...]
     ArraySubscript { array: Box<Expr>, subscripts: Vec<Expr> }, // a[1][2]
     Any { left: Box<Expr>, op: BinOp, array: Box<Expr> }, // x op ANY(array)
@@ -336,6 +364,21 @@ Parser `BinOp` and `UnaryOp` variants use the same names as planner expression o
 
 Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`, and `COUNT(DISTINCT id)` is `Function { name: "count", args: vec![FunctionArg::Expr(...)] , distinct: true }`. Binder converts `COUNT(*)` to `BoundExpr::AggregateCall { arg: None, ... }`, carries `distinct: true` through to `BoundExpr::AggregateCall { distinct: true, ... }` so the executor de-duplicates the argument (e.g. `COUNT(DISTINCT id)`), and rejects `FunctionArg::Wildcard` for non-`COUNT` functions, mixed with other arguments, or combined with `DISTINCT` (`COUNT(DISTINCT *)`). Ordinary function names may be unqualified or qualified with `pg_catalog`; the parser normalizes `pg_catalog.<function>(...)` to the same lowercase function name as `<function>(...)`. Other qualified function schemas and three-or-more-part function names are rejected as unsupported.
 
+Calls with `OVER (...)` parse separately as `Expr::WindowFunction`; their
+ordinary arguments, wildcard shape, and `DISTINCT` flag use the same conversion
+as `Expr::Function`. The window arguments use a boxed slice and the window
+specification is boxed so this variant stays in the existing `Expr` size class.
+`WindowSpec` preserves `PARTITION BY`, per-item window
+`ORDER BY`, and an optional `ROWS`/`RANGE` frame. A shorthand frame such as
+`ROWS 2 PRECEDING` is normalized to an explicit `CurrentRow` end bound.
+`convert_function` rejects `FILTER` and `IGNORE NULLS` / `RESPECT NULLS` with
+precise `0A000` errors. It also rejects `GROUPS`, `OVER <name>`, inherited named
+window specifications, and the query-level `WINDOW` clause with precise
+`0A000` errors; ODBC syntax, function parameters, `WITHIN GROUP`, argument
+clauses, and subquery/named/qualified-wildcard arguments retain their existing
+rejections. Until window-function milestone M2, the binder rejects every
+`Expr::WindowFunction` with `0A000`.
+
 The dedicated `TRIM(expr)`, `SUBSTRING(expr [FROM start] [FOR length])` (and the comma form `SUBSTRING(expr, start[, length])`), `CEIL(expr)` / `FLOOR(expr)`, and `POSITION(substring IN string)` grammar is normalized into ordinary `Function { name: "trim" | "substring" | "ceil" | "floor" | "position", ... }` calls so the binder treats them uniformly (`POSITION` becomes `position(substring, string)`). `EXTRACT(field FROM source)` is normalized to `extract('field', source)`, carrying the field name as a lowercase text literal; only `year`, `month`, `day`, `hour`, `minute`, and `second` are supported (other fields are rejected). PostgreSQL system information names `CURRENT_CATALOG`, `CURRENT_USER`, `SESSION_USER`, and `USER` parse as zero-argument function calls for the binder/executor; `CURRENT_SCHEMA` parses as a column reference and the binder falls back to the zero-argument function only when no real column named `current_schema` resolves. `CURRENT_TIMESTAMP` and `NOW()` parse as zero-argument function calls and bind through the scalar function registry. `CURRENT_DATE` is still unsupported and rejected by the binder as an unknown function. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported; the `CEIL(expr TO <field>)`/scale forms are unsupported. (`CEILING` is not a sqlparser keyword, so it arrives as a plain `ceiling` function call, which the binder treats like `ceil`.)
 
 `a IS [NOT] DISTINCT FROM b` parses to `BinaryOp { op: BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom, ... }`. `COALESCE(...)` and `NULLIF(a, b)` parse as ordinary `Function` calls (named `coalesce`/`nullif`); the binder desugars them to `CASE` because, unlike the generic scalar functions, they are not NULL-propagating.
@@ -381,7 +424,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
   schemas.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
-- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT`, `VALUES`, and set-operation bodies are supported, and an optional `WITH` clause on the wrapper.
+- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. Expressions may contain window calls with an inline `OVER (...)` specification, including `PARTITION BY`, window `ORDER BY`, and `ROWS`/`RANGE` frames; binding remains staged behind the M1 `0A000` guard. Named windows, `GROUPS`, `FILTER`, and NULL-treatment modifiers are rejected as described above. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT`, `VALUES`, and set-operation bodies are supported, and an optional `WITH` clause on the wrapper.
 - `WITH name [(cols)] AS (query), ... <body>` parses to `Query.with`. `WITH RECURSIVE`, `MATERIALIZED` CTEs, and typed CTE column aliases are rejected. Each CTE's query is a full `Query` (so a CTE body may be a `SELECT`, `VALUES`, or set operation). Name resolution, inlining, and scoping are binder concerns.
 - Standalone `VALUES (...), (...)` parses to `QueryBody::Values` — as a top-level statement, in `FROM` (as a derived table), and as a subquery body (`x IN (VALUES ...)`). All rows must be the same width; each column's type is checked and its columns are named `column1, column2, ...` by the binder, not the parser.
 - `a UNION [ALL] b`, `a INTERSECT [ALL] b`, `a EXCEPT [ALL] b` parse to `QueryBody::SetOp`. Each arm is converted to a full `Query` (through `convert_set_expr_to_query`), so a parenthesized arm may carry its own `ORDER BY`/`LIMIT`; an unparenthesized outer `ORDER BY`/`LIMIT` binds to the enclosing `Query` wrapper and applies to the combined result. `MINUS` and the `... BY NAME` quantifiers are rejected as unsupported.
@@ -450,6 +493,10 @@ Unquoted identifiers are normalized to lowercase before AST construction. Quoted
 - Parses `SELECT *` and `table.*` distinctly.
 - Parses every supported plain/analyzed EXPLAIN spelling into `Statement::Explain { analyze, statement }` and rejects other options and non-SELECT inner statements.
 - Parses `INSERT ... SELECT` into `InsertSource::Query`, which the binder binds.
+- Parses window calls, wildcard and `DISTINCT` window arguments, partition and
+  ordering expressions, explicit frame bounds, and shorthand-frame
+  normalization; rejects `GROUPS`, named-window forms, `FILTER`, and NULL
+  treatment with their precise `0A000` messages.
 - Parses `COPY ... FROM STDIN` / `TO STDOUT` (with and without a trailing `;`), an explicit column list, and both modern and legacy CSV option syntaxes; rejects server-side files, `COPY (query)`, `FORMAT binary`, `QUOTE` with text format, and `DELIMITER`=`QUOTE` with the documented SQLSTATEs.
 - Parses `CREATE TABLE ... WITH (compression = 'zstd' | 'none' | zstd)` into `Statement::CreateTable.compression`, and `toast`, `toast_tuple_target`, `toast_min_value_size`, and `toast_compression` into `Statement::CreateTable.toast`. Compatibility-only `fillfactor = <integer>` is accepted in `10..=100`, duplicate/malformed/out-of-range values are rejected, and the value is intentionally discarded rather than added to the AST or catalog.
 - Parses ordered multi-target DROP TABLE and TRUNCATE lists, lowercase-normalizes

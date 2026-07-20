@@ -1,11 +1,14 @@
 use common::{Result, Value};
 use sqlparser::ast as sql;
 
-use crate::{BinOp, Expr, FunctionArg, UnaryOp};
+use crate::{
+    BinOp, Expr, FunctionArg, UnaryOp, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
+};
 
-use super::query::{convert_query, convert_set_expr_to_query};
+use super::query::{convert_order_by_expr, convert_query, convert_set_expr_to_query};
 use super::{
-    convert_pg_type, custom_type_name, function_name, ident_name, parse_error, unsupported,
+    convert_pg_type, custom_type_name, feature_not_supported, function_name, ident_name,
+    parse_error, unsupported,
 };
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
@@ -462,11 +465,14 @@ fn convert_placeholder(name: &str) -> Result<Expr> {
 }
 
 fn convert_function(function: &sql::Function) -> Result<Expr> {
+    if function.filter.is_some() {
+        return feature_not_supported("FILTER is not supported");
+    }
+    if function.null_treatment.is_some() {
+        return feature_not_supported("IGNORE NULLS / RESPECT NULLS is not supported");
+    }
     if function.uses_odbc_syntax
         || !matches!(function.parameters, sql::FunctionArguments::None)
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
         || !function.within_group.is_empty()
     {
         return unsupported("unsupported function call");
@@ -492,11 +498,80 @@ fn convert_function(function: &sql::Function) -> Result<Expr> {
         sql::FunctionArguments::Subquery(_) => return unsupported("unsupported function argument"),
     };
 
-    Ok(Expr::Function {
-        name: function_name(&function.name)?,
-        args,
-        distinct,
+    let name = function_name(&function.name)?;
+    match &function.over {
+        None => Ok(Expr::Function {
+            name,
+            args,
+            distinct,
+        }),
+        Some(sql::WindowType::WindowSpec(spec)) => Ok(Expr::WindowFunction {
+            name,
+            args: args.into_boxed_slice(),
+            distinct,
+            spec: Box::new(convert_window_spec(spec)?),
+        }),
+        Some(sql::WindowType::NamedWindow(_)) => {
+            feature_not_supported("named windows are not supported")
+        }
+    }
+}
+
+fn convert_window_spec(spec: &sql::WindowSpec) -> Result<WindowSpec> {
+    if spec.window_name.is_some() {
+        return feature_not_supported("named windows are not supported");
+    }
+    Ok(WindowSpec {
+        partition_by: spec
+            .partition_by
+            .iter()
+            .map(convert_expr)
+            .collect::<Result<Vec<_>>>()?,
+        order_by: spec
+            .order_by
+            .iter()
+            .map(convert_order_by_expr)
+            .collect::<Result<Vec<_>>>()?,
+        frame: spec
+            .window_frame
+            .as_ref()
+            .map(convert_window_frame)
+            .transpose()?,
     })
+}
+
+fn convert_window_frame(frame: &sql::WindowFrame) -> Result<WindowFrame> {
+    let units = match frame.units {
+        sql::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        sql::WindowFrameUnits::Range => WindowFrameUnits::Range,
+        sql::WindowFrameUnits::Groups => {
+            return feature_not_supported("GROUPS frame mode is not supported");
+        }
+    };
+    Ok(WindowFrame {
+        units,
+        start: convert_frame_bound(&frame.start_bound)?,
+        end: frame
+            .end_bound
+            .as_ref()
+            .map(convert_frame_bound)
+            .transpose()?
+            .unwrap_or(WindowFrameBound::CurrentRow),
+    })
+}
+
+fn convert_frame_bound(bound: &sql::WindowFrameBound) -> Result<WindowFrameBound> {
+    match bound {
+        sql::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        sql::WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
+        sql::WindowFrameBound::Preceding(Some(expr)) => {
+            Ok(WindowFrameBound::Preceding(Box::new(convert_expr(expr)?)))
+        }
+        sql::WindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
+        sql::WindowFrameBound::Following(Some(expr)) => {
+            Ok(WindowFrameBound::Following(Box::new(convert_expr(expr)?)))
+        }
+    }
 }
 
 pub(super) fn convert_function_arg(arg: &sql::FunctionArg) -> Result<FunctionArg> {

@@ -501,6 +501,35 @@ pub struct OrderByItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
+    pub frame: Option<WindowFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Literal(Value),
     /// Extended-protocol parameter placeholder `$n` (1-based as written).
@@ -540,6 +569,14 @@ pub enum Expr {
         name: String,
         args: Vec<FunctionArg>,
         distinct: bool,
+    },
+    WindowFunction {
+        name: String,
+        /// A boxed slice keeps this variant in the existing [`Expr`] size class.
+        args: Box<[FunctionArg]>,
+        distinct: bool,
+        /// Boxed because a [`WindowSpec`] contains several expression-bearing lists.
+        spec: Box<WindowSpec>,
     },
     /// `ARRAY[expr, ...]`; nested constructors represent multidimensional arrays.
     Array(Vec<Expr>),

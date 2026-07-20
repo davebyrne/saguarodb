@@ -1217,6 +1217,23 @@ fn reject_qualified_check_column_refs(expr: &Expr) -> Result<()> {
                 }
             }
         }
+        Expr::WindowFunction { args, spec, .. } => {
+            for arg in args {
+                if let FunctionArg::Expr(arg) = arg {
+                    reject_qualified_check_column_refs(arg)?;
+                }
+            }
+            for expr in &spec.partition_by {
+                reject_qualified_check_column_refs(expr)?;
+            }
+            for item in &spec.order_by {
+                reject_qualified_check_column_refs(&item.expr)?;
+            }
+            if let Some(frame) = &spec.frame {
+                reject_qualified_check_column_refs_in_window_frame_bound(&frame.start)?;
+                reject_qualified_check_column_refs_in_window_frame_bound(&frame.end)?;
+            }
+        }
         Expr::InList { expr, list, .. } => {
             reject_qualified_check_column_refs(expr)?;
             for item in list {
@@ -1252,6 +1269,19 @@ fn reject_qualified_check_column_refs(expr: &Expr) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn reject_qualified_check_column_refs_in_window_frame_bound(
+    bound: &parser::WindowFrameBound,
+) -> Result<()> {
+    match bound {
+        parser::WindowFrameBound::Preceding(expr) | parser::WindowFrameBound::Following(expr) => {
+            reject_qualified_check_column_refs(expr)
+        }
+        parser::WindowFrameBound::UnboundedPreceding
+        | parser::WindowFrameBound::CurrentRow
+        | parser::WindowFrameBound::UnboundedFollowing => Ok(()),
+    }
 }
 
 /// Bind a `CHECK` constraint's canonical text against a table's columns registered
@@ -1879,6 +1909,18 @@ fn expr_has_sequence_function(expr: &Expr) -> bool {
                 || name.eq_ignore_ascii_case("setval")
                 || args.iter().any(function_arg_has_sequence_function)
         }
+        Expr::WindowFunction { args, spec, .. } => {
+            args.iter().any(function_arg_has_sequence_function)
+                || spec.partition_by.iter().any(expr_has_sequence_function)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_has_sequence_function(&item.expr))
+                || spec.frame.as_ref().is_some_and(|frame| {
+                    window_frame_bound_has_sequence_function(&frame.start)
+                        || window_frame_bound_has_sequence_function(&frame.end)
+                })
+        }
         Expr::Subquery(query) => query_has_sequence_function(query),
         Expr::InSubquery { expr, subquery, .. } => {
             expr_has_sequence_function(expr) || query_has_sequence_function(subquery)
@@ -1932,6 +1974,17 @@ fn function_arg_has_sequence_function(arg: &FunctionArg) -> bool {
     match arg {
         FunctionArg::Expr(expr) => expr_has_sequence_function(expr),
         FunctionArg::Wildcard => false,
+    }
+}
+
+fn window_frame_bound_has_sequence_function(bound: &parser::WindowFrameBound) -> bool {
+    match bound {
+        parser::WindowFrameBound::Preceding(expr) | parser::WindowFrameBound::Following(expr) => {
+            expr_has_sequence_function(expr)
+        }
+        parser::WindowFrameBound::UnboundedPreceding
+        | parser::WindowFrameBound::CurrentRow
+        | parser::WindowFrameBound::UnboundedFollowing => false,
     }
 }
 
@@ -2000,6 +2053,18 @@ fn expr_has_placeholder(expr: &Expr) -> bool {
         | Expr::IsNotNull(expr)
         | Expr::Cast { expr, .. } => expr_has_placeholder(expr),
         Expr::Function { args, .. } => args.iter().any(function_arg_has_placeholder),
+        Expr::WindowFunction { args, spec, .. } => {
+            args.iter().any(function_arg_has_placeholder)
+                || spec.partition_by.iter().any(expr_has_placeholder)
+                || spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_has_placeholder(&item.expr))
+                || spec.frame.as_ref().is_some_and(|frame| {
+                    window_frame_bound_has_placeholder(&frame.start)
+                        || window_frame_bound_has_placeholder(&frame.end)
+                })
+        }
         Expr::Array(elements) => elements.iter().any(expr_has_placeholder),
         Expr::ArraySubscript { array, subscripts } => {
             expr_has_placeholder(array) || subscripts.iter().any(expr_has_placeholder)
@@ -2036,5 +2101,16 @@ fn function_arg_has_placeholder(arg: &FunctionArg) -> bool {
     match arg {
         FunctionArg::Expr(expr) => expr_has_placeholder(expr),
         FunctionArg::Wildcard => false,
+    }
+}
+
+fn window_frame_bound_has_placeholder(bound: &parser::WindowFrameBound) -> bool {
+    match bound {
+        parser::WindowFrameBound::Preceding(expr) | parser::WindowFrameBound::Following(expr) => {
+            expr_has_placeholder(expr)
+        }
+        parser::WindowFrameBound::UnboundedPreceding
+        | parser::WindowFrameBound::CurrentRow
+        | parser::WindowFrameBound::UnboundedFollowing => false,
     }
 }

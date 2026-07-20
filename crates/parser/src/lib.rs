@@ -17,7 +17,8 @@ mod convert;
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FetchCount, FromItem,
     FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, ParsedForeignKey, Query,
-    QueryBody, RowLockClause, Select, SelectItem, SetOp, SetScope, Statement, UnaryOp,
+    QueryBody, RowLockClause, Select, SelectItem, SetOp, SetScope, Statement, UnaryOp, WindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowSpec,
 };
 
 use common::Result;
@@ -47,8 +48,23 @@ mod tests {
 
     use crate::{
         Assignment, BinOp, Expr, FetchCount, FromItem, FunctionArg, InsertSource, JoinType, Query,
-        QueryBody, SelectItem, SetOp, SetScope, Statement, UnaryOp, parse,
+        QueryBody, SelectItem, SetOp, SetScope, Statement, UnaryOp, WindowFrame, WindowFrameBound,
+        WindowFrameUnits, WindowSpec, parse,
     };
+
+    fn first_projection_expr(sql: &str) -> Expr {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = parse(sql).unwrap()
+        else {
+            panic!("expected select");
+        };
+        let Some(SelectItem::Expression { expr, .. }) = select.columns.into_iter().next() else {
+            panic!("expected projection expression");
+        };
+        expr
+    }
 
     fn id_column() -> ParsedColumnDef {
         ParsedColumnDef {
@@ -667,6 +683,172 @@ mod tests {
                 ..
             } if name == "count" && matches!(args.as_slice(), [FunctionArg::Expr(_)])
         ));
+    }
+
+    #[test]
+    fn parses_row_number_over_empty_window() {
+        assert_eq!(
+            first_projection_expr("select row_number() over ()"),
+            Expr::WindowFunction {
+                name: "row_number".to_string(),
+                args: Box::new([]),
+                distinct: false,
+                spec: Box::new(WindowSpec {
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    frame: None,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_window_partition_and_ordering() {
+        assert_eq!(
+            first_projection_expr(
+                "select sum(x) over (partition by a, b order by c desc nulls first)"
+            ),
+            Expr::WindowFunction {
+                name: "sum".to_string(),
+                args: Box::new([FunctionArg::Expr(Expr::ColumnRef {
+                    table: None,
+                    column: "x".to_string(),
+                })]),
+                distinct: false,
+                spec: Box::new(WindowSpec {
+                    partition_by: vec![
+                        Expr::ColumnRef {
+                            table: None,
+                            column: "a".to_string(),
+                        },
+                        Expr::ColumnRef {
+                            table: None,
+                            column: "b".to_string(),
+                        },
+                    ],
+                    order_by: vec![crate::OrderByItem {
+                        expr: Expr::ColumnRef {
+                            table: None,
+                            column: "c".to_string(),
+                        },
+                        ascending: false,
+                        nulls_first: Some(true),
+                    }],
+                    frame: None,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_window_rows_between_offsets() {
+        assert_eq!(
+            first_projection_expr("select sum(x) over (rows between 2 preceding and 1 following)"),
+            Expr::WindowFunction {
+                name: "sum".to_string(),
+                args: Box::new([FunctionArg::Expr(Expr::ColumnRef {
+                    table: None,
+                    column: "x".to_string(),
+                })]),
+                distinct: false,
+                spec: Box::new(WindowSpec {
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    frame: Some(WindowFrame {
+                        units: WindowFrameUnits::Rows,
+                        start: WindowFrameBound::Preceding(Box::new(Expr::Literal(
+                            Value::Integer(2),
+                        ))),
+                        end: WindowFrameBound::Following(Box::new(Expr::Literal(Value::Integer(
+                            1
+                        ),))),
+                    }),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_window_frame_shorthand_end_to_current_row() {
+        let Expr::WindowFunction { spec, .. } =
+            first_projection_expr("select sum(x) over (rows 2 preceding)")
+        else {
+            panic!("expected window function");
+        };
+        assert_eq!(
+            spec.frame,
+            Some(WindowFrame {
+                units: WindowFrameUnits::Rows,
+                start: WindowFrameBound::Preceding(Box::new(Expr::Literal(Value::Integer(2)))),
+                end: WindowFrameBound::CurrentRow,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_range_unbounded_preceding() {
+        let Expr::WindowFunction { spec, .. } =
+            first_projection_expr("select sum(x) over (range unbounded preceding)")
+        else {
+            panic!("expected window function");
+        };
+        assert_eq!(
+            spec.frame,
+            Some(WindowFrame {
+                units: WindowFrameUnits::Range,
+                start: WindowFrameBound::UnboundedPreceding,
+                end: WindowFrameBound::CurrentRow,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_window_count_star_and_distinct_argument() {
+        assert!(matches!(
+            first_projection_expr("select count(*) over ()"),
+            Expr::WindowFunction {
+                name,
+                args,
+                distinct: false,
+                ..
+            } if name == "count" && matches!(&*args, [FunctionArg::Wildcard])
+        ));
+        assert!(matches!(
+            first_projection_expr("select count(distinct x) over ()"),
+            Expr::WindowFunction {
+                name,
+                args,
+                distinct: true,
+                ..
+            } if name == "count" && matches!(&*args, [FunctionArg::Expr(_)])
+        ));
+    }
+
+    #[test]
+    fn rejects_deferred_window_syntax_with_precise_errors() {
+        for (sql, message) in [
+            (
+                "select sum(x) over (groups unbounded preceding)",
+                "GROUPS frame mode is not supported",
+            ),
+            ("select sum(x) over w", "named windows are not supported"),
+            (
+                "select sum(x) over w from t window w as ()",
+                "named windows (WINDOW clause) are not supported",
+            ),
+            (
+                "select sum(x) filter (where x > 0) over ()",
+                "FILTER is not supported",
+            ),
+            (
+                "select first_value(x) ignore nulls over ()",
+                "IGNORE NULLS / RESPECT NULLS is not supported",
+            ),
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "{sql}: {err:?}");
+            assert_eq!(err.message, message, "{sql}");
+        }
     }
 
     #[test]

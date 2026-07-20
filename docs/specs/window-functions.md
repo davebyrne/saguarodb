@@ -1,9 +1,10 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress / design — milestone M0 defines the contract in this
-document. Implementation milestones M1–M6 are pending; window functions remain
-unsupported until those milestones land. The affected crate specifications,
+**Status:** In progress — milestones M0–M1 are complete; implementation
+milestones M2–M6 are pending. Window calls now parse into a dedicated AST node,
+but the binder rejects them with `0A000`, so window functions remain unavailable
+for execution. The affected crate specifications,
 `docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
 milestone as listed in §11.
 
@@ -216,12 +217,16 @@ treat `OVER` as scalar evaluation:
 
 ```rust
 Expr::WindowFunction {
-    name,
-    args,
-    distinct,
-    spec: WindowSpec,
+    name: String,
+    args: Box<[FunctionArg]>,
+    distinct: bool,
+    spec: Box<WindowSpec>,
 }
 ```
+
+The argument slice and specification are boxed so the dedicated variant stays
+in the existing `Expr` size class rather than enlarging every expression-bearing
+query node.
 
 `WindowSpec` contains `partition_by`, `order_by: Vec<OrderByItem>`, and an
 optional `WindowFrame`. A frame contains `units` (`Rows` or `Range`), `start`,
@@ -503,7 +508,7 @@ or row context.
 
 - **M0 — `docs(specs): window functions design`.** Create this full design
   contract. Documentation updated: `docs/specs/window-functions.md` only.
-- **M1 — `feat(parser): parse window function calls`.** Add the parser AST,
+- **M1 — `feat(parser): parse window function calls` (complete).** Add the parser AST,
   conversions, shorthand normalization, and parser rejection matrix; leave a
   binder staging guard. Documentation updated: this spec and
   `docs/specs/crates/parser.md`.

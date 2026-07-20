@@ -37,6 +37,10 @@ fn bind_expr_with_pg_type(
             args,
             distinct,
         } => bind_function(ctx, name, args, *distinct),
+        Expr::WindowFunction { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "window functions are not yet supported",
+        )),
         Expr::Array(elements) => bind_array(ctx, elements, expected),
         Expr::ArraySubscript { array, subscripts } => bind_array_subscript(ctx, array, subscripts),
         Expr::Any { left, op, array } => bind_any(ctx, left, op.clone(), array),

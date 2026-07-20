@@ -1472,6 +1472,17 @@ mod tests {
     }
 
     #[test]
+    fn binder_rejects_window_functions_until_m2() {
+        let catalog = MemoryCatalog::empty();
+        let stmt = parse("select row_number() over ()").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert_eq!(err.message, "window functions are not yet supported");
+    }
+
+    #[test]
     fn binder_types_scalar_functions() {
         let catalog = catalog_with_users();
         let stmt =
@@ -2053,6 +2064,16 @@ mod tests {
         let stmt = parse("create view v as select $1").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn binder_finds_create_view_parameter_in_window_argument() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create view v as select sum($1) over ()").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert_eq!(err.message, "CREATE VIEW does not support query parameters");
     }
 
     #[test]
