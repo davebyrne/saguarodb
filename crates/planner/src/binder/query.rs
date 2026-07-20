@@ -1673,13 +1673,11 @@ fn validate_aggregate_usage(
     order_by: &[BoundOrderByItem],
     distinct_on: &[BoundExpr],
 ) -> Result<()> {
-    // `DISTINCT ON` keys do not themselves induce aggregation (matching
-    // PostgreSQL), but in an aggregate query they are subject to the same
-    // grouped-expression rule as the select list and ORDER BY.
     let aggregate_context = !group_by.is_empty()
         || columns.iter().any(|item| contains_aggregate(&item.expr))
         || having.is_some()
-        || order_by.iter().any(|item| contains_aggregate(&item.expr));
+        || order_by.iter().any(|item| contains_aggregate(&item.expr))
+        || distinct_on.iter().any(contains_aggregate);
 
     if !aggregate_context {
         return Ok(());

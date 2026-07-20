@@ -9,7 +9,7 @@ use common::{
 
 use crate::{
     AggregateExpr, ApplyKind, BinOp, BoundExpr, BoundForeignKey, BoundOnConflict, BoundOrderByItem,
-    BoundReturning, JoinSide, JoinType, LogicalPlan, SetOp,
+    BoundReturning, BoundWindowSpec, JoinSide, JoinType, LogicalPlan, SetOp, WindowFuncExpr,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +248,11 @@ pub enum PhysicalPlan {
         group_by: Vec<BoundExpr>,
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
+    },
+    Window {
+        source: Box<PhysicalPlan>,
+        spec: BoundWindowSpec,
+        functions: Vec<WindowFuncExpr>,
     },
     Values {
         rows: Vec<Vec<BoundExpr>>,
@@ -568,6 +573,15 @@ fn physical_plan_inner(
             aggregates: aggregates.clone(),
             output_schema: output_schema.clone(),
         }),
+        LogicalPlan::Window {
+            source,
+            spec,
+            functions,
+        } => Ok(PhysicalPlan::Window {
+            source: Box::new(physical_plan_inner(source, catalog)?),
+            spec: spec.clone(),
+            functions: functions.clone(),
+        }),
         LogicalPlan::Values {
             rows,
             output_schema,
@@ -808,6 +822,9 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. } => output_width(source, catalog),
+        PhysicalPlan::Window {
+            source, functions, ..
+        } => Ok(output_width(source, catalog)? + functions.len()),
         // Both arms have equal width (the binder reconciled them); use the left.
         PhysicalPlan::SetOp { left, .. } => output_width(left, catalog),
         PhysicalPlan::Apply { input, kind, .. } => {

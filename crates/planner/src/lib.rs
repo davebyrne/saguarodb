@@ -44,6 +44,7 @@ pub use explain::{
 pub use expr::{
     AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundFrameBound, BoundOrderByItem,
     BoundWindowFrame, BoundWindowSpec, JoinSide, JoinType, UnaryOp, WindowFrameUnits, WindowFunc,
+    WindowFuncExpr,
 };
 pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_pg_types, collect_param_types, substitute_params};
@@ -1483,23 +1484,317 @@ mod tests {
     }
 
     #[test]
-    fn planner_stages_window_execution_until_m3() {
+    fn planner_plans_from_less_window_query() {
         let catalog = MemoryCatalog::empty();
         let stmt = parse("select row_number() over ()").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let err = logical_plan(&bound).unwrap_err();
+        let logical = logical_plan(&bound).unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = &logical
+        else {
+            panic!("expected projection, got {logical:?}");
+        };
+        assert!(matches!(
+            expressions.as_slice(),
+            [BoundExpr::LocalRef { slot: 0, .. }]
+        ));
+        let LogicalPlan::Window {
+            source, functions, ..
+        } = source.as_ref()
+        else {
+            panic!("expected window, got {source:?}");
+        };
+        assert_eq!(functions.len(), 1);
+        assert!(matches!(source.as_ref(), LogicalPlan::Values { .. }));
 
-        assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let PhysicalPlan::Projection { source, .. } = physical else {
+            panic!("expected physical projection");
+        };
+        assert!(matches!(source.as_ref(), PhysicalPlan::Window { .. }));
+    }
+
+    #[test]
+    fn planner_places_window_between_scan_and_projection() {
+        let catalog = catalog_with_users();
+        let plan = logical_plan(
+            &bind(
+                &parse("select row_number() over () from users").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            expressions.as_slice(),
+            [BoundExpr::LocalRef { slot: 2, .. }]
+        ));
+        let LogicalPlan::Window {
+            source, functions, ..
+        } = source.as_ref()
+        else {
+            panic!("expected window");
+        };
+        assert_eq!(functions.len(), 1);
+        assert!(matches!(source.as_ref(), LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn planner_rewrites_nested_window_call_to_its_result_slot() {
+        let catalog = catalog_with_users();
+        let plan = logical_plan(
+            &bind(
+                &parse("select row_number() over () + 1 from users").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected projection");
+        };
+        let [
+            BoundExpr::BinaryOp {
+                left, op, right, ..
+            },
+        ] = expressions.as_slice()
+        else {
+            panic!("expected binary projection expression");
+        };
+        assert_eq!(*op, BinOp::Add);
+        assert!(matches!(left.as_ref(), BoundExpr::LocalRef { slot: 2, .. }));
+        assert!(matches!(
+            right.as_ref(),
+            BoundExpr::Literal {
+                value: Value::Integer(1),
+                ..
+            }
+        ));
+        let LogicalPlan::Window { functions, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        assert!(matches!(
+            functions.as_slice(),
+            [WindowFuncExpr {
+                func: WindowFunc::RowNumber,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn planner_places_aggregate_window_sort_projection_in_order() {
+        let catalog = catalog_with_users();
+        let plan = logical_plan(
+            &bind(
+                &parse("select id, sum(count(*)) over () from users group by id order by sum(count(*)) over ()").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            expressions.get(1),
+            Some(BoundExpr::LocalRef { slot: 2, .. })
+        ));
+        let LogicalPlan::Sort { source, order_by } = source.as_ref() else {
+            panic!("expected sort");
+        };
+        assert!(matches!(
+            order_by[0].expr,
+            BoundExpr::LocalRef { slot: 2, .. }
+        ));
+        let LogicalPlan::Window { source, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        assert!(matches!(source.as_ref(), LogicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn planner_chains_window_specs_and_deduplicates_calls() {
+        let catalog = catalog_with_users();
+        let plan = logical_plan(
+            &bind(
+                &parse("select row_number() over (order by id), row_number() over (), row_number() over (order by id) from users").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            expressions[0],
+            BoundExpr::LocalRef { slot: 2, .. }
+        ));
+        assert!(matches!(
+            expressions[1],
+            BoundExpr::LocalRef { slot: 3, .. }
+        ));
+        assert!(matches!(
+            expressions[2],
+            BoundExpr::LocalRef { slot: 2, .. }
+        ));
+        let LogicalPlan::Window {
+            source,
+            spec: second,
+            functions: second_functions,
+        } = source.as_ref()
+        else {
+            panic!("expected second window");
+        };
+        assert!(second.order_by.is_empty());
+        assert_eq!(second_functions.len(), 1);
+        let LogicalPlan::Window {
+            source,
+            spec: first,
+            functions: first_functions,
+        } = source.as_ref()
+        else {
+            panic!("expected first window");
+        };
+        assert_eq!(first.order_by.len(), 1);
+        assert_eq!(first_functions.len(), 1);
+        assert!(matches!(source.as_ref(), LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn planner_rewrites_distinct_on_and_order_by_window_slots() {
+        let catalog = catalog_with_users();
+        let plan = logical_plan(
+            &bind(
+                &parse("select distinct on (row_number() over ()) id from users order by row_number() over ()").unwrap(),
+                &catalog,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let LogicalPlan::Projection { source, .. } = plan else {
+            panic!("expected projection");
+        };
+        let LogicalPlan::Distinct { source, on_keys } = source.as_ref() else {
+            panic!("expected distinct");
+        };
+        assert!(matches!(on_keys[0], BoundExpr::LocalRef { slot: 2, .. }));
+        let LogicalPlan::Sort { source, order_by } = source.as_ref() else {
+            panic!("expected sort");
+        };
+        assert!(matches!(
+            order_by[0].expr,
+            BoundExpr::LocalRef { slot: 2, .. }
+        ));
+        let LogicalPlan::Window { functions, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        assert_window_args_contain_no_aggregates(functions);
+    }
+
+    #[test]
+    fn planner_plans_window_in_derived_table_and_formats_explain() {
+        let catalog = catalog_with_users();
+        let physical = plan_sql(
+            "select w.rn from (select row_number() over (order by id rows between 1 preceding and current row) as rn from users) w",
+            &catalog,
+        );
+        assert!(format!("{physical:?}").contains("Window"));
+        let explain = format_explain(&physical, &catalog).unwrap();
+        assert!(explain.contains("Window partition_by=[] order_by=["));
+        assert!(explain.contains("frame=ROWS BETWEEN 1 PRECEDING AND CURRENT ROW"));
+        assert!(explain.contains("functions=[row_number()]"));
+
+        let default_physical = plan_sql(
+            "select row_number() over (order by id) from users",
+            &catalog,
+        );
+        let default_explain = format_explain(&default_physical, &catalog).unwrap();
+        let default_window = default_explain
+            .lines()
+            .find(|line| line.contains("Window "))
+            .unwrap();
+        assert!(!default_window.contains("frame="));
+    }
+
+    #[test]
+    fn window_parameter_substitution_reaches_planned_function_args() {
+        let catalog = catalog_with_users();
+        let statement = parse("select ntile($1) over () from users").unwrap();
+        let (bound, params) = bind_parameterized(&statement, &catalog, &[]).unwrap();
+        assert_eq!(params, vec![DataType::Integer]);
+        let substituted = substitute_params(&bound, &[Value::Integer(4)]).unwrap();
+        let plan = logical_plan(&substituted).unwrap();
+        let LogicalPlan::Projection { source, .. } = plan else {
+            panic!("expected projection");
+        };
+        let LogicalPlan::Window { functions, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        assert!(matches!(
+            functions[0].args.as_slice(),
+            [BoundExpr::Literal {
+                value: Value::Integer(4),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn window_row_estimate_passes_source_through() {
+        let catalog = catalog_with_users();
+        let physical = plan_sql("select row_number() over () from users", &catalog);
+        let PhysicalPlan::Projection { source, .. } = physical else {
+            panic!("expected projection");
+        };
+        let PhysicalPlan::Window { source: input, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
         assert_eq!(
-            err.message,
-            "window function execution is not yet implemented"
+            estimated_rows(source.as_ref(), &catalog),
+            estimated_rows(input, &catalog)
         );
     }
 
     fn window_bind_error(catalog: &MemoryCatalog, sql: &str) -> DbError {
         let statement = parse(sql).unwrap();
         bind(&statement, catalog).unwrap_err()
+    }
+
+    fn assert_window_args_contain_no_aggregates(functions: &[WindowFuncExpr]) {
+        assert!(
+            functions
+                .iter()
+                .flat_map(|function| &function.args)
+                .all(|arg| !crate::logical::contains_aggregate(arg))
+        );
     }
 
     fn first_window_spec(statement: BoundStatement) -> BoundWindowSpec {
@@ -1789,12 +2084,27 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        let err = logical_plan(&grouped_window).unwrap_err();
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
-        assert_eq!(
-            err.message,
-            "window function execution is not yet implemented"
-        );
+        let plan = logical_plan(&grouped_window).unwrap();
+        let LogicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            expressions.as_slice(),
+            [BoundExpr::LocalRef { slot: 2, .. }]
+        ));
+        let LogicalPlan::Window {
+            source, functions, ..
+        } = source.as_ref()
+        else {
+            panic!("expected window");
+        };
+        assert_eq!(functions.len(), 1);
+        assert!(matches!(source.as_ref(), LogicalPlan::Aggregate { .. }));
         bind(
             &parse(
                 "select distinct on (sum(count(*)) over ()) sum(count(*)) over () \
@@ -1824,20 +2134,46 @@ mod tests {
     }
 
     #[test]
-    fn logical_planner_guards_windows_in_distinct_on_before_aggregate_rewrite() {
+    fn logical_planner_rewrites_windows_in_distinct_on_after_aggregates() {
         let catalog = catalog_with_users();
-        for sql in [
-            "select distinct on (sum(count(*)) over ()) id from users group by id",
+        let invalid = window_bind_error(
+            &catalog,
             "select distinct on (sum(count(*)) over ()) name from users",
-        ] {
-            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
-            let err = logical_plan(&bound).unwrap_err();
-            assert_eq!(err.code, SqlState::FeatureNotSupported, "{sql}");
-            assert_eq!(
-                err.message, "window function execution is not yet implemented",
-                "{sql}"
-            );
-        }
+        );
+        assert_eq!(invalid.code, SqlState::DatatypeMismatch);
+        assert_eq!(
+            invalid.message,
+            "non-aggregate expression must appear exactly in GROUP BY"
+        );
+
+        let sql = "select distinct on (sum(count(*)) over ()) id from users group by id";
+        let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+        let plan = logical_plan(&bound).unwrap();
+        let LogicalPlan::Projection { source, .. } = plan else {
+            panic!("expected projection");
+        };
+        let LogicalPlan::Distinct { source, on_keys } = source.as_ref() else {
+            panic!("expected distinct");
+        };
+        assert!(matches!(on_keys.as_slice(), [BoundExpr::LocalRef { .. }]));
+        let LogicalPlan::Window {
+            source, functions, ..
+        } = source.as_ref()
+        else {
+            panic!("expected window");
+        };
+        assert!(matches!(
+            functions.as_slice(),
+            [WindowFuncExpr {
+                args,
+                ..
+            }] if matches!(args.as_slice(), [BoundExpr::LocalRef { slot: 1, .. }])
+        ));
+        assert_window_args_contain_no_aggregates(functions);
+        let LogicalPlan::Aggregate { source, .. } = source.as_ref() else {
+            panic!("expected aggregate");
+        };
+        assert!(matches!(source.as_ref(), LogicalPlan::Scan { .. }));
     }
 
     #[test]
@@ -4791,6 +5127,52 @@ mod tests {
     }
 
     #[test]
+    fn window_narrows_apply_widened_correlated_where_input() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select row_number() over () from users where exists \
+             (select 1 from accounts where accounts.owner > users.name)",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected final projection");
+        };
+        let PhysicalPlan::Window { source, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        let PhysicalPlan::Projection {
+            source,
+            expressions,
+            output_schema,
+        } = source.as_ref()
+        else {
+            panic!("expected narrowing projection");
+        };
+        assert_eq!(expressions.len(), 2);
+        assert_eq!(output_schema.len(), 2);
+        assert!(matches!(
+            expressions[0],
+            BoundExpr::LocalRef {
+                slot: 0,
+                data_type: DataType::Integer,
+                nullable: false,
+            }
+        ));
+        assert!(matches!(
+            expressions[1],
+            BoundExpr::LocalRef {
+                slot: 1,
+                data_type: DataType::Text,
+                nullable: true,
+            }
+        ));
+        let PhysicalPlan::Filter { source, .. } = source.as_ref() else {
+            panic!("expected consuming filter");
+        };
+        assert!(matches!(source.as_ref(), PhysicalPlan::Apply { .. }));
+    }
+
+    #[test]
     fn uncorrelated_in_with_column_operand_decorrelates_to_semi_join() {
         let catalog = catalog_with_users_and_accounts();
         let plan = plan_sql(
@@ -4953,6 +5335,43 @@ mod tests {
             panic!("expected Apply above the Aggregate, got {source:?}");
         };
         assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn window_narrows_apply_widened_correlated_having_input() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select name, row_number() over () from users group by name having exists \
+             (select 1 from accounts where accounts.owner > users.name)",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected final projection");
+        };
+        let PhysicalPlan::Window { source, .. } = source.as_ref() else {
+            panic!("expected window");
+        };
+        let PhysicalPlan::Projection {
+            source,
+            expressions,
+            output_schema,
+        } = source.as_ref()
+        else {
+            panic!("expected narrowing projection");
+        };
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(output_schema.len(), 1);
+        assert!(matches!(
+            expressions[0],
+            BoundExpr::LocalRef { slot: 0, .. }
+        ));
+        let PhysicalPlan::Filter { source, .. } = source.as_ref() else {
+            panic!("expected consuming filter");
+        };
+        let PhysicalPlan::Apply { input, .. } = source.as_ref() else {
+            panic!("expected apply");
+        };
+        assert!(matches!(input.as_ref(), PhysicalPlan::Aggregate { .. }));
     }
 
     #[test]

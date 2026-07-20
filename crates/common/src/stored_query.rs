@@ -1826,7 +1826,12 @@ fn validate_select_semantics(
         || select.having.is_some()
         || order_by
             .iter()
-            .any(|item| expr_contains_aggregate(&item.expr));
+            .any(|item| expr_contains_aggregate(&item.expr))
+        || matches!(
+            &select.distinct,
+            Some(StoredDistinct::On(keys))
+                if keys.iter().any(expr_contains_aggregate)
+        );
     if !aggregate_context {
         return Ok(());
     }
@@ -3639,6 +3644,29 @@ mod tests {
             nulls_first: None,
         });
         assert!(validate_stored_query_shape(&distinct_on).is_err());
+    }
+
+    #[test]
+    fn select_semantics_treats_distinct_on_aggregate_as_aggregate_context() {
+        let mut query = constant_query();
+        let StoredQueryBody::Select(select) = &mut query.body else {
+            panic!("test query is SELECT")
+        };
+        select.columns[0].expr = StoredQueryExpr::InputRef {
+            range: 0,
+            column: StoredColumnReference::Catalog(1),
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+        select.distinct = Some(StoredDistinct::On(vec![StoredQueryExpr::Aggregate {
+            function: 2_147,
+            arg: None,
+            distinct: false,
+            data_type: DataType::Integer,
+            nullable: false,
+        }]));
+
+        assert!(validate_select_semantics(select, &[]).is_err());
     }
 
     #[test]

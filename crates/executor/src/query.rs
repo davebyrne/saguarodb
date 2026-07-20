@@ -901,6 +901,10 @@ fn build_executor_impl<'a>(
             output_schema.clone(),
             ctx.spill.clone(),
         ))),
+        PhysicalPlan::Window { .. } => Err(DbError::plan(
+            SqlState::FeatureNotSupported,
+            "window function execution is not yet implemented",
+        )),
         PhysicalPlan::Values {
             rows,
             output_schema,
@@ -980,7 +984,8 @@ fn executor_child_count(plan: &PhysicalPlan) -> usize {
         | PhysicalPlan::Sort { .. }
         | PhysicalPlan::Distinct { .. }
         | PhysicalPlan::Limit { .. }
-        | PhysicalPlan::Aggregate { .. } => 1,
+        | PhysicalPlan::Aggregate { .. }
+        | PhysicalPlan::Window { .. } => 1,
         PhysicalPlan::CreateSchema { .. }
         | PhysicalPlan::DropSchema { .. }
         | PhysicalPlan::CreateTable { .. }
@@ -1030,7 +1035,8 @@ fn validate_plan_layout(plan: &PhysicalPlan, layout: &PlanNodeLayout) -> Result<
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. }
-        | PhysicalPlan::Aggregate { source, .. } => {
+        | PhysicalPlan::Aggregate { source, .. }
+        | PhysicalPlan::Window { source, .. } => {
             validate_plan_layout(source, required_layout_child(layout, 0)?)
         }
         PhysicalPlan::NestedLoopJoin { left, right, .. }

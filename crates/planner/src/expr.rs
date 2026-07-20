@@ -303,6 +303,14 @@ pub struct AggregateExpr {
     pub nullable: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowFuncExpr {
+    pub func: WindowFunc,
+    pub args: Vec<BoundExpr>,
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateFunc {
     Count,

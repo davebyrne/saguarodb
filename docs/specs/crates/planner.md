@@ -309,8 +309,9 @@ pub enum BoundFrom {
 ```
 
 `source_width` is zero for a FROM-less SELECT and otherwise records the complete
-bound FROM-row width before projection, grouping, or expression rewriting. M3
-uses this fixed boundary as the base slot count for non-aggregate window plans.
+bound FROM-row width before projection, grouping, or expression rewriting. The
+window planner uses this fixed boundary as the base slot count for
+non-aggregate window plans.
 
 For `CREATE TABLE`, binder defaults an absent `compression` option to
 `CompressionSetting::None`. It merges `Statement::CreateTable.toast` into
@@ -536,8 +537,9 @@ Expression metadata rules:
 - `WindowCall`: the binder resolves the function family, arguments, effective
   frame, result type, and nullability. `ROWS` offsets are stored as `u64` and
   `RANGE` offsets as typed `Value`s. Window calls bind only in SELECT output,
-  query `ORDER BY`, and DISTINCT keys; execution remains behind the M2 staging
-  `0A000` guard until window plan nodes arrive in M3.
+  query `ORDER BY`, and DISTINCT keys. Logical planning extracts them into
+  Window nodes and rewrites their downstream uses to `LocalRef`; executor
+  dispatch returns `0A000` until the M4 operator lands.
 - `ScalarSubquery`, `Exists`, `InSubquery`: the binder binds the inner SELECT in a fresh, uncorrelated scope (it does not see the outer query's columns). A scalar subquery and the right side of `IN` must produce exactly one output column (else `SqlState::SyntaxError`); a scalar subquery's type is that column's type and it is always nullable. `EXISTS` is a non-null boolean. For `IN`/`NOT IN`, the left operand is type-checked against the subquery's column type (no implicit casts; mismatch is `SqlState::DatatypeMismatch`). These variants are constants with respect to the outer query, so the outer aggregate/grouping analyses treat them as leaves (only `InSubquery`'s left operand participates in the outer scope). Logical/physical planning preserve the inner `BoundQuery` unchanged; the executor plans and runs it.
 
 ## Shared Plan Expression Types
@@ -679,6 +681,7 @@ pub enum LogicalPlan {
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
     },
+    Window { source: Box<LogicalPlan>, spec: BoundWindowSpec, functions: Vec<WindowFuncExpr> },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
     SetOp { op: SetOp, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> },
 }
@@ -687,6 +690,21 @@ pub enum LogicalPlan {
 Logical plan contains no access method choices. `SystemScan` is the logical
 source for a bound virtual system view; its optional `filter` is the bound `WHERE`
 predicate pushed to the source the same way it is for a base-table `Scan`.
+
+Window planning runs after aggregate extraction and HAVING. Calls are grouped
+by structurally identical `(partition_by, order_by, frame)` specifications in
+first-appearance order and identical calls within a group share one appended
+column. Each Window appends its functions to the source row; its schema is
+derived as `source ++ functions` and is not stored on the node. Projection,
+query ORDER BY, and DISTINCT keys use `LocalRef` slots beginning at the
+aggregate width (`group_by + aggregates`) or the bound `source_width` for a
+non-aggregate query. The resulting pipeline is `Aggregate/HAVING → Window* →
+Sort → Distinct → Projection`.
+
+Correlated-subquery hoisting preserves that fixed input width. If an Apply
+inserted beneath a Window widens the Window's source, the hoister inserts a
+narrowing Projection between the consuming Filter and Window, selecting the
+original slots before any window-result columns are appended.
 
 For a `SELECT DISTINCT` (`BoundSelect.distinct`), logical planning inserts a
 `Distinct` node between any `Sort` and the `Projection`, so keeping the first
@@ -800,6 +818,7 @@ pub enum PhysicalPlan {
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
     },
+    Window { source: Box<PhysicalPlan>, spec: BoundWindowSpec, functions: Vec<WindowFuncExpr> },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
     SetOp { op: SetOp, all: bool, left: Box<PhysicalPlan>, right: Box<PhysicalPlan> },
 }
@@ -823,6 +842,9 @@ pub enum PhysicalPlan {
 - An `Inner` join whose `condition` contains at least one `left_column = right_column` equality conjunct becomes a `HashJoin` on those equality pairs. The node carries `build_left: bool` (`docs/specs/statistics.md` §9.2): set only for a plain inner join outside a DML spine when both inputs are fully analyzed (`plan_fully_analyzed`) and the left side's row estimate is smaller, so the executor builds its hash table over the smaller input; semi/anti joins and any un-analyzed input keep the historical build-right shape. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). Any remaining (non-equi or expression) conjuncts are re-checked in a `Filter` above the `HashJoin`, using their global joined-row slots. An inner join with no column-equality conjunct stays a `NestedLoopJoin`.
 - A `Left`, `Right`, or `Full` join with no DML identity source and at least one extractable cross-side column equality becomes a `MergeJoin`; remaining conjuncts are its internal `residual`, because filtering above an outer join would change NULL-extension semantics. Outer joins with no equality key, outer DML identity spines, cross joins, and non-equality joins remain `NestedLoopJoin`. Merge join performs its own sorts and does not publish an ordering property, so an SQL `ORDER BY` still plans a `Sort`.
 - Sort and aggregate are blocking operators.
+- `LogicalPlan::Window` maps one-to-one to `PhysicalPlan::Window`; its row
+  estimate is the source estimate. Until M4, executor dispatch returns
+  `FeatureNotSupported` (`0A000`) without evaluating the node.
 - The planner performs no projection pushdown: `LogicalPlan::Projection` maps straight to `PhysicalPlan::Projection`, and logical planning always wraps a top-level `Projection`.
 
 ## EXPLAIN
@@ -835,11 +857,11 @@ pub enum PhysicalPlan {
 - The planner crate exposes `PlanNodeLayout::new(plan)`, `format_explain(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> Result<String>`, and `estimated_rows(plan: &PhysicalPlan, catalog: &dyn CatalogManager) -> u64` (the cardinality estimator, `docs/specs/statistics.md` §9.1). Both EXPLAIN formatters return an `InternalError` if a plan/layout invariant is violated instead of panicking.
 - The server `QueryService` handles the outer statement after normal snapshot and object-lock setup. Plain EXPLAIN formats the inner physical plan without execution; analyzed EXPLAIN calls the executor's analysis-only driver and passes its report to `format_explain_analyze`.
 
-`format_explain` appends ` (rows=N)` — the estimated output row count — to every data-producing node line (scans, joins, Apply, filters, projections, sorts, distinct, limits, aggregates, `Values`, set operations, and the `Insert`/`Update`/`Delete` heads); DDL nodes carry no estimate. Estimates come from `planner::estimate` reading ANALYZE statistics through the catalog: base scans use the stored `row_count` (default 1000 when never analyzed), scan-level predicates resolve `column op literal` shapes against MCVs, histograms, and null fractions, and every unresolvable shape uses fixed defaults (equality `0.005`, ranges `1/3`, other predicates `0.5`, join-key/grouping distinct counts `200`, semi/anti joins keep half the left side, system views `100` rows). Upper `Filter` nodes estimate from predicate shape alone — column statistics resolve only at scan level in v1. Estimates are advisory and never affect correctness.
+`format_explain` appends ` (rows=N)` — the estimated output row count — to every data-producing node line (scans, joins, Apply, filters, projections, sorts, distinct, limits, aggregates, Window, `Values`, set operations, and the `Insert`/`Update`/`Delete` heads); DDL nodes carry no estimate. Estimates come from `planner::estimate` reading ANALYZE statistics through the catalog: base scans use the stored `row_count` (default 1000 when never analyzed), scan-level predicates resolve `column op literal` shapes against MCVs, histograms, and null fractions, and every unresolvable shape uses fixed defaults (equality `0.005`, ranges `1/3`, other predicates `0.5`, join-key/grouping distinct counts `200`, semi/anti joins keep half the left side, system views `100` rows). Upper `Filter` nodes estimate from predicate shape alone — column statistics resolve only at scan level in v1. Estimates are advisory and never affect correctness.
 
 `PlanNodeLayout` assigns execution-local, zero-based node IDs in deterministic pre-order: root first, a unary child next, binary left before right, and Apply input before subplan. `new_with_next(plan, &mut next)` lets a caller share one allocation counter across the main tree and init-plan trees, keeping every ID globally distinct within one explanation without exposing mutable layout state. The IDs are stable for an unchanged physical tree but are not durable or catalog identifiers. The immutable layout exposes only its node `id()` and checked `child(index)` lookup; IDs are explanation/execution metadata and are not stored in `PhysicalPlan` variants.
 
-`format_explain` renders each physical node on its own indented line, prefixed exactly once by `[node=N]`, with a stable label vocabulary including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N build=left|right`, `MergeJoin type=Left|Right|Full keys=N residual=yes|none`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line, prefixed exactly once by `[node=N]`, with a stable label vocabulary including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N build=left|right`, `MergeJoin type=Left|Right|Full keys=N residual=yes|none`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Window partition_by=[…] order_by=[…] [frame=…] functions=[…]`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`. Window omits `frame=` when the resolved frame equals the default for its specification.
 
 The planner also owns the executor-to-formatter reporting DTOs `NodeExecutionMetrics`, `InitPlanAnalysis`, and `ExplainAnalysis`, plus `format_explain_analyze`. Cumulative node metrics are keyed by `PlanNodeId`; the formatter divides startup time, total time, and rows by `loops`, rendering exact average rows as an integer and fractional averages with two decimal places. Times use three decimal milliseconds. A missing/zero-loop node renders `(never executed)`. Estimated rows remain on analyzed lines, init-plan sections (when present) precede the final `Execution Time: N.NNN ms` line, and node timing is inclusive rather than additive. SQL exposes this through SELECT-only `EXPLAIN ANALYZE` and `EXPLAIN (ANALYZE [TRUE|FALSE])`; false uses the plain formatter.
 

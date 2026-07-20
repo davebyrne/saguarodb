@@ -165,6 +165,41 @@ pub(crate) fn hoist_correlated_subqueries(
             aggregates,
             output_schema,
         },
+        LogicalPlan::Window {
+            source,
+            spec,
+            functions,
+        } => {
+            let expected_columns = logical_output_columns(&source, catalog)?;
+            let hoisted = hoist_correlated_subqueries(*source, catalog)?;
+            let source = if logical_output_width(&hoisted, catalog)? == expected_columns.len() {
+                hoisted
+            } else {
+                let expressions = expected_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, column)| BoundExpr::LocalRef {
+                        slot,
+                        data_type: column.info.data_type.clone(),
+                        nullable: column.nullable,
+                    })
+                    .collect();
+                let output_schema = expected_columns
+                    .into_iter()
+                    .map(|column| column.info)
+                    .collect();
+                LogicalPlan::Projection {
+                    source: Box::new(hoisted),
+                    expressions,
+                    output_schema,
+                }
+            };
+            LogicalPlan::Window {
+                source: Box::new(source),
+                spec,
+                functions,
+            }
+        }
         LogicalPlan::SetOp {
             op,
             all,
@@ -885,6 +920,9 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
         | LogicalPlan::Sort { source, .. }
         | LogicalPlan::Distinct { source, .. }
         | LogicalPlan::Limit { source, .. } => logical_output_width(source, catalog)?,
+        LogicalPlan::Window {
+            source, functions, ..
+        } => logical_output_width(source, catalog)? + functions.len(),
         LogicalPlan::Projection { output_schema, .. }
         | LogicalPlan::LockRows { output_schema, .. }
         | LogicalPlan::Aggregate { output_schema, .. }
@@ -904,4 +942,248 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
             )));
         }
     })
+}
+
+struct LogicalOutputColumn {
+    info: common::ColumnInfo,
+    nullable: bool,
+}
+
+fn logical_output_columns(
+    plan: &LogicalPlan,
+    catalog: &dyn CatalogManager,
+) -> Result<Vec<LogicalOutputColumn>> {
+    Ok(match plan {
+        LogicalPlan::Scan { table, .. } => {
+            let schema = catalog.get_table(*table)?.ok_or_else(|| {
+                DbError::internal(format!("table {table} disappeared during planning"))
+            })?;
+            schema
+                .columns
+                .iter()
+                .map(|column| LogicalOutputColumn {
+                    info: common::ColumnInfo {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        table_id: Some(*table),
+                        column_id: Some(column.id),
+                        pg_type: column.pg_type.clone(),
+                    },
+                    nullable: column.nullable,
+                })
+                .collect()
+        }
+        LogicalPlan::SystemScan { view, .. } => view
+            .columns()
+            .into_iter()
+            .map(|column| LogicalOutputColumn {
+                info: common::ColumnInfo {
+                    name: column.name,
+                    data_type: column.data_type,
+                    table_id: None,
+                    column_id: Some(column.id),
+                    pg_type: column.pg_type,
+                },
+                nullable: column.nullable,
+            })
+            .collect(),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            let mut columns = logical_output_columns(left, catalog)?;
+            if matches!(join_type, JoinType::Right | JoinType::Full) {
+                for column in &mut columns {
+                    column.nullable = true;
+                }
+            }
+            if !join_type.is_semi_or_anti() {
+                let mut right_columns = logical_output_columns(right, catalog)?;
+                if matches!(join_type, JoinType::Left | JoinType::Full) {
+                    for column in &mut right_columns {
+                        column.nullable = true;
+                    }
+                }
+                columns.extend(right_columns);
+            }
+            columns
+        }
+        LogicalPlan::Filter { source, .. }
+        | LogicalPlan::Sort { source, .. }
+        | LogicalPlan::Distinct { source, .. }
+        | LogicalPlan::Limit { source, .. } => logical_output_columns(source, catalog)?,
+        LogicalPlan::Projection {
+            expressions,
+            output_schema,
+            ..
+        }
+        | LogicalPlan::LockRows {
+            expressions,
+            output_schema,
+            ..
+        } => output_columns_from_exprs(output_schema, expressions)?,
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            output_schema,
+            ..
+        } => {
+            let nullability = group_by
+                .iter()
+                .map(BoundExpr::nullable)
+                .chain(aggregates.iter().map(|aggregate| aggregate.nullable));
+            output_columns_with_nullability(output_schema, nullability)?
+        }
+        LogicalPlan::Values {
+            rows,
+            output_schema,
+        } => {
+            let mut nullability = Vec::new();
+            nullability
+                .try_reserve(output_schema.len())
+                .map_err(|error| {
+                    DbError::internal(format!("could not reserve VALUES nullability: {error}"))
+                })?;
+            for slot in 0..output_schema.len() {
+                let mut nullable = false;
+                for row in rows {
+                    let expr = row.get(slot).ok_or_else(|| {
+                        DbError::internal("VALUES row width does not match its output schema")
+                    })?;
+                    nullable |= expr.nullable();
+                }
+                nullability.push(nullable);
+            }
+            output_columns_with_nullability(output_schema, nullability)?
+        }
+        LogicalPlan::TableFunction {
+            name,
+            output_schema,
+            ..
+        } => {
+            let nullable = match name.as_str() {
+                "unnest" => true,
+                "generate_series" => false,
+                _ => true,
+            };
+            output_columns_with_nullability(
+                output_schema,
+                std::iter::repeat_n(nullable, output_schema.len()),
+            )?
+        }
+        LogicalPlan::Window {
+            source, functions, ..
+        } => {
+            let mut columns = logical_output_columns(source, catalog)?;
+            columns.extend(functions.iter().map(|function| LogicalOutputColumn {
+                info: common::ColumnInfo {
+                    name: format!("{:?}", function.func),
+                    data_type: function.data_type.clone(),
+                    table_id: None,
+                    column_id: None,
+                    pg_type: None,
+                },
+                nullable: function.nullable,
+            }));
+            columns
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            let left = logical_output_columns(left, catalog)?;
+            let right = logical_output_columns(right, catalog)?;
+            if left.len() != right.len() {
+                return Err(DbError::internal(
+                    "set-operation arm widths differ during window hoisting",
+                ));
+            }
+            left.into_iter()
+                .zip(right)
+                .map(|(mut left, right)| {
+                    left.nullable |= right.nullable;
+                    left
+                })
+                .collect()
+        }
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            kind,
+            ..
+        } => {
+            let mut columns = logical_output_columns(input, catalog)?;
+            match kind {
+                ApplyKind::Scalar { data_type } => columns.push(LogicalOutputColumn {
+                    info: common::ColumnInfo {
+                        name: "apply".to_string(),
+                        data_type: data_type.clone(),
+                        table_id: None,
+                        column_id: None,
+                        pg_type: None,
+                    },
+                    nullable: true,
+                }),
+                ApplyKind::Exists { .. } => columns.push(LogicalOutputColumn {
+                    info: common::ColumnInfo {
+                        name: "apply".to_string(),
+                        data_type: DataType::Boolean,
+                        table_id: None,
+                        column_id: None,
+                        pg_type: None,
+                    },
+                    nullable: false,
+                }),
+                ApplyKind::In { .. } => columns.push(LogicalOutputColumn {
+                    info: common::ColumnInfo {
+                        name: "apply".to_string(),
+                        data_type: DataType::Boolean,
+                        table_id: None,
+                        column_id: None,
+                        pg_type: None,
+                    },
+                    nullable: true,
+                }),
+                ApplyKind::Lateral { left_join, .. } => {
+                    let mut appended = logical_output_columns(subplan, catalog)?;
+                    if *left_join {
+                        for column in &mut appended {
+                            column.nullable = true;
+                        }
+                    }
+                    columns.extend(appended);
+                }
+            }
+            columns
+        }
+        other => {
+            return Err(DbError::internal(format!(
+                "plan node has no row schema: {other:?}"
+            )));
+        }
+    })
+}
+
+fn output_columns_from_exprs(
+    output_schema: &[common::ColumnInfo],
+    expressions: &[BoundExpr],
+) -> Result<Vec<LogicalOutputColumn>> {
+    output_columns_with_nullability(output_schema, expressions.iter().map(BoundExpr::nullable))
+}
+
+fn output_columns_with_nullability(
+    output_schema: &[common::ColumnInfo],
+    nullability: impl IntoIterator<Item = bool>,
+) -> Result<Vec<LogicalOutputColumn>> {
+    let columns: Vec<_> = output_schema
+        .iter()
+        .cloned()
+        .zip(nullability)
+        .map(|(info, nullable)| LogicalOutputColumn { info, nullable })
+        .collect();
+    if columns.len() != output_schema.len() {
+        return Err(DbError::internal(
+            "plan output expressions do not match its output schema",
+        ));
+    }
+    Ok(columns)
 }

@@ -62,7 +62,8 @@ pub(crate) fn plan_fully_analyzed(
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Limit { source, .. }
         | PhysicalPlan::Distinct { source, .. }
-        | PhysicalPlan::Aggregate { source, .. } => plan_fully_analyzed(source, catalog),
+        | PhysicalPlan::Aggregate { source, .. }
+        | PhysicalPlan::Window { source, .. } => plan_fully_analyzed(source, catalog),
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::SetOp { left, right, .. } => {
@@ -114,9 +115,9 @@ fn rows(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> f64 {
             // filter estimates from the predicate's shape alone.
             rows(source, catalog) * selectivity(predicate, None)
         }
-        PhysicalPlan::Projection { source, .. } | PhysicalPlan::Sort { source, .. } => {
-            rows(source, catalog)
-        }
+        PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Window { source, .. } => rows(source, catalog),
         PhysicalPlan::Limit {
             source,
             count,

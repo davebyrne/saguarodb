@@ -690,7 +690,8 @@ fn nested_apply_subplans(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
             | PhysicalPlan::Sort { source, .. }
             | PhysicalPlan::Distinct { source, .. }
             | PhysicalPlan::Limit { source, .. }
-            | PhysicalPlan::Aggregate { source, .. } => stack.push(source),
+            | PhysicalPlan::Aggregate { source, .. }
+            | PhysicalPlan::Window { source, .. } => stack.push(source),
             PhysicalPlan::NestedLoopJoin { left, right, .. }
             | PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::MergeJoin { left, right, .. }

@@ -9,7 +9,7 @@ use common::Result;
 
 use crate::{
     AggregateExpr, ApplyKind, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning,
-    PhysicalPlan,
+    PhysicalPlan, WindowFuncExpr,
 };
 
 /// Rewrite every bound expression embedded in `plan` (filters, projections,
@@ -286,6 +286,32 @@ fn rewrite_plan_exprs_impl(
                 .collect::<Result<Vec<_>>>()?,
             output_schema: output_schema.clone(),
         },
+        PhysicalPlan::Window {
+            source,
+            spec,
+            functions,
+        } => {
+            let mut spec = spec.clone();
+            spec.partition_by = rewrite_vec(&spec.partition_by, f)?;
+            for item in &mut spec.order_by {
+                item.expr = rewrite_expr(&item.expr, f)?;
+            }
+            PhysicalPlan::Window {
+                source: Box::new(rewrite_plan_exprs_impl(source, f, descend_apply_subplans)?),
+                spec,
+                functions: functions
+                    .iter()
+                    .map(|function| {
+                        Ok(WindowFuncExpr {
+                            func: function.func,
+                            args: rewrite_vec(&function.args, f)?,
+                            data_type: function.data_type.clone(),
+                            nullable: function.nullable,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        }
         PhysicalPlan::Values {
             rows,
             output_schema,

@@ -1,13 +1,14 @@
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result, SchemaId,
-    SequenceOptions, SqlState, StoredQueryV1, TableId, ToastOptions,
+    SequenceOptions, StoredQueryV1, TableId, ToastOptions,
 };
 
 use crate::{
     AggregateExpr, ApplyKind, BoundDistinct, BoundExpr, BoundForeignKey, BoundFrom,
     BoundInsertSource, BoundOnConflict, BoundOrderByItem, BoundQuery, BoundQueryBody,
-    BoundReturning, BoundSelect, BoundStatement, JoinSide, JoinType, SetOp,
+    BoundReturning, BoundSelect, BoundStatement, BoundWindowSpec, JoinSide, JoinType, SetOp,
+    WindowFuncExpr,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +205,11 @@ pub enum LogicalPlan {
         group_by: Vec<BoundExpr>,
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
+    },
+    Window {
+        source: Box<LogicalPlan>,
+        spec: BoundWindowSpec,
+        functions: Vec<WindowFuncExpr>,
     },
     Values {
         rows: Vec<Vec<BoundExpr>>,
@@ -575,150 +581,258 @@ fn plan_select_body(
             .iter()
             .any(|item| contains_aggregate(&item.expr))
         || select.having.is_some()
-        || order_by.iter().any(|item| contains_aggregate(&item.expr));
+        || order_by.iter().any(|item| contains_aggregate(&item.expr))
+        || matches!(
+            &select.distinct,
+            Some(BoundDistinct::On(keys)) if keys.iter().any(contains_aggregate)
+        );
 
-    if aggregate_context {
-        let mut aggregates = Vec::new();
-        for item in &select.columns {
-            collect_aggregates(&item.expr, &mut aggregates);
-        }
-        if let Some(having) = &select.having {
-            collect_aggregates(having, &mut aggregates);
-        }
-        for item in order_by {
-            collect_aggregates(&item.expr, &mut aggregates);
-        }
-        if let Some(BoundDistinct::On(keys)) = &select.distinct {
-            for key in keys {
-                collect_aggregates(key, &mut aggregates);
+    let (mut expressions, mut planned_order_by, mut distinct_keys, window_base_width) =
+        if aggregate_context {
+            let mut aggregates = Vec::new();
+            for item in &select.columns {
+                collect_aggregates(&item.expr, &mut aggregates);
             }
-        }
+            if let Some(having) = &select.having {
+                collect_aggregates(having, &mut aggregates);
+            }
+            for item in order_by {
+                collect_aggregates(&item.expr, &mut aggregates);
+            }
+            if let Some(BoundDistinct::On(keys)) = &select.distinct {
+                for key in keys {
+                    collect_aggregates(key, &mut aggregates);
+                }
+            }
 
-        let output_schema = aggregate_output_schema(&select.group_by, &aggregates);
-        plan = LogicalPlan::Aggregate {
-            source: Box::new(plan),
-            group_by: select.group_by.clone(),
-            aggregates: aggregates.clone(),
-            output_schema,
+            let output_schema = aggregate_output_schema(&select.group_by, &aggregates);
+            plan = LogicalPlan::Aggregate {
+                source: Box::new(plan),
+                group_by: select.group_by.clone(),
+                aggregates: aggregates.clone(),
+                output_schema,
+            };
+
+            if let Some(having) = &select.having {
+                plan = LogicalPlan::Filter {
+                    source: Box::new(plan),
+                    predicate: rewrite_aggregate_expr(having, &select.group_by, &aggregates)?,
+                };
+            }
+
+            let expressions = select
+                .columns
+                .iter()
+                .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
+                .collect::<Result<Vec<_>>>()?;
+            let planned_order_by = order_by
+                .iter()
+                .map(|item| {
+                    Ok(BoundOrderByItem {
+                        expr: rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates)?,
+                        ascending: item.ascending,
+                        nulls_first: item.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // DISTINCT ON keys may reference grouped columns and aggregates inside
+            // window arguments, so they get the same grouped-expression rewrite as
+            // the projection expressions.
+            let distinct_keys = match &select.distinct {
+                None => None,
+                Some(BoundDistinct::All) => Some(expressions.clone()),
+                Some(BoundDistinct::On(on)) => Some(
+                    on.iter()
+                        .map(|expr| rewrite_aggregate_expr(expr, &select.group_by, &aggregates))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            };
+            (
+                expressions,
+                planned_order_by,
+                distinct_keys,
+                select.group_by.len() + aggregates.len(),
+            )
+        } else {
+            let expressions: Vec<BoundExpr> = select
+                .columns
+                .iter()
+                .map(|item| item.expr.clone())
+                .collect();
+            let distinct_keys = match &select.distinct {
+                None => None,
+                Some(BoundDistinct::All) => Some(expressions.clone()),
+                Some(BoundDistinct::On(on)) => Some(on.clone()),
+            };
+            (
+                expressions,
+                order_by.to_vec(),
+                distinct_keys,
+                select.source_width,
+            )
         };
 
-        if let Some(having) = &select.having {
-            plan = LogicalPlan::Filter {
-                source: Box::new(plan),
-                predicate: rewrite_aggregate_expr(having, &select.group_by, &aggregates)?,
-            };
+    if let Some(lock) = row_lock {
+        if aggregate_context {
+            return Err(DbError::internal(
+                "locking SELECT reached aggregate planning",
+            ));
         }
-
-        if !order_by.is_empty() {
+        if distinct_keys.is_some() {
+            return Err(DbError::internal(
+                "locking SELECT reached planning with DISTINCT",
+            ));
+        }
+        if !planned_order_by.is_empty() {
             plan = LogicalPlan::Sort {
                 source: Box::new(plan),
-                order_by: order_by
-                    .iter()
-                    .map(|item| {
-                        Ok(BoundOrderByItem {
-                            expr: rewrite_aggregate_expr(
-                                &item.expr,
-                                &select.group_by,
-                                &aggregates,
-                            )?,
-                            ascending: item.ascending,
-                            nulls_first: item.nulls_first,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
+                order_by: planned_order_by,
             };
         }
-
-        let expressions = select
-            .columns
-            .iter()
-            .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
-            .collect::<Result<Vec<_>>>()?;
-        if matches!(
-            &select.distinct,
-            Some(BoundDistinct::On(keys)) if keys.iter().any(contains_window)
-        ) {
-            return Err(window_execution_not_implemented());
-        }
-        // DISTINCT ON keys may reference grouped columns and aggregates inside
-        // window arguments, so they get the same grouped-expression rewrite as
-        // the projection expressions.
-        let distinct_keys = match &select.distinct {
-            None => None,
-            Some(BoundDistinct::All) => Some(expressions.clone()),
-            Some(BoundDistinct::On(on)) => Some(
-                on.iter()
-                    .map(|expr| rewrite_aggregate_expr(expr, &select.group_by, &aggregates))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
+        plan = LogicalPlan::LockRows {
+            source: Box::new(plan),
+            table: lock.table,
+            mode: lock.mode,
+            wait_policy: lock.wait_policy,
+            recheck: select.filter.clone(),
+            expressions,
+            output_schema: select.output_schema.clone(),
         };
-        if expressions.iter().any(contains_window)
-            || order_by.iter().any(|item| contains_window(&item.expr))
-            || distinct_keys
-                .as_ref()
-                .is_some_and(|keys| keys.iter().any(contains_window))
-        {
-            return Err(window_execution_not_implemented());
+    } else {
+        let groups = collect_windows(&expressions, &planned_order_by, distinct_keys.as_deref())?;
+        for group in &groups {
+            plan = LogicalPlan::Window {
+                source: Box::new(plan),
+                spec: group.spec.clone(),
+                functions: group.functions.clone(),
+            };
+        }
+        expressions = expressions
+            .iter()
+            .map(|expr| rewrite_window_expr(expr, &groups, window_base_width))
+            .collect::<Result<Vec<_>>>()?;
+        for item in &mut planned_order_by {
+            item.expr = rewrite_window_expr(&item.expr, &groups, window_base_width)?;
+        }
+        if let Some(keys) = &mut distinct_keys {
+            *keys = keys
+                .iter()
+                .map(|expr| rewrite_window_expr(expr, &groups, window_base_width))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        if !planned_order_by.is_empty() {
+            plan = LogicalPlan::Sort {
+                source: Box::new(plan),
+                order_by: planned_order_by,
+            };
         }
         plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
-    } else {
-        if select
-            .columns
-            .iter()
-            .any(|item| contains_window(&item.expr))
-            || order_by.iter().any(|item| contains_window(&item.expr))
-            || matches!(
-                &select.distinct,
-                Some(BoundDistinct::On(exprs)) if exprs.iter().any(contains_window)
-            )
-        {
-            return Err(window_execution_not_implemented());
-        }
-        if !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                source: Box::new(plan),
-                order_by: order_by.to_vec(),
-            };
-        }
-
-        let expressions: Vec<BoundExpr> = select
-            .columns
-            .iter()
-            .map(|item| item.expr.clone())
-            .collect();
-        let distinct_keys = match &select.distinct {
-            None => None,
-            Some(BoundDistinct::All) => Some(expressions.clone()),
-            Some(BoundDistinct::On(on)) => Some(on.clone()),
-        };
-        plan = if let Some(lock) = row_lock {
-            if distinct_keys.is_some() {
-                return Err(DbError::internal(
-                    "locking SELECT reached planning with DISTINCT",
-                ));
-            }
-            LogicalPlan::LockRows {
-                source: Box::new(plan),
-                table: lock.table,
-                mode: lock.mode,
-                wait_policy: lock.wait_policy,
-                recheck: select.filter.clone(),
-                expressions,
-                output_schema: select.output_schema.clone(),
-            }
-        } else {
-            apply_distinct_and_projection(plan, select, distinct_keys, expressions)
-        };
     }
 
     Ok(apply_limit(plan, limit, offset))
 }
 
-fn window_execution_not_implemented() -> DbError {
-    DbError::plan(
-        SqlState::FeatureNotSupported,
-        "window function execution is not yet implemented",
-    )
+#[derive(Clone)]
+struct WindowGroup {
+    spec: BoundWindowSpec,
+    functions: Vec<WindowFuncExpr>,
+}
+
+fn collect_windows(
+    expressions: &[BoundExpr],
+    order_by: &[BoundOrderByItem],
+    distinct_keys: Option<&[BoundExpr]>,
+) -> Result<Vec<WindowGroup>> {
+    let mut groups = Vec::new();
+    for expr in expressions {
+        collect_windows_expr(expr, &mut groups)?;
+    }
+    for item in order_by {
+        collect_windows_expr(&item.expr, &mut groups)?;
+    }
+    if let Some(keys) = distinct_keys {
+        for expr in keys {
+            collect_windows_expr(expr, &mut groups)?;
+        }
+    }
+    Ok(groups)
+}
+
+fn collect_windows_expr(expr: &BoundExpr, groups: &mut Vec<WindowGroup>) -> Result<()> {
+    if let BoundExpr::WindowCall {
+        func,
+        args,
+        spec,
+        data_type,
+        nullable,
+    } = expr
+    {
+        let function = WindowFuncExpr {
+            func: *func,
+            args: args.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.spec == **spec) {
+            if !group.functions.contains(&function) {
+                group.functions.push(function);
+            }
+        } else {
+            groups.push(WindowGroup {
+                spec: (**spec).clone(),
+                functions: vec![function],
+            });
+        }
+        return Ok(());
+    }
+    crate::params::for_each_child(expr, &mut |child| collect_windows_expr(child, groups))
+}
+
+fn rewrite_window_expr(
+    expr: &BoundExpr,
+    groups: &[WindowGroup],
+    base_width: usize,
+) -> Result<BoundExpr> {
+    crate::rewrite::rewrite_expr(expr, &mut |node| {
+        let BoundExpr::WindowCall {
+            func,
+            args,
+            spec,
+            data_type,
+            nullable,
+        } = node
+        else {
+            return Ok(None);
+        };
+        let function = WindowFuncExpr {
+            func: *func,
+            args: args.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        };
+        let mut slot = base_width;
+        for group in groups {
+            if group.spec == **spec {
+                let offset = group
+                    .functions
+                    .iter()
+                    .position(|candidate| candidate == &function)
+                    .ok_or_else(|| DbError::internal("collected window function disappeared"))?;
+                slot = slot
+                    .checked_add(offset)
+                    .ok_or_else(|| DbError::internal("window function result slot overflowed"))?;
+                return Ok(Some(BoundExpr::LocalRef {
+                    slot,
+                    data_type: data_type.clone(),
+                    nullable: *nullable,
+                }));
+            }
+            slot = slot
+                .checked_add(group.functions.len())
+                .ok_or_else(|| DbError::internal("window function result slot overflowed"))?;
+        }
+        Err(DbError::internal("window function was not collected"))
+    })
 }
 
 /// Stack the optional `Distinct` node below the `Projection`. `Distinct` sits
@@ -1610,16 +1724,4 @@ pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }
-}
-
-pub(crate) fn contains_window(expr: &BoundExpr) -> bool {
-    if matches!(expr, BoundExpr::WindowCall { .. }) {
-        return true;
-    }
-    let mut found = false;
-    let _ = crate::params::for_each_child(expr, &mut |child| {
-        found |= contains_window(child);
-        Ok(())
-    });
-    found
 }

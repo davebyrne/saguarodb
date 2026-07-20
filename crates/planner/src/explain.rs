@@ -87,7 +87,8 @@ fn physical_plan_children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. }
-        | PhysicalPlan::Aggregate { source, .. } => vec![source],
+        | PhysicalPlan::Aggregate { source, .. }
+        | PhysicalPlan::Window { source, .. } => vec![source],
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::MergeJoin { left, right, .. }
@@ -642,6 +643,39 @@ fn format_node(
                 output,
             )?;
         }
+        PhysicalPlan::Window {
+            source,
+            spec,
+            functions,
+        } => {
+            let partition_by = format_expr_list(&spec.partition_by);
+            let order_by = format_order_by(&spec.order_by);
+            let frame = format_window_frame(spec)
+                .map(|frame| format!(" frame={frame}"))
+                .unwrap_or_default();
+            let functions = functions
+                .iter()
+                .map(|function| {
+                    format!(
+                        "{}({})",
+                        format_window_func(function.func),
+                        format_expr_list(&function.args)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            output.push_str(&format!(
+                "{prefix}Window partition_by=[{partition_by}] order_by=[{order_by}]{frame} functions=[{functions}]{rows_suffix}{actual_suffix}\n"
+            ));
+            format_node(
+                source,
+                layout_child(layout, 0)?,
+                indent + 1,
+                catalog,
+                metrics,
+                output,
+            )?;
+        }
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!(
                 "{prefix}Values rows={}{rows_suffix}{actual_suffix}\n",
@@ -690,6 +724,98 @@ fn layout_child(layout: &PlanNodeLayout, index: usize) -> Result<&PlanNodeLayout
             layout.id().0
         ))
     })
+}
+
+fn format_expr_list(expressions: &[crate::BoundExpr]) -> String {
+    expressions
+        .iter()
+        .map(|expr| format!("{expr:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_order_by(order_by: &[crate::BoundOrderByItem]) -> String {
+    order_by
+        .iter()
+        .map(|item| {
+            let direction = if item.ascending { "ASC" } else { "DESC" };
+            let nulls = item
+                .nulls_first
+                .map(|first| if first { " NULLS FIRST" } else { " NULLS LAST" })
+                .unwrap_or_default();
+            format!("{:?} {direction}{nulls}", item.expr)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_window_frame(spec: &crate::BoundWindowSpec) -> Option<String> {
+    use crate::{BoundFrameBound, WindowFrameUnits};
+    let default_end = if spec.order_by.is_empty() {
+        BoundFrameBound::UnboundedFollowing
+    } else {
+        BoundFrameBound::CurrentRow
+    };
+    if spec.frame.units == WindowFrameUnits::Range
+        && spec.frame.start == BoundFrameBound::UnboundedPreceding
+        && spec.frame.end == default_end
+    {
+        return None;
+    }
+    let units = match spec.frame.units {
+        WindowFrameUnits::Rows => "ROWS",
+        WindowFrameUnits::Range => "RANGE",
+    };
+    Some(format!(
+        "{units} BETWEEN {} AND {}",
+        format_frame_bound(&spec.frame.start),
+        format_frame_bound(&spec.frame.end)
+    ))
+}
+
+fn format_window_func(function: crate::WindowFunc) -> &'static str {
+    use crate::{AggregateFunc, WindowFunc};
+    match function {
+        WindowFunc::RowNumber => "row_number",
+        WindowFunc::Rank => "rank",
+        WindowFunc::DenseRank => "dense_rank",
+        WindowFunc::Ntile => "ntile",
+        WindowFunc::PercentRank => "percent_rank",
+        WindowFunc::CumeDist => "cume_dist",
+        WindowFunc::Lag => "lag",
+        WindowFunc::Lead => "lead",
+        WindowFunc::FirstValue => "first_value",
+        WindowFunc::LastValue => "last_value",
+        WindowFunc::NthValue => "nth_value",
+        WindowFunc::Aggregate(aggregate) => match aggregate {
+            AggregateFunc::Count => "count",
+            AggregateFunc::Sum => "sum",
+            AggregateFunc::Avg => "avg",
+            AggregateFunc::Min => "min",
+            AggregateFunc::Max => "max",
+            AggregateFunc::StddevSamp => "stddev_samp",
+            AggregateFunc::StddevPop => "stddev_pop",
+            AggregateFunc::VarSamp => "var_samp",
+            AggregateFunc::VarPop => "var_pop",
+            AggregateFunc::BoolAnd => "bool_and",
+            AggregateFunc::BoolOr => "bool_or",
+            AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::StringAgg => "string_agg",
+        },
+    }
+}
+
+fn format_frame_bound(bound: &crate::BoundFrameBound) -> String {
+    use crate::BoundFrameBound;
+    match bound {
+        BoundFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        BoundFrameBound::PrecedingRows(value) => format!("{value} PRECEDING"),
+        BoundFrameBound::PrecedingRange(value) => format!("{value:?} PRECEDING"),
+        BoundFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        BoundFrameBound::FollowingRows(value) => format!("{value} FOLLOWING"),
+        BoundFrameBound::FollowingRange(value) => format!("{value:?} FOLLOWING"),
+        BoundFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    }
 }
 
 fn table_label(table: u32, table_name: &str) -> String {

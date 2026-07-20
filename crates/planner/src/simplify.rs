@@ -148,6 +148,27 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .collect(),
             output_schema,
         },
+        LogicalPlan::Window {
+            source,
+            mut spec,
+            functions,
+        } => {
+            spec.partition_by = spec.partition_by.into_iter().map(fold_expr).collect();
+            for item in &mut spec.order_by {
+                item.expr = fold_expr(item.expr.clone());
+            }
+            LogicalPlan::Window {
+                source: Box::new(simplify_logical(*source)),
+                spec,
+                functions: functions
+                    .into_iter()
+                    .map(|mut function| {
+                        function.args = function.args.into_iter().map(fold_expr).collect();
+                        function
+                    })
+                    .collect(),
+            }
+        }
         LogicalPlan::Values {
             rows,
             output_schema,

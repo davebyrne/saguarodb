@@ -136,6 +136,19 @@ mod tests {
     }
 
     #[test]
+    fn window_plan_dispatch_returns_structured_feature_error() {
+        let harness = ExecutorHarness::with_users();
+        let error = harness
+            .execute("select row_number() over () from users")
+            .unwrap_err();
+        assert_eq!(error.code, SqlState::FeatureNotSupported);
+        assert_eq!(
+            error.message,
+            "window function execution is not yet implemented"
+        );
+    }
+
+    #[test]
     fn boolean_and_uses_sql_null_semantics() {
         let row = ExecRow {
             row: Row { values: vec![] },

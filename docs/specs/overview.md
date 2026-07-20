@@ -1424,6 +1424,7 @@ pub enum LogicalPlan {
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
     },
+    Window { source: Box<LogicalPlan>, spec: BoundWindowSpec, functions: Vec<WindowFuncExpr> },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
     SetOp { op: SetOp, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> },
 }
@@ -1460,6 +1461,15 @@ pub struct BoundOrderByItem {
 ```
 
 Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, the statistical aggregates `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP` and `VARIANCE`/`VAR_SAMP`/`VAR_POP`, `BOOL_AND`/`BOOL_OR`, `ARRAY_AGG`, and `STRING_AGG` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls into `AggregateExpr` values and rewrites expressions above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values, so aggregate slot `i` is read as `LocalRef { slot: group_by.len() + i, ... }`. `AggregateCall` must not reach executor scalar evaluation.
+
+Window calls are extracted after aggregate rewriting and HAVING, grouped by
+identical window specification, and structurally deduplicated within each
+group. One Window node per group appends result columns to its source; uses in
+projection, query ordering, and distinct keys become fixed `LocalRef` slots.
+Window nodes sit before query Sort/Distinct/Projection and lower one-to-one to
+physical Window nodes. Correlated-subquery hoisting restores the precomputed
+Window input width with a narrowing Projection whenever a hoisted Apply widens
+that boundary.
 
 Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM` and `AVG` accept either numeric type and return it (`AVG(integer)` uses integer division truncated toward zero; `AVG(double precision)` is true division), rejecting non-numeric arguments with `SqlState::DatatypeMismatch`; `MIN` and `MAX` return the argument type and are nullable; `STDDEV`/`VARIANCE` (and their `_SAMP`/`_POP` forms) take a numeric argument and return `DOUBLE PRECISION`; `BOOL_AND`/`BOOL_OR` take a boolean argument and return `BOOLEAN`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for the rest (sample variance/stddev also return `NULL` for a single value).
 
@@ -1563,6 +1573,7 @@ pub enum PhysicalPlan {
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
     },
+    Window { source: Box<PhysicalPlan>, spec: BoundWindowSpec, functions: Vec<WindowFuncExpr> },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
     SetOp { op: SetOp, all: bool, left: Box<PhysicalPlan>, right: Box<PhysicalPlan> },
 }

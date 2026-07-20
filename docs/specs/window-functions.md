@@ -1,11 +1,11 @@
 # SaguaroDB Window Functions Specification
 
 **Date:** 2026-07-19
-**Status:** In progress — milestones M0–M2 are complete; implementation
-milestones M3–M6 are pending. Window calls now parse, bind, and receive complete
-placement, nesting, typing, and frame validation, but logical planning rejects
-them with a temporary `0A000`, so window functions remain unavailable for
-execution. The affected crate specifications,
+**Status:** In progress — milestones M0–M3 are complete; implementation
+milestones M4–M6 are pending. Window calls now parse, bind, validate, and lower
+to logical and physical Window nodes with stable result slots and EXPLAIN
+output. Executor dispatch returns a structured `0A000` until M4, so window
+functions remain unavailable for execution. The affected crate specifications,
 `docs/specs/overview.md`, `README.md`, and `AGENTS.md` are updated milestone by
 milestone as listed in §11.
 
@@ -358,7 +358,7 @@ below the Window stack, while a correlated `HAVING` conjunct can produce
 `Aggregate → Apply → Filter → Window`. Because Apply appends columns, whenever
 hoisting inserts an Apply beneath a Window node above the width-defining
 source, it also inserts a narrowing Projection between the consuming Filter
-and the Window. That Projection selects `InputRef` slots `0..W0`, restoring the
+and the Window. That Projection selects `LocalRef` slots `0..W0`, restoring the
 pre-hoist width before window columns are appended. This follows the existing
 `restore_dml_source_shape` precedent for reshaping Apply-widened DML sources.
 As a defense against malformed plans, `WindowOp::new` validates that the source
@@ -519,7 +519,7 @@ or row context.
   walker arms, the durable-view rejection, and a temporary planning guard.
   Documentation updated: this spec, `docs/specs/crates/planner.md`, and
   `docs/specs/crates/common.md`.
-- **M3 — `feat(planner): plan window functions`.** Add logical and physical
+- **M3 — `feat(planner): plan window functions` (complete).** Add logical and physical
   Window nodes, collection/deduplication and LocalRef rewriting, row-estimate
   passthrough, plan walkers, and EXPLAIN registration; execution remains a
   structured staging error. Documentation updated: this spec,
